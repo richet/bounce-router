@@ -4,6 +4,7 @@ import {PassThrough} from 'node:stream';
 import {completions, frameDiff, createMouseInput, mouseTracking, createPasteInput, inputLayout, windowAround, modelRows} from './terminal.js';
 import {modelCatalog, modelEntries, catalogNotes} from './models.js';
 import {clean, createFormatter, createTranscriptRenderer, activeModel} from './format.js';
+import {loadQuota, recordQuota, refreshQuota, quotaSnapshot, quotaShort, quotaReport, quotaUnavailable} from './quota.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import {spawn} from 'node:child_process';
@@ -13,15 +14,16 @@ import {Session, Router, config, saveJSON, dataRoot} from './core.js';
 import {providers} from './providers.js';
 import {projectRoot, fingerprint, validate, supervise} from './reload.js';
 
-const help = `localrouter — one terminal, your coding agents
+const help = `bounce — one terminal, your coding agents
 
-  localrouter [--cwd PATH] [--resume ID] [--provider NAME] [--model ID]
-  localrouter run "prompt" [--image PATH ...] [--cwd PATH] [--json] [--mode yolo|plan]
-  localrouter login claude|codex|muse
-  localrouter models [--json]
-  localrouter sessions
-  localrouter doctor
-  localrouter dev        Improve localrouter itself; validate/reload after changes
+  bounce [--cwd PATH] [--resume ID] [--provider NAME] [--model ID]
+  bounce run "prompt" [--image PATH ...] [--cwd PATH] [--json] [--mode yolo|plan]
+  bounce login claude|codex|muse
+  bounce models [--json]
+  bounce quota [--json]
+  bounce sessions
+  bounce doctor
+  bounce dev        Improve bounce itself; validate/reload after changes
 
 TUI commands:
   /provider NAME        Select and save the default agent
@@ -33,6 +35,7 @@ TUI commands:
   /login NAME           Open the vendor's native login flow
   /new                  Start a new session in this workspace
   /note TEXT            Save a durable handoff note
+  /quota                Show the subscription usage each agent reports
   /retry                Clear locally recorded quota cooldowns
   /restart              Test and reload updated code, keeping this session
   /help                 Show commands
@@ -44,9 +47,10 @@ Keys: / command picker · Tab complete (or next agent) · F2 pause for copying
       Enter send · Alt+Enter newline · Mouse wheel / PgUp/PgDn scroll · ↑/↓ prompt history
       Ctrl+C cancel turn / exit when idle · Ctrl+U clear input
 
-Node.js 22+. Config and journals: LOCALROUTER_HOME or ~/.localrouter.
+Node.js 22+. Config and journals: BOUNCE_HOME or ~/.bounce.
 YOLO disables provider approvals/sandboxing. Native CLI credentials stay with vendors.
-Model names are passed through to each CLI; remaining subscription quota is unknown.
+Model names are passed through to each CLI. Quota comes from the agents themselves:
+Codex answers on demand, Claude reports its windows while a turn runs, Muse reports none.
 `;
 const login = (provider, settings, cwd) => new Promise((resolve, reject) => {
   if (!providers[provider]) return reject(new Error('Choose claude, codex, or muse'));
@@ -68,9 +72,9 @@ async function main() {
     mode: {type: 'string'}, json: {type: 'boolean'}, help: {type: 'boolean', short: 'h'}, version: {type: 'boolean', short: 'v'},
   }});
   if (values.help) return console.log(help);
-  if (values.version) return console.log('localrouter 0.1.0');
-  const restarted = process.env.LOCALROUTER_RESTART ? JSON.parse(process.env.LOCALROUTER_RESTART) : null;
-  delete process.env.LOCALROUTER_RESTART;
+  if (values.version) return console.log('bounce 0.1.0');
+  const restarted = process.env.BOUNCE_RESTART ? JSON.parse(process.env.BOUNCE_RESTART) : null;
+  delete process.env.BOUNCE_RESTART;
   const dev = restarted?.dev ?? positionals[0] === 'dev';
   const root = dataRoot(), settings = restarted?.settings ?? config(root), cwd = fs.realpathSync(dev ? projectRoot : values.cwd || process.cwd());
   if (values.provider && !restarted) {
@@ -90,8 +94,14 @@ async function main() {
     }
     return;
   }
+  if (positionals[0] === 'quota') {
+    const store = await refreshQuota(settings, {root, cwd});
+    if (values.json) return console.log(JSON.stringify(store, null, 2));
+    return console.log(quotaReport(store, settings.order));
+  }
   if (positionals[0] === 'doctor') {
     console.log(`Workspace: ${cwd}\nData: ${root}\nMode: ${settings.mode}\nOrder: ${settings.order.join(' → ')}`);
+    const quotas = await refreshQuota(settings, {root, cwd});
     for (const provider of Object.keys(providers)) {
       await new Promise(resolve => {
         const child = spawn(resolveExecutable(provider, settings.executables[provider]), ['--version'], {stdio: ['ignore', 'pipe', 'pipe']});
@@ -99,21 +109,24 @@ async function main() {
         child.stderr.resume();
         const timer = setTimeout(() => child.kill(), 5000);
         child.once('error', e => { console.log(`${provider}: ${e.message}`); });
-        child.once('close', code => {clearTimeout(timer); console.log(`${provider} (${resolveExecutable(provider, settings.executables[provider])}): ${code === 0 ? clean(out.trim()) : 'not available'} · quota unknown`); resolve();});
+        child.once('close', code => {clearTimeout(timer); console.log(`${provider} (${resolveExecutable(provider, settings.executables[provider])}): ${code === 0 ? clean(out.trim()) : 'not available'} · ${quotaShort(quotas[provider]) || quotas[provider]?.error || quotaUnavailable(provider)}`); resolve();});
       });
     }
     return;
   }
   if (positionals.length && !['run', 'dev'].includes(positionals[0])) throw new Error('Unknown command. Use --help.');
-  if (positionals[0] !== 'run' && (!process.stdin.isTTY || !process.stdout.isTTY)) throw new Error('TUI requires a terminal. Use localrouter run "prompt" for headless execution.');
-  if (positionals[0] === 'run' && !positionals.slice(1).join(' ').trim()) throw new Error('Provide a prompt: localrouter run "prompt"');
+  if (positionals[0] !== 'run' && (!process.stdin.isTTY || !process.stdout.isTTY)) throw new Error('TUI requires a terminal. Use bounce run "prompt" for headless execution.');
+  if (positionals[0] === 'run' && !positionals.slice(1).join(' ').trim()) throw new Error('Provide a prompt: bounce run "prompt"');
   let session = new Session(cwd, {root, id: restarted?.id ?? values.resume});
   session.lock();
   let router = new Router(session, settings);
   if (restarted?.provider || values.provider) session.active = restarted?.provider || values.provider;
   process.on('exit', () => session.unlock?.());
+  // Quota readings survive restarts, so the display starts with the last known usage.
+  const quotas = loadQuota(root);
   if (positionals[0] === 'run') {
     session.onEvent = e => {
+      if (e.kind === 'raw') recordQuota(quotas, root, quotaSnapshot(e.provider, e.raw));
       if (values.json) console.log(JSON.stringify(e));
       else if (e.text && !['raw', 'usage', 'progress'].includes(e.kind)) console.log(`[${e.provider || 'router'}:${e.kind}] ${clean(e.text)}`);
     };
@@ -131,7 +144,7 @@ async function main() {
   let picker = null;
   const suggestions = () => menuDismissed ? [] : completions(input);
   const acceptCompletion = () => {const options = suggestions(); if (options.length) {input = '/' + options[completionIndex % options.length][0] + ' '; completionIndex = 0; menuDismissed = false; return true;} return false;};
-  let notice = 'Ready. /help for commands. Quota is unknown until a provider reports exhaustion.';
+  let notice = 'Ready. /help for commands. /quota shows the usage each agent reports.';
   const history = session.events.filter(e => e.kind === 'user').map(e => e.text);
   const selected = () => session.active || settings.order[0];
   const save = () => saveJSON(path.join(root, 'config.json'), settings);
@@ -186,10 +199,10 @@ async function main() {
     while (body.length < bodyHeight) body.push('');
     const line = '─'.repeat(width);
     const header = [
-      style.title(' LOCALROUTER') + style.muted('  /  your agents, one conversation'),
+      style.title(' BOUNCE') + style.muted('  /  your agents, one conversation'),
       `${selected()} · Model: ${activeModel(session.events, selected(), settings.models[selected()])} · ${settings.mode.toUpperCase()}${settings.mode === 'yolo' ? ' (approvals + sandbox bypassed)' : ''} · ${busy ? 'RUNNING' : 'READY'}`,
       `${session.cwd} · session ${session.id.slice(0, 8)}`,
-      settings.order.map(p => `${p}${router.cooldowns[p] > Date.now() ? ' [cooldown]' : ''}`).join(' → '), line,
+      settings.order.map(p => `${p}${router.cooldowns[p] > Date.now() ? ' [cooldown]' : ''}${quotaShort(quotas[p]) ? ` (${quotaShort(quotas[p])})` : ''}`).join(' → '), line,
     ];
     const nextFrame = [
       ...header.map((s, i) => clip(i === 0 ? s : (i === 1 ? style.status : style.muted)(clean(s)), width)),
@@ -207,7 +220,9 @@ async function main() {
   let renderTimer;
   function scheduleRender(event) {
     if (event?.kind === 'progress') progress = clean(event.text);
-    if (event?.kind === 'raw' || renderTimer) return;
+    // Vendor streams repeat quota many times per turn; only a changed reading redraws.
+    if (event?.kind === 'raw' && !recordQuota(quotas, root, quotaSnapshot(event.provider, event.raw))) return;
+    if (renderTimer) return;
     renderTimer = setTimeout(() => {renderTimer = null; render();}, 40);
   }
   const enter = () => { suspended = false; previousFrame = []; previousCursor = ''; process.stdin.setRawMode(true); process.stdin.resume(); process.stdout.write('\x1b[?1049h\x1b[?25l\x1b[?2004h' + mouseTracking(!copyPaused)); render(); };
@@ -242,6 +257,9 @@ async function main() {
           const order = arg.split(',').map(p => p.trim());
           if (!order.length || order.some(p => !providers[p]) || new Set(order).size !== order.length) throw new Error('Use unique provider names separated by commas');
           settings.order = order; session.active = order[0]; save();
+        } else if (command === 'quota') {
+          await refreshQuota(settings, {root, store: quotas, cwd: session.cwd});
+          session.append({kind: 'quota', text: quotaReport(quotas, settings.order)});
         } else if (command === 'retry') {
           router.cooldowns = {}; for (const p of Object.keys(providers)) session.append({kind: 'cooldown', provider: p, until: 0, text: 'Local cooldown cleared'});
         } else if (command === 'note') {
@@ -257,6 +275,7 @@ async function main() {
         history.push(text); historyIndex = -1; scroll = 0;
         notice = 'Running · Esc or Ctrl+C cancels the agent process group';
         render(); const result = await router.run(text); notice = `Turn ${result}. Session saved.`;
+        void refreshQuota(settings, {root, store: quotas, cwd: session.cwd}).then(render, () => {});
         if (dev && result === 'completed' && fingerprint() !== loadedFingerprint) await restart();
       }
     } catch (e) {notice = e.message; if (!input) input = text;}
@@ -329,9 +348,10 @@ async function main() {
   emitKeypressEvents(keyboard);
   keyboard.on('keypress', handleKey);
   session.onEvent = scheduleRender;
+  void refreshQuota(settings, {root, store: quotas, cwd: session.cwd}).then(render, () => {});
   process.stdout.on('resize', render);
   process.on('SIGTERM', () => { if (busy) {router.cancel(); const timer = setInterval(() => {if (!busy) {clearInterval(timer); quit();}}, 100);} else quit(); });
   process.on('exit', () => { if (!suspended) leave(); });
   enter();
 }
-(process.env.LOCALROUTER_SUPERVISED === '1' && typeof process.send === 'function' ? main() : supervise()).catch(error => {console.error(`localrouter: ${error.message}`); process.exitCode = 1;});
+(process.env.BOUNCE_SUPERVISED === '1' && typeof process.send === 'function' ? main() : supervise()).catch(error => {console.error(`bounce: ${error.message}`); process.exitCode = 1;});

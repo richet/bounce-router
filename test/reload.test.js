@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {fingerprint, validate} from '../src/reload.js';
 test('reload detects added and modified source but ignores journals', t => {
-  const root=fs.mkdtempSync(path.join(os.tmpdir(),'localrouter-reload-'));
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'bounce-reload-'));
   t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
   fs.mkdirSync(path.join(root,'src'));fs.writeFileSync(path.join(root,'package.json'),'{}');
   fs.writeFileSync(path.join(root,'src','a.js'),'one');
@@ -16,7 +16,7 @@ test('reload detects added and modified source but ignores journals', t => {
   fs.writeFileSync(path.join(root,'src','b.js'),'new');assert.notEqual(fingerprint(root),modified);
 });
 test('reload validation rejects failing checks before running tests', async t => {
-  const root=fs.mkdtempSync(path.join(os.tmpdir(),'localrouter-check-'));
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'bounce-check-'));
   t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
   fs.writeFileSync(path.join(root,'package.json'),JSON.stringify({scripts:{check:'node -e "process.exit(1)"',test:'node -e "process.exit(0)"'}}));
   await assert.rejects(validate(root),/keeping this running version/);

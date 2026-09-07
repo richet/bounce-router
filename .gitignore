@@ -1,4 +1,4 @@
 node_modules/
-.localrouter/
+.bounce/
 .DS_Store
 *.log

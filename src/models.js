@@ -1,17 +1,16 @@
-import {spawn as spawnProcess} from 'node:child_process';
-import {createInterface} from 'node:readline';
+import {queryLines} from './query.js';
 import {resolveExecutable} from './executable.js';
 import {providers} from './providers.js';
 
 // Every catalog comes from the vendor CLI's own protocol. Nothing here hard-codes
-// a model name, so a CLI update changes the picker without changing localrouter.
+// a model name, so a CLI update changes the picker without changing bounce.
 export const catalogQueries = {
   claude: {
     args: ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
       '--no-session-persistence', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}'],
-    requests: [{type: 'control_request', request_id: 'localrouter-models', request: {subtype: 'initialize'}}],
+    requests: [{type: 'control_request', request_id: 'bounce-models', request: {subtype: 'initialize'}}],
     read(raw, out) {
-      if (raw.type !== 'control_response' || raw.response?.request_id !== 'localrouter-models') return false;
+      if (raw.type !== 'control_response' || raw.response?.request_id !== 'bounce-models') return false;
       const result = raw.response.response ?? {};
       out.account = result.account?.email ?? null;
       out.models = (result.models ?? []).map(m => ({id: m.value, label: m.displayName || m.value, description: m.description || m.resolvedModel || ''}));
@@ -21,7 +20,7 @@ export const catalogQueries = {
   codex: {
     args: ['app-server'],
     requests: [
-      {id: 1, method: 'initialize', params: {clientInfo: {name: 'localrouter', version: '0.1.0'}}},
+      {id: 1, method: 'initialize', params: {clientInfo: {name: 'bounce', version: '0.1.0'}}},
       {method: 'initialized'},
       {id: 2, method: 'account/read', params: {}},
       {id: 3, method: 'model/list', params: {}},
@@ -36,7 +35,7 @@ export const catalogQueries = {
   muse: {
     args: ['serve'],
     requests: [
-      {jsonrpc: '2.0', id: 1, method: 'initialize', params: {clientInfo: {name: 'localrouter', version: '0.1.0'}}},
+      {jsonrpc: '2.0', id: 1, method: 'initialize', params: {clientInfo: {name: 'bounce', version: '0.1.0'}}},
       {jsonrpc: '2.0', method: 'initialized'},
       {jsonrpc: '2.0', id: 2, method: 'model/list', params: {}},
     ],
@@ -52,34 +51,14 @@ export const catalogQueries = {
 
 // A failed or empty catalog is reported, never thrown: one signed-out agent must
 // not hide the models of the others.
-export function queryCatalog(provider, executable = provider, {spawn = spawnProcess, timeout = 20000, cwd} = {}) {
+export async function queryCatalog(provider, executable = provider, {spawn, timeout = 20000, cwd} = {}) {
   const query = catalogQueries[provider];
-  if (!query) return Promise.resolve({provider, models: [], account: null, error: `Unknown provider: ${provider}`});
-  return new Promise(resolve => {
-    const out = {};
-    let child, settled = false, stderr = '';
-    const finish = error => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      try { child?.kill(); } catch {}
-      resolve({provider, models: out.models ?? [], account: out.account ?? null,
-        error: out.models?.length ? null : error || `${provider} reported no models`});
-    };
-    const timer = setTimeout(() => finish(`${provider} did not answer in time`), timeout);
-    try { child = spawn(executable, query.args, {cwd, stdio: ['pipe', 'pipe', 'pipe']}); }
-    catch (error) { return finish(error.message); }
-    child.on('error', error => finish(error.code === 'ENOENT' ? `${provider} CLI not installed` : error.message));
-    child.stdin.on('error', () => {}); // The CLI may exit before reading the request.
-    child.stderr?.on('data', d => {stderr = (stderr + d).slice(-4000);});
-    createInterface({input: child.stdout}).on('line', line => {
-      let raw;
-      try { raw = JSON.parse(line); } catch { return; }
-      if (query.read(raw, out)) finish();
-    });
-    child.on('close', () => finish(stderr.trim().split('\n').at(-1) || `${provider} exited before listing models`));
-    for (const request of query.requests) child.stdin.write(JSON.stringify(request) + '\n');
-  });
+  if (!query) return {provider, models: [], account: null, error: `Unknown provider: ${provider}`};
+  const {out, error} = await queryLines({executable, args: query.args, requests: query.requests, read: query.read,
+    spawn, timeout, cwd, messages: {missing: `${provider} CLI not installed`, timeout: `${provider} did not answer in time`,
+      closed: `${provider} exited before listing models`}});
+  return {provider, models: out.models ?? [], account: out.account ?? null,
+    error: out.models?.length ? null : error || `${provider} reported no models`};
 }
 
 let cache = {time: 0, value: null};

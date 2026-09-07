@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {Session, Router, defaults, handoff} from '../src/core.js';
 import {invocation, normalize, runProcess} from '../src/providers.js';
-const setup = t => {const root = fs.mkdtempSync(path.join(os.tmpdir(), 'localrouter-test-')); t.after(() => fs.rmSync(root, {recursive:true, force:true})); return {root, session: new Session(root, {root})};};
+const setup = t => {const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-test-')); t.after(() => fs.rmSync(root, {recursive:true, force:true})); return {root, session: new Session(root, {root})};};
 
 test('quota fallback transfers partial work and remains sticky across turns', async t => {
   const {session} = setup(t); const attempts = [];
@@ -117,7 +117,7 @@ test('child cancellation waits for exit and reports cancelled', async () => {
   assert.equal(result.status,'cancelled');
 });
 test('missing executable is classified for fallback', async () => {
-  const result=await runProcess({provider:'codex',executable:'/nonexistent/localrouter-fixture',args:[],prompt:'',cwd:os.tmpdir(),emit:()=>{}});
+  const result=await runProcess({provider:'codex',executable:'/nonexistent/bounce-fixture',args:[],prompt:'',cwd:os.tmpdir(),emit:()=>{}});
   assert.equal(result.status,'missing');
 });
 

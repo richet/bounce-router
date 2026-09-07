@@ -4,8 +4,9 @@ import wrapAnsi from 'wrap-ansi';
 export const commands = [
   ['provider', 'Select default agent'], ['model', 'Select model'], ['order', 'Set fallback order'],
   ['mode', 'Set yolo or plan mode'], ['login', 'Sign in to an agent'], ['new', 'Start new session'],
-  ['note', 'Save handoff note'], ['retry', 'Clear quota cooldowns'], ['restart', 'Validate and reload'],
-  ['help', 'Show help'], ['quit', 'Exit localrouter'],
+  ['note', 'Save handoff note'], ['quota', 'Show reported quota'], ['retry', 'Clear quota cooldowns'],
+  ['restart', 'Validate and reload'],
+  ['help', 'Show help'], ['quit', 'Exit bounce'],
 ];
 export function completions(input) {
   if (!/^\/\S*$/.test(input)) return [];

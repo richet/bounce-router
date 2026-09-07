@@ -1,30 +1,31 @@
-# localrouter
+# bouncerouter
 
-One TUI for your installed Claude Code, Codex, and Muse coding agents. Uses native CLI login and headless processes; localrouter owns the conversation and carries context between providers.
+bouncerouter is one TUI for your installed Claude Code, Codex, and Muse coding agents, run with the `bounce` command. Uses native CLI login and headless processes; bounce owns the conversation and carries context between providers.
 
 ## Run
 
 Requires Node.js 22+ and at least one provider CLI on PATH. Run `npm install` in this project before the first launch.
 
 ```sh
-node /Users/rich/Projects/Lupchoo/localrouter/src/cli.js --cwd /path/to/your/repo
+node /Users/rich/Projects/Lupchoo/bouncerouter/src/cli.js --cwd /path/to/your/repo
 ```
 
-Or run `npm start` from this project. Optional: `npm link` exposes `localrouter` on PATH.
+Or run `npm start` from this project. Optional: `npm link` exposes `bounce` on PATH.
 
 ```sh
-localrouter login claude
-localrouter login codex
-localrouter login muse
-localrouter doctor
-localrouter models
-localrouter --cwd /path/to/repo
-localrouter run "Implement the feature and run relevant tests" --cwd /path/to/repo
-localrouter sessions
-localrouter --resume SESSION_ID
+bounce login claude
+bounce login codex
+bounce login muse
+bounce doctor
+bounce models
+bounce quota
+bounce --cwd /path/to/repo
+bounce run "Implement the feature and run relevant tests" --cwd /path/to/repo
+bounce sessions
+bounce --resume SESSION_ID
 ```
 
-Login temporarily hands the terminal to the vendor. Finish its browser/device login, then return to the TUI. Existing CLI logins work without logging in again. localrouter never reads or exchanges credentials. Native CLI environment variables and settings still apply; if you have vendor API keys set, the vendor may prefer them over subscription login.
+Login temporarily hands the terminal to the vendor. Finish its browser/device login, then return to the TUI. Existing CLI logins work without logging in again. bounce never reads or exchanges credentials. Native CLI environment variables and settings still apply; if you have vendor API keys set, the vendor may prefer them over subscription login.
 
 ## Display
 
@@ -36,7 +37,7 @@ Drop image files into the terminal input, add your question, and press Enter. Qu
 
 Claude receives base64 image blocks through stream-JSON input; Codex and Muse receive repeated `--image` flags. A vision-capable provider model is required. Images are copied into the private session directory before sending, so fallback uses the same bytes even if the original is moved. Journals store attachment metadata and saved paths, not base64. Later turns include those saved paths in history; images are automatically attached only to their original turn and its fallback attempts.
 
-Headless usage: `localrouter run "Explain this screenshot" --image "/path/Screen shot.png"` (repeat `--image` for more files). Standalone local image paths in prompt text are also detected as attachments. Missing explicit image paths or invalid files stop submission with an error.
+Headless usage: `bounce run "Explain this screenshot" --image "/path/Screen shot.png"` (repeat `--image` for more files). Standalone local image paths in prompt text are also detected as attachments. Missing explicit image paths or invalid files stop submission with an error.
 
 ## Controls
 
@@ -46,10 +47,11 @@ Headless usage: `localrouter run "Explain this screenshot" --image "/path/Screen
 - `/provider claude` selects and saves the default.
 - `/model` lists every model each signed-in agent reports and lets you pick one: up/down or 1-9 to choose, Enter to use it, Esc to cancel. A pick saves the model and makes that agent the default. `/model refresh` re-asks the agents; catalogs are cached for five minutes.
 - `/model MODEL_ID` saves the selected provider's model without opening the picker; `/model default` uses its native default.
-- Catalogs come from each CLI's own protocol (Claude stream-JSON `initialize`, Codex app-server `model/list`, Muse MSP `model/list`), so no model list is hard-coded. `localrouter models [--json]` prints the same catalogs headlessly. An agent that is not installed or not signed in is listed as a note under the picker instead of hiding the others.
+- Catalogs come from each CLI's own protocol (Claude stream-JSON `initialize`, Codex app-server `model/list`, Muse MSP `model/list`), so no model list is hard-coded. `bounce models [--json]` prints the same catalogs headlessly. An agent that is not installed or not signed in is listed as a note under the picker instead of hiding the others.
 - `/order claude,codex,muse` saves routing order. Omit a provider to disable it.
 - `/mode yolo` (default) bypasses native approvals and sandboxing.
 - `/mode plan` requests Claude plan mode, Codex read-only sandbox, or Muse disabled write/shell. It is not an interactive approval bridge, and provider-native tools/configuration determine exact restrictions.
+- `/quota` refreshes and prints the usage each agent reports; the header carries a short form.
 - `/login [provider]`, `/new`, `/note TEXT`, `/retry`, `/help`, `/quit`.
 - Escape or Ctrl+C cancels the running process group; Ctrl+C while idle exits.
 - Mouse wheel or trackpad scrolls the transcript (three lines per tick); PgUp/PgDn also scroll. F2 releases mouse capture for selecting/copying text. Up/down recalls prompts; Ctrl+U clears input.
@@ -60,20 +62,31 @@ YOLO intentionally lets agents run commands and change files with your user perm
 
 Default order: Claude → Codex → Muse. Successful fallback becomes sticky for the session. Provider exhaustion detected in structured errors, or stderr on failed execution, moves to the next provider. A missing executable also falls through. Authentication, permission, network, model, and other failures stop the turn rather than replaying side effects on another provider. Every provider is attempted at most once per turn. Escape never causes fallback.
 
-A provider hitting limits is skipped for a configurable local delay (30 minutes by default). This is **not** a subscription reset estimate. `/retry` clears the local delay. Exact remaining subscription quota is currently unknown. Usage events are recorded when supplied by the CLI; no account percentages or costs are invented.
+A provider hitting limits is skipped for a configurable local delay (30 minutes by default). This is **not** a subscription reset estimate. `/retry` clears the local delay. Usage events are recorded when supplied by the CLI; no account percentages or costs are invented.
 
 Every turn starts a fresh native CLI process with a handoff. The handoff includes the original request, a bounded recent journal suffix, current request, and Git HEAD/status/diff-stat. It asks the next agent to inspect partially completed work. Full raw provider events and normalized conversation/tool events remain in the journal. Git observation does not commit, stash, reset, or roll back files. Switching is not transactional: an exhausted agent may already have performed side effects.
 
+## Quota
+
+`/quota` in the TUI, or `bounce quota [--json]`, reports the subscription usage each agent states about itself. Nothing is estimated: a window appears only because a CLI reported that percentage.
+
+- **Codex** answers between turns over its app-server (`account/rateLimits/read`): the 5-hour and weekly windows, their reset times, and the plan. bounce asks at startup, after every turn, and on `/quota`.
+- **Claude** reports its 5-hour and weekly windows only while a turn runs, in the `rate_limit_event` records of its stream. The last reading is kept, so it stays visible between turns and across restarts.
+- **Muse** reports no quota in its protocol, and says so instead of showing a number.
+
+The fallback order in the header carries each agent's short reading, e.g. `claude (5h 42% · 7d 7%) → codex (5h 100% · 7d 16%) → muse`. Readings are stored in `~/.bounce/quota.json`; repeated identical readings do not rewrite the file or redraw the screen. `bounce doctor` prints the same reading beside each CLI version. A reading is a vendor's own percentage at the moment it was reported, and reset times are what the vendor stated, not a prediction of when work will succeed again.
+
 ## Local storage
 
-`~/.localrouter` (override with `LOCALROUTER_HOME`):
+`~/.bounce` (override with `BOUNCE_HOME`). A `~/.localrouter` directory left by the previous name is moved to `~/.bounce` on first launch, keeping existing config, sessions and quota readings:
 
 - `config.json`: order, mode, per-provider models, cooldownMinutes, contextChars, executable overrides.
+- `quota.json`: the latest usage reading each agent reported, kept across restarts.
 - `sessions/<uuid>/journal.jsonl`: append-only normalized and raw events.
 - `sessions/<uuid>/handoff.txt`: latest cross-provider prompt.
 - `sessions/<uuid>/lock`: prevents concurrent session writers; stale PID locks are recovered.
 
-Directories/files are created with owner-only permissions. Journals contain prompts and tool output, which can include sensitive project content. On handoff this context is sent through the next configured provider. To remove localrouter history, remove the relevant session directory while it is not running. Provider-native histories remain under each vendor's control.
+Directories/files are created with owner-only permissions. Journals contain prompts and tool output, which can include sensitive project content. On handoff this context is sent through the next configured provider. To remove bounce history, remove the relevant session directory while it is not running. Provider-native histories remain under each vendor's control.
 
 Example config:
 
@@ -88,7 +101,7 @@ Example config:
 }
 ```
 
-Executable discovery checks PATH, common local install directories, and the macOS Codex/ChatGPT app bundles. `doctor` shows the resolved path. An explicit `executables.codex` override takes precedence if needed. Configuration is global to localrouter; sessions remember their workspace. `--provider`, `--model`, and `--mode` override a launch; slash commands persist settings.
+Executable discovery checks PATH, common local install directories, and the macOS Codex/ChatGPT app bundles. `doctor` shows the resolved path. An explicit `executables.codex` override takes precedence if needed. Configuration is global to bounce; sessions remember their workspace. `--provider`, `--model`, and `--mode` override a launch; slash commands persist settings.
 
 ## Development and verification
 
@@ -103,20 +116,20 @@ Protocol references: [Codex non-interactive execution](https://learn.chatgpt.com
 
 ## Current boundaries
 
-This is a working v0.1 foundation. It uses a simple terminal renderer, not a full terminal emulator: multiline input composition is basic. Claude/Codex messages render as structured events arrive; Muse renders output deltas. Native session resume, semantic long-history compaction, interactive tool approvals, and vendor quota APIs are not implemented. Context is bounded and may omit older decisions; `/note` helps record current handoff details. Raw events preserve unrecognized provider data for adapter updates. Providers can change their flags/event formats, so review adapter fixtures when upgrading them.
+This is a working v0.1 foundation. It uses a simple terminal renderer, not a full terminal emulator: multiline input composition is basic. Claude/Codex messages render as structured events arrive; Muse renders output deltas. Native session resume, semantic long-history compaction, and interactive tool approvals are not implemented. Quota is only as good as what each CLI reports: Codex answers on demand, Claude reports during turns, Muse reports nothing. Context is bounded and may omit older decisions; `/note` helps record current handoff details. Raw events preserve unrecognized provider data for adapter updates. Providers can change their flags/event formats, so review adapter fixtures when upgrading them.
 
-## Improve localrouter using localrouter
+## Improve bounce using bounce
 
-After `npm link`, run `localrouter dev` from any directory. It opens the actual localrouter source directory as the agent workspace. Ask for an improvement, for example:
+After `npm link`, run `bounce dev` from any directory. It opens the actual bounce source directory as the agent workspace. Ask for an improvement, for example:
 
 > Add a /status command showing the current provider, model, routing order, and local cooldowns. Add relevant tests and update the README.
 
 In dev mode, a successful agent turn that changes `src/` or `package.json` triggers `npm run check` and `npm test`. If both pass, a supervisor starts a fresh process and resumes the same journal, workspace, selected provider, model settings, and permission mode. Failed validation keeps the current process running so you can ask the agent to fix the problem. No relink is needed: npm's link already points to these source files.
 
-Use `/restart` in any TUI session to validate and reload manually. A regular launch does not automatically reload. Restart happens between turns, never during a running agent command. Source edits are kept on disk even when checks fail; there is no automatic rollback. Passing tests cannot guarantee the updated app starts successfully; if startup fails, fix the source and use `localrouter --resume ID` (IDs are listed by `localrouter sessions`). Changes to the supervisor itself require fully quitting and launching again. This reloads local changes; it does not download releases or run Git pulls.
+Use `/restart` in any TUI session to validate and reload manually. A regular launch does not automatically reload. Restart happens between turns, never during a running agent command. Source edits are kept on disk even when checks fail; there is no automatic rollback. Passing tests cannot guarantee the updated app starts successfully; if startup fails, fix the source and use `bounce --resume ID` (IDs are listed by `bounce sessions`). Changes to the supervisor itself require fully quitting and launching again. This reloads local changes; it does not download releases or run Git pulls.
 
 Live progress — Claude's thinking-token counters and tool heartbeats, Codex's command starts — is shown on the status line beside the spinner and is never written to the transcript or the journal, so a long turn no longer buries the conversation in repeated `thinking_tokens` blocks. Short bookkeeping events (agent selected, activity, cooldown, agent finished, turn finished) render as a single line; only messages, tool output and results get a block of their own. Tool calls are displayed field by field with real newlines rather than as escaped JSON, while the journal keeps the original text for handoffs.
 
-The header labels the selected model and updates when the provider reports its model. If neither a model override nor runtime metadata is available, it shows `Default (not reported)`; use `/model ID` to select one explicitly. Localrouter activity labels describe local progress. Restart validation shows concise success messages and retains diagnostic output on failure.
+The header labels the selected model and updates when the provider reports its model. If neither a model override nor runtime metadata is available, it shows `Default (not reported)`; use `/model ID` to select one explicitly. Bounce activity labels describe local progress. Restart validation shows concise success messages and retains diagnostic output on failure.
 
 The prompt shows a blinking block cursor and grows as text wraps, up to one third of the terminal height. Longer drafts keep their last lines visible. Pasted newlines are preserved; Alt+Enter inserts a newline and Enter sends. F2 hides the cursor while copying, and exit restores the terminal’s default cursor style.

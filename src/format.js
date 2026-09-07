@@ -17,7 +17,7 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
   const style = {
     title: c.bold.cyan, muted: c.gray, user: c.bold.cyan, assistant: c.bold.green,
     tool: c.magenta, error: c.bold.red, status: c.yellow, result: c.green,
-    note: c.blue, diagnostic: c.yellow, selected: c.bold.inverse, prompt: c.cyan,
+    note: c.blue, diagnostic: c.yellow, selected: c.bold.inverse, prompt: c.cyan, quota: c.bold.blue,
   };
   function codeColors(text, language) {
     if (!color) return text;
@@ -76,8 +76,9 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
   function event(e, width) {
     const names = {user: 'You', assistant: 'Response', delta: 'Response', result: 'Result',
       status: 'Activity', route: 'Agent selected', tool: 'Tool output', error: 'Error',
-      diagnostic: 'Diagnostics', note: 'Saved note', cooldown: 'Retry delay', attempt: 'Agent finished', turn: 'Turn finished'};
-    const label = e.kind === 'user' ? 'You' : `${e.provider || 'Localrouter'} · ${names[e.kind] || e.kind}`;
+      diagnostic: 'Diagnostics', note: 'Saved note', cooldown: 'Retry delay', attempt: 'Agent finished',
+      turn: 'Turn finished', quota: 'Reported quota'};
+    const label = e.kind === 'user' ? 'You' : `${e.provider || 'Bounce'} · ${names[e.kind] || e.kind}`;
     const paint = style[e.kind] || style.muted;
     if (inline.includes(e.kind)) return wrap(`${paint(clean(label))}  ${clean(e.text)}`, width);
     const source = e.kind === 'tool' ? (toolLines(clean(e.text)) ?? [clean(e.text)]).join('\n') : clean(e.text);

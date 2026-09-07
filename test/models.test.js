@@ -20,7 +20,7 @@ test('each agent reports its own catalog over its own protocol', async () => {
   const claude = await queryCatalog('claude', 'claude', {spawn: fake((child, {args, requests}) => {
     assert.ok(args.includes('--strict-mcp-config'));
     assert.equal(requests[0].request.subtype, 'initialize');
-    reply(child, {type: 'control_response', response: {request_id: 'localrouter-models', response: {
+    reply(child, {type: 'control_response', response: {request_id: 'bounce-models', response: {
       account: {email: 'user@example.com'},
       models: [{value: 'default', displayName: 'Default (recommended)', description: 'Opus 5 with 1M context'},
         {value: 'haiku', displayName: 'Haiku', resolvedModel: 'claude-haiku-4-5'}]}}});

@@ -40,7 +40,7 @@ export async function supervise(args = process.argv.slice(2)) {
       let request;
       const child = spawn(process.execPath,[fileURLToPath(new URL('./cli.js',import.meta.url)),...args],{
         stdio:['inherit','inherit','inherit','ipc'],
-        env:{...process.env,LOCALROUTER_SUPERVISED:'1',LOCALROUTER_RESTART:resume ? JSON.stringify(resume) : ''},
+        env:{...process.env,BOUNCE_SUPERVISED:'1',BOUNCE_RESTART:resume ? JSON.stringify(resume) : ''},
       });
       const terminate = () => child.kill('SIGTERM');
       const interrupt = () => {}; // Foreground process group delivers Ctrl+C to the child too.

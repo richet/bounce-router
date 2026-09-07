@@ -9,7 +9,7 @@ import {Session, Router, defaults} from '../src/core.js';
 import {createPasteInput} from '../src/terminal.js';
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64');
 function setup(t) {
- const root = fs.mkdtempSync(path.join(os.tmpdir(),'localrouter-images-'));
+ const root = fs.mkdtempSync(path.join(os.tmpdir(),'bounce-images-'));
  t.after(() => fs.rmSync(root,{recursive:true,force:true}));
  const file = path.join(root,'Screen shot.png'); fs.writeFileSync(file,png);
  return {root,file,session:new Session(root,{root})};

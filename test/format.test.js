@@ -72,7 +72,7 @@ test('headings omit Markdown markers while code and status remain literal', () =
   for (let level = 1; level <= 6; level++) {
     assert.equal(plain.markdown('#'.repeat(level) + ' Heading', 80).join('\n'), 'Heading');
   }
-  assert.match(plain.event({kind: 'status', text: '# literal log'}, 80).join('\n'), /Localrouter · Activity {2}# literal log/);
+  assert.match(plain.event({kind: 'status', text: '# literal log'}, 80).join('\n'), /Bounce · Activity {2}# literal log/);
 });
 test('model display tracks the latest attempt and configuration changes', () => {
   const events = [{kind: 'route', provider: 'claude', model: 'default'},
