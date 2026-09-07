@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import {resolveExecutable} from './executable.js';
-import {completions, frameDiff} from './terminal.js';
-import {clean, createFormatter, displayEvents} from './format.js';
+import {PassThrough} from 'node:stream';
+import {completions, frameDiff, createMouseInput, mouseTracking, createPasteInput, inputLayout, windowAround, modelRows} from './terminal.js';
+import {modelCatalog, modelEntries, catalogNotes} from './models.js';
+import {clean, createFormatter, createTranscriptRenderer, activeModel} from './format.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import {spawn} from 'node:child_process';
@@ -14,15 +16,18 @@ import {projectRoot, fingerprint, validate, supervise} from './reload.js';
 const help = `localrouter — one terminal, your coding agents
 
   localrouter [--cwd PATH] [--resume ID] [--provider NAME] [--model ID]
-  localrouter run "prompt" [--cwd PATH] [--json] [--mode yolo|plan]
+  localrouter run "prompt" [--image PATH ...] [--cwd PATH] [--json] [--mode yolo|plan]
   localrouter login claude|codex|muse
+  localrouter models [--json]
   localrouter sessions
   localrouter doctor
   localrouter dev        Improve localrouter itself; validate/reload after changes
 
 TUI commands:
   /provider NAME        Select and save the default agent
+  /model                Pick from every model your signed-in agents report
   /model ID             Set selected agent's model; "default" resets
+  /model refresh        Re-ask each agent for its catalog, then pick
   /order claude,codex,muse  Save the fallback order
   /mode yolo|plan       YOLO default; plan uses restrictive provider flags
   /login NAME           Open the vendor's native login flow
@@ -33,8 +38,10 @@ TUI commands:
   /help                 Show commands
   /quit                 Exit (Esc cancels an active turn)
 
+Drop PNG/JPEG/GIF/WebP files into your prompt, then press Enter to send.
+
 Keys: / command picker · Tab complete (or next agent) · F2 pause for copying
-      Enter send · PgUp/PgDn scroll · ↑/↓ prompt history
+      Enter send · Alt+Enter newline · Mouse wheel / PgUp/PgDn scroll · ↑/↓ prompt history
       Ctrl+C cancel turn / exit when idle · Ctrl+U clear input
 
 Node.js 22+. Config and journals: LOCALROUTER_HOME or ~/.localrouter.
@@ -57,7 +64,7 @@ function listSessions(root) {
 }
 async function main() {
   const {values, positionals} = parseArgs({allowPositionals: true, options: {
-    cwd: {type: 'string'}, resume: {type: 'string'}, provider: {type: 'string'}, model: {type: 'string'},
+    image: {type: 'string', multiple: true}, cwd: {type: 'string'}, resume: {type: 'string'}, provider: {type: 'string'}, model: {type: 'string'},
     mode: {type: 'string'}, json: {type: 'boolean'}, help: {type: 'boolean', short: 'h'}, version: {type: 'boolean', short: 'v'},
   }});
   if (values.help) return console.log(help);
@@ -74,6 +81,15 @@ async function main() {
   if (values.model && !restarted) settings.models[settings.order[0]] = values.model;
   if (positionals[0] === 'login') return login(positionals[1], settings, cwd);
   if (positionals[0] === 'sessions') return console.log(JSON.stringify(listSessions(root), null, 2));
+  if (positionals[0] === 'models') {
+    const catalogs = await modelCatalog(settings, {maxAge: 0});
+    if (values.json) return console.log(JSON.stringify(catalogs, null, 2));
+    for (const catalog of catalogs) {
+      console.log(`${catalog.provider}${catalog.account ? ` (${catalog.account})` : ''}: ${catalog.error ?? `${catalog.models.length} models`}`);
+      for (const model of catalog.models) console.log(`  ${model.id === settings.models[catalog.provider] ? '✓' : ' '} ${model.id}  ${clean(model.description)}`);
+    }
+    return;
+  }
   if (positionals[0] === 'doctor') {
     console.log(`Workspace: ${cwd}\nData: ${root}\nMode: ${settings.mode}\nOrder: ${settings.order.join(' → ')}`);
     for (const provider of Object.keys(providers)) {
@@ -103,40 +119,67 @@ async function main() {
     };
     const cancel = () => router.cancel();
     process.on('SIGINT', cancel); process.on('SIGTERM', cancel);
-    try { const result = await router.run(positionals.slice(1).join(' ')); process.exitCode = result === 'completed' ? 0 : result === 'cancelled' ? 130 : 1; }
+    try { const result = await router.run(positionals.slice(1).join(' '), values.image || []); process.exitCode = result === 'completed' ? 0 : result === 'cancelled' ? 130 : 1; }
     finally { session.unlock(); process.off('SIGINT', cancel); process.off('SIGTERM', cancel); }
     return;
   }
   let input = '', busy = false, suspended = false, scroll = 0, historyIndex = -1;
+  let activityTimer, activityStarted = 0;
+  const activity = () => `${['◐', '◓', '◑', '◒'][Math.floor((Date.now() - activityStarted) / 150) % 4]} Working · ${Math.floor((Date.now() - activityStarted) / 1000)}s`;
   let loadedFingerprint = fingerprint();
-  let completionIndex = 0, menuDismissed = false, copyPaused = false, previousFrame = [];
+  let completionIndex = 0, menuDismissed = false, copyPaused = false, previousFrame = [], previousCursor = '';
+  let picker = null;
   const suggestions = () => menuDismissed ? [] : completions(input);
   const acceptCompletion = () => {const options = suggestions(); if (options.length) {input = '/' + options[completionIndex % options.length][0] + ' '; completionIndex = 0; menuDismissed = false; return true;} return false;};
   let notice = 'Ready. /help for commands. Quota is unknown until a provider reports exhaustion.';
   const history = session.events.filter(e => e.kind === 'user').map(e => e.text);
   const selected = () => session.active || settings.order[0];
   const save = () => saveJSON(path.join(root, 'config.json'), settings);
-  const {style, clip, wrap: formatterWrap, event: formatEvent} = createFormatter();
-  function formatInput(text, width) {
-    return formatterWrap(clean(text), width).at(-1);
+  const {style, clip, event: formatEvent} = createFormatter();
+  const transcriptRows = createTranscriptRenderer(formatEvent);
+  // Picking a model also picks the agent that reported it.
+  const applyModel = entry => {
+    session.active = entry.provider;
+    settings.order = [entry.provider, ...settings.order.filter(p => p !== entry.provider)];
+    settings.models[entry.provider] = entry.id;
+    save();
+    session.append({kind: 'status', text: `Model: ${entry.provider} · ${entry.label}${entry.id ? ` (${entry.id})` : ''}`});
+    notice = `${entry.provider} · ${entry.label}. Saved as the default.`;
+  };
+  async function openModelPicker(refresh) {
+    notice = 'Asking each signed-in agent for its models…'; render();
+    const catalogs = await modelCatalog(settings, refresh ? {maxAge: 0} : {});
+    const entries = modelEntries(catalogs, settings);
+    const notes = catalogNotes(catalogs);
+    if (!entries.length) throw new Error(notes.join(' · ') || 'No agent reported any models');
+    picker = {entries, notes, index: Math.max(0, entries.findIndex(e => e.provider === selected() && e.current))};
+    notice = 'Select a model. Esc cancels.';
   }
   function render() {
     if (suspended || copyPaused) return;
-    const width = Math.max(12, (process.stdout.columns || 80) - 2), height = Math.max(4, (process.stdout.rows || 24) - 9);
+    const width = Math.max(4, (process.stdout.columns || 80) - 2);
+    const terminalRows = process.stdout.rows || 24;
+    const draft = inputLayout(input, width - 2, Math.max(1, Math.min(Math.floor(terminalRows / 3), terminalRows - 10)));
     const options = suggestions();
+    const menuBudget = Math.max(0, terminalRows - 10 - draft.rows.length);
+    const plain = s => s;
     const menu = [];
-    if (options.length) {
+    if (picker) {
+      const rows = modelRows(picker.entries, picker.index, width - 1);
+      const {start, end} = windowAround(rows.length, picker.index, Math.max(1, menuBudget - 2 - picker.notes.length));
+      menu.push([`Select model · ${rows.length} choices across your signed-in agents`, style.title]);
+      for (let i = start; i < end; i++) menu.push([rows[i], i === picker.index ? style.selected : picker.entries[i].current ? style.result : plain]);
+      for (const note of picker.notes) menu.push([note, style.diagnostic]);
+      menu.push(['↑/↓ choose · 1-9 jump · Enter use it · Esc cancel', style.muted]);
+    } else if (options.length) {
       completionIndex = Math.min(completionIndex, options.length - 1);
       const start = Math.max(0, completionIndex - 3);
-      for (let i = start; i < Math.min(options.length, start + 5); i++) menu.push(`${i === completionIndex ? '›' : ' '} /${options[i][0]}  ${options[i][1]}`);
-      menu.push('↑/↓ choose · Tab/Enter complete · Esc dismiss');
+      for (let i = start; i < Math.min(options.length, start + 5); i++) menu.push([`${i === completionIndex ? '›' : ' '} /${options[i][0]}  ${options[i][1]}`, i === completionIndex ? style.selected : style.muted]);
+      menu.push(['↑/↓ choose · Tab/Enter complete · Esc dismiss', style.muted]);
     }
-    const bodyHeight = Math.max(1, height - menu.length);
-    const rows = [];
-    for (const e of displayEvents(session.events)) {
-      if (['raw', 'usage', 'checkpoint', 'session'].includes(e.kind) || !e.text) continue;
-      rows.push(...formatEvent(e, width));
-    }
+    menu.length = Math.min(menu.length, menuBudget);
+    const bodyHeight = Math.max(1, terminalRows - 9 - draft.rows.length - menu.length);
+    const rows = transcriptRows(session.events, width);
     scroll = Math.min(scroll, Math.max(0, rows.length - bodyHeight));
     const end = rows.length - scroll;
     const body = rows.slice(Math.max(0, end - bodyHeight), end);
@@ -144,18 +187,21 @@ async function main() {
     const line = '─'.repeat(width);
     const header = [
       style.title(' LOCALROUTER') + style.muted('  /  your agents, one conversation'),
-      `${selected()} · ${settings.models[selected()] || 'provider default'} · ${settings.mode.toUpperCase()}${settings.mode === 'yolo' ? ' (approvals + sandbox bypassed)' : ''} · ${busy ? 'RUNNING' : 'READY'}`,
+      `${selected()} · Model: ${activeModel(session.events, selected(), settings.models[selected()])} · ${settings.mode.toUpperCase()}${settings.mode === 'yolo' ? ' (approvals + sandbox bypassed)' : ''} · ${busy ? 'RUNNING' : 'READY'}`,
       `${session.cwd} · session ${session.id.slice(0, 8)}`,
       settings.order.map(p => `${p}${router.cooldowns[p] > Date.now() ? ' [cooldown]' : ''}`).join(' → '), line,
     ];
     const nextFrame = [
       ...header.map((s, i) => clip(i === 0 ? s : (i === 1 ? style.status : style.muted)(clean(s)), width)),
-      ...body, ...menu.map(s => clip(s.startsWith('›') ? style.selected(s) : style.muted(s), width)),
-      style.muted(line), clip(style.status(clean(notice)), width),
-      style.prompt('❯ ') + formatInput(input, width - 2),
+      ...body, ...menu.map(([text, paint]) => clip(paint(clean(text)), width)),
+      style.muted(line),
+      ...draft.rows.map((row, i) => style.prompt(i === 0 ? '❯ ' : '  ') + row),
+      style.muted(line), clip(style.status(clean(busy && activityTimer ? activity() + ' · ' + notice : notice)), width),
     ];
     const update = frameDiff(previousFrame, nextFrame);
-    if (update) process.stdout.write(update);
+    const cursor = busy ? '\x1b[?25l' : `\x1b[${header.length + body.length + menu.length + 2 + draft.cursorRow};${3 + draft.cursorColumn}H\x1b[1 q\x1b[?25h`;
+    if (update || cursor !== previousCursor) process.stdout.write((update ? '\x1b[?25l' + update : '') + cursor);
+    previousCursor = cursor;
     previousFrame = nextFrame;
   }
   let renderTimer;
@@ -163,8 +209,8 @@ async function main() {
     if (event?.kind === 'raw' || renderTimer) return;
     renderTimer = setTimeout(() => {renderTimer = null; render();}, 40);
   }
-  const enter = () => { suspended = false; previousFrame = []; process.stdin.setRawMode(true); process.stdin.resume(); process.stdout.write('\x1b[?1049h\x1b[?25l'); render(); };
-  const leave = () => { suspended = true; process.stdin.setRawMode(false); process.stdout.write('\x1b[?25h\x1b[?1049l'); };
+  const enter = () => { suspended = false; previousFrame = []; previousCursor = ''; process.stdin.setRawMode(true); process.stdin.resume(); process.stdout.write('\x1b[?1049h\x1b[?25l\x1b[?2004h' + mouseTracking(!copyPaused)); render(); };
+  const leave = () => { suspended = true; process.stdin.setRawMode(false); process.stdout.write(mouseTracking(false) + '\x1b[?2004l\x1b[0 q\x1b[?25h\x1b[?1049l'); };
   async function restart() {
     notice = 'Validating updated code…'; render();
     await validate(projectRoot, text => session.append({kind: 'status', text}));
@@ -175,8 +221,10 @@ async function main() {
   }
   const quit = () => { leave(); session.unlock(); process.exit(0); };
   async function submit(text) {
+    activityStarted = Date.now();
+    activityTimer = setInterval(render, 150);
     try {
-      if (text.startsWith('/')) {
+      if (/^\/[a-z]+(?:\s|$)/i.test(text)) {
         const [command, ...parts] = text.slice(1).split(/\s+/); const arg = parts.join(' ');
         if (command === 'quit') return quit();
         if (command === 'restart') return await restart();
@@ -185,7 +233,7 @@ async function main() {
           if (!providers[arg]) throw new Error('Choose claude, codex, or muse');
           session.active = arg; settings.order = [arg, ...settings.order.filter(p => p !== arg)]; save();
         } else if (command === 'model') {
-          if (!arg) throw new Error('Use /model ID or /model default');
+          if (!arg || arg === 'refresh') { await openModelPicker(arg === 'refresh'); return; }
           settings.models[selected()] = arg === 'default' ? '' : arg; save();
         } else if (command === 'mode') {
           if (!['yolo','plan'].includes(arg)) throw new Error('Use /mode yolo or /mode plan'); settings.mode = arg; save();
@@ -210,16 +258,38 @@ async function main() {
         render(); const result = await router.run(text); notice = `Turn ${result}. Session saved.`;
         if (dev && result === 'completed' && fingerprint() !== loadedFingerprint) await restart();
       }
-    } catch (e) {notice = e.message;}
-    finally {busy = false; render();}
+    } catch (e) {notice = e.message; if (!input) input = text;}
+    finally {clearInterval(activityTimer); activityTimer = null; busy = false; render();}
   }
-  emitKeypressEvents(process.stdin);
-  process.stdin.on('keypress', (str, key = {}) => {
+  const keyboard = new PassThrough();
+  // Node's keypress parser holds a lone ESC until another byte follows, so deliver it directly.
+  const toKeyboard = text => text === '\x1b' ? handleKey('\x1b', {name: 'escape'}) : keyboard.write(text);
+  const mouseInput = createMouseInput(toKeyboard, amount => {
+    if (suspended || copyPaused) return;
+    scroll = Math.max(0, scroll + amount); render();
+  });
+  const pasteInput = createPasteInput(text => mouseInput(text), text => {
+    if (busy || suspended || copyPaused || picker) return;
+    input += clean(text);
+    completionIndex = 0; menuDismissed = false; render();
+  });
+  let mouseTimer;
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', chunk => {
+    if (suspended) return;
+    clearTimeout(mouseTimer);
+    pasteInput(chunk);
+    mouseTimer = setTimeout(() => {pasteInput.flush(); mouseInput.flush();}, 50);
+  });
+  function handleKey(str, key = {}) {
     if (suspended) return;
     if (key.name === 'f2') {
       copyPaused = !copyPaused;
+      process.stdout.write(mouseTracking(!copyPaused));
       if (copyPaused) {
-        const row = Math.max(1, previousFrame.length - 1);
+        process.stdout.write('\x1b[?25l');
+        previousCursor = '';
+        const row = Math.max(1, previousFrame.length);
         process.stdout.write(`\x1b[${row};1H\x1b[2KDisplay paused — select and copy text; F2 resumes.`);
         previousFrame[row - 1] = '';
       } else render();
@@ -230,7 +300,16 @@ async function main() {
     if (key.name === 'escape' && busy) {router.cancel(); return;}
     if (key.name === 'pageup') {scroll += 8; render(); return;}
     if (key.name === 'pagedown') {scroll = Math.max(0, scroll - 8); render(); return;}
+    if (picker) {
+      const move = key.name === 'up' ? -1 : key.name === 'down' ? 1 : 0;
+      if (move) picker.index = (picker.index + move + picker.entries.length) % picker.entries.length;
+      else if (str && !key.ctrl && !key.meta && /^[1-9]$/.test(str) && Number(str) <= picker.entries.length) picker.index = Number(str) - 1;
+      else if (key.name === 'escape') {picker = null; notice = 'Model unchanged.';}
+      else if (key.name === 'return') {const entry = picker.entries[picker.index]; picker = null; applyModel(entry);}
+      render(); return;
+    }
     if (busy) return;
+    if (key.name === 'return' && key.meta) {input += '\n'; menuDismissed = true; render(); return;}
     const options = suggestions();
     if (options.length && ['up', 'down'].includes(key.name)) {completionIndex = (completionIndex + (key.name === 'up' ? -1 : 1) + options.length) % options.length; render(); return;}
     if (options.length && ['tab', 'return'].includes(key.name)) {acceptCompletion(); render(); return;}
@@ -245,7 +324,9 @@ async function main() {
     else if (str && !key.ctrl && !key.meta && !['left','right','home','end','delete','escape'].includes(key.name)) input += clean(str).replace(/\n/g, ' ');
     if (input !== beforeInput) {completionIndex = 0; menuDismissed = false;}
     render();
-  });
+  }
+  emitKeypressEvents(keyboard);
+  keyboard.on('keypress', handleKey);
   session.onEvent = scheduleRender;
   process.stdout.on('resize', render);
   process.on('SIGTERM', () => { if (busy) {router.cancel(); const timer = setInterval(() => {if (!busy) {clearInterval(timer); quit();}}, 100);} else quit(); });

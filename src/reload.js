@@ -19,13 +19,16 @@ export function fingerprint(root = projectRoot) {
 }
 export async function validate(root = projectRoot, emit = () => {}) {
   for (const script of ['check','test']) {
+    emit(script === 'check' ? 'Checking syntax…' : 'Running tests…');
     await new Promise((resolve,reject) => {
       const child = spawn('npm',['run',script],{cwd:root,stdio:['ignore','pipe','pipe']});
-      child.stdout.on('data', d => emit(d.toString()));
-      child.stderr.on('data', d => emit(d.toString()));
+      let output = '';
+      const capture = d => { output = (output + d.toString()).slice(-32000); };
+      child.stdout.on('data', capture);
+      child.stderr.on('data', capture);
       const timer = setTimeout(() => {child.kill('SIGKILL'); reject(new Error(`npm run ${script} timed out`));},120000);
       child.once('error', e => {clearTimeout(timer);reject(e);});
-      child.once('close', code => {clearTimeout(timer);code === 0 ? resolve() : reject(new Error(`npm run ${script} failed; keeping this running version. Fix the code and /restart again.`));});
+      child.once('close', code => {clearTimeout(timer); if (code !== 0 && output) emit(output); else if (code === 0) emit(script === 'check' ? 'Syntax checks passed.' : 'Tests passed.'); code === 0 ? resolve() : reject(new Error(`npm run ${script} failed; keeping this running version. Fix the code and /restart again.`));});
     });
   }
 }

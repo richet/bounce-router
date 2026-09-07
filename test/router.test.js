@@ -88,3 +88,15 @@ test('missing executable is classified for fallback', async () => {
   const result=await runProcess({provider:'codex',executable:'/nonexistent/localrouter-fixture',args:[],prompt:'',cwd:os.tmpdir(),emit:()=>{}});
   assert.equal(result.status,'missing');
 });
+
+test('normalizers retain reported models without adding transcript text', () => {
+  for (const [provider, raw] of [
+    ['claude', {type: 'system', subtype: 'init', model: 'claude-model'}],
+    ['codex', {type: 'session.started', model: 'codex-model'}],
+    ['muse', {payload: {model: 'muse-model'}}],
+  ]) {
+    const event = normalize(provider, raw).find(e => e.kind === 'model');
+    assert.equal(event.model, provider + '-model');
+    assert.equal(event.text, undefined);
+  }
+});

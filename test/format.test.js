@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import stripAnsi from 'strip-ansi';
-import {clean, createFormatter, displayEvents} from '../src/format.js';
+import {clean, createFormatter, displayEvents, createTranscriptRenderer, activeModel} from '../src/format.js';
 
 const plain = createFormatter({color: false});
 const color = createFormatter({color: true});
@@ -35,4 +35,52 @@ test('event content stays literal outside assistant output and deltas combine wi
   assert.equal(grouped.length, 2);
   assert.match(grouped[0].text, /^```js/);
   assert.equal(events[0].text, '```j');
+});
+
+test('transcript cache skips unchanged history and only formats appended output', () => {
+  let calls = 0;
+  const render = createTranscriptRenderer((e, width) => { calls++; return plain.event(e, width); });
+  const events = [{kind: 'assistant', text: '# Hello'}];
+  const rows = render(events, 60);
+  for (let i = 0; i < 100; i++) assert.equal(render(events, 60), rows);
+  assert.equal(calls, 1);
+  events.push({kind: 'raw', text: 'ignored'});
+  render(events, 60);
+  assert.equal(calls, 1);
+  events.push({kind: 'delta', provider: 'muse', text: '```j'});
+  render(events, 60);
+  events.push({kind: 'usage'}, {kind: 'delta', provider: 'muse', text: 's\nconst x = 1;\n```'});
+  assert.deepEqual(render(events, 60), displayEvents(events).flatMap(e => plain.event(e, 60)));
+  assert.equal(calls, 3);
+  assert.equal(events[2].text, '```j');
+  assert.deepEqual(render(events, 20), displayEvents(events).flatMap(e => plain.event(e, 20)));
+  assert.equal(calls, 5);
+  assert.deepEqual(render([], 20), []);
+});
+
+test('unlabelled code and tool source get colors without changing literal tool content', () => {
+  const source = 'const greeting = "hello";\nfunction greet() { return greeting; }';
+  const fenced = color.markdown('```\n' + source + '\n```', 100).join('\n');
+  assert.match(fenced, /\x1b\[35mconst/);
+  const tool = color.event({kind: 'tool', text: source}, 100).join('\n');
+  assert.match(tool, /\x1b\[32m"hello"/);
+  assert.ok(stripAnsi(tool).includes(source));
+  assert.doesNotMatch(plain.event({kind: 'tool', text: source}, 100).join('\n'), /\x1b/);
+});
+
+test('headings omit Markdown markers while code and status remain literal', () => {
+  for (let level = 1; level <= 6; level++) {
+    assert.equal(plain.markdown('#'.repeat(level) + ' Heading', 80).join('\n'), 'Heading');
+  }
+  assert.match(plain.event({kind: 'status', text: '# literal log'}, 80).join('\n'), /Localrouter · Activity\n# literal log/);
+});
+test('model display tracks the latest attempt and configuration changes', () => {
+  const events = [{kind: 'route', provider: 'claude', model: 'default'},
+    {kind: 'model', provider: 'claude', model: 'actual-model'}];
+  assert.equal(activeModel(events, 'claude'), 'actual-model');
+  assert.equal(activeModel(events, 'claude', 'new-model'), 'new-model');
+  events.push({kind: 'route', provider: 'codex', model: 'default'});
+  assert.equal(activeModel(events, 'codex'), 'Default (not reported)');
+  events.push({kind: 'route', provider: 'claude', model: 'default'});
+  assert.equal(activeModel(events, 'claude'), 'Default (not reported)');
 });

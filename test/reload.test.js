@@ -21,5 +21,7 @@ test('reload validation rejects failing checks before running tests', async t =>
   fs.writeFileSync(path.join(root,'package.json'),JSON.stringify({scripts:{check:'node -e "process.exit(1)"',test:'node -e "process.exit(0)"'}}));
   await assert.rejects(validate(root),/keeping this running version/);
   fs.writeFileSync(path.join(root,'package.json'),JSON.stringify({scripts:{check:'node -e "process.exit(0)"',test:'node -e "process.exit(0)"'}}));
-  await validate(root);
+  const messages = [];
+  await validate(root, text => messages.push(text));
+  assert.deepEqual(messages, ['Checking syntax…', 'Syntax checks passed.', 'Running tests…', 'Tests passed.']);
 });

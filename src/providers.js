@@ -7,14 +7,15 @@ export const providers = {
   muse: {login: ['login']},
 };
 export const limitPattern = /rate[_ -]?limit|usage[_ -]?limit|quota[_ -]?(?:exceeded|exhausted)|insufficient_quota|too many requests|(?:hit|reached|exceeded) your (?:usage )?limit|out of (?:credits|tokens)|\b429\b/i;
-export function invocation(provider, {model, mode}, promptFile) {
+export function invocation(provider, {model, mode, images = []}, promptFile) {
+  const imageArgs = images.flatMap(image => ['--image', image.path]);
   const modelArgs = model ? ['--model', model] : [];
   switch (provider) {
-    case 'claude': return ['-p', '--output-format', 'stream-json', '--verbose', ...modelArgs,
+    case 'claude': return ['-p', '--output-format', 'stream-json', '--verbose', ...modelArgs, ...(images.length ? ['--input-format', 'stream-json'] : []),
       ...(mode === 'yolo' ? ['--dangerously-skip-permissions'] : ['--permission-mode', 'plan'])];
-    case 'codex': return ['exec', '--json', '--skip-git-repo-check', ...modelArgs,
+    case 'codex': return ['exec', '--json', '--skip-git-repo-check', ...modelArgs, ...imageArgs,
       ...(mode === 'yolo' ? ['--dangerously-bypass-approvals-and-sandbox'] : ['--sandbox', 'read-only']), '-'];
-    case 'muse': return ['exec', '--json', '--prompt-file', promptFile, ...modelArgs,
+    case 'muse': return ['exec', '--json', '--prompt-file', promptFile, ...modelArgs, ...imageArgs,
       ...(mode === 'yolo' ? ['--yolo'] : ['--disable-write', '--disable-shell', '--approval-mode', 'never'])];
     default: throw new Error(`Unknown provider: ${provider}`);
   }
@@ -23,6 +24,8 @@ const describe = value => typeof value === 'string' ? value : JSON.stringify(val
 export function normalize(provider, raw) {
   const events = [];
   const add = (kind, text, extra = {}) => events.push({kind, text: describe(text), ...extra});
+  const model = raw.message?.model ?? raw.model ?? raw.payload?.model;
+  if (typeof model === 'string' && model.trim()) events.push({kind: 'model', model});
   if (provider === 'claude') {
     if (raw.type === 'assistant') for (const block of raw.message?.content ?? []) {
       if (block.type === 'text') add('assistant', block.text);
