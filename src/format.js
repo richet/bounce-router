@@ -56,14 +56,33 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     try { return wrap(parser.parse(source).trimEnd(), width); }
     catch { return wrap(source, width); } // Partial/unknown Markdown must never hide a response.
   }
+  // Claude sends tool calls as `Name: {json}`. Escaped newlines and quotes are unreadable,
+  // so display the fields as lines. The journal keeps the original text for handoffs.
+  const toolLines = text => {
+    const match = /^([A-Za-z_][\w.-]*): (\{[\s\S]*\})$/.exec(text.trim());
+    let input;
+    try { input = match && JSON.parse(match[2]); } catch { return null; }
+    if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
+    const lines = [match[1]];
+    for (const [key, value] of Object.entries(input)) {
+      const rows = (typeof value === 'string' ? value : JSON.stringify(value ?? null)).split('\n');
+      if (rows.length > 1) lines.push(`${key}:`, ...rows.map(row => '  ' + row));
+      else lines.push(`${key}: ${rows[0]}`);
+    }
+    return lines.length > 40 ? [...lines.slice(0, 40), `… ${lines.length - 40} more lines`] : lines;
+  };
+  // Short bookkeeping events read as one line; only real content earns a block of its own.
+  const inline = ['status', 'progress', 'route', 'cooldown', 'attempt', 'turn', 'diagnostic', 'note'];
   function event(e, width) {
     const names = {user: 'You', assistant: 'Response', delta: 'Response', result: 'Result',
       status: 'Activity', route: 'Agent selected', tool: 'Tool output', error: 'Error',
       diagnostic: 'Diagnostics', note: 'Saved note', cooldown: 'Retry delay', attempt: 'Agent finished', turn: 'Turn finished'};
     const label = e.kind === 'user' ? 'You' : `${e.provider || 'Localrouter'} · ${names[e.kind] || e.kind}`;
     const paint = style[e.kind] || style.muted;
+    if (inline.includes(e.kind)) return wrap(`${paint(clean(label))}  ${clean(e.text)}`, width);
+    const source = e.kind === 'tool' ? (toolLines(clean(e.text)) ?? [clean(e.text)]).join('\n') : clean(e.text);
     const content = ['assistant', 'delta', 'result'].includes(e.kind)
-      ? markdown(e.text, width) : wrap(e.kind === 'tool' ? codeColors(clean(e.text)) : clean(e.text), width);
+      ? markdown(e.text, width) : wrap(e.kind === 'tool' ? codeColors(source) : source, width);
     return [clip(paint(clean(label)), width), ...content, ''];
   }
   return {style, wrap, clip, markdown, event};

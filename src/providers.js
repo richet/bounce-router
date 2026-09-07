@@ -21,6 +21,10 @@ export function invocation(provider, {model, mode, images = []}, promptFile) {
   }
 }
 const describe = value => typeof value === 'string' ? value : JSON.stringify(value ?? '');
+// Tool results arrive as content blocks; show their text rather than a JSON dump.
+const contentText = value => Array.isArray(value)
+  ? value.map(part => part?.type === 'text' ? part.text : part?.type === 'image' ? '[image]' : describe(part)).join('\n')
+  : describe(value);
 export function normalize(provider, raw) {
   const events = [];
   const add = (kind, text, extra = {}) => events.push({kind, text: describe(text), ...extra});
@@ -32,7 +36,7 @@ export function normalize(provider, raw) {
       if (block.type === 'tool_use') add('tool', `${block.name}: ${describe(block.input)}`);
     }
     if (raw.type === 'user') for (const block of raw.message?.content ?? []) {
-      if (block.type === 'tool_result') add('tool', block.content);
+      if (block.type === 'tool_result') add('tool', contentText(block.content));
     }
     if (raw.type === 'result') {
       if (raw.is_error) add('error', raw.errors ?? raw.result ?? raw.subtype);
@@ -40,14 +44,23 @@ export function normalize(provider, raw) {
       add('result', raw.result ?? raw.subtype, {success: !raw.is_error});
     }
     if (raw.type === 'rate_limit_event' && raw.rate_limit_info?.status === 'rejected') add('error', 'usage limit: ' + describe(raw.rate_limit_info));
-    if (raw.type === 'system') add('status', raw.subtype ?? 'system');
+    // Claude reports thinking token counts every few tokens. They are live progress,
+    // not transcript: journaling them buries the conversation in "Activity" blocks.
+    if (raw.type === 'system') {
+      if (raw.subtype === 'thinking_tokens') add('progress', `Thinking · ~${raw.estimated_tokens ?? 0} tokens`);
+      else if (raw.subtype === 'init') add('progress', `Ready · ${(raw.tools ?? []).length} tools`);
+      else if (raw.subtype === 'task_started') add('status', `Task started · ${describe(raw.description ?? raw.task_id ?? '')}`);
+      else if (raw.subtype === 'task_notification') add('status', `Task ${describe(raw.status ?? 'update')} · ${describe(raw.summary ?? raw.task_id ?? '')}`);
+      else add('status', raw.subtype ?? 'system');
+    }
+    if (raw.type === 'tool_progress') add('progress', `${describe(raw.tool_name ?? 'Tool')} · ${raw.elapsed_time_seconds ?? 0}s`);
   } else if (provider === 'codex') {
     const item = raw.item;
     if (raw.type === 'item.completed' && item) {
       if (item.type === 'agent_message') add('assistant', item.text);
       else add('tool', item.command ? `${item.command}\n${item.aggregated_output ?? ''}` : item);
     }
-    if (raw.type === 'item.started' && item?.command) add('status', item.command);
+    if (raw.type === 'item.started' && item?.command) add('progress', `Running · ${describe(item.command).split('\n')[0]}`);
     if (raw.type === 'error' || raw.type === 'turn.failed') add('error', raw.error?.message ?? raw.message ?? raw.error ?? raw);
     if (raw.type === 'turn.completed') {
       add('usage', raw.usage, {usage: raw.usage});

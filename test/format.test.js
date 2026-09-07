@@ -72,7 +72,7 @@ test('headings omit Markdown markers while code and status remain literal', () =
   for (let level = 1; level <= 6; level++) {
     assert.equal(plain.markdown('#'.repeat(level) + ' Heading', 80).join('\n'), 'Heading');
   }
-  assert.match(plain.event({kind: 'status', text: '# literal log'}, 80).join('\n'), /Localrouter · Activity\n# literal log/);
+  assert.match(plain.event({kind: 'status', text: '# literal log'}, 80).join('\n'), /Localrouter · Activity {2}# literal log/);
 });
 test('model display tracks the latest attempt and configuration changes', () => {
   const events = [{kind: 'route', provider: 'claude', model: 'default'},
@@ -83,4 +83,27 @@ test('model display tracks the latest attempt and configuration changes', () => 
   assert.equal(activeModel(events, 'codex'), 'Default (not reported)');
   events.push({kind: 'route', provider: 'claude', model: 'default'});
   assert.equal(activeModel(events, 'claude'), 'Default (not reported)');
+});
+
+test('bookkeeping events stay on one line while content keeps its own block', () => {
+  const status = plain.event({kind: 'status', provider: 'claude', text: 'Task started · probe'}, 80);
+  assert.deepEqual(status, ['claude · Activity  Task started · probe']);
+  const progress = plain.event({kind: 'progress', provider: 'claude', text: 'Thinking · ~350 tokens'}, 80);
+  assert.deepEqual(progress, ['claude · progress  Thinking · ~350 tokens']);
+  assert.deepEqual(plain.event({kind: 'attempt', provider: 'codex', text: 'completed'}, 80), ['codex · Agent finished  completed']);
+  // Long inline text wraps instead of being clipped, and never gains a blank spacer row.
+  const long = plain.event({kind: 'note', text: 'x'.repeat(200)}, 40);
+  assert.ok(long.length > 1 && long.at(-1) !== '');
+  assert.deepEqual(plain.event({kind: 'assistant', provider: 'claude', text: 'hi'}, 80), ['claude · Response', 'hi', '']);
+});
+
+test('tool calls render their JSON input as readable lines', () => {
+  const text = 'Bash: ' + JSON.stringify({command: 'grep -n "picker" src/cli.js\nnpm run check', description: 'Check the picker'});
+  const rows = plain.event({kind: 'tool', provider: 'claude', text}, 200);
+  assert.deepEqual(rows, ['claude · Tool output', 'Bash', 'command:', '  grep -n "picker" src/cli.js', '  npm run check',
+    'description: Check the picker', '']);
+  // Anything that is not a `Name: {json}` tool call is shown verbatim.
+  const plainText = plain.event({kind: 'tool', provider: 'claude', text: '270:   if (busy) return;'}, 200);
+  assert.deepEqual(plainText, ['claude · Tool output', '270:   if (busy) return;', '']);
+  assert.match(plain.event({kind: 'tool', text: 'Bash: {not json'}, 200).join('\n'), /Bash: \{not json/);
 });

@@ -115,7 +115,9 @@ export class Router {
         fs.writeFileSync(promptFile, packet, {mode: 0o600});
         const result = await this.runner({provider, executable: resolveExecutable(provider, cfg.executables[provider]),
           args: invocation(provider, {model: cfg.models[provider], mode: cfg.mode, images}, promptFile),
-          cwd: s.cwd, prompt: providerInput(provider, packet, images), signal, emit: e => s.append({...e, provider})});
+          cwd: s.cwd, prompt: providerInput(provider, packet, images), signal,
+          // Progress is live-only: it is shown while the turn runs and never journaled.
+          emit: e => e.kind === 'progress' ? s.onEvent?.({...e, provider}) : s.append({...e, provider})});
         s.append({kind: 'attempt', provider, ...result, text: result.status});
         if (result.status === 'limited') {
           const until = Date.now() + cfg.cooldownMinutes * 60000;

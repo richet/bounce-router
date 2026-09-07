@@ -64,6 +64,38 @@ test('normalizers capture vendor results, tools and usage', () => {
   assert.equal(normalize('muse',{payload_type:'run.output.delta',payload:{text:'hello'}})[0].text,'hello');
   assert.equal(normalize('muse',{payload_type:'run.terminal.completed',payload:{terminal:'completed',text:'hello'}})[0].success,true);
 });
+test('token counters and command starts become live progress, not transcript', () => {
+  const thinking = normalize('claude',{type:'system',subtype:'thinking_tokens',estimated_tokens:350,estimated_tokens_delta:50});
+  assert.deepEqual(thinking,[{kind:'progress',text:'Thinking · ~350 tokens'}]);
+  assert.deepEqual(normalize('claude',{type:'tool_progress',tool_name:'Bash',elapsed_time_seconds:30}),[{kind:'progress',text:'Bash · 30s'}]);
+  assert.equal(normalize('claude',{type:'system',subtype:'init',model:'m',tools:['Bash','Read']}).find(e=>e.kind==='progress').text,'Ready · 2 tools');
+  assert.equal(normalize('codex',{type:'item.started',item:{command:'npm test\nsecond line'}})[0].kind,'progress');
+  // Task lifecycle and unknown system events still describe themselves in the transcript.
+  assert.deepEqual(normalize('claude',{type:'system',subtype:'task_started',description:'Probe models'}),
+    [{kind:'status',text:'Task started · Probe models'}]);
+  assert.deepEqual(normalize('claude',{type:'system',subtype:'task_notification',status:'completed',summary:'Probe models'}),
+    [{kind:'status',text:'Task completed · Probe models'}]);
+  assert.deepEqual(normalize('claude',{type:'system',subtype:'compact_boundary'}),[{kind:'status',text:'compact_boundary'}]);
+  // Tool results arrive as content blocks; their text is kept, not a JSON dump.
+  assert.equal(normalize('claude',{type:'user',message:{content:[{type:'tool_result',content:[{type:'text',text:'passed'}]}]}})[0].text,'passed');
+});
+
+test('progress reaches the display without being written to the journal', async t => {
+  const {session} = setup(t);
+  const seen = [];
+  session.onEvent = e => seen.push(e);
+  const router = new Router(session, defaults(), {runner: async ({emit}) => {
+    emit({kind:'progress',text:'Thinking · ~50 tokens'});
+    emit({kind:'assistant',text:'done'});
+    return {status:'completed'};
+  }});
+  await router.run('hello');
+  assert.deepEqual(seen.filter(e=>e.kind==='progress').map(e=>[e.provider,e.text]), [['claude','Thinking · ~50 tokens']]);
+  assert.equal(session.events.some(e=>e.kind==='progress'), false);
+  assert.equal(fs.readFileSync(session.file,'utf8').includes('progress'), false);
+  assert.ok(session.events.some(e=>e.kind==='assistant'));
+});
+
 async function fixture(source, {signal, provider='codex'} = {}) {
   const events=[];
   const result=await runProcess({provider,executable:process.execPath,args:['-e',source],prompt:'test',cwd:os.tmpdir(),signal,emit:e=>events.push(e)});

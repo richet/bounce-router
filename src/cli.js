@@ -115,7 +115,7 @@ async function main() {
   if (positionals[0] === 'run') {
     session.onEvent = e => {
       if (values.json) console.log(JSON.stringify(e));
-      else if (e.text && !['raw', 'usage'].includes(e.kind)) console.log(`[${e.provider || 'router'}:${e.kind}] ${clean(e.text)}`);
+      else if (e.text && !['raw', 'usage', 'progress'].includes(e.kind)) console.log(`[${e.provider || 'router'}:${e.kind}] ${clean(e.text)}`);
     };
     const cancel = () => router.cancel();
     process.on('SIGINT', cancel); process.on('SIGTERM', cancel);
@@ -124,7 +124,7 @@ async function main() {
     return;
   }
   let input = '', busy = false, suspended = false, scroll = 0, historyIndex = -1;
-  let activityTimer, activityStarted = 0;
+  let activityTimer, activityStarted = 0, progress = '';
   const activity = () => `${['◐', '◓', '◑', '◒'][Math.floor((Date.now() - activityStarted) / 150) % 4]} Working · ${Math.floor((Date.now() - activityStarted) / 1000)}s`;
   let loadedFingerprint = fingerprint();
   let completionIndex = 0, menuDismissed = false, copyPaused = false, previousFrame = [], previousCursor = '';
@@ -196,7 +196,7 @@ async function main() {
       ...body, ...menu.map(([text, paint]) => clip(paint(clean(text)), width)),
       style.muted(line),
       ...draft.rows.map((row, i) => style.prompt(i === 0 ? '❯ ' : '  ') + row),
-      style.muted(line), clip(style.status(clean(busy && activityTimer ? activity() + ' · ' + notice : notice)), width),
+      style.muted(line), clip(style.status(clean(busy && activityTimer ? [activity(), progress, notice].filter(Boolean).join(' · ') : notice)), width),
     ];
     const update = frameDiff(previousFrame, nextFrame);
     const cursor = busy ? '\x1b[?25l' : `\x1b[${header.length + body.length + menu.length + 2 + draft.cursorRow};${3 + draft.cursorColumn}H\x1b[1 q\x1b[?25h`;
@@ -206,6 +206,7 @@ async function main() {
   }
   let renderTimer;
   function scheduleRender(event) {
+    if (event?.kind === 'progress') progress = clean(event.text);
     if (event?.kind === 'raw' || renderTimer) return;
     renderTimer = setTimeout(() => {renderTimer = null; render();}, 40);
   }
@@ -221,7 +222,7 @@ async function main() {
   }
   const quit = () => { leave(); session.unlock(); process.exit(0); };
   async function submit(text) {
-    activityStarted = Date.now();
+    activityStarted = Date.now(); progress = '';
     activityTimer = setInterval(render, 150);
     try {
       if (/^\/[a-z]+(?:\s|$)/i.test(text)) {
@@ -259,7 +260,7 @@ async function main() {
         if (dev && result === 'completed' && fingerprint() !== loadedFingerprint) await restart();
       }
     } catch (e) {notice = e.message; if (!input) input = text;}
-    finally {clearInterval(activityTimer); activityTimer = null; busy = false; render();}
+    finally {clearInterval(activityTimer); activityTimer = null; busy = false; progress = ''; render();}
   }
   const keyboard = new PassThrough();
   // Node's keypress parser holds a lone ESC until another byte follows, so deliver it directly.
