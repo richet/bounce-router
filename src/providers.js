@@ -28,7 +28,7 @@ const contentText = value => Array.isArray(value)
 export function normalize(provider, raw) {
   const events = [];
   const add = (kind, text, extra = {}) => events.push({kind, text: describe(text), ...extra});
-  const model = raw.message?.model ?? raw.model ?? raw.payload?.model;
+  const model = raw.message?.model ?? raw.model ?? raw.payload?.model ?? raw.payload?.model_id;
   if (typeof model === 'string' && model.trim()) events.push({kind: 'model', model});
   if (provider === 'claude') {
     if (raw.type === 'assistant') for (const block of raw.message?.content ?? []) {
@@ -75,7 +75,24 @@ export function normalize(provider, raw) {
       if (!success) add('error', p.reason ?? p);
       add('result', p.text ?? p.reason ?? p.terminal, {success});
     }
-    if (type === 'task.lifecycle.side_effect_intent') add('tool', p.event?.operation ?? p);
+    if (type === 'task.lifecycle.side_effect_intent') {
+      // Model inference is internal chatter: run.output.delta carries the response,
+      // so it leaves no transcript trace. A tool start becomes live progress (never
+      // journaled), mirroring Codex command starts; the journaled record is the
+      // tool.result below. The intent carries no arguments, so a bare operation
+      // name as a Tool output block would say nothing the result does not.
+      const operation = p.event?.operation ?? '';
+      if (operation.startsWith('model.')) { /* internal, no event */ }
+      else if (operation) add('progress', `Running · ${operation.replace(/^tool[:.]/, '') || operation}`);
+    }
+    // task.lifecycle.output chunks duplicate tool.result verbatim, so only the
+    // assembled result is journaled. A failed tool call stays journaled content,
+    // not a turn error: the agent may recover, as with Claude tool results.
+    if (type === 'tool.result') {
+      const name = p.correlation_facts?.tool_name;
+      const text = typeof p.text === 'string' ? p.text : describe(p.text);
+      add('tool', name ? `${name}\n${text}` : text);
+    }
     if (type.endsWith('.failed') || type === 'error') add('error', p);
   }
   return events;

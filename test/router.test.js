@@ -64,6 +64,42 @@ test('normalizers capture vendor results, tools and usage', () => {
   assert.equal(normalize('muse',{payload_type:'run.output.delta',payload:{text:'hello'}})[0].text,'hello');
   assert.equal(normalize('muse',{payload_type:'run.terminal.completed',payload:{terminal:'completed',text:'hello'}})[0].success,true);
 });
+test('muse tool calls journal results, not lifecycle chatter', () => {
+  const intent = op => ({payload_type: 'task.lifecycle.side_effect_intent', payload: {event: {operation: op}}});
+  // Model inference is internal: the deltas carry the response, so the intent leaves no trace.
+  assert.deepEqual(normalize('muse', intent('model.meta.response')), []);
+  // A tool start is live progress, mirroring Codex command starts.
+  assert.deepEqual(normalize('muse', intent('tool:read_file')), [{kind: 'progress', text: 'Running · read_file'}]);
+  assert.deepEqual(normalize('muse', intent('tool:bash')), [{kind: 'progress', text: 'Running · bash'}]);
+  // Lifecycle bookkeeping and streaming output chunks are dropped: the chunk
+  // duplicates the assembled tool.result verbatim, so journaling both would
+  // double every tool result in the transcript and the fallback handoff.
+  for (const raw of [
+    {payload_type: 'task.lifecycle.proposed', payload: {event: {task_kind: 'tool.read_file'}}},
+    {payload_type: 'task.lifecycle.accepted', payload: {}},
+    {payload_type: 'task.lifecycle.scheduled', payload: {}},
+    {payload_type: 'task.lifecycle.started', payload: {}},
+    {payload_type: 'task.lifecycle.status', payload: {event: {message: 'opening meta model stream attempt 1/10'}}},
+    {payload_type: 'task.lifecycle.output', payload: {event: {chunk: 'file contents'}}},
+    {payload_type: 'task.lifecycle.completed', payload: {event: {}}},
+  ]) assert.deepEqual(normalize('muse', raw), [], raw.payload_type);
+  // The assembled result is the journaled record, prefixed with the tool name.
+  const result = normalize('muse', {payload_type: 'tool.result',
+    payload: {text: 'file contents', correlation_facts: {tool_name: 'read_file', outcome: 'success'}}});
+  assert.equal(result.length, 1);
+  assert.equal(result[0].kind, 'tool');
+  assert.match(result[0].text, /read_file/);
+  assert.match(result[0].text, /file contents/);
+  // A failed tool call stays journaled content, not a turn error: the agent may recover.
+  const failed = normalize('muse', {payload_type: 'tool.result',
+    payload: {text: 'no such file', correlation_facts: {tool_name: 'read_file', outcome: 'error'}}});
+  assert.equal(failed.length, 1);
+  assert.equal(failed[0].kind, 'tool');
+  // run.model.configured reports the model under model_id, not model.
+  const model = normalize('muse', {payload_type: 'run.model.configured', payload: {model_id: 'muse-spark-1.3'}})
+    .find(e => e.kind === 'model');
+  assert.equal(model.model, 'muse-spark-1.3');
+});
 test('token counters and command starts become live progress, not transcript', () => {
   const thinking = normalize('claude',{type:'system',subtype:'thinking_tokens',estimated_tokens:350,estimated_tokens_delta:50});
   assert.deepEqual(thinking,[{kind:'progress',text:'Thinking · ~350 tokens'}]);
