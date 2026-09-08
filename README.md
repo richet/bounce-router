@@ -1,16 +1,16 @@
-# bouncerouter
+# bounce-router
 
-bouncerouter is one TUI for your installed Claude Code, Codex, and Muse coding agents, run with the `bounce` command. Uses native CLI login and headless processes; bounce owns the conversation and carries context between providers.
+bounce-router is one TUI for your installed Claude Code, Codex, and Muse coding agents, run with the `bounce` command. Uses native CLI login and headless processes; bounce owns the conversation and carries context between providers.
 
 ## Run
 
 Requires Node.js 22+ and at least one provider CLI on PATH. Run `npm install` in this project before the first launch.
 
 ```sh
-node /Users/rich/Projects/Lupchoo/bouncerouter/src/cli.js --cwd /path/to/your/repo
+node src/cli.js --cwd /path/to/your/repo
 ```
 
-Or run `npm start` from this project. Optional: `npm link` exposes `bounce` on PATH.
+Run that from this project's directory, or use `npm start`. Optional: `npm link` exposes `bounce` on PATH, so `bounce` works from anywhere.
 
 ```sh
 bounce login claude
@@ -32,6 +32,10 @@ Login temporarily hands the terminal to the vendor. Finish its browser/device lo
 
 Assistant responses render Markdown headings, emphasis, lists, quotes, links, tables, and syntax-highlighted fenced code blocks. Unlabelled code blocks and literal tool output use automatic language detection. While a turn is pending, a spinner and elapsed seconds remain visible, including during silent provider work; F2 pauses animation for copying. Event labels, status, and command selection use distinct colors. Layout wraps by terminal cell width and preserves ANSI styles. Set `NO_COLOR=1` to disable colors; `TERM=dumb` also disables styling. Journals and headless `run`/`--json` output retain their original format.
 
+Live progress — Claude's thinking-token counters and tool heartbeats, Codex's command starts — is shown on the status line beside the spinner and is never written to the transcript or the journal, so a long turn no longer buries the conversation in repeated `thinking_tokens` blocks. Short bookkeeping events (agent selected, activity, cooldown, agent finished, turn finished) render as a single line; only messages, tool output and results get a block of their own. Tool calls are displayed field by field with real newlines rather than as escaped JSON, while the journal keeps the original text for handoffs.
+
+The header labels the selected model and updates when the provider reports its model. If neither a model override nor runtime metadata is available, it shows `Default (not reported)`; use `/model ID` to select one explicitly. Bounce activity labels describe local progress. Restart validation shows concise success messages and retains diagnostic output on failure.
+
 ## Image attachments
 
 Drop image files into the terminal input, add your question, and press Enter. Quoted paths, shell-escaped spaces, and local `file://` URLs are supported. PNG, JPEG, GIF and WebP are accepted (up to 10 files, 5 MiB each). Paths stay visible and editable until submission. Clipboard bitmap paste is not implemented; save the screenshot as a file and drag it in.
@@ -44,7 +48,7 @@ Headless usage: `bounce run "Explain this screenshot" --image "/path/Screen shot
 
 - Type `/` to open the command picker; type a prefix to filter. Up/down selects and Tab completes. Enter completes a half-typed command and runs one you typed out in full, so `/skills` lists your skills on the first press. Esc dismisses the picker.
 - Tab switches agent when the picker is closed.
-- Enter sends; Shift+Enter inserts a newline. A terminal sends a bare `\r` for Shift+Enter — indistinguishable from Enter — until an application asks it not to, so bounce turns on the kitty keyboard protocol and xterm's modifyOtherKeys while the TUI is up, and turns them off again whenever it hands the terminal back. That covers iTerm2 3.5+, Ghostty, kitty, WezTerm and xterm with no configuration. In a terminal that supports neither (Apple Terminal, older iTerm2), map the key yourself — in iTerm2, Settings → Profiles → Keys → Key Mappings → `+`, press ⇧↩, choose *Send Escape Sequence* and enter `[13;2u` — or use Alt+Enter or Ctrl+J, which insert a newline everywhere with no configuration. Ctrl+Enter and Cmd+Enter work too.
+- Enter sends; Shift+Enter inserts a newline. A terminal sends a bare `\r` for Shift+Enter — indistinguishable from Enter — until an application asks it not to, so bounce turns on the kitty keyboard protocol and xterm's modifyOtherKeys while the TUI is up, and turns them off again whenever it hands the terminal back. That covers iTerm2 3.5+, Ghostty, kitty, WezTerm and xterm with no configuration. In a terminal that supports neither (Apple Terminal, older iTerm2), map the key yourself — in iTerm2, Settings → Profiles → Keys → Key Mappings → `+`, press ⇧↩, choose *Send Escape Sequence* and enter `[13;2u` — or use Alt+Enter or Ctrl+J, which insert a newline everywhere with no configuration. Ctrl+Enter and Cmd+Enter work too. Modified Enter is accepted in every encoding terminals use for it: CSI u (`\x1b[13;2u` is Shift+Enter), xterm's modifyOtherKeys (`\x1b[27;2;13~`), and Alt's ESC prefix. Requesting those reports also re-encodes other modified keys — Ctrl+C arrives as `\x1b[99;5u` — so the same decoder turns each one back into the key event the prompt expects.
 - F2 freezes display updates for selecting/copying text while an agent runs; F2 resumes. Events continue to be saved while paused. Unchanged frames produce no terminal writes, and ordinary updates redraw only changed rows.
 - `/provider claude` selects and saves the default.
 - `/model` lists every model each signed-in agent reports and lets you pick one: up/down or 1-9 to choose, Enter to use it, Esc to cancel. A pick saves the model and makes that agent the default. `/model refresh` re-asks the agents; catalogs are cached for five minutes.
@@ -58,6 +62,7 @@ Headless usage: `bounce run "Explain this screenshot" --image "/path/Screen shot
 - `/login [provider]`, `/new`, `/note TEXT`, `/retry`, `/help`, `/quit`.
 - Escape or Ctrl+C cancels the running process group; Ctrl+C while idle exits.
 - Mouse wheel or trackpad scrolls the transcript (three lines per tick); PgUp/PgDn also scroll. F2 releases mouse capture for selecting/copying text. Up/down recalls prompts; Ctrl+U clears input.
+- The prompt shows a blinking block cursor and grows as text wraps, up to one third of the terminal height. Longer drafts keep their last lines visible; pasted newlines are preserved. F2 hides the cursor while copying, and exit restores the terminal's default cursor style.
 
 YOLO intentionally lets agents run commands and change files with your user permissions. Launch in the workspace you intend to let the agents modify.
 
@@ -168,9 +173,3 @@ After `npm link`, run `bounce dev` from any directory. It opens the actual bounc
 In dev mode, a successful agent turn that changes `src/` or `package.json` triggers `npm run check` and `npm test`. If both pass, a supervisor starts a fresh process and resumes the same journal, workspace, selected provider, model settings, and permission mode. Failed validation keeps the current process running so you can ask the agent to fix the problem. No relink is needed: npm's link already points to these source files.
 
 Use `/restart` in any TUI session to validate and reload manually. A regular launch does not automatically reload. Restart happens between turns, never during a running agent command. Source edits are kept on disk even when checks fail; there is no automatic rollback. Passing tests cannot guarantee the updated app starts successfully; if startup fails, fix the source and use `bounce --resume ID` (IDs are listed by `bounce sessions`). Changes to the supervisor itself require fully quitting and launching again. This reloads local changes; it does not download releases or run Git pulls.
-
-Live progress — Claude's thinking-token counters and tool heartbeats, Codex's command starts — is shown on the status line beside the spinner and is never written to the transcript or the journal, so a long turn no longer buries the conversation in repeated `thinking_tokens` blocks. Short bookkeeping events (agent selected, activity, cooldown, agent finished, turn finished) render as a single line; only messages, tool output and results get a block of their own. Tool calls are displayed field by field with real newlines rather than as escaped JSON, while the journal keeps the original text for handoffs.
-
-The header labels the selected model and updates when the provider reports its model. If neither a model override nor runtime metadata is available, it shows `Default (not reported)`; use `/model ID` to select one explicitly. Bounce activity labels describe local progress. Restart validation shows concise success messages and retains diagnostic output on failure.
-
-The prompt shows a blinking block cursor and grows as text wraps, up to one third of the terminal height. Longer drafts keep their last lines visible. Pasted newlines are preserved; Enter sends, and Shift+Enter — or any other modifier with Enter — drops down a line instead. Ctrl+J also inserts a newline. Modified Enter is accepted in every encoding terminals use for it: CSI u (`\x1b[13;2u` is Shift+Enter), xterm's modifyOtherKeys (`\x1b[27;2;13~`), and Alt's ESC prefix. Requesting those reports also re-encodes other modified keys — Ctrl+C arrives as `\x1b[99;5u` — so the same decoder turns each one back into the key event the prompt expects. F2 hides the cursor while copying, and exit restores the terminal’s default cursor style.
