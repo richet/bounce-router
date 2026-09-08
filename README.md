@@ -2,6 +2,13 @@
 
 bounce-router is one TUI for your installed Claude Code, Codex, and Muse coding agents, run with the `bounce` command. Uses native CLI login and headless processes; bounce owns the conversation and carries context between providers. When one provider's subscription usage is exhausted, it automatically fails over to the next signed-in provider.
 
+### Auto usage fail over while maintaining context
+<img width="562" height="91" alt="bounce-usage" src="https://github.com/user-attachments/assets/00ab13a6-dd54-42c3-9638-4169fe3b85c7" />
+
+### Model selection across all providers
+<img width="910" height="426" alt="bounce-model-selection" src="https://github.com/user-attachments/assets/8749e47d-89b3-4bb4-834f-a972eff8923a" />
+
+
 ## Install
 
 Requires Node.js 22+.
