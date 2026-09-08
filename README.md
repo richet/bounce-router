@@ -122,7 +122,7 @@ Headless usage: `bounce run "Explain this screenshot" --image "/path/Screen shot
 - `/order claude,codex,muse` saves routing order. Omit a provider to disable it.
 - `/mode yolo` (default) bypasses native approvals and sandboxing.
 - `/mode plan` requests Claude plan mode, Codex read-only sandbox, or Muse disabled write/shell. It is not an interactive approval bridge, and provider-native tools/configuration determine exact restrictions.
-- `/quota` refreshes and prints the usage each agent reports; the header carries a short form.
+- `/quota` refreshes and prints the usage each agent reports; a compact right sidebar, topped by a one-line BOUNCE wordmark, carries a short form alongside the model and session details on terminals at least 102 columns wide and 22 rows tall (smaller terminals keep the header). Below a divider, Work Done shows one short response excerpt per completed turn, wrapping to at most three lines with indented continuations, newest first, restored from the session journal. Older entries collapse to a count when space is limited. Use `/review` to print the full text of every work item in chronological order (oldest first) in the conversation; PgUp/PgDn scroll through the list.
 - `/skills` lists bounce's skills and where each agent has them; `/skills sync`, `/skills new NAME`, `/skills add PATH`, `/skills remove NAME`, `/skills import [provider]`, `/skills clear` and `/skills reset` manage them. See [Skills](#skills).
 - `/login [provider]`, `/new`, `/note TEXT`, `/retry`, `/help`, `/quit`.
 - Escape or Ctrl+C cancels the running process group; Ctrl+C while idle exits.

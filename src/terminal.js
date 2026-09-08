@@ -5,7 +5,7 @@ export const commands = [
   ['provider', 'Select default agent'], ['model', 'Select model'], ['order', 'Set fallback order'],
   ['mode', 'Set yolo or plan mode'], ['login', 'Sign in to an agent'], ['new', 'Start new session'],
   ['note', 'Save handoff note'], ['skills', 'Manage and install skills'],
-  ['quota', 'Show reported quota'], ['retry', 'Clear quota cooldowns'],
+  ['review', 'Show full session work items'], ['quota', 'Show reported quota'], ['retry', 'Clear quota cooldowns'],
   ['update', 'Install latest npm release'],
   ['restart', 'Validate and reload'],
   ['help', 'Show help'], ['quit', 'Exit bounce'],

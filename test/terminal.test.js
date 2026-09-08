@@ -3,12 +3,14 @@ import assert from 'node:assert/strict';
 import {completions, typedCommand, frameDiff} from '../src/terminal.js';
 import {resolveExecutable} from '../src/executable.js';
 test('slash shows all commands; prefixes narrow and arguments dismiss',()=>{
- assert.equal(completions('/').length,14);
+ assert.equal(completions('/').length,15);
  assert.deepEqual(completions('/sk').map(x=>x[0]),['skills']);
  assert.deepEqual(completions('/mo').map(x=>x[0]),['model','mode']);
  assert.deepEqual(completions('/q').map(x=>x[0]),['quota','quit']);
  assert.deepEqual(completions('/up').map(x=>x[0]),['update']);
  assert.equal(typedCommand('/update'), 'update');
+ assert.equal(typedCommand('/review'), 'review');
+ assert.deepEqual(completions('/rev').map(x=>x[0]), ['review']);
  assert.deepEqual(completions('/restart').map(x=>x[0]),['restart']);
  for (const input of ['hello','/model ','/unknown']) assert.deepEqual(completions(input),[]);
 });

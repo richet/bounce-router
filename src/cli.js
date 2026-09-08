@@ -4,7 +4,8 @@ import {resolveExecutable} from './executable.js';
 import {PassThrough} from 'node:stream';
 import {completions, typedCommand, frameDiff, createMouseInput, mouseTracking, createPasteInput, createKeyInput, inputLayout, windowAround, modelRows, checklistRows, suspendTerminal, resumeTerminal} from './terminal.js';
 import {modelCatalog, modelEntries, catalogNotes} from './models.js';
-import {clean, createFormatter, createTranscriptRenderer, activeModel} from './format.js';
+import stringWidth from 'string-width';
+import {clean, createFormatter, createTranscriptRenderer, createWorkSummary, workReview, activeModel} from './format.js';
 import {loadQuota, recordQuota, refreshQuota, quotaSnapshot, quotaShort, quotaReport, quotaUnavailable} from './quota.js';
 import {skillsCommand, syncSkills, inspectSkills, skillsChanged, importCandidates, importSelected, importSummary, syncSummary, skillAreas} from './skills.js';
 import fs from 'node:fs';
@@ -50,6 +51,7 @@ TUI commands:
   /skills clear         Remove every copy bounce installed
   /skills reset         Delete every bounce skill and withdraw its copies
   /quota                Show the subscription usage each agent reports
+  /review               Show full text of all session work items
   /retry                Clear locally recorded quota cooldowns
   /update [check]       Install the latest npm release, or only check
   /restart              Test and reload updated code, keeping this session
@@ -183,8 +185,9 @@ async function main() {
   const history = session.events.filter(e => e.kind === 'user').map(e => e.text);
   const selected = () => session.active || settings.order[0];
   const save = () => saveJSON(path.join(root, 'config.json'), settings);
-  const {style, clip, event: formatEvent} = createFormatter();
+  const {style, clip, wrap, event: formatEvent} = createFormatter();
   const transcriptRows = createTranscriptRenderer(formatEvent);
+  const workSummary = createWorkSummary();
   // Picking a model also picks the agent that reported it.
   const applyModel = entry => {
     session.active = entry.provider;
@@ -238,15 +241,12 @@ async function main() {
   }
   function render() {
     if (suspended || copyPaused) return;
-    const width = Math.max(4, (process.stdout.columns || 80) - 2);
+    const totalWidth = Math.max(4, (process.stdout.columns || 80) - 2);
+    const sidebarWidth = totalWidth >= 100 && (process.stdout.rows || 24) >= 22 ? 30 : 0;
+    const width = totalWidth - (sidebarWidth ? sidebarWidth + 3 : 0);
     const terminalRows = process.stdout.rows || 24;
-    // The banner only earns its extra rows when the art fits the width and still
-    // leaves the transcript, composer and status bar room; otherwise fall back to
-    // the one-line title. Every budget below is measured from the header height,
-    // so the bottom chrome stays on screen whichever banner is showing.
-    const art = BOUNCE_LOGO.split('\n');
-    const logoFits = width >= Math.max(...art.map(row => row.length)) && terminalRows >= art.length + 13;
-    const headerRows = (logoFits ? art.length : 1) + 4;
+    // Sidebar branding leaves the conversation pane free of header rows.
+    const headerRows = sidebarWidth ? 0 : 5;
     const draft = inputLayout(input, width - 2, Math.max(1, Math.min(Math.floor(terminalRows / 3), terminalRows - headerRows - 5)));
     const options = suggestions();
     const menuBudget = Math.max(0, terminalRows - headerRows - 5 - draft.rows.length);
@@ -280,9 +280,8 @@ async function main() {
     const body = rows.slice(Math.max(0, end - bodyHeight), end);
     while (body.length < bodyHeight) body.push('');
     const line = '─'.repeat(width);
-    const banner = logoFits ? art.map(row => style.title(row)) : [style.title(' BOUNCE')];
-    const header = [
-      ...banner,
+    const header = sidebarWidth ? [] : [
+      style.title(BOUNCE_LOGO),
       style.status(clean(`${selected()} · Model: ${activeModel(session.events, selected(), settings.models[selected()])} · ${settings.mode.toUpperCase()}${settings.mode === 'yolo' ? ' (approvals + sandbox bypassed)' : ''} · ${busy ? `RUNNING${pending.length ? ` · ${pending.length} QUEUED` : ''}` : 'READY'}`)),
       style.muted(clean(`${session.cwd} · session ${session.id.slice(0, 8)}`)),
       style.muted(clean(settings.order.map(p => `${p}${router.cooldowns[p] > Date.now() ? ' [cooldown]' : ''}${quotaShort(quotas[p]) ? ` (${quotaShort(quotas[p])})` : ''}`).join(' → '))),
@@ -295,6 +294,52 @@ async function main() {
       ...draft.rows.map((row, i) => style.prompt(i === 0 ? '❯ ' : '  ') + row),
       style.muted(line), clip(style.status(clean(busy && activityTimer ? [activity(), progress, notice].filter(Boolean).join(' · ') : notice)), width),
     ];
+    if (sidebarWidth) {
+      const singleLine = value => clean(value).replace(/\s+/g, ' ').trim();
+      const side = [
+        style.title(BOUNCE_LOGO),
+        style.status(singleLine(`${selected()} · ${settings.mode.toUpperCase()}`)),
+        singleLine(`Model: ${activeModel(session.events, selected(), settings.models[selected()])}`),
+        style.status(busy ? `RUNNING${pending.length ? ` · ${pending.length} QUEUED` : ''}` : 'READY'),
+        ...(settings.mode === 'yolo' ? [style.muted('Approvals + sandbox bypassed')] : []),
+        style.muted(singleLine(session.cwd)),
+        style.muted(`Session ${session.id.slice(0, 8)}`),
+        '', style.title('USAGE'),
+        ...settings.order.flatMap(p => [
+          singleLine(`${p}${router.cooldowns[p] > Date.now() ? ' [cooldown]' : ''}`),
+          ...wrap(style.muted(singleLine(quotaShort(quotas[p]) || 'Not reported')), sidebarWidth),
+        ]),
+        style.muted('─'.repeat(sidebarWidth)),
+        style.title('WORK DONE'),
+      ];
+      const work = workSummary(session.events);
+      const available = Math.max(0, nextFrame.length - side.length);
+      if (!work.length && available) side.push(style.muted('No completed turns yet'));
+      else if (available) {
+        let remaining = available, shown = 0;
+        for (const item of [...work].reverse()) {
+          // Reserve a row for the count of older entries that will not fit.
+          const budget = remaining - (shown + 1 < work.length ? 1 : 0);
+          if (budget <= 0) break;
+          const lines = wrap(singleLine(item), sidebarWidth - 2);
+          const count = Math.min(3, budget, lines.length);
+          for (let i = 0; i < count; i++) {
+            const text = i === count - 1 && count < lines.length
+              ? clip(lines[i], sidebarWidth - 3) + '…' : lines[i];
+            side.push((i === 0 ? '• ' : '  ') + text);
+          }
+          remaining -= count;
+          shown++;
+        }
+        if (shown < work.length) side.push(style.muted(`+ ${work.length - shown} earlier`));
+      }
+      for (let i = 0; i < nextFrame.length; i++) {
+        const left = clip(nextFrame[i], width);
+        nextFrame[i] = left + ' '.repeat(Math.max(0, width - stringWidth(left)))
+          + style.muted(' │ ') + (stringWidth(side[i] || '') > sidebarWidth
+            ? clip(side[i], sidebarWidth - 1) + '…' : side[i] || '');
+      }
+    }
     const update = frameDiff(previousFrame, nextFrame);
     const cursor = `\x1b[${header.length + body.length + menu.length + 2 + draft.cursorRow};${3 + draft.cursorColumn}H\x1b[1 q\x1b[?25h`;
     if (update || cursor !== previousCursor) process.stdout.write((update ? '\x1b[?25l' + update : '') + cursor);
@@ -344,6 +389,12 @@ async function main() {
         }
         if (command === 'restart') return await restart();
         if (command === 'help') {session.append({kind: 'status', text: help}); return;}
+        if (command === 'review') {
+          session.append({kind: 'review', text: workReview(workSummary(session.events))});
+          scroll = 0;
+          notice = 'Work review · PgUp/PgDn scroll through all items';
+          return;
+        }
         if (command === 'provider') {
           if (!providers[arg]) throw new Error('Choose claude, codex, or muse');
           session.active = arg; settings.order = [arg, ...settings.order.filter(p => p !== arg)]; save();

@@ -118,3 +118,46 @@ test('Inline Markdown inside list items is parsed, not shown as literal markers'
   // Emphasis inside a list item must be styled exactly as it is in a paragraph.
   assert.match(color.markdown('- item with **bold**', 80).join('\n'), /\x1b\[1mbold/);
 });
+
+test('work recap includes only completed turns, uses final response and survives resume', async () => {
+  const {createWorkSummary} = await import('../src/format.js');
+  const events = [
+    {kind: 'user', text: 'Please fix it'},
+    {kind: 'assistant', text: 'I will inspect it'},
+    {kind: 'assistant', text: '## Summary\n- Fixed **routing**.'},
+    {kind: 'turn', text: 'completed'},
+    {kind: 'assistant', text: 'Failed work'},
+    {kind: 'turn', text: 'failed'},
+  ];
+  const recap = createWorkSummary();
+  assert.deepEqual(recap(events), ['Fixed routing.']);
+  assert.deepEqual(recap(events), ['Fixed routing.']);
+  events.push({kind: 'user'}, {kind: 'delta', text: 'Added '}, {kind: 'delta', text: 'tests.'});
+  assert.deepEqual(recap(events), ['Fixed routing.']);
+  events.push({kind: 'turn', text: 'completed'});
+  assert.deepEqual(recap(events), ['Fixed routing.', 'Added tests.']);
+  assert.deepEqual(createWorkSummary()(events), recap(events));
+  assert.deepEqual(recap([]), []);
+});
+
+test('work recap discards failed provider output on fallback', async () => {
+  const {createWorkSummary} = await import('../src/format.js');
+  assert.deepEqual(createWorkSummary()([
+    {kind: 'assistant', text: 'Unfinished'}, {kind: 'route'},
+    {kind: 'turn', text: 'completed'},
+  ]), ['Completed turn']);
+});
+
+test('work review preserves all item text and orders oldest first without mutating the recap', async () => {
+  const {workReview} = await import('../src/format.js');
+  const long = 'Detailed completed work '.repeat(30) + 'END';
+  const items = ['First item', long, 'Last item'];
+  const report = workReview(items);
+  assert.equal(report, '1. First item\n\n2. ' + long + '\n\n3. Last item');
+  const rows = plain.event({kind: 'review', text: report}, 30);
+  assert.match(rows.join('\n'), /Work Done review/);
+  assert.match(rows.join('\n'), /END/);
+  assert.match(rows.join('\n'), /First item/);
+  assert.deepEqual(items, ['First item', long, 'Last item']);
+  assert.equal(workReview([]), 'No completed turns yet.');
+});

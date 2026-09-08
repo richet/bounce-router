@@ -82,7 +82,7 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     const names = {user: 'You', assistant: 'Response', delta: 'Response', result: 'Result',
       status: 'Activity', route: 'Agent selected', tool: 'Tool output', error: 'Error',
       diagnostic: 'Diagnostics', note: 'Saved note', cooldown: 'Retry delay', attempt: 'Agent finished',
-      turn: 'Turn finished', quota: 'Reported quota', skills: 'Skills'};
+      turn: 'Turn finished', quota: 'Reported quota', skills: 'Skills', review: 'Work Done review'};
     const label = e.kind === 'user' ? 'You' : `${e.provider || 'Bounce'} · ${names[e.kind] || e.kind}`;
     const paint = style[e.kind] || style.muted;
     if (inline.includes(e.kind)) return wrap(`${paint(clean(label))}  ${clean(e.text)}`, width);
@@ -147,4 +147,38 @@ export function activeModel(events, provider, configured) {
     if (reported) return clean(reported.model);
   }
   return configured ? clean(configured) : 'Default (not reported)';
+}
+
+// Derive a small, local recap from successful turns; never summarize tool intents
+// as completed work. Incremental consumption keeps the activity timer inexpensive.
+export function createWorkSummary() {
+  let source, consumed = 0, items = [], response = '';
+  return events => {
+    if (source !== events || events.length < consumed) {
+      source = events; consumed = 0; items = []; response = '';
+    }
+    for (; consumed < events.length; consumed++) {
+      const event = events[consumed];
+      if (event.kind === 'user' || event.kind === 'route') response = '';
+      if (event.kind === 'assistant') response = event.text || '';
+      if (event.kind === 'delta') response += event.text || '';
+      if (event.kind === 'result' && event.success && event.text && event.text !== 'Turn completed') response = event.text;
+      if (event.kind !== 'turn') continue;
+      if (event.text === 'completed') {
+        const lines = clean(response).split('\n').map(line => line
+          .replace(/^\s*(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+)/, '')
+          .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1').replace(/[*`_]/g, '').trim());
+        const summary = lines.find(line => line && !/^(?:summary|changes|done|completed|tests|implementation)[:.!]?$/i.test(line));
+        items.push(summary || 'Completed turn');
+      }
+      response = '';
+    }
+    return items;
+  };
+}
+
+// Keep every item's text intact; the transcript renderer wraps to the terminal width.
+export function workReview(items) {
+  if (!items.length) return 'No completed turns yet.';
+  return items.map((item, index) => `${index + 1}. ${item}`).join('\n\n');
 }
