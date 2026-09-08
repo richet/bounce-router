@@ -14,6 +14,7 @@ import {parseArgs} from 'node:util';
 import {Session, Router, config, saveJSON, dataRoot} from './core.js';
 import {providers} from './providers.js';
 import {projectRoot, fingerprint, validate, supervise} from './reload.js';
+import {BOUNCE_LOGO} from './logo.js';
 
 const help = `bounce — one terminal, your coding agents
 
@@ -231,9 +232,16 @@ async function main() {
     if (suspended || copyPaused) return;
     const width = Math.max(4, (process.stdout.columns || 80) - 2);
     const terminalRows = process.stdout.rows || 24;
-    const draft = inputLayout(input, width - 2, Math.max(1, Math.min(Math.floor(terminalRows / 3), terminalRows - 10)));
+    // The banner only earns its extra rows when the art fits the width and still
+    // leaves the transcript, composer and status bar room; otherwise fall back to
+    // the one-line title. Every budget below is measured from the header height,
+    // so the bottom chrome stays on screen whichever banner is showing.
+    const art = BOUNCE_LOGO.split('\n');
+    const logoFits = width >= Math.max(...art.map(row => row.length)) && terminalRows >= art.length + 13;
+    const headerRows = (logoFits ? art.length : 1) + 4;
+    const draft = inputLayout(input, width - 2, Math.max(1, Math.min(Math.floor(terminalRows / 3), terminalRows - headerRows - 5)));
     const options = suggestions();
-    const menuBudget = Math.max(0, terminalRows - 10 - draft.rows.length);
+    const menuBudget = Math.max(0, terminalRows - headerRows - 5 - draft.rows.length);
     const plain = s => s;
     const menu = [];
     if (picker?.kind === 'import') {
@@ -257,21 +265,23 @@ async function main() {
       menu.push(['↑/↓ choose · Tab completes · Enter runs · Esc dismiss', style.muted]);
     }
     menu.length = Math.min(menu.length, menuBudget);
-    const bodyHeight = Math.max(1, terminalRows - 9 - draft.rows.length - menu.length);
+    const bodyHeight = Math.max(1, terminalRows - headerRows - 4 - draft.rows.length - menu.length);
     const rows = transcriptRows(session.events, width);
     scroll = Math.min(scroll, Math.max(0, rows.length - bodyHeight));
     const end = rows.length - scroll;
     const body = rows.slice(Math.max(0, end - bodyHeight), end);
     while (body.length < bodyHeight) body.push('');
     const line = '─'.repeat(width);
+    const banner = logoFits ? art.map(row => style.title(row)) : [style.title(' BOUNCE')];
     const header = [
-      style.title(' BOUNCE') + style.muted('  /  your agents, one conversation'),
-      `${selected()} · Model: ${activeModel(session.events, selected(), settings.models[selected()])} · ${settings.mode.toUpperCase()}${settings.mode === 'yolo' ? ' (approvals + sandbox bypassed)' : ''} · ${busy ? 'RUNNING' : 'READY'}`,
-      `${session.cwd} · session ${session.id.slice(0, 8)}`,
-      settings.order.map(p => `${p}${router.cooldowns[p] > Date.now() ? ' [cooldown]' : ''}${quotaShort(quotas[p]) ? ` (${quotaShort(quotas[p])})` : ''}`).join(' → '), line,
+      ...banner,
+      style.status(clean(`${selected()} · Model: ${activeModel(session.events, selected(), settings.models[selected()])} · ${settings.mode.toUpperCase()}${settings.mode === 'yolo' ? ' (approvals + sandbox bypassed)' : ''} · ${busy ? 'RUNNING' : 'READY'}`)),
+      style.muted(clean(`${session.cwd} · session ${session.id.slice(0, 8)}`)),
+      style.muted(clean(settings.order.map(p => `${p}${router.cooldowns[p] > Date.now() ? ' [cooldown]' : ''}${quotaShort(quotas[p]) ? ` (${quotaShort(quotas[p])})` : ''}`).join(' → '))),
+      style.muted(line),
     ];
     const nextFrame = [
-      ...header.map((s, i) => clip(i === 0 ? s : (i === 1 ? style.status : style.muted)(clean(s)), width)),
+      ...header.map(s => clip(s, width)),
       ...body, ...menu.map(([text, paint]) => clip(paint(clean(text)), width)),
       style.muted(line),
       ...draft.rows.map((row, i) => style.prompt(i === 0 ? '❯ ' : '  ') + row),
