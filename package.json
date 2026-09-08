@@ -1,6 +1,6 @@
 {
   "name": "bouncerouter",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "One terminal. Your local coding agent subscriptions.",
   "type": "module",
   "bin": {
@@ -14,8 +14,17 @@
   "engines": {
     "node": ">=22"
   },
-  "license": "UNLICENSED",
-  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/richet/bounce-router.git"
+  },
+  "files": [
+    "src/"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "chalk": "^5.6.2",
     "cli-highlight": "^2.1.11",

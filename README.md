@@ -1,6 +1,38 @@
 # bounce-router
 
-bounce-router is one TUI for your installed Claude Code, Codex, and Muse coding agents, run with the `bounce` command. Uses native CLI login and headless processes; bounce owns the conversation and carries context between providers.
+bounce-router is one TUI for your installed Claude Code, Codex, and Muse coding agents, run with the `bounce` command. Uses native CLI login and headless processes; bounce owns the conversation and carries context between providers. When one provider's subscription usage is exhausted, it automatically fails over to the next signed-in provider.
+
+## Install
+
+Requires Node.js 22+.
+
+```sh
+npm install -g bouncerouter
+bounce
+```
+
+Then inside bounce, connect your agents:
+
+### Provider sign-in
+
+```
+/login claude
+/login codex
+/login muse
+```
+
+If Claude, Codex, or Muse are already signed in on this machine, there is
+nothing to do — bounce reuses those logins and you can skip `/login`.
+
+### Model selection
+
+Switch models on your signed-in agents with `/model`.
+
+### Skills
+
+Bring an agent's existing skills into bounce with `/skills import` (tick the
+ones you want). Bounce keeps imported skills in sync across all providers,
+so a skill works whichever agent answers the turn.
 
 ## Run
 
