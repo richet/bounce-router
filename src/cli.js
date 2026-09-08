@@ -60,8 +60,10 @@ Drop PNG/JPEG/GIF/WebP files into your prompt, then press Enter to send.
 
 Keys: / command picker · Tab complete (or next agent) · F2 pause for copying
       Enter send · Shift+Enter newline (Alt+Enter and Ctrl+J too)
-      Mouse wheel / PgUp/PgDn scroll · ↑/↓ prompt history
+      PgUp/PgDn scroll · F3 toggle mouse scrolling · ↑/↓ prompt history
       Ctrl+C cancel turn / exit when idle · Ctrl+U clear input
+
+You can keep typing while an agent works. Press Enter to queue each next message.
 
 Node.js 22+. Config and journals: BOUNCE_HOME or ~/.bounce.
 YOLO disables provider approvals/sandboxing. Native CLI credentials stay with vendors.
@@ -168,14 +170,16 @@ async function main() {
     return;
   }
   let input = '', busy = false, suspended = false, scroll = 0, historyIndex = -1;
+  const pending = [];
   let activityTimer, activityStarted = 0, progress = '';
   const activity = () => `${['◐', '◓', '◑', '◒'][Math.floor((Date.now() - activityStarted) / 150) % 4]} Working · ${Math.floor((Date.now() - activityStarted) / 1000)}s`;
   let loadedFingerprint = fingerprint();
   let completionIndex = 0, menuDismissed = false, copyPaused = false, previousFrame = [], previousCursor = '';
+  let mouseScroll = false;
   let picker = null;
   const suggestions = () => menuDismissed ? [] : completions(input);
   const acceptCompletion = () => {const options = suggestions(); if (options.length) {input = '/' + options[completionIndex % options.length][0] + ' '; completionIndex = 0; menuDismissed = false; return true;} return false;};
-  let notice = [restarted?.updateNotice, skillNotice, 'Ready. /help for commands. /quota shows the usage each agent reports.'].filter(Boolean).join(' ');
+  let notice = [restarted?.updateNotice, skillNotice, 'Ready. Select text / open links with your terminal. F2 pause · F3 mouse scroll · /help'].filter(Boolean).join(' ');
   const history = session.events.filter(e => e.kind === 'user').map(e => e.text);
   const selected = () => session.active || settings.order[0];
   const save = () => saveJSON(path.join(root, 'config.json'), settings);
@@ -279,7 +283,7 @@ async function main() {
     const banner = logoFits ? art.map(row => style.title(row)) : [style.title(' BOUNCE')];
     const header = [
       ...banner,
-      style.status(clean(`${selected()} · Model: ${activeModel(session.events, selected(), settings.models[selected()])} · ${settings.mode.toUpperCase()}${settings.mode === 'yolo' ? ' (approvals + sandbox bypassed)' : ''} · ${busy ? 'RUNNING' : 'READY'}`)),
+      style.status(clean(`${selected()} · Model: ${activeModel(session.events, selected(), settings.models[selected()])} · ${settings.mode.toUpperCase()}${settings.mode === 'yolo' ? ' (approvals + sandbox bypassed)' : ''} · ${busy ? `RUNNING${pending.length ? ` · ${pending.length} QUEUED` : ''}` : 'READY'}`)),
       style.muted(clean(`${session.cwd} · session ${session.id.slice(0, 8)}`)),
       style.muted(clean(settings.order.map(p => `${p}${router.cooldowns[p] > Date.now() ? ' [cooldown]' : ''}${quotaShort(quotas[p]) ? ` (${quotaShort(quotas[p])})` : ''}`).join(' → '))),
       style.muted(line),
@@ -292,7 +296,7 @@ async function main() {
       style.muted(line), clip(style.status(clean(busy && activityTimer ? [activity(), progress, notice].filter(Boolean).join(' · ') : notice)), width),
     ];
     const update = frameDiff(previousFrame, nextFrame);
-    const cursor = busy ? '\x1b[?25l' : `\x1b[${header.length + body.length + menu.length + 2 + draft.cursorRow};${3 + draft.cursorColumn}H\x1b[1 q\x1b[?25h`;
+    const cursor = `\x1b[${header.length + body.length + menu.length + 2 + draft.cursorRow};${3 + draft.cursorColumn}H\x1b[1 q\x1b[?25h`;
     if (update || cursor !== previousCursor) process.stdout.write((update ? '\x1b[?25l' + update : '') + cursor);
     previousCursor = cursor;
     previousFrame = nextFrame;
@@ -305,7 +309,7 @@ async function main() {
     if (renderTimer) return;
     renderTimer = setTimeout(() => {renderTimer = null; render();}, 40);
   }
-  const enter = () => { suspended = false; previousFrame = []; previousCursor = ''; resumeTerminal(process.stdin, process.stdout, {mouse: !copyPaused}); render(); };
+  const enter = () => { suspended = false; previousFrame = []; previousCursor = ''; resumeTerminal(process.stdin, process.stdout, {mouse: mouseScroll && !copyPaused}); render(); };
   const leave = () => { suspended = true; suspendTerminal(process.stdin, process.stdout); };
   async function restart() {
     notice = 'Validating updated code…'; render();
@@ -391,7 +395,18 @@ async function main() {
         if (dev && result === 'completed' && fingerprint() !== loadedFingerprint) await restart();
       }
     } catch (e) {notice = e.message; if (!input) input = text;}
-    finally {clearInterval(activityTimer); activityTimer = null; busy = false; progress = ''; render();}
+    finally {
+      clearInterval(activityTimer); activityTimer = null; progress = '';
+      const next = pending.shift();
+      if (next) {
+        notice = pending.length ? `Starting queued message · ${pending.length} still queued` : 'Starting queued message';
+        render();
+        void submit(next);
+      } else {
+        busy = false;
+        render();
+      }
+    }
   }
   const keyboard = new PassThrough();
   // Node's keypress parser holds a lone ESC until another byte follows, so deliver it directly.
@@ -401,11 +416,11 @@ async function main() {
   // the event the prompt already treats as "newline, do not submit".
   const keyInput = createKeyInput(toKeyboard, () => handleKey('\r', {name: 'return', meta: true}), handleKey);
   const mouseInput = createMouseInput(keyInput, amount => {
-    if (suspended || copyPaused) return;
+    if (suspended || copyPaused || !mouseScroll) return;
     scroll = Math.max(0, scroll + amount); render();
   });
   const pasteInput = createPasteInput(text => mouseInput(text), text => {
-    if (busy || suspended || copyPaused || picker) return;
+    if (suspended || copyPaused || picker) return;
     input += clean(text);
     completionIndex = 0; menuDismissed = false; render();
   });
@@ -421,17 +436,25 @@ async function main() {
     if (suspended) return;
     if (key.name === 'f2') {
       copyPaused = !copyPaused;
-      process.stdout.write(mouseTracking(!copyPaused));
+      process.stdout.write(mouseTracking(mouseScroll && !copyPaused));
       if (copyPaused) {
         process.stdout.write('\x1b[?25l');
         previousCursor = '';
         const row = Math.max(1, previousFrame.length);
-        process.stdout.write(`\x1b[${row};1H\x1b[2KDisplay paused — select and copy text; F2 resumes.`);
+        process.stdout.write(`\x1b[${row};1H\x1b[2KPaused — select/copy or open links with your terminal; F2 resumes.`);
         previousFrame[row - 1] = '';
       } else render();
       return;
     }
     if (copyPaused && !(key.ctrl && key.name === 'c')) return;
+    if (key.name === 'f3') {
+      mouseScroll = !mouseScroll;
+      process.stdout.write(mouseTracking(mouseScroll));
+      notice = mouseScroll
+        ? 'Mouse scrolling on · F3 restores text selection and link clicks · F2 pauses for copying'
+        : 'Mouse scrolling off · Select text / open links with your terminal · PgUp/PgDn scroll';
+      render(); return;
+    }
     if (key.ctrl && key.name === 'c') { if (busy) {router.cancel(); notice = 'Cancelling…'; render();} else quit(); return; }
     if (key.name === 'escape' && busy) {router.cancel(); return;}
     if (key.name === 'pageup') {scroll += 8; render(); return;}
@@ -450,7 +473,6 @@ async function main() {
       else if (key.name === 'return') {const entry = picker.entries[picker.index]; picker = null; applyModel(entry);}
       render(); return;
     }
-    if (busy) return;
     // Enter alone submits; Shift+Enter — or any other modifier, or Ctrl+J — drops down a line.
     if (key.name === 'enter' || (key.name === 'return' && (key.meta || key.ctrl || key.shift))) {input += '\n'; menuDismissed = true; render(); return;}
     const options = suggestions();
@@ -460,7 +482,15 @@ async function main() {
     if (options.length && key.name === 'return' && !typedCommand(input)) {acceptCompletion(); render(); return;}
     if (key.name === 'escape') {menuDismissed = true; render(); return;}
     const beforeInput = input;
-    if (key.name === 'return') {const text = input.trim(); input = ''; if (text) {busy = true; void submit(text);} }
+    if (key.name === 'return') {
+      const text = input.trim(); input = '';
+      if (text) {
+        if (busy) {
+          pending.push(text); historyIndex = -1;
+          notice = `Queued · ${pending.length} message${pending.length === 1 ? '' : 's'} waiting`;
+        } else { busy = true; void submit(text); }
+      }
+    }
     else if (key.name === 'backspace') input = [...input].slice(0,-1).join('');
     else if (key.ctrl && key.name === 'u') input = '';
     else if (key.name === 'tab') {const i = settings.order.indexOf(selected()); session.active = settings.order[(i + 1) % settings.order.length];}

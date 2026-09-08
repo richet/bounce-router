@@ -33,8 +33,9 @@ export function frameDiff(previous, next) {
 
 // SGR mouse reports can arrive across multiple stdin chunks. Remove every mouse
 // report before readline sees it, so clicks cannot become prompt text.
-export const mouseTracking = enabled => enabled
-  ? '\x1b[?1000h\x1b[?1006h' : '\x1b[?1000l\x1b[?1006l';
+// Clear legacy, drag and motion tracking too: another CLI may have left them enabled.
+const releaseMouse = '\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l';
+export const mouseTracking = enabled => releaseMouse + (enabled ? '\x1b[?1000h\x1b[?1006h' : '');
 
 // Handing the terminal to a vendor CLI means handing over the keyboard too. Node keeps
 // reading fd 0 while stdin is flowing, so an inherited child never sees the keystrokes
@@ -44,7 +45,7 @@ export function suspendTerminal(stdin = process.stdin, stdout = process.stdout) 
   stdin.pause();
   stdout.write(keyboardProtocol(false) + mouseTracking(false) + '\x1b[?2004l\x1b[0 q\x1b[?25h\x1b[?1049l');
 }
-export function resumeTerminal(stdin = process.stdin, stdout = process.stdout, {mouse = true} = {}) {
+export function resumeTerminal(stdin = process.stdin, stdout = process.stdout, {mouse = false} = {}) {
   stdin.setRawMode?.(true);
   stdin.resume();
   stdout.write('\x1b[?1049h\x1b[?25l\x1b[?2004h' + keyboardProtocol(true) + mouseTracking(mouse));

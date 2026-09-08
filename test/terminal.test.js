@@ -37,8 +37,8 @@ test('mouse input handles split/coalesced wheel reports without changing prompt 
  assert.deepEqual(scroll, [3, -3, 3]);
  feed('\x1b[A'); feed('\x1b'); feed.flush();
  assert.equal(text.join(''), 'helloworld\x1b[A\x1b');
- assert.equal(mouseTracking(true), '\x1b[?1000h\x1b[?1006h');
- assert.equal(mouseTracking(false), '\x1b[?1000l\x1b[?1006l');
+ assert.equal(mouseTracking(true), '\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1000h\x1b[?1006h');
+ assert.equal(mouseTracking(false), '\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l');
 });
 
 test('input grows with wrapping and newlines, keeping the cursor within the viewport', async () => {
@@ -89,13 +89,13 @@ test('handing the terminal to a vendor login releases stdin and restores the mai
   // Leaving raw mode is not enough: while stdin flows, Node reads fd 0 and the inherited
   // login process never sees the keystrokes typed at its own prompt.
   assert.deepEqual(calls, ['raw:false', 'pause']);
-  assert.equal(out, '\x1b[>4;0m\x1b[<1u\x1b[?1000l\x1b[?1006l\x1b[?2004l\x1b[0 q\x1b[?25h\x1b[?1049l');
-  calls.length = 0; out = '';
-  resumeTerminal(stdin, stdout, {mouse: false});
-  assert.deepEqual(calls, ['raw:true', 'resume']);
-  assert.equal(out, '\x1b[?1049h\x1b[?25l\x1b[?2004h\x1b[>1u\x1b[>4;2m\x1b[?1000l\x1b[?1006l');
+  assert.equal(out, '\x1b[>4;0m\x1b[<1u\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[0 q\x1b[?25h\x1b[?1049l');
   calls.length = 0; out = '';
   resumeTerminal(stdin, stdout);
+  assert.deepEqual(calls, ['raw:true', 'resume']);
+  assert.equal(out, '\x1b[?1049h\x1b[?25l\x1b[?2004h\x1b[>1u\x1b[>4;2m\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l');
+  calls.length = 0; out = '';
+  resumeTerminal(stdin, stdout, {mouse: true});
   assert.ok(out.endsWith('\x1b[?1000h\x1b[?1006h'));
   // A stream without setRawMode (a pipe under test) must not throw.
   suspendTerminal({pause: () => {}}, stdout);

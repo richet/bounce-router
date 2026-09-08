@@ -87,7 +87,7 @@ test('quota reads as a compact header and a full report', () => {
     claude: {provider: 'claude', time: '2026-09-08T11:59:50Z', windows: [{label: '5h', percent: 5, resetsAt: null}]},
     muse: {provider: 'muse', windows: [], error: 'muse does not report quota'},
   };
-  assert.equal(quotaShort(store.codex), '5h 100% · 7d 16%');
+  assert.equal(quotaShort(store.codex, now), '5h 100% · 7d 16%');
   assert.equal(quotaShort(store.muse), '');
   assert.equal(quotaShort(undefined), '');
   assert.deepEqual(quotaReport(store, ['codex', 'claude', 'muse'], now).split('\n'), [

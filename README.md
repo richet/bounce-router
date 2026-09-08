@@ -126,7 +126,7 @@ Headless usage: `bounce run "Explain this screenshot" --image "/path/Screen shot
 - `/skills` lists bounce's skills and where each agent has them; `/skills sync`, `/skills new NAME`, `/skills add PATH`, `/skills remove NAME`, `/skills import [provider]`, `/skills clear` and `/skills reset` manage them. See [Skills](#skills).
 - `/login [provider]`, `/new`, `/note TEXT`, `/retry`, `/help`, `/quit`.
 - Escape or Ctrl+C cancels the running process group; Ctrl+C while idle exits.
-- Mouse wheel or trackpad scrolls the transcript (three lines per tick); PgUp/PgDn also scroll. F2 releases mouse capture for selecting/copying text. Up/down recalls prompts; Ctrl+U clears input.
+- Mouse capture is off by default so you can drag to select text and open visible URLs using your terminal’s usual link gesture (often Cmd+click on macOS or Ctrl+click elsewhere). Use your terminal’s copy shortcut (usually Cmd+C or Ctrl+Shift+C); Ctrl+C cancels a turn or exits bounce. PgUp/PgDn scroll the transcript. F3 toggles mouse wheel/trackpad scrolling (three lines per tick); toggle it off again to select text or open links. F2 freezes updates and releases mouse capture while you copy; F2 resumes the previous mode. Up/down recalls prompts; Ctrl+U clears input.
 - The prompt shows a blinking block cursor and grows as text wraps, up to one third of the terminal height. Longer drafts keep their last lines visible; pasted newlines are preserved. F2 hides the cursor while copying, and exit restores the terminal's default cursor style.
 
 YOLO intentionally lets agents run commands and change files with your user permissions. Launch in the workspace you intend to let the agents modify.
