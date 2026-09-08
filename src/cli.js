@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import {login} from './login.js';
 import {resolveExecutable} from './executable.js';
 import {PassThrough} from 'node:stream';
 import {completions, typedCommand, frameDiff, createMouseInput, mouseTracking, createPasteInput, createKeyInput, inputLayout, windowAround, modelRows, checklistRows, suspendTerminal, resumeTerminal} from './terminal.js';
@@ -67,13 +68,6 @@ YOLO disables provider approvals/sandboxing. Native CLI credentials stay with ve
 Model names are passed through to each CLI. Quota comes from the agents themselves:
 Codex answers on demand, Claude reports its windows while a turn runs, Muse reports none.
 `;
-// stdio is inherited so the vendor's browser/device prompt owns the real terminal.
-const login = (provider, settings, cwd) => new Promise((resolve, reject) => {
-  if (!providers[provider]) return reject(new Error('Choose claude, codex, or muse'));
-  const child = spawn(resolveExecutable(provider, settings.executables[provider]), providers[provider].login, {cwd, stdio: 'inherit'});
-  child.once('error', error => reject(new Error(error.code === 'ENOENT' ? `${provider} CLI not found on PATH` : error.message)));
-  child.once('exit', code => code === 0 ? resolve() : reject(new Error(`Login exited ${code}`)));
-});
 function listSessions(root) {
   const dir = path.join(root, 'sessions');
   if (!fs.existsSync(dir)) return [];
