@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {completions, frameDiff} from '../src/terminal.js';
+import {completions, typedCommand, frameDiff} from '../src/terminal.js';
 import {resolveExecutable} from '../src/executable.js';
 test('slash shows all commands; prefixes narrow and arguments dismiss',()=>{
  assert.equal(completions('/').length,13);
@@ -115,4 +115,18 @@ test('the import checklist marks the cursor and each ticked row independently', 
     '  [×] imagegen      Make pictures',
   ]);
   assert.equal(checklistRows(entries, 0, 20, new Set()).every(row => row.length <= 20), true);
+});
+
+test('a command typed in full is recognised, so Enter runs it instead of completing it', () => {
+  // /skills has to list the skills on the first Enter. Treating it as a completion to accept
+  // swallowed that press, and the silent no-op is what sent people back to the prompt.
+  assert.equal(typedCommand('/skills'), 'skills');
+  assert.equal(typedCommand('/QUIT'), 'quit');
+  // Half-typed, ambiguous, argument-bearing or unknown: Enter still completes or submits.
+  for (const input of ['/sk', '/mo', '/skills ', '/skills sync', '/nonsense', '/', 'skills', ''])
+    assert.equal(typedCommand(input), '', input);
+  // /mode is also a prefix of /model, so its menu still offers both and the first entry is the
+  // one Enter used to accept. Typing the command out in full has to beat that.
+  assert.deepEqual(completions('/mode').map(x => x[0]), ['model', 'mode']);
+  assert.equal(typedCommand('/mode'), 'mode');
 });

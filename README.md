@@ -42,7 +42,7 @@ Headless usage: `bounce run "Explain this screenshot" --image "/path/Screen shot
 
 ## Controls
 
-- Type `/` to open the command picker; type a prefix to filter. Up/down selects, Tab or Enter completes, and Enter then submits. Esc dismisses the picker.
+- Type `/` to open the command picker; type a prefix to filter. Up/down selects and Tab completes. Enter completes a half-typed command and runs one you typed out in full, so `/skills` lists your skills on the first press. Esc dismisses the picker.
 - Tab switches agent when the picker is closed.
 - Enter sends; Shift+Enter inserts a newline. A terminal sends a bare `\r` for Shift+Enter — indistinguishable from Enter — until an application asks it not to, so bounce turns on the kitty keyboard protocol and xterm's modifyOtherKeys while the TUI is up, and turns them off again whenever it hands the terminal back. That covers iTerm2 3.5+, Ghostty, kitty, WezTerm and xterm with no configuration. In a terminal that supports neither (Apple Terminal, older iTerm2), map the key yourself — in iTerm2, Settings → Profiles → Keys → Key Mappings → `+`, press ⇧↩, choose *Send Escape Sequence* and enter `[13;2u` — or use Alt+Enter or Ctrl+J, which insert a newline everywhere with no configuration. Ctrl+Enter and Cmd+Enter work too.
 - F2 freezes display updates for selecting/copying text while an agent runs; F2 resumes. Events continue to be saved while paused. Unchanged frames produce no terminal writes, and ordinary updates redraw only changed rows.

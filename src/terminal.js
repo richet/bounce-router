@@ -13,6 +13,14 @@ export function completions(input) {
   if (!/^\/\S*$/.test(input)) return [];
   return commands.filter(([name]) => name.startsWith(input.slice(1)));
 }
+// A command typed out in full is not a completion waiting to be accepted. Enter on it must
+// run the command, so /skills lists the skills on the first press rather than quietly
+// appending a space and leaving the user to press Enter again.
+export function typedCommand(input) {
+  const match = /^\/([a-z]+)$/i.exec(input);
+  const name = match?.[1].toLowerCase();
+  return commands.some(([command]) => command === name) ? name : '';
+}
 // Update only changed rows. An unchanged frame produces no terminal writes.
 export function frameDiff(previous, next) {
   let output = '';

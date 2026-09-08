@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import {resolveExecutable} from './executable.js';
 import {PassThrough} from 'node:stream';
-import {completions, frameDiff, createMouseInput, mouseTracking, createPasteInput, createKeyInput, inputLayout, windowAround, modelRows, checklistRows, suspendTerminal, resumeTerminal} from './terminal.js';
+import {completions, typedCommand, frameDiff, createMouseInput, mouseTracking, createPasteInput, createKeyInput, inputLayout, windowAround, modelRows, checklistRows, suspendTerminal, resumeTerminal} from './terminal.js';
 import {modelCatalog, modelEntries, catalogNotes} from './models.js';
 import {clean, createFormatter, createTranscriptRenderer, activeModel} from './format.js';
 import {loadQuota, recordQuota, refreshQuota, quotaSnapshot, quotaShort, quotaReport, quotaUnavailable} from './quota.js';
@@ -217,9 +217,11 @@ async function main() {
   }
   function applyImport() {
     const {entries, chosen, options} = picker;
+    // Closing on an empty Enter drops the next keystrokes into the prompt, where they become
+    // an agent turn nobody asked for. Say what is missing and stay put instead.
+    if (!chosen.size) { notice = 'Nothing ticked yet · Space ticks one · a ticks all · Esc cancels.'; return; }
     const selection = [...chosen].sort((a, b) => a - b).map(i => entries[i]);
     picker = null;
-    if (!selection.length) { notice = 'Nothing selected. No skills imported.'; return; }
     const report = importSelected(root, selection, {home: undefined, force: true});
     const synced = syncSkills(options);
     session.append({kind: 'skills', text: [importSummary(report), syncSummary(synced)].filter(Boolean).join('\n')});
@@ -252,7 +254,7 @@ async function main() {
       completionIndex = Math.min(completionIndex, options.length - 1);
       const start = Math.max(0, completionIndex - 3);
       for (let i = start; i < Math.min(options.length, start + 5); i++) menu.push([`${i === completionIndex ? '›' : ' '} /${options[i][0]}  ${options[i][1]}`, i === completionIndex ? style.selected : style.muted]);
-      menu.push(['↑/↓ choose · Tab/Enter complete · Esc dismiss', style.muted]);
+      menu.push(['↑/↓ choose · Tab completes · Enter runs · Esc dismiss', style.muted]);
     }
     menu.length = Math.min(menu.length, menuBudget);
     const bodyHeight = Math.max(1, terminalRows - 9 - draft.rows.length - menu.length);
@@ -424,7 +426,9 @@ async function main() {
     if (key.name === 'enter' || (key.name === 'return' && (key.meta || key.ctrl || key.shift))) {input += '\n'; menuDismissed = true; render(); return;}
     const options = suggestions();
     if (options.length && ['up', 'down'].includes(key.name)) {completionIndex = (completionIndex + (key.name === 'up' ? -1 : 1) + options.length) % options.length; render(); return;}
-    if (options.length && ['tab', 'return'].includes(key.name)) {acceptCompletion(); render(); return;}
+    if (options.length && key.name === 'tab') {acceptCompletion(); render(); return;}
+    // Enter only completes a half-typed command; a complete one falls through and is run.
+    if (options.length && key.name === 'return' && !typedCommand(input)) {acceptCompletion(); render(); return;}
     if (key.name === 'escape') {menuDismissed = true; render(); return;}
     const beforeInput = input;
     if (key.name === 'return') {const text = input.trim(); input = ''; if (text) {busy = true; void submit(text);} }
