@@ -25,3 +25,35 @@ test('reload validation rejects failing checks before running tests', async t =>
   await validate(root, text => messages.push(text));
   assert.deepEqual(messages, ['Checking syntax…', 'Syntax checks passed.', 'Running tests…', 'Tests passed.']);
 });
+
+test('supervisor installs only after child exits and resumes session on success or failure', async () => {
+  const {EventEmitter} = await import('node:events');
+  const {supervise} = await import('../src/reload.js');
+  for (const fail of [false, true]) {
+    let launches = 0, exited = false, installed = false;
+    const state = {id: 'saved-session', provider: 'codex', settings: {mode: 'plan'}, dev: false};
+    await supervise([], {
+      updateInstall: async () => {
+        assert.equal(exited, true); installed = true;
+        if (fail) throw new Error('offline');
+        return 'Updated bounce to 0.1.4.';
+      },
+      spawnChild: (_exe, _args, options) => {
+        const child = new EventEmitter(); child.kill = () => {};
+        const first = launches++ === 0;
+        if (!first) {
+          assert.equal(installed, true);
+          const resumed = JSON.parse(options.env.BOUNCE_RESTART);
+          assert.deepEqual({...resumed, updateNotice: undefined}, {...state, updateNotice: undefined});
+          assert.match(resumed.updateNotice, fail ? /Update failed: offline/ : /Updated bounce/);
+        }
+        process.nextTick(() => {
+          if (first) {child.emit('message', {type: 'restart', state, update: true}); exited = true;}
+          child.emit('close', first ? 75 : 0);
+        });
+        return child;
+      },
+    });
+    assert.equal(launches, 2);
+  }
+});

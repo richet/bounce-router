@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {createHash} from 'node:crypto';
+import {installUpdate} from './update.js';
 import {spawn} from 'node:child_process';
 export const projectRoot = fileURLToPath(new URL('../', import.meta.url));
 export function fingerprint(root = projectRoot) {
@@ -33,26 +34,31 @@ export async function validate(root = projectRoot, emit = () => {}) {
   }
 }
 // Keep this supervisor independent of the agent/UI modules loaded by each child.
-export async function supervise(args = process.argv.slice(2)) {
+export async function supervise(args = process.argv.slice(2), {spawnChild = spawn, updateInstall = installUpdate} = {}) {
   let resume;
   for (;;) {
     const outcome = await new Promise(resolve => {
-      let request;
-      const child = spawn(process.execPath,[fileURLToPath(new URL('./cli.js',import.meta.url)),...args],{
+      let request, update;
+      const child = spawnChild(process.execPath,[fileURLToPath(new URL('./cli.js',import.meta.url)),...args],{
         stdio:['inherit','inherit','inherit','ipc'],
         env:{...process.env,BOUNCE_SUPERVISED:'1',BOUNCE_RESTART:resume ? JSON.stringify(resume) : ''},
       });
       const terminate = () => child.kill('SIGTERM');
       const interrupt = () => {}; // Foreground process group delivers Ctrl+C to the child too.
       process.on('SIGTERM',terminate); process.on('SIGINT',interrupt);
-      child.on('message', message => {if (message?.type === 'restart') request = message.state;});
+      child.on('message', message => {if (message?.type === 'restart') {request = message.state; update = message.update === true;}});
       child.once('error', error => {console.error(error.message);});
       child.once('close', (code,signal) => {
         process.off('SIGTERM',terminate); process.off('SIGINT',interrupt);
-        resolve({code:code ?? (signal ? 130 : 1),request});
+        resolve({code:code ?? (signal ? 130 : 1),request,update});
       });
     });
     if (outcome.code !== 75 || !outcome.request) {process.exitCode=outcome.code;return;}
     resume=outcome.request;
+    if (outcome.update) {
+      try {resume.updateNotice = await updateInstall();}
+      catch (error) {resume.updateNotice = `Update failed: ${error.message}. Retry with /update.`;}
+      console.log(resume.updateNotice);
+    }
   }
 }

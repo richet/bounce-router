@@ -14,6 +14,7 @@ import {parseArgs} from 'node:util';
 import {Session, Router, config, saveJSON, dataRoot} from './core.js';
 import {providers} from './providers.js';
 import {projectRoot, fingerprint, validate, supervise} from './reload.js';
+import {version, checkUpdate, globalInstall, installUpdate} from './update.js';
 import {BOUNCE_LOGO} from './logo.js';
 
 const help = `bounce — one terminal, your coding agents
@@ -26,6 +27,7 @@ const help = `bounce — one terminal, your coding agents
   bounce skills [list|sync|new NAME|add PATH|remove NAME|import [NAME] [--list]|clear|reset] [--scope user|project]
   bounce sessions
   bounce doctor
+  bounce update [--check]  Check for or install the latest npm release
   bounce dev        Improve bounce itself; validate/reload after changes
 
 TUI commands:
@@ -48,6 +50,7 @@ TUI commands:
   /skills reset         Delete every bounce skill and withdraw its copies
   /quota                Show the subscription usage each agent reports
   /retry                Clear locally recorded quota cooldowns
+  /update [check]       Install the latest npm release, or only check
   /restart              Test and reload updated code, keeping this session
   /help                 Show commands
   /quit                 Exit (Esc cancels an active turn)
@@ -83,10 +86,10 @@ async function main() {
   const {values, positionals} = parseArgs({allowPositionals: true, options: {
     image: {type: 'string', multiple: true}, cwd: {type: 'string'}, resume: {type: 'string'}, provider: {type: 'string'}, model: {type: 'string'},
     mode: {type: 'string'}, json: {type: 'boolean'}, help: {type: 'boolean', short: 'h'}, version: {type: 'boolean', short: 'v'},
-    scope: {type: 'string'}, force: {type: 'boolean'}, list: {type: 'boolean'}, all: {type: 'boolean'},
+    check: {type: 'boolean'}, scope: {type: 'string'}, force: {type: 'boolean'}, list: {type: 'boolean'}, all: {type: 'boolean'},
   }});
   if (values.help) return console.log(help);
-  if (values.version) return console.log('bounce 0.1.0');
+  if (values.version) return console.log(`bounce ${version}`);
   const restarted = process.env.BOUNCE_RESTART ? JSON.parse(process.env.BOUNCE_RESTART) : null;
   delete process.env.BOUNCE_RESTART;
   const dev = restarted?.dev ?? positionals[0] === 'dev';
@@ -97,6 +100,13 @@ async function main() {
   }
   if (values.mode && !restarted) { if (!['yolo', 'plan'].includes(values.mode)) throw new Error('Mode must be yolo or plan'); settings.mode = values.mode; }
   if (values.model && !restarted) settings.models[settings.order[0]] = values.model;
+  if (positionals[0] === 'update') {
+    if (values.check) {
+      const release = await checkUpdate({root, force: true});
+      return console.log(release.available ? `Update available: ${version} → ${release.latest}. Run bounce update.` : `Bounce ${version} is up to date.`);
+    }
+    return console.log(await installUpdate({root}));
+  }
   if (positionals[0] === 'login') return login(positionals[1], settings, cwd);
   if (positionals[0] === 'sessions') return console.log(JSON.stringify(listSessions(root), null, 2));
   if (positionals[0] === 'models') {
@@ -171,7 +181,7 @@ async function main() {
   let picker = null;
   const suggestions = () => menuDismissed ? [] : completions(input);
   const acceptCompletion = () => {const options = suggestions(); if (options.length) {input = '/' + options[completionIndex % options.length][0] + ' '; completionIndex = 0; menuDismissed = false; return true;} return false;};
-  let notice = [skillNotice, 'Ready. /help for commands. /quota shows the usage each agent reports.'].filter(Boolean).join(' ');
+  let notice = [restarted?.updateNotice, skillNotice, 'Ready. /help for commands. /quota shows the usage each agent reports.'].filter(Boolean).join(' ');
   const history = session.events.filter(e => e.kind === 'user').map(e => e.text);
   const selected = () => session.active || settings.order[0];
   const save = () => saveJSON(path.join(root, 'config.json'), settings);
@@ -311,6 +321,17 @@ async function main() {
     await new Promise((resolve, reject) => process.send({type: 'restart', state}, error => error ? reject(error) : resolve()));
     leave(); session.unlock(); process.exit(75);
   }
+  async function update(checkOnly) {
+    const release = await checkUpdate({root, force: true});
+    if (checkOnly || !release.available) {
+      session.append({kind: 'status', text: release.available ? `Update available: ${version} → ${release.latest}. Run /update.` : `Bounce ${version} is up to date.`});
+      return;
+    }
+    await globalInstall();
+    const state = {id: session.id, settings, provider: selected(), dev};
+    await new Promise((resolve, reject) => process.send({type: 'restart', state, update: true}, error => error ? reject(error) : resolve()));
+    leave(); session.unlock(); process.exit(75);
+  }
   const quit = () => { leave(); session.unlock(); process.exit(0); };
   async function submit(text) {
     activityStarted = Date.now(); progress = '';
@@ -319,6 +340,10 @@ async function main() {
       if (/^\/[a-z]+(?:\s|$)/i.test(text)) {
         const [command, ...parts] = text.slice(1).split(/\s+/); const arg = parts.join(' ');
         if (command === 'quit') return quit();
+        if (command === 'update') {
+          if (arg && arg !== 'check') throw new Error('Use /update or /update check');
+          return await update(arg === 'check');
+        }
         if (command === 'restart') return await restart();
         if (command === 'help') {session.append({kind: 'status', text: help}); return;}
         if (command === 'provider') {
@@ -459,5 +484,13 @@ async function main() {
   process.on('SIGTERM', () => { if (busy) {router.cancel(); const timer = setInterval(() => {if (!busy) {clearInterval(timer); quit();}}, 100);} else quit(); });
   process.on('exit', () => { if (!suspended) leave(); });
   enter();
+  if (!dev && process.env.BOUNCE_NO_UPDATE_CHECK !== '1') {
+    void globalInstall().then(() => checkUpdate({root})).then(release => {
+      if (release.available) {
+        session.append({kind: 'status', text: `Update available: ${version} → ${release.latest}. Run /update.`});
+        render();
+      }
+    }).catch(() => {});
+  }
 }
 (process.env.BOUNCE_SUPERVISED === '1' && typeof process.send === 'function' ? main() : supervise()).catch(error => {console.error(`bounce: ${error.message}`); process.exitCode = 1;});

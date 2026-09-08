@@ -6,6 +6,7 @@ export const commands = [
   ['mode', 'Set yolo or plan mode'], ['login', 'Sign in to an agent'], ['new', 'Start new session'],
   ['note', 'Save handoff note'], ['skills', 'Manage and install skills'],
   ['quota', 'Show reported quota'], ['retry', 'Clear quota cooldowns'],
+  ['update', 'Install latest npm release'],
   ['restart', 'Validate and reload'],
   ['help', 'Show help'], ['quit', 'Exit bounce'],
 ];

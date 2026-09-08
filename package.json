@@ -1,6 +1,6 @@
 {
   "name": "bouncerouter",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "One terminal. Your local coding agent subscriptions.",
   "type": "module",
   "bin": {
@@ -9,7 +9,7 @@
   "scripts": {
     "start": "node src/cli.js",
     "test": "node --test",
-    "check": "node --check src/cli.js && node --check src/core.js && node --check src/providers.js && node --check src/reload.js && node --check src/terminal.js && node --check src/executable.js && node --check src/format.js && node --check src/images.js && node --check src/logo.js && node --check src/models.js && node --check src/query.js && node --check src/quota.js && node --check src/skills.js"
+    "check": "node --check src/cli.js && node --check src/core.js && node --check src/providers.js && node --check src/reload.js && node --check src/terminal.js && node --check src/executable.js && node --check src/format.js && node --check src/images.js && node --check src/logo.js && node --check src/models.js && node --check src/query.js && node --check src/quota.js && node --check src/skills.js && node --check src/update.js"
   },
   "engines": {
     "node": ">=22"

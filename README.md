@@ -11,6 +11,27 @@ npm install -g bouncerouter
 bounce
 ```
 
+Global npm installations check for a newer stable release in the background on
+interactive startup. Successful checks are cached for 24 hours; network failures
+are silent. Set `BOUNCE_NO_UPDATE_CHECK=1` to disable startup checks.
+
+```sh
+bounce update --check
+bounce update
+```
+
+Inside bounce, use `/update check` to check now, or `/update` to install. Updates
+are explicit: bounce never automatically installs a release. `/update` exits the
+idle UI before installing, then starts a fresh process with the same session,
+provider and settings. Installation errors are reported on resume; if npm leaves
+an incomplete installation, repair it with `npm install -g bouncerouter@latest`
+and resume with `bounce --resume SESSION_ID`.
+
+Self-update requires a global npm installation matching the npm on PATH and uses
+that npm's global prefix. Linked development checkouts and local installations
+are skipped. No elevated permissions are requested. `/restart` remains the
+separate development validation/reload command.
+
 Then inside bounce, connect your agents:
 
 ### Provider sign-in
