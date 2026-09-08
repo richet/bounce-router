@@ -18,6 +18,7 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     title: c.bold.cyan, muted: c.gray, user: c.bold.cyan, assistant: c.bold.green,
     tool: c.magenta, error: c.bold.red, status: c.yellow, result: c.green,
     note: c.blue, diagnostic: c.yellow, selected: c.bold.inverse, prompt: c.cyan, quota: c.bold.blue,
+    skills: c.bold.magenta,
   };
   function codeColors(text, language) {
     if (!color) return text;
@@ -48,6 +49,10 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
       return c.gray(`  ┌─ ${lang || 'code'}`) + '\n' + code.split('\n').map(line => '  ' + line).join('\n') + '\n\n';
     },
     link({href, tokens}) { return c.blue(this.parser.parseInline(tokens)) + c.underline(` (${clean(href)})`); },
+    // marked-terminal's text renderer emits a token's raw source instead of parsing its
+    // inline tokens, so bold, emphasis and code spans inside list items reach the display
+    // as literal Markdown. Parse the nested tokens; leaf text tokens still pass through.
+    text(token) { return token.tokens ? this.parser.parseInline(token.tokens) : token.text; },
   }});
   const wrap = (text, width) => wrapAnsi(color ? text : stripAnsi(text), Math.max(1, width), {hard: true, trim: false}).split('\n');
   const clip = (text, width) => sliceAnsi(color ? text : stripAnsi(text), 0, Math.max(0, width));
@@ -77,7 +82,7 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     const names = {user: 'You', assistant: 'Response', delta: 'Response', result: 'Result',
       status: 'Activity', route: 'Agent selected', tool: 'Tool output', error: 'Error',
       diagnostic: 'Diagnostics', note: 'Saved note', cooldown: 'Retry delay', attempt: 'Agent finished',
-      turn: 'Turn finished', quota: 'Reported quota'};
+      turn: 'Turn finished', quota: 'Reported quota', skills: 'Skills'};
     const label = e.kind === 'user' ? 'You' : `${e.provider || 'Bounce'} · ${names[e.kind] || e.kind}`;
     const paint = style[e.kind] || style.muted;
     if (inline.includes(e.kind)) return wrap(`${paint(clean(label))}  ${clean(e.text)}`, width);

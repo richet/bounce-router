@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 import {resolveExecutable} from './executable.js';
 import {PassThrough} from 'node:stream';
-import {completions, frameDiff, createMouseInput, mouseTracking, createPasteInput, inputLayout, windowAround, modelRows} from './terminal.js';
+import {completions, frameDiff, createMouseInput, mouseTracking, createPasteInput, createKeyInput, inputLayout, windowAround, modelRows, checklistRows, suspendTerminal, resumeTerminal} from './terminal.js';
 import {modelCatalog, modelEntries, catalogNotes} from './models.js';
 import {clean, createFormatter, createTranscriptRenderer, activeModel} from './format.js';
 import {loadQuota, recordQuota, refreshQuota, quotaSnapshot, quotaShort, quotaReport, quotaUnavailable} from './quota.js';
+import {skillsCommand, syncSkills, inspectSkills, skillsChanged, importCandidates, importSelected, importSummary, syncSummary, skillAreas} from './skills.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import {spawn} from 'node:child_process';
@@ -21,6 +22,7 @@ const help = `bounce — one terminal, your coding agents
   bounce login claude|codex|muse
   bounce models [--json]
   bounce quota [--json]
+  bounce skills [list|sync|new NAME|add PATH|remove NAME|import [NAME] [--list]|clear|reset] [--scope user|project]
   bounce sessions
   bounce doctor
   bounce dev        Improve bounce itself; validate/reload after changes
@@ -35,6 +37,14 @@ TUI commands:
   /login NAME           Open the vendor's native login flow
   /new                  Start a new session in this workspace
   /note TEXT            Save a durable handoff note
+  /skills               List bounce skills and where each agent has them
+  /skills sync          Install them into every agent's skills directory
+  /skills new NAME      Scaffold a SKILL.md under ~/.bounce/skills
+  /skills add PATH      Adopt a skill folder or SKILL.md into bounce
+  /skills remove NAME   Delete it from bounce and from every agent
+  /skills import [NAME] Pick from the skills an agent already has
+  /skills clear         Remove every copy bounce installed
+  /skills reset         Delete every bounce skill and withdraw its copies
   /quota                Show the subscription usage each agent reports
   /retry                Clear locally recorded quota cooldowns
   /restart              Test and reload updated code, keeping this session
@@ -44,7 +54,8 @@ TUI commands:
 Drop PNG/JPEG/GIF/WebP files into your prompt, then press Enter to send.
 
 Keys: / command picker · Tab complete (or next agent) · F2 pause for copying
-      Enter send · Alt+Enter newline · Mouse wheel / PgUp/PgDn scroll · ↑/↓ prompt history
+      Enter send · Shift+Enter newline (Alt+Enter and Ctrl+J too)
+      Mouse wheel / PgUp/PgDn scroll · ↑/↓ prompt history
       Ctrl+C cancel turn / exit when idle · Ctrl+U clear input
 
 Node.js 22+. Config and journals: BOUNCE_HOME or ~/.bounce.
@@ -52,10 +63,11 @@ YOLO disables provider approvals/sandboxing. Native CLI credentials stay with ve
 Model names are passed through to each CLI. Quota comes from the agents themselves:
 Codex answers on demand, Claude reports its windows while a turn runs, Muse reports none.
 `;
+// stdio is inherited so the vendor's browser/device prompt owns the real terminal.
 const login = (provider, settings, cwd) => new Promise((resolve, reject) => {
   if (!providers[provider]) return reject(new Error('Choose claude, codex, or muse'));
   const child = spawn(resolveExecutable(provider, settings.executables[provider]), providers[provider].login, {cwd, stdio: 'inherit'});
-  child.once('error', reject);
+  child.once('error', error => reject(new Error(error.code === 'ENOENT' ? `${provider} CLI not found on PATH` : error.message)));
   child.once('exit', code => code === 0 ? resolve() : reject(new Error(`Login exited ${code}`)));
 });
 function listSessions(root) {
@@ -70,6 +82,7 @@ async function main() {
   const {values, positionals} = parseArgs({allowPositionals: true, options: {
     image: {type: 'string', multiple: true}, cwd: {type: 'string'}, resume: {type: 'string'}, provider: {type: 'string'}, model: {type: 'string'},
     mode: {type: 'string'}, json: {type: 'boolean'}, help: {type: 'boolean', short: 'h'}, version: {type: 'boolean', short: 'v'},
+    scope: {type: 'string'}, force: {type: 'boolean'}, list: {type: 'boolean'}, all: {type: 'boolean'},
   }});
   if (values.help) return console.log(help);
   if (values.version) return console.log('bounce 0.1.0');
@@ -99,6 +112,11 @@ async function main() {
     if (values.json) return console.log(JSON.stringify(store, null, 2));
     return console.log(quotaReport(store, settings.order));
   }
+  if (positionals[0] === 'skills') {
+    const options = {root, scope: values.scope || settings.skills.scope, cwd, base: process.cwd()};
+    const {text, report} = skillsCommand([...positionals.slice(1), ...(values.force ? ['--force'] : []), ...(values.list ? ['--list'] : [])], options);
+    return console.log(values.json ? JSON.stringify(report ?? inspectSkills(options), null, 2) : text);
+  }
   if (positionals[0] === 'doctor') {
     console.log(`Workspace: ${cwd}\nData: ${root}\nMode: ${settings.mode}\nOrder: ${settings.order.join(' → ')}`);
     const quotas = await refreshQuota(settings, {root, cwd});
@@ -117,6 +135,13 @@ async function main() {
   if (positionals.length && !['run', 'dev'].includes(positionals[0])) throw new Error('Unknown command. Use --help.');
   if (positionals[0] !== 'run' && (!process.stdin.isTTY || !process.stdout.isTTY)) throw new Error('TUI requires a terminal. Use bounce run "prompt" for headless execution.');
   if (positionals[0] === 'run' && !positionals.slice(1).join(' ').trim()) throw new Error('Provide a prompt: bounce run "prompt"');
+  // Each vendor CLI only reads skills from its own directory, so bounce's copies are pushed
+  // out before the session starts. Nothing is written while every agent is already current.
+  let skillNotice = '';
+  if (settings.skills.autoSync) {
+    try { if (skillsChanged(syncSkills({root, scope: settings.skills.scope, cwd}))) skillNotice = 'Skills installed to your agents.'; }
+    catch (error) { skillNotice = `Skills not synced: ${error.message}`; }
+  }
   let session = new Session(cwd, {root, id: restarted?.id ?? values.resume});
   session.lock();
   let router = new Router(session, settings);
@@ -125,6 +150,7 @@ async function main() {
   // Quota readings survive restarts, so the display starts with the last known usage.
   const quotas = loadQuota(root);
   if (positionals[0] === 'run') {
+    if (skillNotice && !values.json) console.log(`[router:skills] ${skillNotice}`);
     session.onEvent = e => {
       if (e.kind === 'raw') recordQuota(quotas, root, quotaSnapshot(e.provider, e.raw));
       if (values.json) console.log(JSON.stringify(e));
@@ -144,7 +170,7 @@ async function main() {
   let picker = null;
   const suggestions = () => menuDismissed ? [] : completions(input);
   const acceptCompletion = () => {const options = suggestions(); if (options.length) {input = '/' + options[completionIndex % options.length][0] + ' '; completionIndex = 0; menuDismissed = false; return true;} return false;};
-  let notice = 'Ready. /help for commands. /quota shows the usage each agent reports.';
+  let notice = [skillNotice, 'Ready. /help for commands. /quota shows the usage each agent reports.'].filter(Boolean).join(' ');
   const history = session.events.filter(e => e.kind === 'user').map(e => e.text);
   const selected = () => session.active || settings.order[0];
   const save = () => saveJSON(path.join(root, 'config.json'), settings);
@@ -168,6 +194,37 @@ async function main() {
     picker = {entries, notes, index: Math.max(0, entries.findIndex(e => e.provider === selected() && e.current))};
     notice = 'Select a model. Esc cancels.';
   }
+  // Import is a choice, not a command: adopting an agent's whole skill set unasked is what
+  // filled the store with skills the user never wanted. Offer the list and adopt the ticks.
+  function openImportPicker(args) {
+    const providers = args.length ? args : undefined;
+    for (const provider of providers ?? []) if (!skillAreas[provider]) throw new Error(`Unknown provider: ${provider}`);
+    const options = {root, scope: settings.skills.scope, cwd: session.cwd, base: session.cwd};
+    const found = importCandidates({...options, providers});
+    const entries = found.filter(row => row.dir);
+    if (!entries.length) throw new Error(found.filter(row => row.detail).map(row => `${row.provider}: ${row.detail}`).join(' · ') || 'No agent skills left to import.');
+    picker = {
+      kind: 'import', entries, index: 0,
+      // Nothing is ticked to begin with: "select all" is one key away, and an empty
+      // selection makes Enter a safe no-op rather than a repeat of the accidental import.
+      chosen: new Set(),
+      notes: found.filter(row => row.action === 'invalid').map(row => `${row.skill} (${row.provider}): ${row.detail}`),
+      entryLabel: entry => `${entry.skill} (${entry.provider})${entry.action === 'exists' ? ' — already in bounce, replaces it' : ''}`,
+      options,
+    };
+    for (const entry of entries) entry.label = picker.entryLabel(entry);
+    notice = 'Space ticks a skill · a all · n none · Enter imports · Esc cancels.';
+  }
+  function applyImport() {
+    const {entries, chosen, options} = picker;
+    const selection = [...chosen].sort((a, b) => a - b).map(i => entries[i]);
+    picker = null;
+    if (!selection.length) { notice = 'Nothing selected. No skills imported.'; return; }
+    const report = importSelected(root, selection, {home: undefined, force: true});
+    const synced = syncSkills(options);
+    session.append({kind: 'skills', text: [importSummary(report), syncSummary(synced)].filter(Boolean).join('\n')});
+    notice = `Imported ${selection.length} skill${selection.length === 1 ? '' : 's'}.`;
+  }
   function render() {
     if (suspended || copyPaused) return;
     const width = Math.max(4, (process.stdout.columns || 80) - 2);
@@ -177,7 +234,14 @@ async function main() {
     const menuBudget = Math.max(0, terminalRows - 10 - draft.rows.length);
     const plain = s => s;
     const menu = [];
-    if (picker) {
+    if (picker?.kind === 'import') {
+      const rows = checklistRows(picker.entries, picker.index, width - 1, picker.chosen);
+      const {start, end} = windowAround(rows.length, picker.index, Math.max(1, menuBudget - 2 - picker.notes.length));
+      menu.push([`Import skills · ${rows.length} found · ${picker.chosen.size} selected`, style.title]);
+      for (let i = start; i < end; i++) menu.push([rows[i], i === picker.index ? style.selected : picker.chosen.has(i) ? style.result : plain]);
+      for (const note of picker.notes) menu.push([note, style.diagnostic]);
+      menu.push(['↑/↓ move · Space tick · a all · n none · Enter import · Esc cancel', style.muted]);
+    } else if (picker) {
       const rows = modelRows(picker.entries, picker.index, width - 1);
       const {start, end} = windowAround(rows.length, picker.index, Math.max(1, menuBudget - 2 - picker.notes.length));
       menu.push([`Select model · ${rows.length} choices across your signed-in agents`, style.title]);
@@ -225,8 +289,8 @@ async function main() {
     if (renderTimer) return;
     renderTimer = setTimeout(() => {renderTimer = null; render();}, 40);
   }
-  const enter = () => { suspended = false; previousFrame = []; previousCursor = ''; process.stdin.setRawMode(true); process.stdin.resume(); process.stdout.write('\x1b[?1049h\x1b[?25l\x1b[?2004h' + mouseTracking(!copyPaused)); render(); };
-  const leave = () => { suspended = true; process.stdin.setRawMode(false); process.stdout.write(mouseTracking(false) + '\x1b[?2004l\x1b[0 q\x1b[?25h\x1b[?1049l'); };
+  const enter = () => { suspended = false; previousFrame = []; previousCursor = ''; resumeTerminal(process.stdin, process.stdout, {mouse: !copyPaused}); render(); };
+  const leave = () => { suspended = true; suspendTerminal(process.stdin, process.stdout); };
   async function restart() {
     notice = 'Validating updated code…'; render();
     await validate(projectRoot, text => session.append({kind: 'status', text}));
@@ -262,13 +326,30 @@ async function main() {
           session.append({kind: 'quota', text: quotaReport(quotas, settings.order)});
         } else if (command === 'retry') {
           router.cooldowns = {}; for (const p of Object.keys(providers)) session.append({kind: 'cooldown', provider: p, until: 0, text: 'Local cooldown cleared'});
+        } else if (command === 'skills') {
+          // Import is interactive here; every other word goes to the shared command surface.
+          if (parts[0] === 'import' && !parts.includes('--all')) return openImportPicker(parts.slice(1).filter(word => !word.startsWith('--')));
+          const {text} = skillsCommand(parts.filter(word => word !== '--all'), {root, scope: settings.skills.scope, cwd: session.cwd, base: session.cwd});
+          session.append({kind: 'skills', text});
         } else if (command === 'note') {
           if (!arg) throw new Error('Use /note TEXT'); session.append({kind: 'note', text: arg});
         } else if (command === 'new') {
           const next = new Session(session.cwd, {root}); next.lock(); session.unlock(); session = next;
           router = new Router(session, settings); session.onEvent = scheduleRender; scroll = 0;
         } else if (command === 'login') {
-          leave(); try { await login(arg || selected(), settings, session.cwd); } finally {enter();}
+          // Validate before the screen flips, so a typo never drops the user out of the TUI.
+          const provider = arg || selected();
+          if (!providers[provider]) throw new Error('Choose claude, codex, or muse');
+          leave();
+          process.stdout.write(`\nbounce: handing this terminal to \u2018${provider} login\u2019. Finish it here; bounce returns when it exits.\n\n`);
+          let outcome;
+          try { await login(provider, settings, session.cwd); outcome = `Signed in to ${provider}.`; }
+          catch (error) { outcome = `${provider} login did not complete: ${error.message}`; }
+          finally { enter(); }
+          // The vendor's output is on the main screen bounce just left, so say what happened.
+          session.append({kind: 'status', text: outcome});
+          notice = outcome;
+          return;
         } else throw new Error('Unknown command. Type /help');
         notice = 'Updated.';
       } else {
@@ -284,7 +365,11 @@ async function main() {
   const keyboard = new PassThrough();
   // Node's keypress parser holds a lone ESC until another byte follows, so deliver it directly.
   const toKeyboard = text => text === '\x1b' ? handleKey('\x1b', {name: 'escape'}) : keyboard.write(text);
-  const mouseInput = createMouseInput(toKeyboard, amount => {
+  // Asking the terminal to report Shift+Enter also re-encodes Ctrl+C, Escape and friends,
+  // so decoded modifier keys are dispatched straight to handleKey; a modified Enter becomes
+  // the event the prompt already treats as "newline, do not submit".
+  const keyInput = createKeyInput(toKeyboard, () => handleKey('\r', {name: 'return', meta: true}), handleKey);
+  const mouseInput = createMouseInput(keyInput, amount => {
     if (suspended || copyPaused) return;
     scroll = Math.max(0, scroll + amount); render();
   });
@@ -299,7 +384,7 @@ async function main() {
     if (suspended) return;
     clearTimeout(mouseTimer);
     pasteInput(chunk);
-    mouseTimer = setTimeout(() => {pasteInput.flush(); mouseInput.flush();}, 50);
+    mouseTimer = setTimeout(() => {pasteInput.flush(); mouseInput.flush(); keyInput.flush();}, 50);
   });
   function handleKey(str, key = {}) {
     if (suspended) return;
@@ -323,13 +408,20 @@ async function main() {
     if (picker) {
       const move = key.name === 'up' ? -1 : key.name === 'down' ? 1 : 0;
       if (move) picker.index = (picker.index + move + picker.entries.length) % picker.entries.length;
+      else if (key.name === 'escape') {const kind = picker.kind; picker = null; notice = kind === 'import' ? 'Import cancelled. Nothing changed.' : 'Model unchanged.';}
+      else if (picker.kind === 'import') {
+        if (str === ' ' || key.name === 'space') {picker.chosen.has(picker.index) ? picker.chosen.delete(picker.index) : picker.chosen.add(picker.index);}
+        else if (str === 'a') for (let i = 0; i < picker.entries.length; i++) picker.chosen.add(i);
+        else if (str === 'n') picker.chosen.clear();
+        else if (key.name === 'return') applyImport();
+      }
       else if (str && !key.ctrl && !key.meta && /^[1-9]$/.test(str) && Number(str) <= picker.entries.length) picker.index = Number(str) - 1;
-      else if (key.name === 'escape') {picker = null; notice = 'Model unchanged.';}
       else if (key.name === 'return') {const entry = picker.entries[picker.index]; picker = null; applyModel(entry);}
       render(); return;
     }
     if (busy) return;
-    if (key.name === 'return' && key.meta) {input += '\n'; menuDismissed = true; render(); return;}
+    // Enter alone submits; Shift+Enter — or any other modifier, or Ctrl+J — drops down a line.
+    if (key.name === 'enter' || (key.name === 'return' && (key.meta || key.ctrl || key.shift))) {input += '\n'; menuDismissed = true; render(); return;}
     const options = suggestions();
     if (options.length && ['up', 'down'].includes(key.name)) {completionIndex = (completionIndex + (key.name === 'up' ? -1 : 1) + options.length) % options.length; render(); return;}
     if (options.length && ['tab', 'return'].includes(key.name)) {acceptCompletion(); render(); return;}

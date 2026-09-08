@@ -107,3 +107,14 @@ test('tool calls render their JSON input as readable lines', () => {
   assert.deepEqual(plainText, ['claude · Tool output', '270:   if (busy) return;', '']);
   assert.match(plain.event({kind: 'tool', text: 'Bash: {not json'}, 200).join('\n'), /Bash: \{not json/);
 });
+
+test('Inline Markdown inside list items is parsed, not shown as literal markers', () => {
+  const source = '1. **Picker** — type `/model`, then *up/down*\n2. plain item\n\n- bullet with **bold**, `code` and *em*\n  - nested **inner**\n';
+  const out = plain.markdown(source, 80).join('\n');
+  assert.doesNotMatch(out, /\*\*|`/);
+  assert.match(out, /Picker — type \/model, then up\/down/);
+  assert.match(out, /bullet with bold, code and em/);
+  assert.match(out, /nested inner/);
+  // Emphasis inside a list item must be styled exactly as it is in a paragraph.
+  assert.match(color.markdown('- item with **bold**', 80).join('\n'), /\x1b\[1mbold/);
+});

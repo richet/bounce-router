@@ -19,6 +19,7 @@ bounce login muse
 bounce doctor
 bounce models
 bounce quota
+bounce skills
 bounce --cwd /path/to/repo
 bounce run "Implement the feature and run relevant tests" --cwd /path/to/repo
 bounce sessions
@@ -43,6 +44,7 @@ Headless usage: `bounce run "Explain this screenshot" --image "/path/Screen shot
 
 - Type `/` to open the command picker; type a prefix to filter. Up/down selects, Tab or Enter completes, and Enter then submits. Esc dismisses the picker.
 - Tab switches agent when the picker is closed.
+- Enter sends; Shift+Enter inserts a newline. A terminal sends a bare `\r` for Shift+Enter — indistinguishable from Enter — until an application asks it not to, so bounce turns on the kitty keyboard protocol and xterm's modifyOtherKeys while the TUI is up, and turns them off again whenever it hands the terminal back. That covers iTerm2 3.5+, Ghostty, kitty, WezTerm and xterm with no configuration. In a terminal that supports neither (Apple Terminal, older iTerm2), map the key yourself — in iTerm2, Settings → Profiles → Keys → Key Mappings → `+`, press ⇧↩, choose *Send Escape Sequence* and enter `[13;2u` — or use Alt+Enter or Ctrl+J, which insert a newline everywhere with no configuration. Ctrl+Enter and Cmd+Enter work too.
 - F2 freezes display updates for selecting/copying text while an agent runs; F2 resumes. Events continue to be saved while paused. Unchanged frames produce no terminal writes, and ordinary updates redraw only changed rows.
 - `/provider claude` selects and saves the default.
 - `/model` lists every model each signed-in agent reports and lets you pick one: up/down or 1-9 to choose, Enter to use it, Esc to cancel. A pick saves the model and makes that agent the default. `/model refresh` re-asks the agents; catalogs are cached for five minutes.
@@ -52,11 +54,48 @@ Headless usage: `bounce run "Explain this screenshot" --image "/path/Screen shot
 - `/mode yolo` (default) bypasses native approvals and sandboxing.
 - `/mode plan` requests Claude plan mode, Codex read-only sandbox, or Muse disabled write/shell. It is not an interactive approval bridge, and provider-native tools/configuration determine exact restrictions.
 - `/quota` refreshes and prints the usage each agent reports; the header carries a short form.
+- `/skills` lists bounce's skills and where each agent has them; `/skills sync`, `/skills new NAME`, `/skills add PATH`, `/skills remove NAME`, `/skills import [provider]`, `/skills clear` and `/skills reset` manage them. See [Skills](#skills).
 - `/login [provider]`, `/new`, `/note TEXT`, `/retry`, `/help`, `/quit`.
 - Escape or Ctrl+C cancels the running process group; Ctrl+C while idle exits.
 - Mouse wheel or trackpad scrolls the transcript (three lines per tick); PgUp/PgDn also scroll. F2 releases mouse capture for selecting/copying text. Up/down recalls prompts; Ctrl+U clears input.
 
 YOLO intentionally lets agents run commands and change files with your user permissions. Launch in the workspace you intend to let the agents modify.
+
+## Skills
+
+Skills are a vendor feature: each CLI scans its own directory and none of them knows about bounce. A routed turn can land on any agent, so a skill installed for one of them silently disappears on fallback. bounce therefore keeps one copy of each skill under `~/.bounce/skills/<name>/SKILL.md` and installs it into all three agents' skill directories.
+
+```sh
+bounce skills                       # what bounce manages, and which agents have it
+bounce skills new deploy-web        # scaffold a SKILL.md, then edit it
+bounce skills add ./path/to/skill   # adopt a skill folder, or a single SKILL.md
+bounce skills import --list         # what an agent has that bounce could adopt
+bounce skills import codex          # adopt all of it (the TUI asks which instead)
+bounce skills sync                  # install into every agent
+bounce skills remove deploy-web     # delete from bounce and from every agent
+bounce skills clear                 # withdraw every copy bounce installed
+bounce skills reset --force         # also empty bounce's own store
+```
+
+The same words work as `/skills …` in the TUI, with one difference: `/skills import` opens a checklist rather than adopting everything, because an agent's whole skill set is rarely what you meant to take. ↑/↓ moves, Space ticks one, `a` ticks all, `n` clears, Enter imports the ticks and Esc changes nothing. `/skills import --all` skips the checklist. Every write happens through the same sync, so `add`, `remove` and `import` leave the agents up to date without a separate step.
+
+`clear` withdraws the copies bounce installed but keeps its store; `reset` empties the store as well, so an import you did not want can be undone in one step. Because deleting the store cannot be undone, `reset` first lists what would go and only acts on `--force`. Neither touches a skill the agent shipped or you installed natively.
+
+A skill is a directory whose `SKILL.md` opens with `name` and `description` frontmatter; the directory name must match `name`. Everything else in the directory — references, scripts, assets — is copied along with it, and the rest of the frontmatter is passed through untouched for the vendor to interpret. Symbolic links are not copied, so an installed skill cannot reach outside itself.
+
+Skill directories, verified 2026-09-08:
+
+| Agent | User scope | Project scope |
+| --- | --- | --- |
+| Claude | `~/.claude/skills` (`CLAUDE_CONFIG_DIR`) | `<workspace>/.claude/skills` |
+| Codex | `~/.codex/skills` (`CODEX_HOME`) | `<workspace>/.codex/skills` |
+| Muse | `~/.agents/skills` | `<workspace>/.agents/skills` |
+
+Each installed copy carries a `.bounce-skill.json` marker naming the skill and hashing its contents. Sync updates or removes exactly the directories carrying that marker, so a skill the agent shipped or you installed natively is never overwritten or deleted: a name collision is reported as a conflict and left alone. A collision whose contents are byte-identical is not a conflict — that is the skill bounce adopted from that very agent, and there is nothing to write. It is reported as `identical` and deliberately left unmarked, so removing it from bounce later never deletes the agent's own copy. An unchanged skill is not rewritten, so the sync that runs at every launch touches nothing when everything is current. Set `skills.autoSync` to `false` in `config.json` to only sync on request.
+
+`skills.scope` (or `--scope` for one command) chooses between the agents' home directories and the workspace. Project scope writes into the repository you are working in — commit or ignore those directories deliberately. In a workspace Muse also reads `.claude/skills` and `.codex/skills`, so it sees the same skill three times and keeps the highest-priority copy with a note; nothing fails. `bounce skills clear --scope project` withdraws them again.
+
+Skills are the only capability bounce carries across providers. Instructions in the handoff packet — the transcript and `/note` — reach every agent as text; `CLAUDE.md`, `AGENTS.md` and each vendor's own configuration remain that vendor's business.
 
 ## Routing and context
 
@@ -80,7 +119,8 @@ The fallback order in the header carries each agent's short reading, e.g. `claud
 
 `~/.bounce` (override with `BOUNCE_HOME`). A `~/.localrouter` directory left by the previous name is moved to `~/.bounce` on first launch, keeping existing config, sessions and quota readings:
 
-- `config.json`: order, mode, per-provider models, cooldownMinutes, contextChars, executable overrides.
+- `config.json`: order, mode, per-provider models, cooldownMinutes, contextChars, executable overrides, skill scope and auto-sync.
+- `skills/<name>/SKILL.md`: the skills bounce manages and installs into every agent.
 - `quota.json`: the latest usage reading each agent reported, kept across restarts.
 - `sessions/<uuid>/journal.jsonl`: append-only normalized and raw events.
 - `sessions/<uuid>/handoff.txt`: latest cross-provider prompt.
@@ -97,7 +137,8 @@ Example config:
   "models": {},
   "executables": {},
   "cooldownMinutes": 30,
-  "contextChars": 48000
+  "contextChars": 48000,
+  "skills": {"scope": "user", "autoSync": true}
 }
 ```
 
@@ -116,7 +157,7 @@ Protocol references: [Codex non-interactive execution](https://learn.chatgpt.com
 
 ## Current boundaries
 
-This is a working v0.1 foundation. It uses a simple terminal renderer, not a full terminal emulator: multiline input composition is basic. Claude/Codex messages render as structured events arrive; Muse renders output deltas. Native session resume, semantic long-history compaction, and interactive tool approvals are not implemented. Quota is only as good as what each CLI reports: Codex answers on demand, Claude reports during turns, Muse reports nothing. Context is bounded and may omit older decisions; `/note` helps record current handoff details. Raw events preserve unrecognized provider data for adapter updates. Providers can change their flags/event formats, so review adapter fixtures when upgrading them.
+This is a working v0.1 foundation. It uses a simple terminal renderer, not a full terminal emulator: multiline input composition is basic. Claude/Codex messages render as structured events arrive; Muse renders output deltas. Native session resume, semantic long-history compaction, and interactive tool approvals are not implemented. Skills are installed as copies rather than being run by bounce: which of them an agent actually loads, and when, stays that agent's decision, and a vendor changing its skill directory or frontmatter needs the table in [Skills](#skills) revisited. Quota is only as good as what each CLI reports: Codex answers on demand, Claude reports during turns, Muse reports nothing. Context is bounded and may omit older decisions; `/note` helps record current handoff details. Raw events preserve unrecognized provider data for adapter updates. Providers can change their flags/event formats, so review adapter fixtures when upgrading them.
 
 ## Improve bounce using bounce
 
@@ -132,4 +173,4 @@ Live progress — Claude's thinking-token counters and tool heartbeats, Codex's 
 
 The header labels the selected model and updates when the provider reports its model. If neither a model override nor runtime metadata is available, it shows `Default (not reported)`; use `/model ID` to select one explicitly. Bounce activity labels describe local progress. Restart validation shows concise success messages and retains diagnostic output on failure.
 
-The prompt shows a blinking block cursor and grows as text wraps, up to one third of the terminal height. Longer drafts keep their last lines visible. Pasted newlines are preserved; Alt+Enter inserts a newline and Enter sends. F2 hides the cursor while copying, and exit restores the terminal’s default cursor style.
+The prompt shows a blinking block cursor and grows as text wraps, up to one third of the terminal height. Longer drafts keep their last lines visible. Pasted newlines are preserved; Enter sends, and Shift+Enter — or any other modifier with Enter — drops down a line instead. Ctrl+J also inserts a newline. Modified Enter is accepted in every encoding terminals use for it: CSI u (`\x1b[13;2u` is Shift+Enter), xterm's modifyOtherKeys (`\x1b[27;2;13~`), and Alt's ESC prefix. Requesting those reports also re-encodes other modified keys — Ctrl+C arrives as `\x1b[99;5u` — so the same decoder turns each one back into the key event the prompt expects. F2 hides the cursor while copying, and exit restores the terminal’s default cursor style.

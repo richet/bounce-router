@@ -4,7 +4,8 @@ import wrapAnsi from 'wrap-ansi';
 export const commands = [
   ['provider', 'Select default agent'], ['model', 'Select model'], ['order', 'Set fallback order'],
   ['mode', 'Set yolo or plan mode'], ['login', 'Sign in to an agent'], ['new', 'Start new session'],
-  ['note', 'Save handoff note'], ['quota', 'Show reported quota'], ['retry', 'Clear quota cooldowns'],
+  ['note', 'Save handoff note'], ['skills', 'Manage and install skills'],
+  ['quota', 'Show reported quota'], ['retry', 'Clear quota cooldowns'],
   ['restart', 'Validate and reload'],
   ['help', 'Show help'], ['quit', 'Exit bounce'],
 ];
@@ -25,6 +26,20 @@ export function frameDiff(previous, next) {
 // report before readline sees it, so clicks cannot become prompt text.
 export const mouseTracking = enabled => enabled
   ? '\x1b[?1000h\x1b[?1006h' : '\x1b[?1000l\x1b[?1006l';
+
+// Handing the terminal to a vendor CLI means handing over the keyboard too. Node keeps
+// reading fd 0 while stdin is flowing, so an inherited child never sees the keystrokes
+// typed at its own prompt: pausing is what releases them, leaving raw mode is not enough.
+export function suspendTerminal(stdin = process.stdin, stdout = process.stdout) {
+  stdin.setRawMode?.(false);
+  stdin.pause();
+  stdout.write(keyboardProtocol(false) + mouseTracking(false) + '\x1b[?2004l\x1b[0 q\x1b[?25h\x1b[?1049l');
+}
+export function resumeTerminal(stdin = process.stdin, stdout = process.stdout, {mouse = true} = {}) {
+  stdin.setRawMode?.(true);
+  stdin.resume();
+  stdout.write('\x1b[?1049h\x1b[?25l\x1b[?2004h' + keyboardProtocol(true) + mouseTracking(mouse));
+}
 export function createMouseInput(onText, onScroll) {
   let pending = '';
   const consume = chunk => {
@@ -50,6 +65,56 @@ export function createMouseInput(onText, onScroll) {
     }
   };
   consume.flush = () => { if (pending) onText(pending); pending = ''; };
+  return consume;
+}
+
+// Enter with a modifier has no encoding until the application asks for one: with no
+// request, every terminal sends a bare \r for Shift+Enter, indistinguishable from Enter.
+// Asking means enabling the kitty keyboard protocol's disambiguation flag and xterm's
+// modifyOtherKeys; terminals that know neither ignore both. Both re-encode other modified
+// keys too (Ctrl+C becomes \x1b[99;5u), so createKeyInput decodes the whole family back
+// into the events readline would have named, not just Enter.
+export const keyboardProtocol = enabled => enabled ? '\x1b[>1u\x1b[>4;2m' : '\x1b[>4;0m\x1b[<1u';
+
+// kitty: CSI code[:alt];modifiers[:event][;text] u — xterm: CSI 27;modifiers;code ~
+const MODIFIED_KEY = /^\x1b\[(?:(\d+)(?::\d+)*(?:;(\d+)(?::\d+)?)?(?:;[\d:]*)?u|27;(\d+)(?::\d+)?;(\d+)~)/;
+const PARTIAL_KEY = /^\x1b\[[\d;:]*$/;
+const NAMED = {8: ['backspace', '\x7f'], 9: ['tab', '\t'], 27: ['escape', '\x1b'], 127: ['backspace', '\x7f']};
+export function createKeyInput(onText, onNewline, onControl = () => {}) {
+  let pending = '';
+  const consume = chunk => {
+    pending += chunk;
+    while (pending) {
+      const start = pending.indexOf('\x1b[');
+      if (start < 0) {
+        const keep = pending.endsWith('\x1b') ? 1 : 0;
+        if (pending.length > keep) onText(pending.slice(0, pending.length - keep));
+        pending = keep ? pending.slice(-keep) : '';
+        return;
+      }
+      if (start) { onText(pending.slice(0, start)); pending = pending.slice(start); }
+      const match = MODIFIED_KEY.exec(pending);
+      if (match) {
+        pending = pending.slice(match[0].length);
+        const code = Number(match[1] ?? match[4]);
+        const bits = Math.max(0, Number(match[2] ?? match[3] ?? 1) - 1);
+        const key = {shift: !!(bits & 1), meta: !!(bits & 2), ctrl: !!(bits & 4)};
+        // Enter with any modifier — Shift, Ctrl, Alt or Cmd — opens a line instead of sending.
+        if (code === 13 || code === 10) { if (bits) onNewline(); else onText('\r'); continue; }
+        const named = NAMED[code];
+        const text = named ? named[1] : String.fromCodePoint(code);
+        // Only Ctrl and Alt need a synthesized event; anything else readline can read as text.
+        if (!key.ctrl && !key.meta) onText(text);
+        else if (named) onControl(text, {...key, name: named[0]});
+        else onControl(key.ctrl && code > 63 && code < 128 ? String.fromCharCode(code & 31) : text,
+          {...key, name: String.fromCodePoint(code).toLowerCase()});
+        continue;
+      }
+      if (PARTIAL_KEY.test(pending) && pending.length < 32) return;
+      onText(pending.slice(0, 2)); pending = pending.slice(2); // Any other escape sequence.
+    }
+  };
+  consume.flush = () => { if (pending) { onText(pending); pending = ''; } };
   return consume;
 }
 
@@ -106,6 +171,15 @@ const fit = (text, width) => {
   }
   return out + ' '.repeat(Math.max(0, width - used));
 };
+// A checklist reuses the model picker's window and cursor; only the row differs, because
+// each entry carries its own chosen/not-chosen state rather than one selection for the list.
+export function checklistRows(entries, index, width, chosen) {
+  const labels = entries.map(e => String(e.label ?? e.skill ?? '').replace(/\s+/g, ' '));
+  const labelWidth = Math.min(Math.max(0, ...labels.map(stringWidth)), Math.max(16, Math.floor(width / 3)));
+  return entries.map((entry, i) => fit(
+    `${i === index ? '›' : ' '} [${chosen.has(i) ? '×' : ' '}] ${fit(labels[i], labelWidth)} ${String(entry.description ?? '').replace(/\s+/g, ' ')}`,
+    Math.max(1, width)).trimEnd());
+}
 export function modelRows(entries, index, width) {
   const labels = entries.map(e => `${e.provider} · ${e.label}`.replace(/\s+/g, ' '));
   const labelWidth = Math.min(Math.max(0, ...labels.map(stringWidth)), Math.max(16, Math.floor(width / 2)));

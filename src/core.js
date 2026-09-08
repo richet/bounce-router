@@ -16,7 +16,7 @@ export function dataRoot() {
   if (!fs.existsSync(root) && fs.existsSync(legacy)) fs.renameSync(legacy, root);
   return root;
 }
-export const defaults = () => ({order: ['claude', 'codex', 'muse'], mode: 'yolo', models: {}, cooldownMinutes: 30, contextChars: 48000, executables: {}});
+export const defaults = () => ({order: ['claude', 'codex', 'muse'], mode: 'yolo', models: {}, cooldownMinutes: 30, contextChars: 48000, executables: {}, skills: {scope: 'user', autoSync: true}});
 export function saveJSON(file, value) {
   fs.mkdirSync(path.dirname(file), {recursive: true, mode: 0o700});
   const tmp = file + '.' + randomUUID() + '.tmp';
@@ -30,6 +30,9 @@ export function config(root = dataRoot()) {
   if (!['yolo', 'plan'].includes(value.mode)) throw new Error('config.mode must be yolo or plan');
   if (!Number.isFinite(value.contextChars) || value.contextChars < 4000 || value.contextChars > 200000) throw new Error('contextChars must be between 4000 and 200000');
   if (!Number.isFinite(value.cooldownMinutes) || value.cooldownMinutes < 0) throw new Error('Invalid cooldownMinutes');
+  // A partial skills block keeps the defaults for the fields it leaves out.
+  value.skills = {...defaults().skills, ...(value.skills && typeof value.skills === 'object' ? value.skills : {})};
+  if (!['user', 'project'].includes(value.skills.scope) || typeof value.skills.autoSync !== 'boolean') throw new Error('config.skills must be {scope: "user" or "project", autoSync: true or false}');
   for (const map of [value.models, value.executables]) if (!map || typeof map !== 'object' || Object.values(map).some(v => typeof v !== 'string')) throw new Error('models and executables must map provider names to strings');
   return value;
 }
