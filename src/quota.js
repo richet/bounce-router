@@ -6,18 +6,22 @@ import {saveJSON} from './core.js';
 
 // Quota is whatever the vendor CLI states about its own subscription windows.
 // Nothing here estimates remaining quota, and an agent that reports none says so.
-const makeWindow = (label, used, resetsAt) => ({label, percent: Math.max(0, Math.round(Number(used) || 0)),
-  resetsAt: Number.isFinite(resetsAt) ? resetsAt * 1000 : null});
+// A window carries its own length so the sidebar can mark how much of its clock has run.
+const makeWindow = (label, used, resetsAt, minutes) => ({label, percent: Math.max(0, Math.round(Number(used) || 0)),
+  resetsAt: Number.isFinite(resetsAt) ? resetsAt * 1000 : null,
+  minutes: minutes === undefined || minutes === null || !Number.isFinite(Number(minutes)) ? null : Number(minutes)});
 const pick = (value, ...names) => {for (const name of names) if (value?.[name] !== undefined && value?.[name] !== null) return value[name];};
 export const windowLabel = minutes => !Number.isFinite(minutes) ? ''
   : minutes % 1440 === 0 ? `${minutes / 1440}d` : minutes % 60 === 0 ? `${minutes / 60}h` : `${minutes}m`;
 // Claude names its windows; Codex gives their length. Both reach the same label.
 const claudeLabels = {five_hour: '5h', seven_day: '7d'};
+const claudeMinutes = {five_hour: 300, seven_day: 10080};
 const codexWindows = limits => ['primary', 'secondary'].flatMap(key => {
   const w = limits?.[key];
   if (!w) return [];
-  return [makeWindow(windowLabel(pick(w, 'windowDurationMins', 'window_minutes')) || key,
-    pick(w, 'usedPercent', 'used_percent'), pick(w, 'resetsAt', 'resets_at'))];
+  const minutes = pick(w, 'windowDurationMins', 'window_minutes');
+  return [makeWindow(windowLabel(minutes) || key,
+    pick(w, 'usedPercent', 'used_percent'), pick(w, 'resetsAt', 'resets_at'), minutes)];
 });
 
 // A live stream event carrying quota, or null. Claude reports quota only this way.
@@ -26,9 +30,11 @@ export function quotaSnapshot(provider, raw) {
   if (provider === 'claude' && raw.type === 'rate_limit_event') {
     const info = raw.rate_limit_info ?? {};
     const windows = Object.entries(info.unifiedWindows ?? {})
-      .map(([key, w]) => makeWindow(claudeLabels[key] ?? key.replace(/_/g, ' '), (w.utilization ?? 0) * 100, w.resetsAt));
+      .map(([key, w]) => makeWindow(claudeLabels[key] ?? key.replace(/_/g, ' '), (w.utilization ?? 0) * 100, w.resetsAt,
+        pick(w, 'windowDurationMins', 'window_minutes') ?? claudeMinutes[key]));
     if (!windows.length && Number.isFinite(info.utilization)) {
-      windows.push(makeWindow(claudeLabels[info.rateLimitType] ?? info.rateLimitType ?? 'limit', info.utilization * 100, info.resetsAt));
+      windows.push(makeWindow(claudeLabels[info.rateLimitType] ?? info.rateLimitType ?? 'limit', info.utilization * 100, info.resetsAt,
+        claudeMinutes[info.rateLimitType]));
     }
     return windows.length ? {provider, windows, plan: null} : null;
   }
@@ -125,4 +131,81 @@ export function quotaReport(store, order, now = Date.now()) {
       : `${w.label} ${w.percent}% used${w.resetsAt ? ` (resets in ${duration(w.resetsAt - now)})` : ''}`);
     return [provider, entry.plan, ...windows, `reported ${since(entry.time, now)}`, entry.error].filter(Boolean).join(' · ');
   }).join('\n');
+}
+
+// --- Sidebar panel -------------------------------------------------------
+// A window is named the way the plan names it, so the sidebar reads like the account page.
+const windowTitles = {'1h': 'Hourly limit', '5h': '5-hour limit', '1d': 'Daily limit', '7d': 'Weekly limit'};
+export const windowTitle = label => windowTitles[label]
+  ?? `${String(label).charAt(0).toUpperCase()}${String(label).slice(1)} limit`;
+// Within a day the wall clock is the quickest read; a weekly window needs the distance instead.
+const clock = ms => new Date(ms).toLocaleTimeString('en-US', {hour: 'numeric', minute: '2-digit'})
+  .replace(/\s+/g, '').toLowerCase();
+// Longest form first: the bare time still answers "when" once "resets" no longer fits.
+export const resetForms = (w, now = Date.now()) => !Number.isFinite(w?.resetsAt) || w.resetsAt <= now ? []
+  : w.resetsAt - now > 86400000 ? [`resets in ${duration(w.resetsAt - now)}`, duration(w.resetsAt - now)]
+  : [`resets ${clock(w.resetsAt)}`, clock(w.resetsAt)];
+export const resetText = (w, now = Date.now()) => resetForms(w, now)[0] ?? '';
+const planTitle = plan => String(plan).replace(/[_-]+/g, ' ').replace(/\b[a-z]/g, c => c.toUpperCase());
+
+const BAR = {used: '■', free: '□', tick: '│'};
+// Fill is quota spent; the tick is how much of the window's own clock has run. Fill
+// running ahead of the tick is the sidebar saying this window will not last the window.
+export function quotaBar(w, width, now, paint) {
+  const cells = Math.max(4, width);
+  const fill = Math.min(cells, Math.round(Math.min(w.percent, 100) / 100 * cells));
+  const tone = w.percent >= 100 ? paint.high : w.percent >= 80 ? paint.warn : paint.ok;
+  const ran = Number.isFinite(w.minutes) && w.minutes > 0 && Number.isFinite(w.resetsAt)
+    ? 1 - (w.resetsAt - now) / (w.minutes * 60000) : null;
+  const tick = ran === null ? -1 : Math.min(cells - 1, Math.max(0, Math.round(ran * cells)));
+  const parts = [];
+  const add = (count, char, p) => {if (count > 0) parts.push(p(char.repeat(count)));};
+  if (tick >= 0 && tick < fill) {
+    add(tick, BAR.used, tone); parts.push(paint.tick(BAR.tick)); add(fill - tick - 1, BAR.used, tone);
+    add(cells - fill, BAR.free, paint.muted);
+  } else if (tick >= fill) {
+    add(fill, BAR.used, tone); add(tick - fill, BAR.free, paint.muted);
+    parts.push(paint.tick(BAR.tick)); add(cells - tick - 1, BAR.free, paint.muted);
+  } else {
+    add(fill, BAR.used, tone); add(cells - fill, BAR.free, paint.muted);
+  }
+  return parts.join('');
+}
+// Title left, reset time beside the percentage on the right; the reset drops first when
+// the sidebar is too narrow to hold all three.
+const panelRow = (left, middles, right, width, p) => {
+  const room = width - left.length - right.length;
+  const middle = middles.find(m => room >= m.length + 2);
+  return middle
+    ? p.text(left) + ' '.repeat(room - middle.length - 1) + p.muted(middle) + ' ' + p.text(right)
+    : p.text(left) + ' '.repeat(Math.max(1, room)) + p.text(right);
+};
+const noPaint = {title: s => s, text: s => s, muted: s => s, ok: s => s, warn: s => s, high: s => s, tick: s => s};
+// One titled group per provider, each window a labelled bar. Detail steps down from bars
+// to plain lines to a single summary line as the sidebar runs out of rows to give it.
+export function quotaPanel(store, order, {width = 30, now = Date.now(), rows = Infinity, cooldowns = {}, paint} = {}) {
+  const p = {...noPaint, ...paint};
+  const head = provider => {
+    const entry = store[provider];
+    return p.title([provider.toUpperCase(), entry?.plan ? planTitle(entry.plan) : null].filter(Boolean).join(' · '))
+      + (cooldowns[provider] > now ? p.muted(' · cooldown') : '');
+  };
+  const line = (w, detail) => {
+    if (expired(w, now)) return [panelRow(windowTitle(w.label), [], 'reset', width, p)];
+    const head = panelRow(windowTitle(w.label), resetForms(w, now), `${w.percent}%`, width, p);
+    return detail === 'bars' ? [head, quotaBar(w, width, now, p)] : [head];
+  };
+  const build = detail => order.flatMap(provider => {
+    const entry = store[provider];
+    const windows = entry?.windows ?? [];
+    if (!windows.length) return [head(provider), p.muted(entry?.error ?? quotaUnavailable(provider))];
+    if (detail === 'compact') return [head(provider), p.muted(quotaShort(entry, now))];
+    return [head(provider), ...windows.flatMap(w => line(w, detail))];
+  });
+  let built = [];
+  for (const detail of ['bars', 'lines', 'compact']) {
+    built = build(detail);
+    if (built.length <= rows) return built;
+  }
+  return built.slice(0, Math.max(0, rows));
 }

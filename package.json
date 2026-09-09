@@ -1,6 +1,6 @@
 {
   "name": "bouncerouter",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "One terminal. Your local coding agent subscriptions.",
   "type": "module",
   "bin": {

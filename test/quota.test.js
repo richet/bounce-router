@@ -1,3 +1,4 @@
+process.env.TZ = 'UTC';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -5,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {EventEmitter} from 'node:events';
 import {PassThrough} from 'node:stream';
-import {quotaSnapshot, readQuota, loadQuota, recordQuota, quotaShort, quotaReport, windowLabel} from '../src/quota.js';
+import {quotaSnapshot, readQuota, loadQuota, recordQuota, quotaShort, quotaReport, quotaPanel, windowLabel, windowTitle, resetText} from '../src/quota.js';
 
 const fake = script => (executable, args) => {
   const child = new EventEmitter();
@@ -22,15 +23,17 @@ test('each vendor stream shape becomes the same window reading', () => {
   const claude = quotaSnapshot('claude', {type: 'rate_limit_event', rate_limit_info: {status: 'allowed',
     unifiedWindows: {five_hour: {utilization: 0.05, resetsAt: 1788832200}, seven_day: {utilization: 0.024, resetsAt: 1789279200}}}});
   assert.deepEqual(claude, {provider: 'claude', plan: null, windows: [
-    {label: '5h', percent: 5, resetsAt: 1788832200000}, {label: '7d', percent: 2, resetsAt: 1789279200000}]});
+    {label: '5h', percent: 5, resetsAt: 1788832200000, minutes: 300},
+    {label: '7d', percent: 2, resetsAt: 1789279200000, minutes: 10080}]});
   // Older Claude builds report a single window without the unified block.
   assert.deepEqual(quotaSnapshot('claude', {type: 'rate_limit_event', rate_limit_info: {rateLimitType: 'five_hour', utilization: 0.9, resetsAt: 1788832200}}).windows,
-    [{label: '5h', percent: 90, resetsAt: 1788832200000}]);
+    [{label: '5h', percent: 90, resetsAt: 1788832200000, minutes: 300}]);
   const codex = quotaSnapshot('codex', {type: 'token_count', rate_limits: {plan_type: 'plus',
     primary: {used_percent: 91, window_minutes: 300, resets_at: 1788833024},
     secondary: {used_percent: 14, window_minutes: 10080, resets_at: 1789419824}}});
   assert.deepEqual(codex, {provider: 'codex', plan: 'plus', windows: [
-    {label: '5h', percent: 91, resetsAt: 1788833024000}, {label: '7d', percent: 14, resetsAt: 1789419824000}]});
+    {label: '5h', percent: 91, resetsAt: 1788833024000, minutes: 300},
+    {label: '7d', percent: 14, resetsAt: 1789419824000, minutes: 10080}]});
   // Anything else, including a turn with no limits attached, reports nothing.
   for (const raw of [{type: 'assistant'}, {type: 'token_count', rate_limits: null}, null, 'text'])
     assert.equal(quotaSnapshot('codex', raw), null);
@@ -102,4 +105,64 @@ test('quota reads as a compact header and a full report', () => {
   assert.equal(quotaShort(stale.claude, now), '5h reset · 7d 30%');
   assert.equal(quotaReport(stale, ['claude'], now),
     'claude · 5h window reset since this reading · 7d 30% used (resets in 1d 0h) · reported 8h 0m ago');
+});
+
+test('the sidebar panel draws each window as a bar with its reset time and pace tick', () => {
+  const now = Date.parse('2026-09-08T12:00:00Z');
+  const store = {
+    claude: {provider: 'claude', plan: null, time: '2026-09-08T12:00:00Z', windows: [
+      {label: '5h', percent: 40, resetsAt: now + 180 * 60000, minutes: 300},
+      {label: '7d', percent: 15, resetsAt: now + 4 * 86400000, minutes: 10080}]},
+    codex: {provider: 'codex', plan: 'plus', time: '2026-09-08T12:00:00Z', windows: [
+      {label: '5h', percent: 100, resetsAt: now + 60 * 60000, minutes: 300}]},
+    muse: {provider: 'muse', windows: [], error: 'muse does not report quota'},
+  };
+  const panel = quotaPanel(store, ['claude', 'codex', 'muse'], {width: 30, now});
+  assert.deepEqual(panel, [
+    'CLAUDE',
+    // Two of the five hours have run and 40% is spent, so fill and tick meet at cell 12.
+    '5-hour limit resets 3:00pm 40%',
+    '■'.repeat(12) + '│' + '□'.repeat(17),
+    // Half the week has run against 15% spent, so the tick sits well ahead of the fill.
+    'Weekly limit         4d 0h 15%',
+    '■'.repeat(5) + '□'.repeat(8) + '│' + '□'.repeat(16),
+    'CODEX · Plus',
+    // A full window keeps its reset time by dropping the word that no longer fits.
+    '5-hour limit       1:00pm 100%',
+    '■'.repeat(24) + '│' + '■'.repeat(5),
+    'MUSE',
+    'muse does not report quota',
+  ]);
+  for (const row of panel) assert.ok(row.length <= 30, `row too wide: ${row}`);
+  // A window with no length reported draws no tick, and one already past its reset says so.
+  assert.deepEqual(quotaPanel({claude: {windows: [{label: '5h', percent: 50, resetsAt: null, minutes: null}]}}, ['claude'], {width: 10, now}),
+    ['CLAUDE', '5-hour limit 50%', '■■■■■□□□□□']);
+  assert.deepEqual(quotaPanel({claude: {windows: [{label: '5h', percent: 90, resetsAt: now - 1, minutes: 300}]}}, ['claude'], {width: 20, now}),
+    ['CLAUDE', '5-hour limit   reset']);
+  // A cooldown is named beside the provider, not buried in the window rows.
+  assert.equal(quotaPanel(store, ['muse'], {width: 30, now, cooldowns: {muse: now + 1000}})[0], 'MUSE · cooldown');
+});
+
+test('the panel gives up bars, then lines, as the sidebar runs out of rows', () => {
+  const now = Date.parse('2026-09-08T12:00:00Z');
+  const store = {codex: {provider: 'codex', plan: 'plus', windows: [
+    {label: '5h', percent: 100, resetsAt: now + 60 * 60000, minutes: 300},
+    {label: '7d', percent: 34, resetsAt: now + 3 * 86400000, minutes: 10080}]}};
+  const rows = budget => quotaPanel(store, ['codex'], {width: 30, now, rows: budget});
+  assert.equal(rows(Infinity).length, 5);
+  assert.deepEqual(rows(3), ['CODEX · Plus', '5-hour limit       1:00pm 100%', 'Weekly limit         3d 0h 34%']);
+  assert.deepEqual(rows(2), ['CODEX · Plus', '5h 100% · 7d 34%']);
+  // Below even the compact form, the panel is cut rather than allowed to push the recap out.
+  assert.deepEqual(rows(1), ['CODEX · Plus']);
+});
+
+test('window titles and reset text read the way a plan states them', () => {
+  const now = Date.parse('2026-09-08T12:00:00Z');
+  assert.deepEqual(['5h', '7d', '1d', '1h', '45m', 'fable weekly'].map(windowTitle),
+    ['5-hour limit', 'Weekly limit', 'Daily limit', 'Hourly limit', '45m limit', 'Fable weekly limit']);
+  // Past a day the distance is the only unambiguous form; inside one, the wall clock is quicker.
+  assert.equal(resetText({resetsAt: now + 6.75 * 86400000}, now), 'resets in 6d 18h');
+  assert.match(resetText({resetsAt: now + 90 * 60000}, now), /^resets \d{1,2}:\d{2}(am|pm)$/);
+  assert.equal(resetText({resetsAt: null}, now), '');
+  assert.equal(resetText({resetsAt: now - 1}, now), '');
 });

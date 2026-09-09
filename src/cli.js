@@ -6,7 +6,7 @@ import {completions, typedCommand, frameDiff, createMouseInput, mouseTracking, c
 import {modelCatalog, modelEntries, catalogNotes} from './models.js';
 import stringWidth from 'string-width';
 import {clean, createFormatter, createTranscriptRenderer, createWorkSummary, workReview, activeModel} from './format.js';
-import {loadQuota, recordQuota, refreshQuota, quotaSnapshot, quotaShort, quotaReport, quotaUnavailable} from './quota.js';
+import {loadQuota, recordQuota, refreshQuota, quotaSnapshot, quotaShort, quotaPanel, quotaReport, quotaUnavailable} from './quota.js';
 import {skillsCommand, syncSkills, inspectSkills, skillsChanged, importCandidates, importSelected, importSummary, syncSummary, skillAreas} from './skills.js';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -296,7 +296,7 @@ async function main() {
     ];
     if (sidebarWidth) {
       const singleLine = value => clean(value).replace(/\s+/g, ' ').trim();
-      const side = [
+      const top = [
         style.title(BOUNCE_LOGO),
         style.status(singleLine(`${selected()} · ${settings.mode.toUpperCase()}`)),
         singleLine(`Model: ${activeModel(session.events, selected(), settings.models[selected()])}`),
@@ -304,14 +304,16 @@ async function main() {
         ...(settings.mode === 'yolo' ? [style.muted('Approvals + sandbox bypassed')] : []),
         style.muted(singleLine(session.cwd)),
         style.muted(`Session ${session.id.slice(0, 8)}`),
-        '', style.title('USAGE'),
-        ...settings.order.flatMap(p => [
-          singleLine(`${p}${router.cooldowns[p] > Date.now() ? ' [cooldown]' : ''}`),
-          ...wrap(style.muted(singleLine(quotaShort(quotas[p]) || 'Not reported')), sidebarWidth),
-        ]),
         style.muted('─'.repeat(sidebarWidth)),
-        style.title('WORK DONE'),
       ];
+      // The provider headings say what the block is, so it needs no title of its own.
+      // Usage takes the rows left after the recap keeps its rule, its title and three entries;
+      // the panel itself gives up its bars, then its per-window lines, when that is too few.
+      const usage = quotaPanel(quotas, settings.order, {width: sidebarWidth, now: Date.now(),
+        rows: Math.max(2, nextFrame.length - top.length - 5), cooldowns: router.cooldowns,
+        paint: {title: style.title, text: plain, muted: style.muted, ok: style.result,
+          warn: style.status, high: style.error, tick: style.note}});
+      const side = [...top, ...usage, style.muted('─'.repeat(sidebarWidth)), style.title('WORK DONE')];
       const work = workSummary(session.events);
       const available = Math.max(0, nextFrame.length - side.length);
       if (!work.length && available) side.push(style.muted('No completed turns yet'));
