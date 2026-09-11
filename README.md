@@ -1,5 +1,12 @@
 # bounce-router
 
+[![npm version](https://img.shields.io/npm/v/bouncerouter?logo=npm&color=cb3837)](https://www.npmjs.com/package/bouncerouter)
+[![npm downloads](https://img.shields.io/npm/dm/bouncerouter?logo=npm)](https://www.npmjs.com/package/bouncerouter)
+[![Node.js 22+](https://img.shields.io/node/v/bouncerouter?logo=node.js&color=339933)](https://nodejs.org/)
+[![License: MIT](https://img.shields.io/github/license/richet/bounce-router?color=blue)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/richet/bounce-router?style=flat&logo=github)](https://github.com/richet/bounce-router/stargazers)
+[![Last commit](https://img.shields.io/github/last-commit/richet/bounce-router?logo=github)](https://github.com/richet/bounce-router/commits/main)
+
 bounce-router is one TUI for your installed Claude Code, Codex, and Muse coding agents, run with the `bounce` command. Uses native CLI login and headless processes; bounce owns the conversation and carries context between providers. When one provider's subscription usage is exhausted, it automatically fails over to the next signed-in provider.
 
 ### Auto usage fail over while maintaining context
