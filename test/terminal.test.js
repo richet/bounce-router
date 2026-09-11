@@ -31,16 +31,24 @@ test('Codex discovery respects override and PATH then finds bundled desktop CLI'
 test('mouse input handles split/coalesced wheel reports without changing prompt text', async () => {
  const {createMouseInput, mouseTracking} = await import('../src/terminal.js');
  const text = [], scroll = [];
- const feed = createMouseInput(s => text.push(s), n => scroll.push(n));
+ let presses = 0;
+ const feed = createMouseInput(s => text.push(s), n => scroll.push(n), () => presses++);
  feed('hello\x1b['); feed('<64;10;'); feed('5M\x1b[<65;10;5Mworld');
  feed('\x1b[<0;10;5M\x1b[<0;10;5m'); // Click and release are consumed.
  feed('\x1b[<68;10;5M\x1b[<66;10;5M'); // Modified up, horizontal wheel.
  assert.equal(text.join(''), 'helloworld');
  assert.deepEqual(scroll, [3, -3, 3]);
+ // Tracking the wheel swallows the click that would have started a selection: the press is
+ // reported once, so the prompt can say how to select, and the release adds no second hint.
+ assert.equal(presses, 1);
+ feed('\x1b[<2;10;5M\x1b[<64;10;5M'); // Right button and the wheel are not selection attempts.
+ assert.equal(presses, 1);
  feed('\x1b[A'); feed('\x1b'); feed.flush();
  assert.equal(text.join(''), 'helloworld\x1b[A\x1b');
- assert.equal(mouseTracking(true), '\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1000h\x1b[?1006h');
- assert.equal(mouseTracking(false), '\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l');
+ // Alternate scroll mode stays off in both states: it would turn the wheel into arrow keys
+ // that walk prompt history instead of the transcript.
+ assert.equal(mouseTracking(true), '\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1007l\x1b[?1000h\x1b[?1006h');
+ assert.equal(mouseTracking(false), '\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1007l');
 });
 
 test('input grows with wrapping and newlines, keeping the cursor within the viewport', async () => {
@@ -91,11 +99,12 @@ test('handing the terminal to a vendor login releases stdin and restores the mai
   // Leaving raw mode is not enough: while stdin flows, Node reads fd 0 and the inherited
   // login process never sees the keystrokes typed at its own prompt.
   assert.deepEqual(calls, ['raw:false', 'pause']);
-  assert.equal(out, '\x1b[>4;0m\x1b[<1u\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[0 q\x1b[?25h\x1b[?1049l');
+  // The child CLI gets alternate scroll mode back: bounce only suppresses it for its own screen.
+  assert.equal(out, '\x1b[>4;0m\x1b[<1u\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1007h\x1b[?2004l\x1b[0 q\x1b[?25h\x1b[?1049l');
   calls.length = 0; out = '';
   resumeTerminal(stdin, stdout);
   assert.deepEqual(calls, ['raw:true', 'resume']);
-  assert.equal(out, '\x1b[?1049h\x1b[?25l\x1b[?2004h\x1b[>1u\x1b[>4;2m\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l');
+  assert.equal(out, '\x1b[?1049h\x1b[?25l\x1b[?2004h\x1b[>1u\x1b[>4;2m\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1007l');
   calls.length = 0; out = '';
   resumeTerminal(stdin, stdout, {mouse: true});
   assert.ok(out.endsWith('\x1b[?1000h\x1b[?1006h'));

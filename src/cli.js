@@ -60,9 +60,9 @@ TUI commands:
 
 Drop PNG/JPEG/GIF/WebP files into your prompt, then press Enter to send.
 
-Keys: / command picker · Tab complete (or next agent) · F2 pause for copying
+Keys: / command picker · Tab complete (or next agent) · F2 pause + hide sidebar to copy
       Enter send · Shift+Enter newline (Alt+Enter and Ctrl+J too)
-      PgUp/PgDn scroll · F3 toggle mouse scrolling · ↑/↓ prompt history
+      PgUp/PgDn or mouse wheel scroll · F3 mouse scroll off (drag-select) · ↑/↓ prompt history
       Ctrl+C cancel turn / exit when idle · Ctrl+U clear input
 
 You can keep typing while an agent works. Press Enter to queue each next message.
@@ -176,12 +176,16 @@ async function main() {
   let activityTimer, activityStarted = 0, progress = '';
   const activity = () => `${['◐', '◓', '◑', '◒'][Math.floor((Date.now() - activityStarted) / 150) % 4]} Working · ${Math.floor((Date.now() - activityStarted) / 1000)}s`;
   let loadedFingerprint = fingerprint();
-  let completionIndex = 0, menuDismissed = false, copyPaused = false, previousFrame = [], previousCursor = '';
-  let mouseScroll = false;
+  // copyFrame draws one sidebar-free, full-width frame: a terminal selects whole lines, so
+  // dragging across the transcript with the sidebar up drags the sidebar's text along with it.
+  let completionIndex = 0, menuDismissed = false, copyPaused = false, copyFrame = false, previousFrame = [], previousCursor = '';
+  // On by default: the wheel scrolls the transcript, which is what a scroll gesture means here.
+  // F3 hands the mouse back to the terminal for drag-selection and link clicks.
+  let mouseScroll = true;
   let picker = null;
   const suggestions = () => menuDismissed ? [] : completions(input);
   const acceptCompletion = () => {const options = suggestions(); if (options.length) {input = '/' + options[completionIndex % options.length][0] + ' '; completionIndex = 0; menuDismissed = false; return true;} return false;};
-  let notice = [restarted?.updateNotice, skillNotice, 'Ready. Select text / open links with your terminal. F2 pause · F3 mouse scroll · /help'].filter(Boolean).join(' ');
+  let notice = [restarted?.updateNotice, skillNotice, 'Ready. Mouse wheel scrolls the transcript · Option-drag selects text (F3 turns the wheel off) · F2 pause + hide sidebar · /help'].filter(Boolean).join(' ');
   const history = session.events.filter(e => e.kind === 'user').map(e => e.text);
   const selected = () => session.active || settings.order[0];
   const save = () => saveJSON(path.join(root, 'config.json'), settings);
@@ -239,10 +243,12 @@ async function main() {
     session.append({kind: 'skills', text: [importSummary(report), syncSummary(synced)].filter(Boolean).join('\n')});
     notice = `Imported ${selection.length} skill${selection.length === 1 ? '' : 's'}.`;
   }
+  // Called with no arguments everywhere (including as a resize and promise handler), so the
+  // copy frame is asked for through copyFrame rather than a parameter a stray value could set.
   function render() {
-    if (suspended || copyPaused) return;
+    if (suspended || (copyPaused && !copyFrame)) return;
     const totalWidth = Math.max(4, (process.stdout.columns || 80) - 2);
-    const sidebarWidth = totalWidth >= 100 && (process.stdout.rows || 24) >= 22 ? 30 : 0;
+    const sidebarWidth = !copyFrame && totalWidth >= 100 && (process.stdout.rows || 24) >= 22 ? 30 : 0;
     const width = totalWidth - (sidebarWidth ? sidebarWidth + 3 : 0);
     const terminalRows = process.stdout.rows || 24;
     // Sidebar branding leaves the conversation pane free of header rows.
@@ -468,9 +474,16 @@ async function main() {
   // so decoded modifier keys are dispatched straight to handleKey; a modified Enter becomes
   // the event the prompt already treats as "newline, do not submit".
   const keyInput = createKeyInput(toKeyboard, () => handleKey('\r', {name: 'return', meta: true}), handleKey);
+  // A terminal reports either the whole mouse or none of it: wheel scrolling and native
+  // click-drag selection cannot both be live. Rather than let a click do nothing, answer it
+  // with the three ways to select text.
+  const selectionHint = 'Drag-select needs the mouse back · hold Option (Shift in most terminals) to select now · F3 turns wheel scrolling off · F2 pauses and hides the sidebar so copied lines carry the transcript alone';
   const mouseInput = createMouseInput(keyInput, amount => {
     if (suspended || copyPaused || !mouseScroll) return;
     scroll = Math.max(0, scroll + amount); render();
+  }, () => {
+    if (suspended || copyPaused || !mouseScroll || notice === selectionHint) return;
+    notice = selectionHint; render();
   });
   const pasteInput = createPasteInput(text => mouseInput(text), text => {
     if (suspended || copyPaused || picker) return;
@@ -491,10 +504,15 @@ async function main() {
       copyPaused = !copyPaused;
       process.stdout.write(mouseTracking(mouseScroll && !copyPaused));
       if (copyPaused) {
+        // Redraw full width with the sidebar gone before freezing, so a dragged line copies
+        // the transcript alone. The transcript re-wraps to the wider pane, which is the text
+        // being copied anyway.
+        copyFrame = true;
+        try { render(); } finally { copyFrame = false; }
         process.stdout.write('\x1b[?25l');
         previousCursor = '';
         const row = Math.max(1, previousFrame.length);
-        process.stdout.write(`\x1b[${row};1H\x1b[2KPaused — select/copy or open links with your terminal; F2 resumes.`);
+        process.stdout.write(`\x1b[${row};1H\x1b[2KPaused — sidebar hidden, select/copy or open links with your terminal; F2 resumes.`);
         previousFrame[row - 1] = '';
       } else render();
       return;
@@ -504,8 +522,8 @@ async function main() {
       mouseScroll = !mouseScroll;
       process.stdout.write(mouseTracking(mouseScroll));
       notice = mouseScroll
-        ? 'Mouse scrolling on · F3 restores text selection and link clicks · F2 pauses for copying'
-        : 'Mouse scrolling off · Select text / open links with your terminal · PgUp/PgDn scroll';
+        ? 'Mouse scrolling on · Option-drag (Shift-drag elsewhere) still selects · F3 restores plain drag-select and link clicks'
+        : 'Mouse scrolling off · Drag to select text / click links · PgUp/PgDn scroll · F3 restores the wheel';
       render(); return;
     }
     if (key.ctrl && key.name === 'c') { if (busy) {router.cancel(); notice = 'Cancelling…'; render();} else quit(); return; }

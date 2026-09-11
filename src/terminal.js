@@ -35,7 +35,12 @@ export function frameDiff(previous, next) {
 // report before readline sees it, so clicks cannot become prompt text.
 // Clear legacy, drag and motion tracking too: another CLI may have left them enabled.
 const releaseMouse = '\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l';
-export const mouseTracking = enabled => releaseMouse + (enabled ? '\x1b[?1000h\x1b[?1006h' : '');
+// Alternate scroll mode makes the terminal send bare arrow keys for the wheel while the
+// alternate screen is up. They arrive indistinguishable from typed arrows, so a scroll walks
+// prompt history instead of the transcript. Turn it off whenever bounce owns the screen and
+// read the wheel from mouse reports instead; restore it before handing a child CLI the terminal.
+const alternateScroll = enabled => enabled ? '\x1b[?1007h' : '\x1b[?1007l';
+export const mouseTracking = enabled => releaseMouse + alternateScroll(false) + (enabled ? '\x1b[?1000h\x1b[?1006h' : '');
 
 // Handing the terminal to a vendor CLI means handing over the keyboard too. Node keeps
 // reading fd 0 while stdin is flowing, so an inherited child never sees the keystrokes
@@ -43,14 +48,18 @@ export const mouseTracking = enabled => releaseMouse + (enabled ? '\x1b[?1000h\x
 export function suspendTerminal(stdin = process.stdin, stdout = process.stdout) {
   stdin.setRawMode?.(false);
   stdin.pause();
-  stdout.write(keyboardProtocol(false) + mouseTracking(false) + '\x1b[?2004l\x1b[0 q\x1b[?25h\x1b[?1049l');
+  stdout.write(keyboardProtocol(false) + releaseMouse + alternateScroll(true) + '\x1b[?2004l\x1b[0 q\x1b[?25h\x1b[?1049l');
 }
 export function resumeTerminal(stdin = process.stdin, stdout = process.stdout, {mouse = false} = {}) {
   stdin.setRawMode?.(true);
   stdin.resume();
   stdout.write('\x1b[?1049h\x1b[?25l\x1b[?2004h' + keyboardProtocol(true) + mouseTracking(mouse));
 }
-export function createMouseInput(onText, onScroll) {
+// Tracking the wheel means the terminal reports the whole mouse, so a plain click-drag no
+// longer reaches its own selection. onPress fires on a left button press so the caller can
+// say how to get selection back, at the moment the click is swallowed rather than in a
+// startup line nobody rereads.
+export function createMouseInput(onText, onScroll, onPress = () => {}) {
   let pending = '';
   const consume = chunk => {
     pending += chunk;
@@ -70,7 +79,10 @@ export function createMouseInput(onText, onScroll) {
         onText(pending.slice(0, 3)); pending = pending.slice(3); continue;
       }
       const button = Number(match[1]);
-      if (match[4] === 'M' && (button & 64) && !(button & 2)) onScroll(button & 1 ? -3 : 3);
+      const wheel = button & 64;
+      if (match[4] === 'M' && wheel && !(button & 2)) onScroll(button & 1 ? -3 : 3);
+      // Press only: a click reports press then release, and one hint per click is enough.
+      else if (match[4] === 'M' && !wheel && (button & 3) === 0) onPress();
       pending = pending.slice(match[0].length);
     }
   };
