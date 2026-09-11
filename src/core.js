@@ -17,6 +17,9 @@ export function dataRoot() {
   return root;
 }
 export const defaults = () => ({order: ['claude', 'codex', 'muse'], mode: 'yolo', models: {}, cooldownMinutes: 30, contextChars: 48000, executables: {}, skills: {scope: 'user', autoSync: true}});
+// Kinds folded in memory only: never journaled, delivered straight to onEvent.
+export const LIVE_KINDS = new Set(['progress', 'task.activity', 'tool.started', 'tool.finished']);
+const defaultFrom = e => e.from ?? (e.kind === 'user' ? 'user' : e.provider ? 'main' : 'bounce');
 export function saveJSON(file, value) {
   fs.mkdirSync(path.dirname(file), {recursive: true, mode: 0o700});
   const tmp = file + '.' + randomUUID() + '.tmp';
@@ -41,6 +44,7 @@ export class Session {
     this.root = root;
     this.id = id ?? randomUUID();
     if (!/^[a-zA-Z0-9-]+$/.test(this.id)) throw new Error('Invalid session ID');
+    this.context = this.id;
     this.dir = path.join(root, 'sessions', this.id);
     this.events = [];
     this.file = path.join(this.dir, 'journal.jsonl');
@@ -57,6 +61,11 @@ export class Session {
       }
       if (!source.endsWith('\n')) this.needsRepair = true;
     }
+    // ref index for O(1) dedupe; seq continues from the last row (legacy rows count as their own 1-based index).
+    this.refIndex = new Map();
+    for (const e of this.events) if (typeof e.ref === 'string' && !this.refIndex.has(e.ref)) this.refIndex.set(e.ref, e);
+    const last = this.events.at(-1);
+    this.nextSeq = (last ? last.seq ?? this.events.length : 0) + 1;
     this.cwd = this.events.find(e => e.kind === 'session')?.cwd ?? fs.realpathSync(cwd);
     if (!this.events.length) this.append({kind: 'session', cwd: this.cwd, text: this.cwd});
     this.active = this.events.findLast(e => e.kind === 'route')?.provider;
@@ -66,9 +75,18 @@ export class Session {
       fs.writeFileSync(this.file, this.events.map(e => JSON.stringify(e)).join('\n') + '\n', {mode: 0o600});
       this.needsRepair = false;
     }
-    const row = {id: randomUUID(), time: new Date().toISOString(), ...event};
+    if (typeof event.ref === 'string' && this.refIndex.has(event.ref)) return this.refIndex.get(event.ref);
+    const row = {id: randomUUID(), time: new Date().toISOString(), ...event, from: defaultFrom(event), context: event.context ?? this.context, seq: this.nextSeq++};
     fs.appendFileSync(this.file, JSON.stringify(row) + '\n', {mode: 0o600});
     this.events.push(row);
+    if (typeof row.ref === 'string') this.refIndex.set(row.ref, row);
+    this.onEvent?.(row);
+    return row;
+  }
+  // Live kinds are folded in memory only: delivered straight to onEvent, never journaled, no seq assigned.
+  publish(event) {
+    if (!LIVE_KINDS.has(event.kind)) return this.append(event);
+    const row = {id: randomUUID(), time: new Date().toISOString(), ...event, from: defaultFrom(event), context: event.context ?? this.context};
     this.onEvent?.(row);
     return row;
   }
@@ -127,8 +145,8 @@ export class Router {
         const result = await this.runner({provider, executable: resolveExecutable(provider, cfg.executables[provider]),
           args: invocation(provider, {model: cfg.models[provider], mode: cfg.mode, images}, promptFile),
           cwd: s.cwd, prompt: providerInput(provider, packet, images), signal,
-          // Progress is live-only: it is shown while the turn runs and never journaled.
-          emit: e => e.kind === 'progress' ? s.onEvent?.({...e, provider}) : s.append({...e, provider})});
+          // Live kinds (progress, etc.) are shown while the turn runs and never journaled; see Session.publish.
+          emit: e => s.publish({...e, provider})});
         s.append({kind: 'attempt', provider, ...result, text: result.status});
         if (result.status === 'limited') {
           const until = Date.now() + cfg.cooldownMinutes * 60000;
