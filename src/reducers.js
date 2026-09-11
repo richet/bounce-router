@@ -1,0 +1,105 @@
+// Pure folds over a session's event log: no IO, no clock except an explicit `now`; rows are {id, seq, time, kind, from, context, task?, ...payload fields at the top level}.
+
+export function peers(events) {
+  const result = {};
+  for (const e of events) {
+    if (!e.kind?.startsWith('peer.')) continue;
+    const peer = result[e.from] ??= {name: e.from, role: undefined, adapter: undefined, profile: undefined, joined: undefined, left: null, native: null};
+    if (e.kind === 'peer.joined') { peer.role = e.role; peer.adapter = e.adapter; peer.profile = e.profile; peer.joined = e.time; }
+    else if (e.kind === 'peer.left') peer.left = e.time;
+    else if (e.kind === 'peer.native') peer.native = {provider: e.provider, sessionId: e.sessionId};
+  }
+  return result;
+}
+
+const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'timed_out']);
+const emptyTask = id => ({id, parent: null, lastMilestone: null, blocker: null, reason: null, error: null, children: []});
+
+// A task exists only once its own task.submitted is seen; any other task.* row for an unknown id is dropped. A parent stays waiting through its own progress events while any child is non-terminal, remembering which state (its last progress, or its own queued submission) to resume once every child terminates; terminal states never change again.
+export function tasks(events) {
+  const result = {};
+  const priorState = {};
+  const ensure = id => result[id] ??= emptyTask(id);
+  const settleParent = parentId => {
+    const parent = result[parentId];
+    if (!parent || parent.state !== 'waiting') return;
+    if (parent.children.every(id => TERMINAL.has(result[id]?.state))) parent.state = priorState[parentId];
+  };
+  for (const e of events) {
+    if (!e.kind?.startsWith('task.')) continue;
+    if (e.kind === 'task.submitted') {
+      const t = ensure(e.task);
+      if (TERMINAL.has(t.state)) continue;
+      t.context = e.context; t.profile = e.profile; t.deadline = e.deadline; t.budget = e.budget && {...e.budget};
+      if (t.state === 'waiting') priorState[e.task] = 'queued'; else t.state = 'queued';
+      if (e.parent) {
+        t.parent = e.parent;
+        const parent = ensure(e.parent);
+        parent.children.push(e.task);
+        if (!TERMINAL.has(parent.state) && parent.state !== 'waiting') { priorState[e.parent] = parent.state; parent.state = 'waiting'; }
+      }
+      continue;
+    }
+    const t = result[e.task];
+    if (!t || TERMINAL.has(t.state)) continue;
+    switch (e.kind) {
+      case 'task.started':
+        if (t.state === 'waiting') priorState[e.task] = 'running'; else t.state = 'running';
+        t.attempt = e.attempt;
+        break;
+      case 'task.blocked': t.state = 'blocked'; t.blocker = e.text; break;
+      case 'task.input_required': t.state = 'input_required'; break;
+      case 'task.milestone':
+        if (t.state === 'waiting') priorState[e.task] = 'running';
+        else if (t.state === 'blocked' || t.state === 'input_required') t.state = 'running';
+        t.lastMilestone = {time: e.time, text: e.text, evidence: e.evidence};
+        break;
+      case 'task.completed': t.state = 'completed'; t.summary = e.summary; t.artifacts = e.artifacts && [...e.artifacts]; settleParent(t.parent); break;
+      case 'task.failed': t.state = 'failed'; t.reason = e.reason ?? null; t.error = e.text ?? null; settleParent(t.parent); break;
+      case 'task.cancelled': t.state = 'cancelled'; settleParent(t.parent); break;
+      case 'task.deadline': t.state = 'timed_out'; settleParent(t.parent); break;
+    }
+  }
+  return result;
+}
+
+const sumInto = (target, amount) => { for (const key in amount) target[key] = (target[key] || 0) + amount[key]; return target; };
+const descendants = (taskView, id) => (taskView[id]?.children || []).flatMap(child => [child, ...descendants(taskView, child)]);
+
+// Descendants, retries and replacements draw on the root's own allowance; unknown usage reads as unmeasured, never zero; a budget/usage row against an id with no submitted task lands in orphans instead of a root.
+export function budgets(events) {
+  const taskView = tasks(events);
+  const reserved = {}, released = {}, usage = {}, measured = new Set();
+  const orphanReserved = {}, orphanReleased = {}, orphanUsage = {}, orphanTasks = new Set();
+  for (const e of events) {
+    if (e.kind === 'budget.reserved') { if (taskView[e.task]) sumInto(reserved[e.task] ??= {}, e.amount); else { sumInto(orphanReserved, e.amount); orphanTasks.add(e.task); } }
+    else if (e.kind === 'budget.released') { if (taskView[e.task]) sumInto(released[e.task] ??= {}, e.amount); else { sumInto(orphanReleased, e.amount); orphanTasks.add(e.task); } }
+    else if (e.kind === 'task.usage') { if (taskView[e.task]) { sumInto(usage[e.task] ??= {}, e.usage); measured.add(e.task); } else { sumInto(orphanUsage, e.usage); orphanTasks.add(e.task); } }
+  }
+  const roots = {};
+  for (const root of Object.values(taskView)) {
+    if (root.parent) continue;
+    const tree = [root.id, ...descendants(taskView, root.id)];
+    const allowance = root.budget ? {...root.budget} : {};
+    const treeReserved = {}, treeReleased = {}, treeUsage = {};
+    let isMeasured = true;
+    for (const id of tree) {
+      sumInto(treeReserved, reserved[id]);
+      sumInto(treeReleased, released[id]);
+      sumInto(treeUsage, usage[id]);
+      if (!measured.has(id)) isMeasured = false;
+    }
+    const remaining = {};
+    for (const key of new Set([...Object.keys(allowance), ...Object.keys(treeReserved), ...Object.keys(treeReleased)]))
+      remaining[key] = (allowance[key] || 0) - ((treeReserved[key] || 0) - (treeReleased[key] || 0));
+    roots[root.id] = {root: root.id, allowance, reserved: treeReserved, released: treeReleased, remaining, usage: treeUsage, measured: isMeasured};
+  }
+  return {roots, orphans: {reserved: orphanReserved, released: orphanReleased, usage: orphanUsage, tasks: [...orphanTasks]}};
+}
+
+export function cooldowns(events, now) {
+  const result = {};
+  for (const e of events) if (e.kind === 'cooldown') result[e.provider] = e.until;
+  for (const provider in result) if (result[provider] <= now) delete result[provider];
+  return result;
+}
