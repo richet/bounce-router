@@ -1,6 +1,7 @@
 import {createConnection as nodeConnect} from 'node:net';
 import nodeFs from 'node:fs';
 import claude from './claude.js';
+import {resolveExecutable} from '../executable.js';
 import {spawnLive, vendorEnv, verifiedCancel, appendPending, readPending, takePending, TEXT_MAX} from './live-common.js';
 
 const WRITE_WAIT = 2000; // how long a live push waits for the turn to take the message
@@ -21,10 +22,11 @@ export function createClaudeLive({connect = nodeConnect, fs = nodeFs, kill = pro
   const messagingPath = dir => `${dir}/messaging.json`;
 
   const start = ({profile = {}, extraArgs = [], stdin, cwd, dir}) => {
-    const {executable = 'claude', preArgs = [], model, mode, images = []} = profile;
-    const args = [...preArgs, ...claude.invocation({model, mode, images}), ...extraArgs, '--settings', settingsFor(dir)];
+    const {model, mode, images = []} = profile;
+    const executable = resolveExecutable('claude', profile.executables?.claude);
+    const args = [...claude.invocation({model, mode, images}), ...extraArgs, '--settings', settingsFor(dir)];
     const live = spawnLive({executable, args, cwd, env: vendorEnv(), stdin: claude.stdin(stdin), ...(spawn ? {spawn} : {})});
-    return {handle: {live, child: live.child, pid: live.child.pid, args, dir, cwd, sessionId: null}};
+    return {live, child: live.child, pid: live.child.pid, args, dir, cwd, sessionId: null};
   };
 
   return {
@@ -51,19 +53,28 @@ export function createClaudeLive({connect = nodeConnect, fs = nodeFs, kill = pro
         try { raw = JSON.parse(event.text); } catch { yield {kind: 'status', text: event.text}; continue; }
         yield {kind: 'raw', raw}; // the scheduler journals raw rows for quota, before the normalized view
         for (const normalized of claude.normalize(raw)) {
-          if (normalized.kind === 'peer.native') handle.sessionId = normalized.sessionId;
-          if (normalized.kind === 'result') sawResult = true;
+          if (normalized.kind === 'peer.native') {
+            handle.sessionId = normalized.sessionId;
+            yield {kind: 'native', provider: normalized.provider, sessionId: normalized.sessionId};
+            continue;
+          }
+          if (normalized.kind === 'result') {
+            sawResult = true;
+            yield {kind: 'result', text: normalized.text, success: normalized.success, status: normalized.success ? 'completed' : 'failed'};
+            continue;
+          }
           yield normalized;
         }
       }
     },
 
     async deliver(handle, {text}) {
+      text = String(text);
       const queue = () => {
         if (handle.live.exited() && !handle.sessionId) return 'queued';
         return appendPending(pendingPath(handle.dir), text) ? 'next-turn' : 'queued';
       };
-      if (typeof text !== 'string' || text.length > TEXT_MAX) return 'queued';
+      if (text.length > TEXT_MAX) return 'queued';
       let messaging = null;
       try { messaging = JSON.parse(fs.readFileSync(messagingPath(handle.dir), 'utf8')); } catch {}
       if (typeof messaging?.socket !== 'string' || !messaging.socket) return queue();

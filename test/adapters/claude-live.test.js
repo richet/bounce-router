@@ -9,7 +9,7 @@ import {fileURLToPath} from 'node:url';
 import {createClaudeLive, hookCommand, shellQuote} from '../../src/adapters/claude-live.js';
 
 const fake = fileURLToPath(new URL('../helpers/fake-claude.js', import.meta.url));
-const launcher = {executable: process.execPath, preArgs: [fake]};
+const launcher = {executables: {claude: fake}};
 const settingsOf = args => JSON.parse(args[args.indexOf('--settings') + 1]);
 const expectedCommand = dir =>
   `node -e "const fs=require('fs');fs.writeFileSync(process.argv[1],JSON.stringify({socket:process.env.CLAUDE_CODE_MESSAGING_SOCKET,token:process.env.CLAUDE_CODE_MESSAGING_TOKEN}),{mode:0o600})" '${dir.replace(/'/g, "'\\''")}/messaging.json'`;
@@ -40,15 +40,15 @@ test('L1 launch: SessionStart hook is passed with --settings, the hook writes me
   const dir = tmp(t), sock = path.join(dir, 's');
   withEnv(t, {FAKE_SOCKET: sock, FAKE_TOKEN: 'tok-l1', FAKE_SESSION: 'sess-l1', FAKE_HOLD: '', FAKE_TRAP_SIGTERM: '', FAKE_READY: '', FAKE_STDERR_LINES: ''});
   const adapter = createClaudeLive({});
-  const {handle} = await adapter.launch({peer: {}, profile: {mode: 'yolo', ...launcher}, orders: 'do it', cwd: dir, dir});
+  const handle = await adapter.launch({peer: {}, profile: {mode: 'yolo', ...launcher}, orders: 'do it', cwd: dir, dir});
   const events = await drain(adapter, handle);
   assert.deepEqual(settingsOf(handle.args), expectedSettings(dir));
   assert.equal(hookCommand(dir), expectedCommand(dir));
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, 'messaging.json'), 'utf8')), {socket: `uds:${sock}`, token: 'tok-l1'});
   assert.deepEqual(events[0], {kind: 'raw', raw: {type: 'system', subtype: 'init', session_id: 'sess-l1', tools: []}});
-  assert.deepEqual(events.find(e => e.kind === 'peer.native'), {kind: 'peer.native', provider: 'claude', sessionId: 'sess-l1'});
+  assert.deepEqual(events.find(e => e.kind === 'native'), {kind: 'native', provider: 'claude', sessionId: 'sess-l1'});
   assert.equal(events.filter(e => e.kind === 'raw').length, 2);
-  assert.deepEqual(events.find(e => e.kind === 'result'), {kind: 'result', text: 'ok', success: true});
+  assert.deepEqual(events.find(e => e.kind === 'result'), {kind: 'result', text: 'ok', success: true, status: 'completed'});
 });
 
 test('L1b hook literal: a task directory with a space or a quote still gets messaging.json at mode 0600', async t => {
@@ -56,7 +56,7 @@ test('L1b hook literal: a task directory with a space or a quote still gets mess
     const dir = tmp(t, prefix), sock = path.join(dir, 's');
     withEnv(t, {FAKE_SOCKET: sock, FAKE_TOKEN: 'tok-q', FAKE_SESSION: 'sess-q', FAKE_HOLD: '', FAKE_READY: '', FAKE_STDERR_LINES: ''});
     const adapter = createClaudeLive({});
-    const {handle} = await adapter.launch({peer: {}, profile: {mode: 'yolo', ...launcher}, orders: 'x', cwd: dir, dir});
+    const handle = await adapter.launch({peer: {}, profile: {mode: 'yolo', ...launcher}, orders: 'x', cwd: dir, dir});
     await drain(adapter, handle);
     const file = path.join(dir, 'messaging.json');
     assert.equal(fs.existsSync(file), true, `no messaging.json for ${prefix}`);
@@ -70,7 +70,7 @@ test('L2 deliver live: the message and its auth line reach the running turn over
   const dir = tmp(t), sock = path.join(dir, 's'), received = path.join(dir, 'received.log');
   withEnv(t, {FAKE_SOCKET: sock, FAKE_TOKEN: 'tok-l2', FAKE_SESSION: 'sess-l2', FAKE_RECEIVED: received, FAKE_HOLD: '1', FAKE_READY: '', FAKE_STDERR_LINES: ''});
   const adapter = createClaudeLive({});
-  const {handle} = await adapter.launch({peer: {}, profile: {mode: 'yolo', ...launcher}, orders: 'hold', cwd: dir, dir});
+  const handle = await adapter.launch({peer: {}, profile: {mode: 'yolo', ...launcher}, orders: 'hold', cwd: dir, dir});
   t.after(() => adapter.cancel(handle));
   assert.equal(await waitFor(() => fs.existsSync(path.join(dir, 'messaging.json'))), true);
   assert.equal(await adapter.deliver(handle, {text: 'ping'}), 'live');
@@ -83,7 +83,7 @@ test('L3 deliver next-turn: with no socket the message queues for --resume, one 
   const dir = tmp(t);
   withEnv(t, {FAKE_SOCKET: '', FAKE_SESSION: 'sess-l3', FAKE_HOLD: '1', FAKE_READY: '', FAKE_STDERR_LINES: ''});
   const adapter = createClaudeLive({});
-  const {handle} = await adapter.launch({peer: {}, profile: {mode: 'yolo', ...launcher}, orders: 'hold', cwd: dir, dir});
+  const handle = await adapter.launch({peer: {}, profile: {mode: 'yolo', ...launcher}, orders: 'hold', cwd: dir, dir});
   t.after(() => adapter.cancel(handle));
   assert.equal(await adapter.deliver(handle, {text: 'a'}), 'next-turn');
   assert.equal(await adapter.deliver(handle, {text: 'b'}), 'next-turn');
@@ -107,7 +107,7 @@ test('L4 resume: pending texts then the new message go on stdin, --resume carrie
   withEnv(t, {FAKE_SOCKET: '', FAKE_SESSION: 'sess-l4', FAKE_STDIN: stdinFile, FAKE_HOLD: '', FAKE_READY: '', FAKE_STDERR_LINES: ''});
   fs.writeFileSync(path.join(dir, 'pending.jsonl'), '{"text":"a"}\n{"text":"b"}\n');
   const adapter = createClaudeLive({});
-  const {handle} = await adapter.resume({peer: {}, profile: {mode: 'yolo', ...launcher}, native: {sessionId: 's1'}, message: 'go', cwd: dir, dir});
+  const handle = await adapter.resume({peer: {}, profile: {mode: 'yolo', ...launcher}, native: {sessionId: 's1'}, message: 'go', cwd: dir, dir});
   await drain(adapter, handle);
   const at = handle.args.indexOf('--resume');
   assert.deepEqual(handle.args.slice(at, at + 2), ['--resume', 's1']);
@@ -121,7 +121,7 @@ test('L5 cancel: SIGTERM then SIGKILL only when needed, verified by ESRCH', asyn
     withEnv(t, {FAKE_SOCKET: '', FAKE_SESSION: marker, FAKE_HOLD: '1', FAKE_TRAP_SIGTERM: trap, FAKE_READY: ready, FAKE_STDERR_LINES: ''});
     const calls = [];
     const adapter = createClaudeLive({kill: (pid, signal) => { calls.push([pid, signal]); return process.kill(pid, signal); }});
-    const {handle} = await adapter.launch({peer: {}, profile: {mode: 'yolo', ...launcher}, orders: 'hold', cwd: dir, dir});
+    const handle = await adapter.launch({peer: {}, profile: {mode: 'yolo', ...launcher}, orders: 'hold', cwd: dir, dir});
     // The marker is written only after the fake settled its SIGTERM disposition.
     assert.equal(await waitFor(() => fs.existsSync(ready)), true);
     return {result: await adapter.cancel(handle), calls, pid: handle.pid};
@@ -144,7 +144,7 @@ test('L6 capabilities are reported honestly and no bus grant reaches the spawned
     return realSpawn(process.execPath, ['-e', ''], options); // spy on the call, never run a real claude
   }});
   assert.deepEqual(adapter.capabilities(), {live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'], quota: 'stream'});
-  const {handle} = await adapter.launch({peer: {}, profile: {mode: 'yolo'}, orders: 'x', cwd: dir, dir});
+  const handle = await adapter.launch({peer: {}, profile: {mode: 'yolo', executables: {claude: 'claude'}}, orders: 'x', cwd: dir, dir});
   await drain(adapter, handle);
   assert.deepEqual(Object.keys(seen[0].options.env).filter(k => k.startsWith('BOUNCE_BUS')), []);
   assert.equal('BOUNCE_REMOTE_SESSION' in seen[0].options.env, false);
@@ -200,13 +200,13 @@ test('L10 events: 1.1 MB of stderr still completes, and a missing executable end
   withEnv(t, {FAKE_SOCKET: '', FAKE_SESSION: 'sess-l10', FAKE_HOLD: '', FAKE_READY: '', FAKE_STDERR_LINES: '1100'});
   const adapter = createClaudeLive({});
   const noisy = await adapter.launch({peer: {}, profile: {mode: 'yolo', ...launcher}, orders: 'x', cwd: dir, dir});
-  const events = await drain(adapter, noisy.handle);
+  const events = await drain(adapter, noisy);
   const diagnostics = events.filter(e => e.kind === 'diagnostic');
   assert.equal(diagnostics.length, 1100);
   assert.equal(diagnostics[0].text.length, 1000);
-  assert.deepEqual(events.find(e => e.kind === 'result'), {kind: 'result', text: 'ok', success: true});
+  assert.deepEqual(events.find(e => e.kind === 'result'), {kind: 'result', text: 'ok', success: true, status: 'completed'});
 
-  const gone = await adapter.launch({peer: {}, profile: {mode: 'yolo', executable: path.join(dir, 'no-such-claude')},
+  const gone = await adapter.launch({peer: {}, profile: {mode: 'yolo', executables: {claude: path.join(dir, 'no-such-claude')}},
     orders: 'x', cwd: dir, dir});
-  assert.deepEqual((await drain(adapter, gone.handle)).map(e => ({kind: e.kind, code: e.code})), [{kind: 'error', code: 'missing'}]);
+  assert.deepEqual((await drain(adapter, gone)).map(e => ({kind: e.kind, code: e.code})), [{kind: 'error', code: 'missing'}]);
 });
