@@ -52,7 +52,7 @@ function harness(t, {delay = 0} = {}) {
   const handles = [];
   // The fake executable is applied last: no caller can accidentally reach the real `codex`.
   const open = async (method, {profile, ...rest} = {}) => {
-    const {handle} = await adapter[method]({peer: 'worker:probe', cwd: root, dir: root, ...rest,
+    const handle = await adapter[method]({peer: 'worker:probe', cwd: root, dir: root, ...rest,
       profile: {...profile, executables: {codex: fakeExecutable}}});
     handles.push(handle);
     return handle;
@@ -103,11 +103,11 @@ async function scriptedLaunch({model} = {}) {
   server.send({id: 2, result: {threadId: 't-9'}});
   await server.expect(4);
   server.send({id: 3, result: {turnId: 'u-1'}});
-  const {handle} = await launching;
+  const handle = await launching;
   return {adapter, handle, server};
 }
 
-test('X1 launch drives the handshake and a turn ends in a milestone, never a result', async t => {
+test('X1 launch drives the handshake; a turn that ends with nothing queued is the result and the server exits', async t => {
   const h = harness(t);
   const handle = await h.launch({orders: 'do the thing'});
   const rows = await take(h.adapter.events(handle), 4);
@@ -128,24 +128,25 @@ test('X1 launch drives the handshake and a turn ends in a milestone, never a res
   assert.equal(rows[1].text, 'echo: do the thing');
   assert.equal(rows[2].kind, 'usage');
   assert.deepEqual(rows[2].usage, {input_tokens: 1, output_tokens: 1});
-  assert.deepEqual(rows[3], {kind: 'milestone', text: 'echo: do the thing'});
-  assert.equal(rows.filter(row => row.kind === 'result').length, 0);
+  assert.deepEqual(rows[3], {kind: 'result', status: 'completed', text: 'echo: do the thing'});
+  await waitFor(() => handle.exited, 'the server exits on EOF after the result');
+  assert.deepEqual((await take(h.adapter.events(handle), 1)), []); // one result, never a second on exit
 });
 
-test('X2 deliver while idle starts a second turn on the same iterable', async t => {
-  const h = harness(t);
+test('X2 a delivery queued mid-turn makes the first turn a milestone and the second the result, on one iterable', async t => {
+  const h = harness(t, {delay: 120});
   const handle = await h.launch({orders: 'first'});
   const stream = h.adapter.events(handle);
-  const first = await take(stream, 4);
-  assert.equal(first[3].kind, 'milestone');
-
+  assert.deepEqual(await take(stream, 1), [{kind: 'native', provider: 'codex', sessionId: 't-1'}]);
   assert.equal(await h.adapter.deliver(handle, {text: 'second'}), 'next-turn');
   assert.equal(h.adapter.events(handle), stream); // one iterable per handle, across turns
 
+  const first = await take(stream, 3);
+  assert.deepEqual(first[2], {kind: 'milestone', text: 'echo: first'});
   const second = await take(stream, 3);
   assert.equal(second[0].text, 'echo: second');
   assert.equal(second[1].kind, 'usage');
-  assert.deepEqual(second[2], {kind: 'milestone', text: 'echo: second'});
+  assert.deepEqual(second[2], {kind: 'result', status: 'completed', text: 'echo: second'});
 
   const starts = h.methods('turn/start');
   assert.equal(starts.length, 2);
@@ -166,7 +167,7 @@ test('X3 a mid-turn deliver waits: the second turn/start follows the first turn/
   assert.equal(h.methods('turn/start').length, 1); // nothing sent while the first turn runs
 
   const rows = await take(stream, 6);
-  assert.deepEqual(rows.map(row => row.kind), ['assistant', 'usage', 'milestone', 'assistant', 'usage', 'milestone']);
+  assert.deepEqual(rows.map(row => row.kind), ['assistant', 'usage', 'milestone', 'assistant', 'usage', 'result']);
   assert.equal(rows[2].text, 'echo: first');
   assert.equal(rows[5].text, 'echo: second');
   assert.equal(h.methods('turn/start').length, 2);
@@ -184,7 +185,7 @@ test('X4 resume re-attaches to the thread and starts a turn on it', async t => {
   assert.deepEqual(h.methods('turn/start')[0].params, {threadId: 't-42', input: [{type: 'text', text: 'again'}]});
   assert.equal(handle.threadId, 't-42');
   assert.deepEqual(rows[0], {kind: 'native', provider: 'codex', sessionId: 't-42'});
-  assert.deepEqual(rows[3], {kind: 'milestone', text: 'echo: again'});
+  assert.deepEqual(rows[3], {kind: 'result', status: 'completed', text: 'echo: again'});
   assert.equal(h.methods('thread/start').length, 0);
 });
 
@@ -242,7 +243,7 @@ test('X6 the reader ignores malformed, null, oversized and unmatched lines', asy
   assert.deepEqual(rows[1], {kind: 'native', provider: 'codex', sessionId: 't-9'}); // never `peer.native`
   assert.deepEqual(rows[2], {kind: 'assistant', text: 'survivor'});
   assert.equal(rows[3].kind, 'usage');
-  assert.deepEqual(rows[4], {kind: 'milestone', text: 'survivor'});
+  assert.deepEqual(rows[4], {kind: 'result', status: 'completed', text: 'survivor'});
   assert.equal(handle.threadId, 't-9'); // the forged id resolved nothing
   assert.deepEqual(adapter.capabilities(),
     {live: false, resume: true, modelPin: true, policies: ['yolo', 'plan'], quota: 'query'});
@@ -316,10 +317,10 @@ test('deliver is bounded and never throws: cap at 50, queued once the peer is go
 });
 
 test('a pinned model rides on every turn/start', async t => {
-  const h = harness(t);
+  const h = harness(t, {delay: 120});
   const handle = await h.launch({orders: 'first', profile: {model: 'gpt-5-codex'}});
-  await take(h.adapter.events(handle), 4);
-  assert.equal(await h.adapter.deliver(handle, {text: 'second'}), 'next-turn');
+  await take(h.adapter.events(handle), 1);
+  assert.equal(await h.adapter.deliver(handle, {text: 'second'}), 'next-turn'); // queued mid-turn
   await waitFor(() => h.methods('turn/start').length === 2, 'the second turn');
   assert.deepEqual(h.methods('turn/start').map(message => message.params.model), ['gpt-5-codex', 'gpt-5-codex']);
 });

@@ -1,13 +1,14 @@
 import {spawn as spawnProcess} from 'node:child_process';
 import codex from './codex.js';
 import {resolveExecutable} from '../executable.js';
-import {spawnLive, vendorEnv, verifiedCancel} from './live-common.js';
+import {spawnLive, vendorEnv, verifiedCancel, TEXT_MAX} from './live-common.js';
 
 // The Codex peer: one long-lived `codex app-server` process per worker, driven over stdio
 // JSON-RPC ("lite": one object per line, `jsonrpc` omitted, numeric ids on requests). A thread
 // is started once and every delivery is a turn on it, one turn at a time — which is why no
-// delivery here is ever better than `next-turn`. The worker outlives its turns, so a turn ends
-// with a milestone, not a result; the result is the process's own exit.
+// delivery here is ever better than `next-turn`. A turn that ends with deliveries queued is a
+// milestone and the next turn starts; a turn that ends with nothing queued is the task's result and
+// the worker ends with it — continuing a completed task is resume(), never a lingering server.
 
 // Every wire shape in one table: a vendor version bump is one edit.
 const REQUESTS = {
@@ -90,7 +91,7 @@ function startTurn(handle, text) {
 function rows(handle, message) {
   for (const event of codex.normalize(message)) {
     if (event.kind === 'peer.native') handle.stream.push({kind: 'native', provider: 'codex', sessionId: event.sessionId});
-    else if (event.kind === 'result') handle.stream.push({kind: 'milestone', text: handle.lastAssistant ?? 'turn completed'});
+    else if (event.kind === 'result') continue; // a turn's end is decided in receive(), by the queue
     else {
       if (event.kind === 'assistant') handle.lastAssistant = event.text;
       handle.stream.push(event);
@@ -118,8 +119,18 @@ function receive(handle, line) {
   }
   rows(handle, message);
   if (!completed) return;
+  const summary = handle.lastAssistant ?? 'turn completed';
   handle.lastAssistant = null;
-  if (handle.queue.length) startTurn(handle, handle.queue.shift()).catch(() => {});
+  if (handle.queue.length) {
+    handle.stream.push({kind: 'milestone', text: summary});
+    startTurn(handle, handle.queue.shift()).catch(() => {});
+    return;
+  }
+  handle.resulted = true;
+  handle.stream.push({kind: 'result', status: 'completed', text: summary});
+  // The server exits on EOF; the group kill is only the fallback for one that does not.
+  try { handle.child.stdin.end(); } catch {}
+  setTimeout(() => { if (!handle.exited) handle.stop().catch(() => {}); }, 1500).unref();
 }
 
 // The one place a process event becomes a log row. A result is the worker's own end.
@@ -131,7 +142,7 @@ async function pump(handle, source) {
     }
     if (event.kind === 'diagnostic') { handle.stream.push(event); continue; }
     if (event.kind === 'error') { handle.stream.push({kind: 'error', code: event.code, text: event.text}); break; }
-    if (!handle.cancelled) handle.stream.push({kind: 'result',
+    if (!handle.cancelled && !handle.resulted) handle.stream.push({kind: 'result',
       status: event.limited ? 'limited' : event.code === 0 ? 'completed' : 'failed'});
     break;
   }
@@ -151,7 +162,7 @@ export function createCodexLive({spawn = spawnProcess, kill = process.kill} = {}
     const live = spawnLive({executable, args: ['app-server'], cwd, env: vendorEnv(), keepStdin: true, spawn});
     const handle = {provider: 'codex', peer, child: live.child, pid: live.child.pid, cwd, dir,
       model: profile.model ?? null, threadId: null, queue: [], pending: new Map(), nextId: 1,
-      running: false, exited: false, cancelled: false, lastAssistant: null, stream: makeStream()};
+      running: false, exited: false, cancelled: false, resulted: false, lastAssistant: null, stream: makeStream(), stop: () => stop(handle)};
     pump(handle, live.events);
     await begin(handle, async () => {
       await request(handle, REQUESTS.initialize());
@@ -164,7 +175,7 @@ export function createCodexLive({spawn = spawnProcess, kill = process.kill} = {}
     handle.threadId = threadId;
     handle.stream.push({kind: 'native', provider: 'codex', sessionId: threadId});
     await startTurn(handle, text);
-    return {handle};
+    return handle;
   });
 
   return {
@@ -188,10 +199,12 @@ export function createCodexLive({spawn = spawnProcess, kill = process.kill} = {}
     // Never `live`: one turn at a time per thread, so a mid-turn message waits for the next one.
     // `queued` is only for a peer that is gone, a queue that is full, or a turn that would not start.
     async deliver(handle, {text}) {
+      const coerced = String(text);
+      if (coerced.length > TEXT_MAX) return 'queued';
       if (handle.exited || handle.cancelled) return 'queued';
-      if (!handle.running) return startTurn(handle, text).then(() => 'next-turn', () => 'queued');
+      if (!handle.running) return startTurn(handle, coerced).then(() => 'next-turn', () => 'queued');
       if (handle.queue.length >= MAX_QUEUE) return 'queued';
-      handle.queue.push(text);
+      handle.queue.push(coerced);
       return 'next-turn';
     },
 
