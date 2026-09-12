@@ -79,3 +79,37 @@ test('legacy journal rows without seq/from/context load, and the next append get
   assert.equal(resumed.events.at(-1).from, undefined);
   assert.equal(resumed.append({kind: 'note', text: 'new'}).seq, 3);
 });
+
+test('subscribe fans out journaled and live rows alongside onEvent and can be undone', t => {
+  const {session} = setup(t);
+  const seen = [], viaOnEvent = [];
+  session.onEvent = e => viaOnEvent.push(e.kind);
+  const off = session.subscribe(e => seen.push(e.kind));
+  session.append({kind: 'note', text: 'a'});
+  session.publish({kind: 'task.activity', text: 'b'});
+  off();
+  session.append({kind: 'note', text: 'c'});
+  assert.deepEqual(seen, ['note', 'task.activity']);
+  assert.deepEqual(viaOnEvent, ['note', 'task.activity', 'note']);
+});
+
+test('a throwing subscriber never breaks append for the writer or other subscribers', t => {
+  const {session} = setup(t);
+  const seen = [];
+  session.subscribe(() => { throw new Error('boom'); });
+  session.subscribe(e => seen.push(e.kind));
+  const row = session.append({kind: 'note', text: 'still written'});
+  assert.equal(row.seq, 2);
+  assert.deepEqual(seen, ['note']);
+  assert.equal(session.subscriberErrors.length, 1);
+  assert.equal(session.subscriberErrors[0].error.message, 'boom');
+  assert.equal(session.events.at(-1).text, 'still written');
+});
+
+test('subscriber errors are bounded so a broken subscriber cannot grow memory forever', t => {
+  const {session} = setup(t);
+  session.subscribe(() => { throw new Error('boom'); });
+  for (let i = 0; i < 150; i++) session.append({kind: 'note', text: String(i)});
+  assert.equal(session.subscriberErrors.length, 100);
+  assert.equal(session.subscriberErrors.at(-1).row.text, '149');
+});

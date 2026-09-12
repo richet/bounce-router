@@ -151,3 +151,31 @@ test('reducers are pure: the same event array yields deepEqual results every cal
   view.t1.artifacts.push('mutated');
   assert.deepEqual(events, snapshot);
 });
+
+test('a replacement task (replaces) draws on the replaced task root budget and is not a new root', () => {
+  const ev = [
+    {kind: 'task.submitted', task: 'r', parent: null, budget: {starts: 3}, time: 't0'},
+    {kind: 'budget.reserved', task: 'r', amount: {starts: 1}},
+    {kind: 'task.failed', task: 'r', reason: 'limited', time: 't1'},
+    {kind: 'task.submitted', task: 'r2', parent: null, replaces: 'r', time: 't2'},
+    {kind: 'budget.reserved', task: 'r2', amount: {starts: 1}},
+  ];
+  const view = budgets(ev);
+  assert.deepEqual(Object.keys(view.roots), ['r']);
+  assert.equal(view.roots.r.remaining.starts, 1);
+  assert.equal(tasks(ev).r2.replaces, 'r');
+  assert.deepEqual(view.orphans.tasks, []);
+});
+
+test('a self-referencing or cyclic parent/replaces chain never recurses forever', () => {
+  const cyclic = [
+    {kind: 'task.submitted', task: 'a', parent: 'a', time: 't0'},
+    {kind: 'task.submitted', task: 'b', parent: 'c', time: 't1'},
+    {kind: 'task.submitted', task: 'c', parent: 'b', time: 't2'},
+    {kind: 'task.submitted', task: 'd', replaces: 'd', time: 't3'},
+  ];
+  const view = budgets(cyclic);
+  // Each member of a mutual cycle resolves to itself: the chain stops at the first revisited id.
+  assert.deepEqual(Object.keys(view.roots).sort(), ['a', 'b', 'c', 'd']);
+  assert.deepEqual(view.orphans.tasks, []);
+});

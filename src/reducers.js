@@ -13,7 +13,7 @@ export function peers(events) {
 }
 
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'timed_out']);
-const emptyTask = id => ({id, parent: null, lastMilestone: null, blocker: null, reason: null, error: null, children: []});
+const emptyTask = id => ({id, parent: null, replaces: null, lastMilestone: null, blocker: null, reason: null, error: null, children: []});
 
 // A task exists only once its own task.submitted is seen; any other task.* row for an unknown id is dropped. A parent stays waiting through its own progress events while any child is non-terminal, remembering which state (its last progress, or its own queued submission) to resume once every child terminates; terminal states never change again.
 export function tasks(events) {
@@ -30,7 +30,7 @@ export function tasks(events) {
     if (e.kind === 'task.submitted') {
       const t = ensure(e.task);
       if (TERMINAL.has(t.state)) continue;
-      t.context = e.context; t.profile = e.profile; t.deadline = e.deadline; t.budget = e.budget && {...e.budget};
+      t.context = e.context; t.profile = e.profile; t.deadline = e.deadline; t.budget = e.budget && {...e.budget}; t.replaces = e.replaces ?? null;
       if (t.state === 'waiting') priorState[e.task] = 'queued'; else t.state = 'queued';
       if (e.parent) {
         t.parent = e.parent;
@@ -64,7 +64,6 @@ export function tasks(events) {
 }
 
 const sumInto = (target, amount) => { for (const key in amount) target[key] = (target[key] || 0) + amount[key]; return target; };
-const descendants = (taskView, id) => (taskView[id]?.children || []).flatMap(child => [child, ...descendants(taskView, child)]);
 
 // Descendants, retries and replacements draw on the root's own allowance; unknown usage reads as unmeasured, never zero; a budget/usage row against an id with no submitted task lands in orphans instead of a root.
 export function budgets(events) {
@@ -76,10 +75,13 @@ export function budgets(events) {
     else if (e.kind === 'budget.released') { if (taskView[e.task]) sumInto(released[e.task] ??= {}, e.amount); else { sumInto(orphanReleased, e.amount); orphanTasks.add(e.task); } }
     else if (e.kind === 'task.usage') { if (taskView[e.task]) { sumInto(usage[e.task] ??= {}, e.usage); measured.add(e.task); } else { sumInto(orphanUsage, e.usage); orphanTasks.add(e.task); } }
   }
+  // A replacement (fallback retry) belongs to the root of the task it replaces, never to a root of its own.
+  // A cycle (self-parent, mutual parents, self-replace) can only come from a peer's row; it ends at the first revisited id.
+  const rootOf = (id, seen = new Set()) => { const t = taskView[id]; if (seen.has(id)) return id; seen.add(id); return t.replaces && taskView[t.replaces] ? rootOf(t.replaces, seen) : t.parent && taskView[t.parent] ? rootOf(t.parent, seen) : id; };
   const roots = {};
   for (const root of Object.values(taskView)) {
-    if (root.parent) continue;
-    const tree = [root.id, ...descendants(taskView, root.id)];
+    if (rootOf(root.id) !== root.id) continue;
+    const tree = Object.keys(taskView).filter(id => rootOf(id) === root.id);
     const allowance = root.budget ? {...root.budget} : {};
     const treeReserved = {}, treeReleased = {}, treeUsage = {};
     let isMeasured = true;

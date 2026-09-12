@@ -66,6 +66,7 @@ export class Session {
     for (const e of this.events) if (typeof e.ref === 'string' && !this.refIndex.has(e.ref)) this.refIndex.set(e.ref, e);
     const last = this.events.at(-1);
     this.nextSeq = (last ? last.seq ?? this.events.length : 0) + 1;
+    this.listeners = new Set(); this.subscriberErrors = [];
     this.cwd = this.events.find(e => e.kind === 'session')?.cwd ?? fs.realpathSync(cwd);
     if (!this.events.length) this.append({kind: 'session', cwd: this.cwd, text: this.cwd});
     this.active = this.events.findLast(e => e.kind === 'route')?.provider;
@@ -80,14 +81,21 @@ export class Session {
     fs.appendFileSync(this.file, JSON.stringify(row) + '\n', {mode: 0o600});
     this.events.push(row);
     if (typeof row.ref === 'string') this.refIndex.set(row.ref, row);
-    this.onEvent?.(row);
+    this.emit(row);
     return row;
   }
+  // onEvent stays the display's hook; subscribers (bus, scheduler) fan out beside it.
+  emit(row) {
+    this.onEvent?.(row);
+    // One broken subscriber (a policy, the bus) must not turn a journal write into a caller-visible crash.
+    for (const fn of this.listeners) { try { fn(row); } catch (error) { if (this.subscriberErrors.push({error, row}) > 100) this.subscriberErrors.shift(); } }
+  }
+  subscribe(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn); }
   // Live kinds are folded in memory only: delivered straight to onEvent, never journaled, no seq assigned.
   publish(event) {
     if (!LIVE_KINDS.has(event.kind)) return this.append(event);
     const row = {id: randomUUID(), time: new Date().toISOString(), ...event, from: defaultFrom(event), context: event.context ?? this.context};
-    this.onEvent?.(row);
+    this.emit(row);
     return row;
   }
   lock() {
