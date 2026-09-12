@@ -117,7 +117,8 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
       if (FORBIDDEN_PREFIXES.some(prefix => e.kind.startsWith(prefix))) return refuse(id, -32001, 'unauthorized');
       if (FORBIDDEN_TASK_KINDS.has(e.kind)) return refuse(id, -32001, 'unauthorized');
       if (e.kind === 'task.submitted') {
-        if (!authenticated.canSubmit || !authenticated.tasks.includes(e.parent)) return refuse(id, -32001, 'unauthorized');
+        // A canSubmit grant may open a root (parent explicitly null); anything with a parent needs that parent in its own tasks.
+        if (!authenticated.canSubmit || !(e.parent === null || authenticated.tasks.includes(e.parent))) return refuse(id, -32001, 'unauthorized');
         delete e.replaces; delete e.budget;
         if (e.task === e.parent) return refuse(id, -32602, 'invalid event');
         if (session.events.some(row => row.kind === 'task.submitted' && row.task === e.task)) return refuse(id, -32602, 'invalid event');

@@ -480,3 +480,17 @@ test('G3 createBus rejects (not crashes) when the socket path is blocked by a st
   fs.mkdirSync(stale); // a directory sitting where the socket file belongs
   await assert.rejects(createBus({session, dir: session.dir}), error => typeof error.code === 'string');
 });
+
+test('a canSubmit grant may submit a ROOT task (parent null); child submits still require the parent in its tasks', async t => {
+  const {session, bus, cleanup} = await setup(t);
+  t.after(cleanup);
+  const {token} = bus.grant({peer: 'orchestrator', tasks: [], canSubmit: true, context: session.id});
+  const c = await connectBus({path: bus.path, token});
+  const root = await c.publish({kind: 'task.submitted', task: 'root-1', parent: null, profile: 'p', orders: 'x'});
+  assert.equal(root.kind, 'task.submitted');
+  assert.equal(root.from, 'orchestrator');
+  assert.equal(root.parent, null);
+  await assert.rejects(c.publish({kind: 'task.submitted', task: 'child-1', parent: 'someone-elses', profile: 'p', orders: 'x'}), e => e.code === -32001);
+  await assert.rejects(c.publish({kind: 'task.submitted', task: 'root-2', profile: 'p', orders: 'x'}), e => e.code === -32001, 'parent omitted is not a root submit; it must be explicitly null');
+  await c.close();
+});
