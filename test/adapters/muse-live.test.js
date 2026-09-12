@@ -259,7 +259,7 @@ test('muse-live cancel is verified, capabilities are honest, and the spawn env c
   assert.deepEqual(killed, [{pid: handle.child.pid, signal: 0}, {pid: -handle.child.pid, signal: 'SIGTERM'}]);
 
   assert.deepEqual(adapter.capabilities(),
-    {live: false, resume: false, modelPin: true, policies: ['yolo', 'plan'], quota: 'none'});
+    {live: false, resume: false, modelPin: true, policies: ['yolo', 'plan'], executionPolicies: ['read-only', 'plan', 'yolo'], quota: 'none'});
 
   const env = calls[0].env;
   assert.deepEqual(Object.keys(env).filter(k => k.startsWith('BOUNCE_BUS')), []);

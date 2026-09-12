@@ -248,7 +248,7 @@ test('X6 the reader ignores malformed, null, oversized and unmatched lines', asy
   assert.deepEqual(rows[4], {kind: 'result', status: 'completed', text: 'survivor'});
   assert.equal(handle.threadId, 't-9'); // the forged id resolved nothing
   assert.deepEqual(adapter.capabilities(),
-    {live: false, resume: true, modelPin: true, policies: ['yolo', 'plan'], quota: 'query'});
+    {live: false, resume: true, modelPin: true, policies: ['yolo', 'plan'], executionPolicies: ['read-only', 'plan', 'yolo'], quota: 'query'});
 });
 
 test('the vendor process sees no bus keys, is detached, and gets the task cwd', async t => {

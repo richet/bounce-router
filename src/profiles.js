@@ -3,6 +3,19 @@
 const ROLES = ['orchestrator', 'builder', 'critic', 'verifier', 'analyst', 'extractor'];
 const READ_ONLY_ROLES = new Set(['critic', 'verifier', 'analyst']);
 
+// Phase 7 execution-policy ladder (docs/local-orchestration.md "Permissions", CONTRACT.md §1):
+// least to most privileged. `write` exists for adapters to declare and future profiles to
+// request; no current bounce profile produces it.
+export const POLICY_RANK = {'read-only': 0, plan: 1, write: 2, yolo: 3};
+
+// A profile's effective policy (pure): read-only is absolute; otherwise mode narrows write/unset
+// down to plan or yolo.
+export function effectivePolicy(profile) {
+  if (profile.policy === 'read-only') return 'read-only';
+  if (profile.mode === 'plan') return 'plan';
+  return 'yolo';
+}
+
 export function validateOrchestration(settings, adapterNames = ['claude', 'codex', 'muse']) {
   if (settings.operation === undefined || settings.operation === 'classic') {
     return {operation: 'classic', orchestrator: null, profiles: {}, shape: 'none', strict: false};

@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import * as reducers from './reducers.js';
 import {takeCheckpoint, sameTree} from './checkpoint.js';
+import {POLICY_RANK, effectivePolicy} from './profiles.js';
 
 const FALLBACK_REASONS = new Set(['limited', 'missing', 'backend_unavailable']);
 const RISKS = new Set(['boundary', 'process-model', 'logic', 'extraction']);
@@ -61,6 +62,28 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
   const stamp = () => new Date(clock()).toISOString();
   const append = event => session.append({...event, time: stamp()});
   const publish = event => session.publish({...event, time: stamp()});
+
+  // Session effective policy: the user session is write-privileged; only its mode narrows it
+  // (docs/local-orchestration.md "Permissions", CONTRACT.md §1).
+  const sessionEffective = sessionMode === 'plan' ? 'plan' : 'yolo';
+
+  // The pre-launch policy check (CONTRACT.md §3), shared by every path that launches a profile
+  // (the worker's own launch and a prelaunch review's launch): ratchet-down first (never more
+  // privileged than the session), then per-provider support (`unsupported` over downgrade — an
+  // adapter that declares no executionPolicies is unconstrained, so bare test fakes keep
+  // working). Order matters: a yolo profile under a plan session reports `policy`, not
+  // `unsupported`, even on an adapter that cannot enforce yolo.
+  function policyRefusal(profile) {
+    const eff = effectivePolicy(profile);
+    if (POLICY_RANK[eff] > POLICY_RANK[sessionEffective]) {
+      return {reason: 'policy', text: `worker policy ${eff} exceeds session policy ${sessionEffective}`};
+    }
+    const caps = adapters[profile.adapter]?.capabilities?.() ?? {};
+    if (Array.isArray(caps.executionPolicies) && !caps.executionPolicies.includes(eff)) {
+      return {reason: 'unsupported', text: `${profile.adapter} cannot enforce ${eff}`};
+    }
+    return null;
+  }
 
   const validate = (spec, view) => {
     if (!profiles[spec.profile]) return 'profile';
@@ -366,11 +389,20 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
     const root = budgetRootOf(task, view);
     const round = (t.rounds || 0) + 1;
 
+    const profileName = row.review.completion;
+    const profile = profiles[profileName];
+    // A completion review is a review launch too (CONTRACT.md §3, Amendment A1): the same
+    // shared check runs before it reserves its own start — no reservation, no launch on refusal.
+    const refusal = policyRefusal(profile);
+    if (refusal) {
+      append({kind: 'policy.escalated', task, reason: refusal.reason, text: refusal.text, context});
+      append({kind: 'task.blocked', task, text: refusal.text, context});
+      return;
+    }
+
     if (availableStarts(root) < 1) return escalateBudget(task, context);
     append({kind: 'budget.reserved', task, root, amount: {starts: 1}, context});
 
-    const profileName = row.review.completion;
-    const profile = profiles[profileName];
     const dir = path.join(session.dir, 'tasks', task, `review-completion-${round}`);
     fs.mkdirSync(dir, {recursive: true, mode: 0o700});
     const orders = profile.role === 'verifier' ? row.steps : `${row.orders}\n\n--- worker report ---\n${t.summary ?? ''}`;
@@ -436,9 +468,12 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
       append({kind: 'task.failed', task, reason: 'error', text: `malformed: profile`, context});
       return;
     }
-    if (profile.mode === 'yolo' && sessionMode === 'plan') {
-      append({kind: 'task.failed', task, reason: 'policy', text: 'worker mode exceeds session mode', context});
-      return;
+    {
+      const refusal = policyRefusal(profile);
+      if (refusal) {
+        append({kind: 'task.failed', task, reason: refusal.reason, text: refusal.text, context});
+        return;
+      }
     }
     // depends_on holds before any reservation: a dependency still pending (queued/running/
     // waiting/blocked/input_required, OR merely `completed`/`reviewing` — completed with no
@@ -488,6 +523,14 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
     if (reviewGate) {
       const profileName = row.review.prelaunch;
       const reviewProfile = profiles[profileName];
+      // A review profile is a profile too (CONTRACT.md §3): the same shared check runs before
+      // its launch, on the same reservation this dispatch already made above.
+      const reviewRefusal = policyRefusal(reviewProfile);
+      if (reviewRefusal) {
+        append({kind: 'budget.released', task, root, amount: {starts: 1}, text: reviewRefusal.reason, context});
+        append({kind: 'task.failed', task, reason: reviewRefusal.reason, text: reviewRefusal.text, context});
+        return;
+      }
       const dir = path.join(session.dir, 'tasks', task, 'review-prelaunch-1');
       fs.mkdirSync(dir, {recursive: true, mode: 0o700});
       const verdict = await runReview({task, stage: 'prelaunch', round: 1, profileName, profile: reviewProfile, orders: row.orders, dir, context});

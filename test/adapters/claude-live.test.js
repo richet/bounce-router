@@ -143,7 +143,7 @@ test('L6 capabilities are reported honestly and no bus grant reaches the spawned
     seen.push({executable, args, options});
     return realSpawn(process.execPath, ['-e', ''], options); // spy on the call, never run a real claude
   }});
-  assert.deepEqual(adapter.capabilities(), {live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'], quota: 'stream'});
+  assert.deepEqual(adapter.capabilities(), {live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'], executionPolicies: ['read-only', 'plan', 'yolo'], quota: 'stream'});
   const handle = await adapter.launch({peer: {}, profile: {mode: 'yolo', executables: {claude: 'claude'}}, orders: 'x', cwd: dir, dir});
   await drain(adapter, handle);
   assert.deepEqual(Object.keys(seen[0].options.env).filter(k => k.startsWith('BOUNCE_BUS')), []);

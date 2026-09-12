@@ -243,6 +243,6 @@ export function createLocalLive({backends: suppliedBackends, fetchImpl = globalT
       return {verified: true};
     },
 
-    capabilities: () => ({live: true, resume: true, modelPin: true, policies: ['yolo'], quota: 'stream'}),
+    capabilities: () => ({live: true, resume: true, modelPin: true, policies: ['yolo'], executionPolicies: ['read-only'], quota: 'stream'}),
   };
 }

@@ -99,6 +99,8 @@ export function createMuseLive({spawn = nodeSpawn, kill = process.kill} = {}) {
 
     cancel(handle) { return verifiedCancel(handle.child, {kill}); },
 
-    capabilities: muse.capabilities,
+    // muse.js (classic, not owned by this phase) declares the delivery-tier capabilities;
+    // executionPolicies is this adapter's own addition, layered on without touching muse.js.
+    capabilities: () => ({...muse.capabilities(), executionPolicies: ['read-only', 'plan', 'yolo']}),
   };
 }

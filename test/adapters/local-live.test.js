@@ -239,7 +239,7 @@ test('concurrency 1: a second launch on the same adapter instance queues and run
 
 test('capabilities reports the contract shape', () => {
   const adapter = createLocalLive({backends: {fake: createFakeBackend()}});
-  assert.deepEqual(adapter.capabilities(), {live: true, resume: true, modelPin: true, policies: ['yolo'], quota: 'stream'});
+  assert.deepEqual(adapter.capabilities(), {live: true, resume: true, modelPin: true, policies: ['yolo'], executionPolicies: ['read-only'], quota: 'stream'});
 });
 
 test('resume resolves to a bare handle and completes like launch', async () => {

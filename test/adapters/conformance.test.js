@@ -128,7 +128,10 @@ test('local: launch runs through the real scheduler, completes, and the task dir
     [{kind: 'done', text: 'hello'}],
   ];
   const adapter = createLocalLive({backends: {fake: createFakeBackend()}});
-  const scheduler = createScheduler({session, adapters: {local: adapter}, profiles: {p: {adapter: 'local', backend: 'fake', model: '', mode: 'yolo', fallback: [], script}}});
+  // Phase 7: local only enforces read-only (executionPolicies: ['read-only']), so this profile's
+  // effective policy must be read-only, not yolo (CONTRACT.md §5) — the honest replacement for
+  // the old yolo-local conformance launch (E7 in test/policy-exec.test.js covers the refusal).
+  const scheduler = createScheduler({session, adapters: {local: adapter}, profiles: {p: {adapter: 'local', backend: 'fake', model: '', policy: 'read-only', fallback: [], script}}});
   t.after(async () => { await scheduler.cancel(row.task); scheduler.close(); });
   const row = scheduler.submit({parent: null, profile: 'p', orders: 'say hello'});
   await waitFor(() => ['completed', 'failed'].includes(scheduler.tasks()[row.task].state));

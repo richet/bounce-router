@@ -122,7 +122,7 @@ export function createClaudeLive({connect = nodeConnect, fs = nodeFs, kill = pro
     },
 
     capabilities() {
-      return {live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'], quota: 'stream'};
+      return {live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'], executionPolicies: ['read-only', 'plan', 'yolo'], quota: 'stream'};
     },
 
     pending: dir => readPending(pendingPath(dir)),

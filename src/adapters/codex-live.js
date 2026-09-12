@@ -191,7 +191,7 @@ export function createCodexLive({spawn = spawnProcess, kill = process.kill} = {}
 
   return {
     name: 'codex',
-    capabilities: () => ({live: false, resume: true, modelPin: true, policies: ['yolo', 'plan'], quota: 'query'}),
+    capabilities: () => ({live: false, resume: true, modelPin: true, policies: ['yolo', 'plan'], executionPolicies: ['read-only', 'plan', 'yolo'], quota: 'query'}),
 
     async launch({peer, profile, orders = '', cwd, dir}) {
       const handle = await connect({profile, peer, cwd, dir});
