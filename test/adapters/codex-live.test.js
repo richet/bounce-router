@@ -127,7 +127,9 @@ test('X1 launch drives the handshake; a turn that ends with nothing queued is th
   assert.equal(rows[1].kind, 'assistant');
   assert.equal(rows[1].text, 'echo: do the thing');
   assert.equal(rows[2].kind, 'usage');
-  assert.deepEqual(rows[2].usage, {input_tokens: 1, output_tokens: 1});
+  // CONTRACT.md #5: mapped to {input, cache_read, cache_write, output} before yielding — the
+  // fake's default usage carries no cached_input_tokens, so cache_read stays absent.
+  assert.deepEqual(rows[2].usage, {input: 1, output: 1});
   assert.deepEqual(rows[3], {kind: 'result', status: 'completed', text: 'echo: do the thing'});
   await waitFor(() => handle.exited, 'the server exits on EOF after the result');
   assert.deepEqual((await take(h.adapter.events(handle), 1)), []); // one result, never a second on exit

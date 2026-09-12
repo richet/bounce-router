@@ -14,6 +14,7 @@ import {spawn} from 'node:child_process';
 import {emitKeypressEvents} from 'node:readline';
 import {parseArgs} from 'node:util';
 import {Session, Router, config, saveJSON, dataRoot} from './core.js';
+import * as reducers from './reducers.js';
 import {providers, runProcess} from './providers.js';
 import {projectRoot, fingerprint, validate, supervise, pidAlive} from './reload.js';
 import {createRemoteSession} from './remote.js';
@@ -77,6 +78,20 @@ YOLO disables provider approvals/sandboxing. Native CLI credentials stay with ve
 Model names are passed through to each CLI. Quota comes from the agents themselves:
 Codex answers on demand, Claude reports its windows while a turn runs, Muse reports none.
 `;
+// CONTRACT.md #5 bullet 3: `bounce sessions` rows gain `spend: {tokens, measured, tasks}` from
+// reducers.spend over the session log — null for a session with no task rows (classic rows).
+// reducers.spend is builder-1's (src/reducers.js); guarded so this module still loads and the
+// command still runs before it lands — a session with task rows then just reads spend: null.
+function sessionSpend(events) {
+  if (!events.some(e => e.kind === 'task.submitted')) return null;
+  const view = reducers.spend?.(events);
+  if (!view) return null;
+  const roots = Object.values(view.roots ?? {});
+  const tokens = roots.reduce((sum, r) => sum + (r.tokens || 0), 0);
+  const measured = roots.length > 0 && roots.every(r => r.measured);
+  const tasks = Object.keys(view.tasks ?? {}).length;
+  return {tokens, measured, tasks};
+}
 function listSessions(root) {
   const dir = path.join(root, 'sessions');
   if (!fs.existsSync(dir)) return [];
@@ -91,7 +106,8 @@ function listSessions(root) {
       const operation = s.events.findLast(e => e.kind === 'operation');
       return [{id, cwd: s.cwd, updated: s.events.at(-1)?.time, live, pid: live ? daemon.pid : undefined,
         operation: operation?.operation ?? 'classic', orchestrator: operation?.orchestrator ?? null,
-        prompt: s.events.find(e => e.kind === 'user')?.text?.slice(0, 80) ?? '(empty)'}];
+        prompt: s.events.find(e => e.kind === 'user')?.text?.slice(0, 80) ?? '(empty)',
+        spend: sessionSpend(s.events)}];
     }
     catch { return []; }
   }).sort((a,b) => b.updated.localeCompare(a.updated));
@@ -141,6 +157,22 @@ async function main() {
     const options = {root, scope: values.scope || settings.skills.scope, cwd, base: process.cwd()};
     const {text, report} = skillsCommand([...positionals.slice(1), ...(values.force ? ['--force'] : []), ...(values.list ? ['--list'] : [])], options);
     return console.log(values.json ? JSON.stringify(report ?? inspectSkills(options), null, 2) : text);
+  }
+  // CONTRACT.md #5 bullet 4: the built-in A/B, legacy CLI path, no daemon. Unknown session/task
+  // is a thrown Error, which the top-level .catch prints to stderr and exits 1 (same convention
+  // as every other legacy command's error here, e.g. Session's own "Session not found").
+  if (positionals[0] === 'task' && positionals[1] === 'compare') {
+    const [, , sessionId, taskA, taskB] = positionals;
+    if (!sessionId || !taskA || !taskB) throw new Error('Use: bounce task compare SESSION TASK_A TASK_B');
+    const taskSession = new Session(process.cwd(), {root, id: sessionId});
+    const view = reducers.spend?.(taskSession.events); // depends on builder-1: reducers.spend
+    const rowFor = taskId => {
+      const submitted = taskSession.events.find(e => e.kind === 'task.submitted' && e.task === taskId);
+      if (!submitted) throw new Error(`Unknown task: ${taskId}`);
+      return {...(view?.tasks?.[taskId] ?? null), orders: submitted.orders};
+    };
+    const a = rowFor(taskA), b = rowFor(taskB);
+    return console.log(JSON.stringify({session: sessionId, a, b, same_orders: a.orders === b.orders}));
   }
   if (positionals[0] === 'doctor') {
     console.log(`Workspace: ${cwd}\nData: ${root}\nMode: ${settings.mode}\nOrder: ${settings.order.join(' → ')}`);

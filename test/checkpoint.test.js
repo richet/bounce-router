@@ -91,7 +91,18 @@ test('C4 scheduler: dispatch refuses when the tree no longer matches the submitt
   await waitFor(() => scheduler.tasks()[row.task]?.state === 'failed');
 
   assert.equal(scheduler.tasks()[row.task].reason, 'baseline');
-  assert.equal(session.events.some(e => e.kind === 'budget.reserved'), false);
+  // CONTRACT.md §4 (amendment A2): the reservation and the availableStarts check are one
+  // synchronous span, before the checkpoint's own await — so a baseline refusal reserves
+  // first, then releases what it never consumed.
+  const kinds = session.events.filter(e => e.task === row.task).map(e => e.kind);
+  assert.deepEqual(kinds, ['task.submitted', 'budget.reserved', 'budget.released', 'task.failed']);
+  const released = session.events.find(e => e.kind === 'budget.released' && e.task === row.task);
+  assert.deepEqual(released.amount, {starts: 1});
+  assert.equal(released.text, 'baseline refusal');
+  // No `budget` on this submission: it's its own root with no declared allowance.
+  const budgets = scheduler.budgets().roots[row.task];
+  assert.equal(budgets.reserved.starts, 1);
+  assert.equal(budgets.released.starts, 1);
   assert.equal(adapter.calls.launch, 0);
 });
 

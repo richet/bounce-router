@@ -17,6 +17,8 @@ import fs from 'node:fs';
 
 const logFile = process.env.FAKE_LOG;
 const delay = Number(process.env.FAKE_DELAY_MS ?? 0);
+// FAKE_USAGE=<json>   usage object on turn/completed (default {input_tokens:1, output_tokens:1} — vendor field names)
+const defaultUsage = process.env.FAKE_USAGE ? JSON.parse(process.env.FAKE_USAGE) : {input_tokens: 1, output_tokens: 1};
 const send = message => process.stdout.write(JSON.stringify(message) + '\n');
 const notify = (method, params) => send({method, params});
 
@@ -26,7 +28,7 @@ const complete = extra => {
   const turn = running;
   running = null;
   clearTimeout(turn.timer);
-  notify('turn/completed', {turnId: turn.turnId, usage: {input_tokens: 1, output_tokens: 1}, ...extra});
+  notify('turn/completed', {turnId: turn.turnId, usage: defaultUsage, ...extra});
 };
 
 const handlers = {

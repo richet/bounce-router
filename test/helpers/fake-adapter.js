@@ -15,11 +15,21 @@
 // produces a handle the same shape launch() does. calls.resume counts invocations; resumeCalls
 // records each call's full args for assertion (native, message, dir, checkpoint).
 export function fakeAdapter(script) {
-  const calls = {launch: 0, cancel: 0, events: 0, resume: 0};
+  const calls = {launch: 0, cancel: 0, events: 0, resume: 0, deliver: 0};
   const resumeCalls = [];
+  const deliveries = [];
   return {
     calls,
     resumeCalls,
+    deliveries,
+    // Default delivery contract: records the call and reports 'live'. Tests that need a
+    // different tier or a throwing deliver override this property directly on the returned
+    // adapter (see test/scheduler.test.js's deliveringAdapter for the pattern).
+    async deliver(handle, event) {
+      calls.deliver++;
+      deliveries.push({handle, event});
+      return 'live';
+    },
     async launch(args) {
       calls.launch++;
       const outcome = await script(args);

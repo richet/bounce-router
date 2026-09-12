@@ -124,6 +124,107 @@ export function budgets(events) {
   return {roots, orphans: {reserved: orphanReserved, released: orphanReleased, usage: orphanUsage, tasks: [...orphanTasks]}};
 }
 
+// Spend is a fold, never a hand-kept ledger: per task, usage/starts/rounds/findings/verdicts
+// summed straight off the log; wall is (first task.started -> the row that actually carried the
+// task into its current terminal state) or null for a task never terminal. Per root, the same
+// summed over its tree (fallback retries and replacements draw on the root's own numbers, same
+// rootOf rule as budgets()), plus tokens = the sum of the four usage categories present anywhere
+// in the tree. `measured` is true only when every task in the tree has at least one usage row.
+const TERMINAL_ROW_KIND = {completed: 'task.completed', failed: 'task.failed', cancelled: 'task.cancelled', timed_out: 'task.deadline', accepted: 'task.accepted', rejected: 'task.rejected'};
+export function spend(events) {
+  const taskView = tasks(events);
+  const perTask = {};
+  const startedTimes = {};
+  const ensure = id => perTask[id] ??= {task: id, usage: {}, measured: false, starts: 0, rounds: 0, wall: null, findings: 0, verdicts: [], state: taskView[id]?.state};
+  for (const e of events) {
+    if (!taskView[e.task]) continue;
+    if (e.kind === 'task.usage') { const t = ensure(e.task); sumInto(t.usage, e.usage); t.measured = true; }
+    else if (e.kind === 'task.started') { ensure(e.task).starts++; (startedTimes[e.task] ??= []).push(Date.parse(e.time)); }
+    else if (e.kind === 'task.rework') { const t = ensure(e.task); t.rounds++; t.findings += (e.findings?.length ?? 0); }
+    else if (e.kind === 'review.finished') ensure(e.task).verdicts.push(e.verdict);
+  }
+  for (const id of Object.keys(taskView)) {
+    const t = ensure(id);
+    const state = taskView[id].state;
+    const starts = startedTimes[id];
+    const kind = TERMINAL_ROW_KIND[state];
+    if (kind && starts?.length) {
+      const terminalRow = events.filter(e => e.task === id && e.kind === kind).at(-1);
+      if (terminalRow) t.wall = Date.parse(terminalRow.time) - Math.min(...starts);
+    }
+  }
+  // Same rootOf rule as budgets(): a replacement belongs to the root of the task it replaces;
+  // a cycle (only possible from a directly-journaled row) ends at the first revisited id.
+  const rootOf = (id, seen = new Set()) => { const t = taskView[id]; if (seen.has(id)) return id; seen.add(id); return t.replaces && taskView[t.replaces] ? rootOf(t.replaces, seen) : t.parent && taskView[t.parent] ? rootOf(t.parent, seen) : id; };
+  const roots = {};
+  for (const root of Object.values(taskView)) {
+    if (rootOf(root.id) !== root.id) continue;
+    const tree = Object.keys(taskView).filter(id => rootOf(id) === root.id);
+    const usage = {}, verdicts = [];
+    let starts = 0, rounds = 0, findings = 0, wall = null, isMeasured = true;
+    for (const id of tree) {
+      const t = perTask[id];
+      sumInto(usage, t.usage);
+      verdicts.push(...t.verdicts);
+      starts += t.starts; rounds += t.rounds; findings += t.findings;
+      if (!t.measured) isMeasured = false;
+      if (t.wall != null) wall = (wall ?? 0) + t.wall;
+    }
+    const tokens = ['input', 'cache_read', 'cache_write', 'output'].reduce((sum, key) => sum + (usage[key] || 0), 0);
+    // A1: rootRow is the same shape as a task row (task = the root's own id, state = the
+    // root task's own state), summed over the tree, plus tokens and tasks (count in the tree).
+    roots[root.id] = {task: root.id, state: taskView[root.id].state, usage, measured: isMeasured, starts, rounds, wall, findings, verdicts, tokens, tasks: tree.length};
+  }
+  return {tasks: perTask, roots};
+}
+
+// Pure escalation input: for every `running` task, the deadline/silence/stall verdicts computed
+// against `now`, given the scheduler's live (never-journaled) activity map — {task -> {at,
+// expectUntil}}. A `blocked` task yields a single minimal entry; everything else is omitted, not
+// zeroed, so the caller (scheduler tick()) only ever iterates actionable rows.
+export function watchdog(events, now, {activity = new Map(), watchdog: cfg} = {}) {
+  const taskView = tasks(events);
+  const result = [];
+  for (const t of Object.values(taskView)) {
+    if (t.state === 'blocked') { result.push({task: t.id, verdicts: ['blocked']}); continue; }
+    if (t.state !== 'running') continue;
+    const startedRows = events.filter(e => e.kind === 'task.started' && e.task === t.id);
+    if (!startedRows.length) continue;
+    const startedAt = Date.parse(startedRows[0].time);
+    const submitted = events.find(e => e.kind === 'task.submitted' && e.task === t.id);
+    const deadlineMs = submitted?.deadline ?? cfg.defaultDeadlineMs;
+    const deadlineAt = startedAt + deadlineMs;
+    let progressAt = Date.parse(startedRows.at(-1).time);
+    for (const e of events) {
+      if (e.task !== t.id) continue;
+      if (e.kind === 'task.milestone' || e.kind === 'task.usage' || e.kind === 'task.blocked') progressAt = Math.max(progressAt, Date.parse(e.time));
+      // A delivered message counts as progress only when it came from someone other than the
+      // watchdog itself: its own corrective nudge (§3) must never reset the very signature it
+      // was sent because of, or the escalation ladder could never reach grace/cancel.
+      else if (e.kind === 'task.delivered' && (e.tier === 'live' || e.tier === 'next-turn')) {
+        const message = events.find(m => m.kind === 'message' && m.id === e.message);
+        if (message?.from !== 'bounce') progressAt = Math.max(progressAt, Date.parse(e.time));
+      }
+    }
+    const act = activity.get(t.id);
+    const activityAt = Math.max(progressAt, act?.at ?? -Infinity);
+    const expectUntil = act?.expectUntil ?? null;
+    const elapsed = now - startedAt;
+    const verdicts = [];
+    if (now >= deadlineAt) verdicts.push('deadline');
+    const suppressed = expectUntil != null && now < expectUntil;
+    if (!suppressed) {
+      if (now - activityAt >= cfg.silence) verdicts.push('silent');
+      else if (now - progressAt >= cfg.stall) verdicts.push('stalled');
+    }
+    // F4/A7: absolute timestamps (a moment), never durations — lastActivityAt/lastProgressAt.
+    // The policy that consumes this row (scheduler tick()) is the one place that turns them
+    // into elapsed ms, under the duration names, inside its own evidence object.
+    if (verdicts.length) result.push({task: t.id, startedAt, deadlineAt, elapsed, lastActivityAt: activityAt, lastProgressAt: progressAt, expectUntil, verdicts});
+  }
+  return result;
+}
+
 export function cooldowns(events, now) {
   const result = {};
   for (const e of events) if (e.kind === 'cooldown') result[e.provider] = e.until;

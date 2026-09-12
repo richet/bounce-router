@@ -6,6 +6,20 @@ import {spawnLive, vendorEnv, verifiedCancel, appendPending, readPending, takePe
 
 const WRITE_WAIT = 2000; // how long a live push waits for the turn to take the message
 
+// CONTRACT.md #5: live adapters yield usage already normalized to {input, cache_read,
+// cache_write, output} — only the keys the vendor actually reported, integers — so
+// reducers.spend never has to know a vendor's field names. claude: input_tokens→input,
+// cache_read_input_tokens→cache_read, cache_creation_input_tokens→cache_write,
+// output_tokens→output. The classic normalizer (src/adapters/claude.js) keeps yielding the
+// raw vendor shape unchanged — only this live adapter maps it before yielding.
+const USAGE_FIELDS = [['input_tokens', 'input'], ['cache_read_input_tokens', 'cache_read'],
+  ['cache_creation_input_tokens', 'cache_write'], ['output_tokens', 'output']];
+const mapUsage = raw => {
+  const usage = {};
+  for (const [from, to] of USAGE_FIELDS) if (Number.isInteger(raw?.[from])) usage[to] = raw[from];
+  return usage;
+};
+
 // Single-quote for the shell the CLI runs the hook command in; a quote inside the path is closed,
 // escaped and reopened, so a task directory with spaces or quotes still writes to the right file.
 export const shellQuote = value => `'${String(value).replace(/'/g, "'\\''")}'`;
@@ -63,6 +77,7 @@ export function createClaudeLive({connect = nodeConnect, fs = nodeFs, kill = pro
             yield {kind: 'result', text: normalized.text, success: normalized.success, status: normalized.success ? 'completed' : 'failed'};
             continue;
           }
+          if (normalized.kind === 'usage') { yield {kind: 'usage', usage: mapUsage(normalized.usage)}; continue; }
           yield normalized;
         }
       }

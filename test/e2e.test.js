@@ -98,10 +98,12 @@ async function startOrchestratorDaemon(root, cwd, env = {}) {
 }
 
 // ---- E2 ------------------------------------------------------------------
-// The checkpoint is re-taken by dispatch BEFORE anything is reserved or launched
-// (src/scheduler.js:148-154), so there is no window in which a gated adapter could be held
-// open and the tree dirtied behind it: this probe takes the checkpoint on the clean tree and
-// dirties the tracked file before submitting, which is the alternative the brief names.
+// CONTRACT.md §4 (amendment A2): the availableStarts check and the reservation are one
+// synchronous span, before the checkpoint's own await — an await between check and
+// reservation would let two concurrent submits over-reserve the same root (see W8 in
+// test/watchdog.test.js). So a baseline refusal here DOES reserve, then releases what it
+// never consumed; this probe takes the checkpoint on the clean tree and dirties the tracked
+// file before submitting, which is the alternative the brief names.
 test('E2 baseline refusal: a task submitted against a checkpoint the tree no longer matches fails with reason "baseline" and never launches', async t => {
   const root = tmpRoot('bounce-e2-');
   const cwd = tmpRoot('bounce-e2-cwd-');
@@ -126,7 +128,7 @@ test('E2 baseline refusal: a task submitted against a checkpoint the tree no lon
 
   const trigger = path.join(root, 'finish-turn');
   const worker = fakeAdapter(() => []);
-  let session, taskId;
+  let session, taskId, scheduler;
   await withEnv({BOUNCE_HOME: root, FAKE_CLI_WAIT_FILE: trigger}, async () => {
     const done = supervise(['run', 'hi', '--json', '--cwd', cwd], {
       adapters: {fake: worker},
@@ -134,8 +136,9 @@ test('E2 baseline refusal: a task submitted against a checkpoint the tree no lon
         main: {adapter: 'codex', mode: 'yolo', fallback: []},
         build: {adapter: 'fake', mode: 'yolo', fallback: []},
       },
-      onReady: async ({session: s, scheduler}) => {
+      onReady: async ({session: s, scheduler: sch}) => {
         session = s;
+        scheduler = sch;
         taskId = scheduler.submit({parent: null, profile: 'build', orders: 'x', deadline: null, checkpoint}).task;
       },
     });
@@ -146,7 +149,15 @@ test('E2 baseline refusal: a task submitted against a checkpoint the tree no lon
       assert.equal(failed.reason, 'baseline');
       assert.equal(failed.text, 'tree differs from the task checkpoint');
       assert.equal(worker.calls.launch, 0, 'the adapter must never be launched against a drifted tree');
-      assert.equal(session.events.some(e => e.kind === 'budget.reserved' && e.task === taskId), false, 'the refusal precedes the reservation');
+      const kinds = session.events.filter(e => e.task === taskId).map(e => e.kind);
+      assert.deepEqual(kinds, ['task.submitted', 'budget.reserved', 'budget.released', 'task.failed']);
+      const released = session.events.find(e => e.kind === 'budget.released' && e.task === taskId);
+      assert.deepEqual(released.amount, {starts: 1});
+      assert.equal(released.text, 'baseline refusal');
+      // No `budget` on this submission: it's its own root with no declared allowance.
+      const budgets = scheduler.budgets().roots[taskId];
+      assert.equal(budgets.reserved.starts, 1);
+      assert.equal(budgets.released.starts, 1);
       assert.equal(session.events.some(e => e.kind === 'task.started' && e.task === taskId), false);
       assert.equal(session.events.some(e => e.kind === 'peer.joined' && e.name === `worker:${taskId}`), false);
     } finally {

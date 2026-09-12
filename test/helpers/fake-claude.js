@@ -14,6 +14,7 @@
 // FAKE_READY=<path>       touch this file once the SIGTERM disposition above is settled — a test
 //                         that cancels must gate on it, or it races the interpreter's boot
 // FAKE_STDERR_LINES=<n>   write n 1,000-character lines to stderr before finishing
+// FAKE_USAGE=<json>       usage object on the result line (default '{}' — vendor field names)
 import {execSync} from 'node:child_process';
 import {createServer} from 'node:net';
 import fs from 'node:fs';
@@ -59,7 +60,8 @@ const start = async () => {
   // is the one a cancel will actually meet. A cancelling test must gate on this marker.
   if (process.env.FAKE_READY) fs.writeFileSync(process.env.FAKE_READY, 'ready');
   if (process.env.FAKE_HOLD === '1') { setInterval(() => {}, 1000); return; }
-  console.log(JSON.stringify({type: 'result', subtype: 'success', is_error: false, result: 'ok', session_id: sessionId, usage: {}}));
+  const usage = process.env.FAKE_USAGE ? JSON.parse(process.env.FAKE_USAGE) : {};
+  console.log(JSON.stringify({type: 'result', subtype: 'success', is_error: false, result: 'ok', session_id: sessionId, usage}));
   process.exitCode = 0;
 };
 start();

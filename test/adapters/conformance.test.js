@@ -72,6 +72,46 @@ for (const [name, {make, executable, env}] of Object.entries(adapters)) {
   });
 }
 
+// Phase 5 (CONTRACT.md #5, #6): live adapters map the vendor usage shape onto
+// {input, cache_read, cache_write, output} (integer values only, absent keys stay absent)
+// before yielding, so reducers.spend never sees a vendor field name. muse yields no usage
+// at all. The fakes' default usage lines carry no real fields (claude: '{}', codex:
+// {input_tokens:1, output_tokens:1}, no cache_read) so FAKE_USAGE drives real vendor field
+// names through the fakes here — a real conformance case, not a trivial empty-to-empty pass.
+const usageEnv = {
+  claude: {FAKE_SESSION: 'sess-conf-usage', FAKE_USAGE: JSON.stringify({
+    input_tokens: 11, cache_read_input_tokens: 3, cache_creation_input_tokens: 2, output_tokens: 7})},
+  codex: {FAKE_USAGE: JSON.stringify({input_tokens: 11, cached_input_tokens: 3, output_tokens: 7})},
+  muse: {},
+};
+const expectedUsage = {
+  claude: {input: 11, cache_read: 3, cache_write: 2, output: 7},
+  codex: {input: 11, cache_read: 3, output: 7},
+};
+for (const [name, {make, executable}] of Object.entries(adapters)) {
+  test(`${name}: usage events normalize to {input, cache_read, cache_write, output} only, integers, only vendor-reported keys`, async t => {
+    const {session} = setup(t);
+    const env = usageEnv[name];
+    const saved = {...process.env}; Object.assign(process.env, env); t.after(() => { for (const k of Object.keys(env)) delete process.env[k]; Object.assign(process.env, saved); });
+    const adapter = make();
+    const scheduler = createScheduler({session, adapters: {[name]: adapter}, profiles: {p: {adapter: name, model: '', mode: 'yolo', fallback: [], executables: {[name]: executable}}}});
+    t.after(async () => { await scheduler.cancel(row.task); scheduler.close(); });
+    const row = scheduler.submit({parent: null, profile: 'p', orders: 'say hello'});
+    await waitFor(() => ['completed', 'failed'].includes(scheduler.tasks()[row.task].state));
+    const usageRows = session.events.filter(e => e.kind === 'task.usage' && e.task === row.task);
+    if (name === 'muse') { assert.deepEqual(usageRows, [], 'muse yields no usage events'); return; }
+    assert.equal(usageRows.length >= 1, true, 'the adapter must yield at least one usage event');
+    for (const usageRow of usageRows) {
+      const allowed = new Set(['input', 'cache_read', 'cache_write', 'output']);
+      for (const [key, value] of Object.entries(usageRow.usage)) {
+        assert.equal(allowed.has(key), true, `unexpected usage key ${key}`);
+        assert.equal(Number.isInteger(value), true, `usage.${key} must be an integer`);
+      }
+    }
+    assert.deepEqual(usageRows[0].usage, expectedUsage[name]);
+  });
+}
+
 // muse's resume used to re-create the task dir itself ("dir may not exist" — Phase 3 leftover,
 // since resume was not yet scheduler-driven). Phase 4 makes resume scheduler-driven like launch,
 // so that workaround must be gone: resume must fail rather than silently paper over a missing dir.

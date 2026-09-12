@@ -1,6 +1,24 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {peers, tasks, budgets, cooldowns} from '../src/reducers.js';
+import {peers, tasks, budgets, cooldowns, watchdog} from '../src/reducers.js';
+
+// F4/A7: the reducer's own row fields hold absolute timestamps (a moment), not durations —
+// named lastActivityAt/lastProgressAt so nothing reads them as elapsed ms by mistake. The
+// policy's own evidence object (src/scheduler.js) is the only place the duration names survive.
+test('watchdog row fields lastActivityAt/lastProgressAt are absolute timestamps, not durations', () => {
+  const events = [
+    {kind: 'task.submitted', task: 't1', time: '1970-01-01T00:00:00.000Z', deadline: null},
+    {kind: 'task.started', task: 't1', time: '1970-01-01T00:00:00.000Z', attempt: 1},
+  ];
+  const now = 130000; // 130s: past the 120s silence threshold with no activity/progress at all
+  const rows = watchdog(events, now, {activity: new Map(), watchdog: {silence: 120000, stall: 600000, defaultDeadlineMs: 900000}});
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].lastActivityAt, 0); // the task's own first task.started, in ms
+  assert.equal(rows[0].lastProgressAt, 0);
+  assert.equal('sinceActivity' in rows[0], false);
+  assert.equal('sinceProgress' in rows[0], false);
+  assert.deepEqual(rows[0].verdicts, ['silent']);
+});
 
 test('peers folds joined, native and left by peer name, later rows winning', () => {
   const events = [

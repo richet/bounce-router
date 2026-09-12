@@ -21,6 +21,16 @@ const REQUESTS = {
   turnInterrupt: threadId => ({method: 'turn/interrupt', params: {threadId}}),
 };
 
+// CONTRACT.md #5: same usage-mapping obligation as claude-live.js, codex's own vendor field
+// names — input_tokens→input, cached_input_tokens→cache_read, output_tokens→output (codex
+// reports no cache_write). The classic normalizer (src/adapters/codex.js) is unchanged.
+const USAGE_FIELDS = [['input_tokens', 'input'], ['cached_input_tokens', 'cache_read'], ['output_tokens', 'output']];
+const mapUsage = raw => {
+  const usage = {};
+  for (const [from, to] of USAGE_FIELDS) if (Number.isInteger(raw?.[from])) usage[to] = raw[from];
+  return usage;
+};
+
 const MAX_LINE = 1024 * 1024; // a line this long is a protocol fault, not a message
 const MAX_QUEUE = 50;
 const INTERRUPT_MS = 1000; // how long the polite interrupt gets before the signals start
@@ -92,6 +102,7 @@ function rows(handle, message) {
   for (const event of codex.normalize(message)) {
     if (event.kind === 'peer.native') handle.stream.push({kind: 'native', provider: 'codex', sessionId: event.sessionId});
     else if (event.kind === 'result') continue; // a turn's end is decided in receive(), by the queue
+    else if (event.kind === 'usage') handle.stream.push({kind: 'usage', usage: mapUsage(event.usage)});
     else {
       if (event.kind === 'assistant') handle.lastAssistant = event.text;
       handle.stream.push(event);
