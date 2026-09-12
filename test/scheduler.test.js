@@ -442,3 +442,13 @@ test('T7: worker raw and model events reach the journal with provider and task; 
   assert.equal(session.events.find(e => e.kind === 'task.started' && e.task === row.task).requested, 'sonnet');
   assert.equal(fs.readFileSync(session.file, 'utf8').split('\n').filter(l => l.includes('"kind":"raw"')).length, 1);
 });
+
+test('T7 critic minors: a raw event without raw journals raw: null; a non-string model is coerced', async t => {
+  const {session} = setup(t);
+  const adapter = fakeAdapter(() => [{kind: 'raw'}, {kind: 'model', model: 12345}, {kind: 'result', status: 'completed', text: 'ok'}]);
+  const scheduler = createScheduler({session, adapters: {a: adapter}, profiles: {p: {adapter: 'a', mode: 'yolo', fallback: []}}});
+  const row = scheduler.submit({parent: null, profile: 'p', orders: 'x'});
+  await waitFor(() => scheduler.tasks()[row.task].state === 'completed');
+  assert.equal(session.events.find(e => e.kind === 'raw' && e.task === row.task).raw, null);
+  assert.equal(session.events.find(e => e.kind === 'model' && e.task === row.task).model, '12345');
+});

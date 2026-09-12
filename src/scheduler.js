@@ -1,5 +1,6 @@
 import {randomUUID} from 'node:crypto';
 import * as reducers from './reducers.js';
+import {takeCheckpoint, sameTree} from './checkpoint.js';
 
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'timed_out']);
 const FALLBACK_REASONS = new Set(['limited', 'missing', 'backend_unavailable']);
@@ -7,7 +8,7 @@ const FALLBACK_REASONS = new Set(['limited', 'missing', 'backend_unavailable']);
 // Dispatch, fallback, permission ratchet, cancellation and reconcile as policies over the
 // log, driven by adapters. Everything the scheduler knows is re-derived from session.events
 // via the reducers — it keeps only a live-handle map, which cannot survive a restart by design.
-export function createScheduler({session, adapters, profiles, sessionMode = 'yolo', depthCap = 1}) {
+export function createScheduler({session, adapters, profiles, sessionMode = 'yolo', depthCap = 1, checkpointRunner}) {
   const handles = new Map(); // task -> {adapter, handle}
   const workerFrom = task => `worker:${task}`;
   const submittedRow = task => session.events.find(e => e.kind === 'task.submitted' && e.task === task);
@@ -35,6 +36,7 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
       deadline: spec.deadline ?? null,
       budget: spec.budget,
       replaces: spec.replaces ?? null,
+      checkpoint: spec.checkpoint ?? null,
       ref: spec.ref,
     });
   }
@@ -119,6 +121,16 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
       session.append({kind: 'task.failed', task, reason: 'budget', text: 'root budget exhausted', context});
       return;
     }
+    // A checkpoint on the row means the task was submitted against a specific tree state:
+    // never launch a worker against a tree that has since drifted (tests/check are not part
+    // of the comparison — only head/status/diff, via sameTree).
+    if (row.checkpoint) {
+      const current = await takeCheckpoint({cwd: session.cwd, run: checkpointRunner});
+      if (!sameTree(row.checkpoint, current)) {
+        session.append({kind: 'task.failed', task, reason: 'baseline', text: 'tree differs from the task checkpoint', context});
+        return;
+      }
+    }
     session.append({kind: 'budget.reserved', task, root, amount: {starts: 1}, context});
 
     const adapter = adapters[profile.adapter];
@@ -147,8 +159,8 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
         switch (event.kind) {
           case 'activity': session.publish({kind: 'task.activity', task, text: event.text, from, context}); break;
           // Quota rides on the vendor stream; journaling the worker's raw lines with its provider lets recordQuota see them exactly as it sees the main provider's.
-          case 'raw': session.append({kind: 'raw', raw: event.raw, provider: profile.adapter, task, from, context}); break;
-          case 'model': session.append({kind: 'model', model: event.model, provider: profile.adapter, task, from, context}); break;
+          case 'raw': session.append({kind: 'raw', raw: event.raw ?? null, provider: profile.adapter, task, from, context}); break;
+          case 'model': session.append({kind: 'model', model: String(event.model), provider: profile.adapter, task, from, context}); break;
           case 'milestone': session.append({kind: 'task.milestone', task, text: event.text, evidence: event.evidence, from, context}); break;
           case 'blocked': session.append({kind: 'task.blocked', task, text: event.text, from, context}); break;
           case 'usage': session.append({kind: 'task.usage', task, usage: event.usage, from, context}); break;
