@@ -2,8 +2,9 @@ import {spawn as nodeSpawn} from 'node:child_process';
 import {mkdirSync, writeFileSync} from 'node:fs';
 import {join} from 'node:path';
 import {invocation, normalize} from '../providers.js';
+import {resolveExecutable} from '../executable.js';
 import muse from './muse.js';
-import {appendPending, promptSafe, readPending, spawnLive, takePending, vendorEnv, verifiedCancel} from './live-common.js';
+import {TEXT_MAX, appendPending, promptSafe, readPending, spawnLive, takePending, vendorEnv, verifiedCancel} from './live-common.js';
 
 const field = value => value === undefined || value === null || value === '' ? 'none' : promptSafe(value);
 
@@ -19,6 +20,12 @@ async function* museEvents(live) {
       yield {kind: 'raw', raw};
       for (const normalized of normalize('muse', raw)) {
         sawResult ||= normalized.kind === 'result';
+        // The scheduler only recognizes the adapter-event spelling 'native' (see scheduler.js);
+        // the provider layer emits the journal spelling 'peer.native'.
+        if (normalized.kind === 'peer.native') { yield {kind: 'native', provider: normalized.provider, sessionId: normalized.sessionId}; continue; }
+        // Same gap for 'result': the provider layer reports success/failure as a boolean, but the
+        // scheduler (and the exit-code fallback below) only ever look at event.status.
+        if (normalized.kind === 'result') { yield {kind: 'result', text: normalized.text, status: normalized.success ? 'completed' : 'failed'}; continue; }
         yield normalized;
       }
     } else if (event.kind === 'diagnostic') yield event;
@@ -30,8 +37,9 @@ async function* museEvents(live) {
 export function createMuseLive({spawn = nodeSpawn, kill = process.kill} = {}) {
   // `muse` reads its prompt from --prompt-file, never stdin, so no shell is ever involved.
   const start = ({promptFile, profile = {}, cwd, dir, native}) => new Promise((resolve, reject) => {
+    const executable = resolveExecutable('muse', profile.executables?.muse);
     const args = invocation('muse', {model: profile.model, mode: profile.mode}, promptFile);
-    const live = spawnLive({executable: 'muse', args, cwd, env: vendorEnv(), stdin: muse.stdin(), spawn});
+    const live = spawnLive({executable, args, cwd, env: vendorEnv(), stdin: muse.stdin(), spawn});
     // A spawn failure is the one outcome the caller cannot act on through the stream:
     // the scheduler maps `.code === 'missing'` to task.failed{reason:'missing'}.
     live.child.once('error', error => {
@@ -39,15 +47,19 @@ export function createMuseLive({spawn = nodeSpawn, kill = process.kill} = {}) {
       failure.code = error.code === 'ENOENT' ? 'missing' : error.code;
       reject(failure);
     });
-    live.child.once('spawn', () => resolve({handle: {
+    // C1: launch/resume resolve to the handle itself, never {handle}.
+    live.child.once('spawn', () => resolve({
       child: live.child, dir, args, promptFile, native: native ?? null, events: museEvents(live),
-    }}));
+    }));
   });
 
   return {
     name: 'muse',
 
     async launch({peer, profile, orders, cwd, dir}) {
+      // C2: dir is the scheduler's, already created (0700) before launch. Kept defensively
+      // (recursive, so a no-op against an existing 0700 dir) because launch writes orders.txt
+      // into dir itself and the conformance suite's direct-call case doesn't pre-create it.
       mkdirSync(dir, {recursive: true, mode: 0o700});
       const promptFile = join(dir, 'orders.txt');
       writeFileSync(promptFile, orders);
@@ -61,13 +73,17 @@ export function createMuseLive({spawn = nodeSpawn, kill = process.kill} = {}) {
     // claim is a file the next launch reads. A refused append (cap or size) still reports
     // 'queued' — the tier describes the channel, not whether this message made the cut.
     async deliver(handle, {text}) {
-      appendPending(join(handle.dir, 'pending.jsonl'), String(text));
+      // C4: coerce first, then cap — a text over TEXT_MAX is queued without ever touching the file.
+      const value = String(text);
+      if (value.length > TEXT_MAX) return 'queued';
+      appendPending(join(handle.dir, 'pending.jsonl'), value);
       return 'queued';
     },
 
     // Re-launch, not a native continuation: the prompt is a compact checkpoint —
     // last milestone, blocker and the queued messages — never a transcript.
     async resume({native, message, cwd, dir, profile, checkpoint = {}}) {
+      // Kept here (unlike launch): resume is not yet scheduler-driven (Phase 4), so dir may not exist.
       mkdirSync(dir, {recursive: true, mode: 0o700});
       // Every peer-supplied line is flattened: nothing queued may forge the template.
       const pending = takePending(join(dir, 'pending.jsonl')).map(promptSafe);
