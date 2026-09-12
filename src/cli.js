@@ -14,7 +14,7 @@ import {spawn} from 'node:child_process';
 import {emitKeypressEvents} from 'node:readline';
 import {parseArgs} from 'node:util';
 import {Session, Router, config, saveJSON, dataRoot} from './core.js';
-import {providers} from './providers.js';
+import {providers, runProcess} from './providers.js';
 import {projectRoot, fingerprint, validate, supervise, pidAlive} from './reload.js';
 import {createRemoteSession} from './remote.js';
 import {version, checkUpdate, globalInstall, installUpdate} from './update.js';
@@ -86,7 +86,11 @@ function listSessions(root) {
       let daemon = null;
       try { daemon = JSON.parse(fs.readFileSync(path.join(dir, id, 'daemon.json'), 'utf8')); } catch {}
       const live = !!(daemon && pidAlive(daemon.pid));
+      // Which operation mode a session ran under is a fold over its own log, so it survives
+      // the daemon that wrote it (daemon.json is removed on a clean exit).
+      const operation = s.events.findLast(e => e.kind === 'operation');
       return [{id, cwd: s.cwd, updated: s.events.at(-1)?.time, live, pid: live ? daemon.pid : undefined,
+        operation: operation?.operation ?? 'classic', orchestrator: operation?.orchestrator ?? null,
         prompt: s.events.find(e => e.kind === 'user')?.text?.slice(0, 80) ?? '(empty)'}];
     }
     catch { return []; }
@@ -166,14 +170,35 @@ async function main() {
   // BOUNCE_REMOTE_SESSION is a distinct flag from BOUNCE_SUPERVISED (which also covers
   // the legacy TUI restart loop, src/reload.js's legacySupervise, that hosts no real
   // session over IPC): only src/reload.js's daemonSupervise sets it, for `run`. This
-  // child never receives BOUNCE_BUS/BOUNCE_BUS_TOKEN_FILE — those stay in daemon.json
-  // for attach/stop only, so a vendor CLI spawned as this process's own child can never
-  // inherit bus authority (see T3b rework round 2, BLOCKER).
+  // child never receives BOUNCE_BUS/BOUNCE_BUS_TOKEN_FILE in classic mode — those stay in
+  // daemon.json for attach/stop only, so a vendor CLI spawned as this process's own child can
+  // never inherit bus authority (see T3b rework round 2, BLOCKER). Orchestrator mode is the one
+  // exception: this child holds the orchestrator grant and hands it on to its own CLI (below).
+  //
+  // Orchestrator mode (T3b): the supervisor validated the profile table and serialized the
+  // orchestrator's own profile here, so the main conversation runs on that adapter/model/mode.
+  // Both vars are set (or removed) by the supervisor on every spawn from the validated config,
+  // so this is the config's decision, never something inherited from the surrounding shell.
+  // In orchestrator mode the profile table is authoritative over config.models/order/mode: the
+  // profile is what the session was validated against, so it wins over the legacy fields here.
+  const orchestrating = process.env.BOUNCE_ROLE === 'orchestrator' && !!process.env.BOUNCE_ORCHESTRATOR_PROFILE;
+  if (orchestrating) {
+    const profile = JSON.parse(process.env.BOUNCE_ORCHESTRATOR_PROFILE);
+    settings.order = [profile.adapter];
+    settings.models[profile.adapter] = profile.model;
+    settings.mode = profile.mode;
+  }
   let session = process.env.BOUNCE_REMOTE_SESSION === '1'
     ? await createRemoteSession(process)
     : new Session(cwd, {root, id: restarted?.id ?? values.resume});
   session.lock();
-  let router = new Router(session, settings);
+  // The orchestrator's CLI is a peer, not a plain vendor process: keepBus is the single
+  // documented exception to runProcess's env strip (src/providers.js).
+  const routerOptions = orchestrating ? {runner: options => runProcess({...options, keepBus: true})} : {};
+  let router = new Router(session, settings, routerOptions);
+  const orchestratorBrief = orchestrating
+    ? `You are the orchestrator peer of session ${session.id}; the bounce bridge is available via BOUNCE_BUS/BOUNCE_BUS_TOKEN_FILE; see ${path.join(session.dir, 'orchestrator', 'ORDERS.md')}.\n`
+    : '';
   if (restarted?.provider || values.provider) session.active = restarted?.provider || values.provider;
   process.on('exit', () => session.unlock?.());
   // Quota readings survive restarts, so the display starts with the last known usage.
@@ -187,7 +212,7 @@ async function main() {
     };
     const cancel = () => router.cancel();
     process.on('SIGINT', cancel); process.on('SIGTERM', cancel);
-    try { const result = await router.run(positionals.slice(1).join(' '), values.image || []); process.exitCode = result === 'completed' ? 0 : result === 'cancelled' ? 130 : 1; }
+    try { const result = await router.run(orchestratorBrief + positionals.slice(1).join(' '), values.image || []); process.exitCode = result === 'completed' ? 0 : result === 'cancelled' ? 130 : 1; }
     finally { session.unlock(); process.off('SIGINT', cancel); process.off('SIGTERM', cancel); }
     // `run` is always this process's whole job, and under the supervisor's daemon
     // apparatus this session is a RemoteSession that keeps the IPC channel actively
@@ -455,7 +480,7 @@ async function main() {
           if (!arg) throw new Error('Use /note TEXT'); session.append({kind: 'note', text: arg});
         } else if (command === 'new') {
           const next = new Session(session.cwd, {root}); next.lock(); session.unlock(); session = next;
-          router = new Router(session, settings); session.onEvent = scheduleRender; scroll = 0;
+          router = new Router(session, settings, routerOptions); session.onEvent = scheduleRender; scroll = 0;
         } else if (command === 'login') {
           // Validate before the screen flips, so a typo never drops the user out of the TUI.
           const provider = arg || selected();
@@ -475,7 +500,7 @@ async function main() {
       } else {
         history.push(text); historyIndex = -1; scroll = 0;
         notice = 'Running · Esc or Ctrl+C cancels the agent process group';
-        render(); const result = await router.run(text); notice = `Turn ${result}. Session saved.`;
+        render(); const result = await router.run(orchestratorBrief + text); notice = `Turn ${result}. Session saved.`;
         void refreshQuota(settings, {root, store: quotas, cwd: session.cwd}).then(render, () => {});
         if (dev && result === 'completed' && fingerprint() !== loadedFingerprint) await restart();
       }

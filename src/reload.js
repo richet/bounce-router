@@ -7,6 +7,8 @@ import {spawn} from 'node:child_process';
 import {parseArgs} from 'node:util';
 import {Session, config, dataRoot} from './core.js';
 import {createBus, connectBus} from './bus.js';
+import {validateOrchestration} from './profiles.js';
+import {providers} from './providers.js';
 import {createScheduler} from './scheduler.js';
 import {hostSession} from './remote.js';
 
@@ -77,6 +79,32 @@ export function buildProfiles(settings) {
   return {main: {adapter: settings.order[0], mode: settings.mode, fallback: settings.order.slice(1)}};
 }
 
+// The four rows that end a task, mirroring src/reducers.js's own switch — `timed_out` is a
+// derived state, not a kind: the row that produces it is `task.deadline`.
+const TERMINAL_KINDS = new Set(['task.completed', 'task.failed', 'task.cancelled', 'task.deadline']);
+// Set explicitly on every spawned child, from the validated config alone: whatever the daemon's
+// own environment carries, the child's operation mode is never inherited (T3b rework, item 1).
+const ORCHESTRATOR_ENV = ['BOUNCE_BUS', 'BOUNCE_BUS_TOKEN_FILE', 'BOUNCE_ROLE', 'BOUNCE_ORCHESTRATOR_PROFILE'];
+
+// The orchestrator profile's standing brief, written once per daemon start: where its skill
+// lives and how to reach the bridge. The prompt line cli.js prepends points at this file.
+function writeOrders({session, root, bus, grant}) {
+  const dir = path.join(session.dir, 'orchestrator');
+  fs.mkdirSync(dir, {recursive: true, mode: 0o700});
+  const file = path.join(dir, 'ORDERS.md');
+  fs.writeFileSync(file, [
+    `# Orchestrator orders — session ${session.id}`, '',
+    `Skill: ${path.join(root, 'skills', 'agent-orchestrator', 'SKILL.md')}`, '',
+    'Bridge (already in your environment):',
+    `    BOUNCE_BUS=${bus.path}`,
+    `    BOUNCE_BUS_TOKEN_FILE=${grant.file}`, '',
+    'Submit work with `bounce publish --event <json>` and wait for it with `bounce wait --match <json>`.',
+    'You may publish only: task.submitted, task.milestone, task.blocked, task.input_required, task.usage, task.activity, message.',
+    'Everything else is refused — `user`, `control.*`, and every task lifecycle row the scheduler owns.',
+  ].join('\n') + '\n', {mode: 0o600});
+  return file;
+}
+
 // Enforces that only the `user` peer may publish control.* — src/bus.js has no notion
 // of peer roles beyond task ownership, so this authority lives here (see T3b orders,
 // "Prohibitions and open questions"). Exported so test/daemon.test.js can drive it
@@ -135,17 +163,47 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   const detachedDaemon = process.env.BOUNCE_DETACHED === '1';
   const root = dataRoot();
   const settings = config(root);
+  const adapters = {...extraAdapters};
+  // Validated once, before anything is created: an invalid orchestration config throws out of
+  // supervise() (cli.js prints it and exits 1) with no session, daemon.json or socket behind it.
+  // Adapter names are the task adapters plus the legacy provider names, so a production profile
+  // naming claude/codex/muse validates before its live adapter is registered; such a profile then
+  // fails at dispatch as task.failed{reason:'missing'}, which is the intended behavior.
+  const orchestration = validateOrchestration(settings, [...new Set([...Object.keys(adapters), ...Object.keys(providers)])]);
+  const orchestrating = orchestration.operation === 'orchestrator';
   const cwd = fs.realpathSync(values.cwd || process.cwd());
   const session = new Session(cwd, {root, id: values.resume});
   session.lock();
 
-  const adapters = {...extraAdapters};
-  const profiles = profileOverride ?? buildProfiles(settings);
+  const profiles = profileOverride ?? (orchestrating ? orchestration.profiles : buildProfiles(settings));
 
   const bus = await createBus({session, dir: session.dir});
   const scheduler = createScheduler({session, adapters, profiles, sessionMode: settings.mode});
   const userGrant = bus.grant({peer: 'user', canSubmit: true, tasks: [], context: session.id});
   writeDaemonJson(session.dir, {pid: process.pid, bus: bus.path, started: new Date().toISOString(), userToken: userGrant.file});
+
+  // Orchestrator mode: the main conversation is a peer, not a plain vendor session. It gets the
+  // orchestrator grant (canSubmit, its own context, no tasks — never the user grant), its profile
+  // to run on, and a standing brief on disk; classic mode reaches none of this.
+  const orchestratorProfile = orchestrating ? orchestration.profiles[orchestration.orchestrator] : null;
+  const orchestratorGrant = orchestrating ? bus.grant({peer: 'orchestrator', canSubmit: true, tasks: [], context: session.id}) : null;
+  if (orchestrating) writeOrders({session, root, bus, grant: orchestratorGrant});
+  if (orchestrating) session.append({kind: 'operation', operation: 'orchestrator', orchestrator: orchestration.orchestrator, shape: orchestration.shape, text: `Operation: orchestrator on ${orchestration.orchestrator} (${orchestration.shape})`});
+
+  // Worker grants are the dispatch policy expressed on the bus: a task that starts gets a grant
+  // scoped to itself alone, and any terminal row revokes it. The orchestrator's own grant is
+  // widened in place as it opens tasks, so it can report on its work and on nothing else. The
+  // scheduler stays unaware of the bus; token paths are daemon-side state, never journaled.
+  const workerTokens = new Map(); // peer -> token file, for the life of that worker's grant
+  const grantsUnsubscribe = !orchestrating ? () => {} : session.subscribe(row => {
+    if (row.kind === 'task.submitted' && row.from === 'orchestrator') bus.extendGrant('orchestrator', [row.task]);
+    else if (row.kind === 'task.started') {
+      const peer = `worker:${row.task}`;
+      workerTokens.set(peer, bus.grant({peer, tasks: [row.task], context: row.context}).file);
+    } else if (TERMINAL_KINDS.has(row.kind) && workerTokens.delete(`worker:${row.task}`)) {
+      void bus.revoke(`worker:${row.task}`);
+    }
+  });
 
   let unverifiedOnStop = [];
   let currentChild = null;
@@ -158,8 +216,14 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
     finished = true;
     process.exitCode = code;
     stopUnsubscribe();
+    grantsUnsubscribe();
     scheduler.close();
     process.off('SIGTERM', onSigterm); process.off('SIGINT', onSigterm);
+    // Every grant this daemon minted goes away with it: the worker and orchestrator grants
+    // explicitly here, the user grant with bus.close(), which unlinks every remaining token file.
+    for (const peer of workerTokens.keys()) await bus.revoke(peer).catch(() => {});
+    workerTokens.clear();
+    if (orchestratorGrant) await bus.revoke('orchestrator').catch(() => {});
     await bus.close().catch(() => {});
     session.unlock();
     if (unverifiedOnStop.length) writeDaemonJson(session.dir, {pid: process.pid, bus: bus.path, started: new Date().toISOString(), userToken: userGrant.file, unverified: unverifiedOnStop});
@@ -218,14 +282,22 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   for (;;) {
     if (finished) break;
     const childArgs = args.filter(a => a !== '--detach');
+    const childEnv = {
+      ...process.env, BOUNCE_SUPERVISED: '1', BOUNCE_REMOTE_SESSION: '1',
+      BOUNCE_RESTART: resume ? JSON.stringify(resume) : '',
+    };
+    // Removed first, then set only in orchestrator mode: a classic run must not inherit a stale
+    // (or hostile) BOUNCE_ROLE/BOUNCE_BUS from whoever started the daemon.
+    for (const key of ORCHESTRATOR_ENV) delete childEnv[key];
+    if (orchestratorProfile) Object.assign(childEnv, {
+      BOUNCE_BUS: bus.path, BOUNCE_BUS_TOKEN_FILE: orchestratorGrant.file,
+      BOUNCE_ROLE: 'orchestrator', BOUNCE_ORCHESTRATOR_PROFILE: JSON.stringify(orchestratorProfile),
+    });
     const outcome = await new Promise(resolvePromise => {
       let request, update;
       const child = spawnChild(process.execPath, [cliPath, ...childArgs], {
         stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
-        env: {
-          ...process.env, BOUNCE_SUPERVISED: '1', BOUNCE_REMOTE_SESSION: '1',
-          BOUNCE_RESTART: resume ? JSON.stringify(resume) : '',
-        },
+        env: childEnv,
       });
       currentChild = child;
       const host = hostSession({session, child});

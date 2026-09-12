@@ -14,11 +14,15 @@ export function normalize(provider, raw) {
 }
 
 // Only error channels are classified as exhaustion. Assistant/tool text can quote errors.
-export function runProcess({provider, executable = provider, args, prompt, cwd, signal, emit}) {
+export function runProcess({provider, executable = provider, args, prompt, cwd, signal, emit, keepBus = false}) {
   return new Promise(resolve => {
     let failed = false, limited = false, terminal = false, stderr = '', closed = false;
-    // A vendor CLI must never see the bus or a grant: it acts through its own adapter, not as a peer.
-    const {BOUNCE_BUS, BOUNCE_BUS_TOKEN_FILE, BOUNCE_REMOTE_SESSION, ...env} = process.env;
+    // A vendor CLI must never see the bus, a grant, or the role/profile that would make a nested
+    // bounce believe it is the orchestrator: it acts through its own adapter, not as a peer.
+    // The single exception (T3b): the orchestrator profile's own CLI *is* a peer — it holds the
+    // orchestrator grant and talks to the bridge — so only that one child keeps BOUNCE_BUS*.
+    const {BOUNCE_BUS, BOUNCE_BUS_TOKEN_FILE, BOUNCE_REMOTE_SESSION, BOUNCE_ROLE, BOUNCE_ORCHESTRATOR_PROFILE, ...env} = process.env;
+    if (keepBus && BOUNCE_BUS !== undefined) { env.BOUNCE_BUS = BOUNCE_BUS; env.BOUNCE_BUS_TOKEN_FILE = BOUNCE_BUS_TOKEN_FILE; }
     const child = spawn(executable, args, {cwd, env, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe']});
     const finish = result => { if (!closed) { closed = true; clearTimeout(killTimer); signal?.removeEventListener('abort', cancel); resolve(result); } };
     let killTimer;

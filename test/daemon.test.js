@@ -381,3 +381,240 @@ test('D10 SIGTERM to a daemon with a running task cancels it and removes bus.soc
   // there is no foreground parent to synchronously observe this background process's
   // own exit code against, so this test only checks the cleanup side effects.
 });
+
+// ---- T3b orchestrator mode (O1-O6) ---------------------------------------
+// The orchestrator profile is hosted as the main peer: its vendor CLI is a stand-in
+// (test/helpers/fake-orchestrator-cli.js) that holds the orchestrator grant and drives
+// the bridge, while the worker it delegates to runs on a fake task adapter injected
+// through supervise()'s own {adapters} seam. No real vendor CLI is ever spawned.
+const fakeOrchestratorCli = fileURLToPath(new URL('./helpers/fake-orchestrator-cli.js', import.meta.url));
+
+function writeOrchestratorConfig(root, {orchestrator = 'main', profiles, order = ['codex']} = {}) {
+  fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify({
+    order, mode: 'yolo', models: {}, cooldownMinutes: 30, contextChars: 48000,
+    executables: Object.fromEntries(order.map(p => [p, fakeOrchestratorCli])),
+    skills: {scope: 'user', autoSync: false},
+    operation: 'orchestrator', orchestrator, profiles,
+  }));
+}
+
+const completingAdapter = () => ({
+  async launch() { return {}; },
+  async *events() { yield {kind: 'result', status: 'completed', text: 'child done'}; },
+  async cancel() { return {verified: true}; },
+});
+
+// Runs one whole orchestrator-mode session in this process (real spawned child, real bus,
+// injected worker adapters) and returns the supervisor's own Session.
+async function runOrchestratorSession(root, {adapters, env = {}}) {
+  let session;
+  await withEnv({BOUNCE_HOME: root, FAKE_ORCH_MODE: 'submit', FAKE_ORCH_PROFILE: 'build', ...env}, async () => {
+    await Promise.race([
+      supervise(['run', 'go'], {adapters, onReady: async ({session: s}) => { session = s; }}),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('orchestrator run did not finish within 25s')), 25000)),
+    ]);
+  });
+  return session;
+}
+
+const ABSENT_ORCHESTRATOR_ENV = {BOUNCE_BUS: 'absent', BOUNCE_BUS_TOKEN_FILE: 'absent', BOUNCE_ROLE: 'absent', BOUNCE_ORCHESTRATOR_PROFILE: 'absent'};
+
+function writeClassicConfig(root) {
+  fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify({
+    order: ['codex'], mode: 'yolo', models: {}, cooldownMinutes: 30, contextChars: 48000,
+    executables: {codex: fakeOrchestratorCli}, skills: {scope: 'user', autoSync: false},
+  }));
+}
+
+test('O1 classic: the main child gets no bus, token file, role or profile, and the journal has one user row', async t => {
+  const root = tmpRoot('bounce-o1-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  writeClassicConfig(root);
+  const {code, stdout} = await run(['run', 'hi', '--json'], bounceEnv(root, {FAKE_ORCH_MODE: 'env'}));
+  assert.equal(code, 0);
+  const rows = stdout.trim().split('\n').filter(Boolean).map(l => JSON.parse(l));
+  assert.deepEqual(JSON.parse(rows.find(r => r.kind === 'assistant').text), ABSENT_ORCHESTRATOR_ENV);
+  const dir = path.join(root, 'sessions', fs.readdirSync(path.join(root, 'sessions'))[0]);
+  const journal = fs.readFileSync(path.join(dir, 'journal.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l));
+  assert.equal(journal.filter(r => r.kind === 'user').length, 1);
+  assert.equal(journal.some(r => r.kind === 'task.submitted'), false);
+});
+
+// Rework round 1, item 1: the child's operation mode is decided by the validated config alone.
+// A parent environment that already carries all four orchestrator vars (a nested bounce, an
+// exported shell var, a stale export) must not smuggle orchestrator authority into a classic run.
+test('O7 classic with all four orchestrator env vars pre-set in the parent: the vendor CLI still sees none', async t => {
+  const root = tmpRoot('bounce-o7-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  writeClassicConfig(root);
+  const {code, stdout} = await run(['run', 'hi', '--json'], bounceEnv(root, {
+    FAKE_ORCH_MODE: 'env',
+    BOUNCE_BUS: '/tmp/smuggled.sock', BOUNCE_BUS_TOKEN_FILE: '/tmp/smuggled.token',
+    BOUNCE_ROLE: 'orchestrator', BOUNCE_ORCHESTRATOR_PROFILE: JSON.stringify({adapter: 'codex', model: '', mode: 'yolo'}),
+  }));
+  assert.equal(code, 0);
+  const rows = stdout.trim().split('\n').filter(Boolean).map(l => JSON.parse(l));
+  assert.deepEqual(JSON.parse(rows.find(r => r.kind === 'assistant').text), ABSENT_ORCHESTRATOR_ENV);
+  // Classic stayed classic: no orchestrator brief on the prompt, no operation row.
+  assert.equal(rows.find(r => r.kind === 'user').text, 'hi');
+  assert.equal(rows.some(r => r.kind === 'operation'), false);
+});
+
+test('O2 orchestrator single-provider: the orchestrator submits over the bridge, the worker completes, its wait returns', async t => {
+  const root = tmpRoot('bounce-o2-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  writeOrchestratorConfig(root, {profiles: {main: {adapter: 'codex'}, build: {adapter: 'codex'}}});
+  const session = await runOrchestratorSession(root, {adapters: {codex: completingAdapter()}});
+
+  const submitted = session.events.find(e => e.kind === 'task.submitted');
+  assert.equal(submitted.from, 'orchestrator');
+  assert.equal(submitted.profile, 'build');
+  const completed = session.events.find(e => e.kind === 'task.completed' && e.task === submitted.task);
+  assert.equal(completed.from, `worker:${submitted.task}`);
+  assert.equal(session.events.some(e => e.kind === 'assistant' && e.text === 'child completed'), true);
+  assert.equal(session.events.filter(e => e.kind === 'user').length, 1);
+  // The role brief: one prepended prompt line, and the ORDERS.md it points at.
+  const ordersFile = path.join(session.dir, 'orchestrator', 'ORDERS.md');
+  assert.equal(session.events.find(e => e.kind === 'user').text,
+    `You are the orchestrator peer of session ${session.id}; the bounce bridge is available via BOUNCE_BUS/BOUNCE_BUS_TOKEN_FILE; see ${ordersFile}.\ngo`);
+  const orders = fs.readFileSync(ordersFile, 'utf8');
+  assert.equal(orders.includes(path.join(root, 'skills', 'agent-orchestrator', 'SKILL.md')), true);
+  assert.equal(orders.includes('BOUNCE_BUS_TOKEN_FILE='), true);
+  // The stated capability is the bus's own allowlist (src/bus.js PEER_KINDS), verbatim.
+  assert.equal(orders.includes('You may publish only: task.submitted, task.milestone, task.blocked, task.input_required, task.usage, task.activity, message.'), true);
+});
+
+test('O3 the orchestrator grant cannot publish a user row (even with `from` omitted) nor control.stop', async t => {
+  const root = tmpRoot('bounce-o3-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  writeOrchestratorConfig(root, {profiles: {main: {adapter: 'codex'}, build: {adapter: 'codex'}}});
+  const session = await runOrchestratorSession(root, {adapters: {codex: completingAdapter()}, env: {FAKE_ORCH_FORGE: '1'}});
+
+  // The forgery omits `from` entirely, so the bus cannot fall back to the from-mismatch rule:
+  // `user` is simply not a kind any peer may publish, and control.* is the user peer's alone.
+  const tried = JSON.parse(session.events.filter(e => e.kind === 'assistant').map(e => e.text).find(text => text.includes('user')));
+  assert.deepEqual(tried, {user: 'refused -32001', stop: 'refused -32001'});
+  assert.equal(session.events.filter(e => e.kind === 'user').length, 1);
+  assert.equal(session.events.find(e => e.kind === 'user').text.endsWith('\ngo'), true);
+  assert.equal(session.events.some(e => e.kind === 'control.stop'), false);
+  assert.equal(session.events.some(e => e.kind === 'control.stopped'), false);
+  // The daemon stayed up for the whole delegation: the child still completed after the forgeries.
+  assert.equal(session.events.some(e => e.kind === 'task.completed'), true);
+  assert.equal(session.events.some(e => e.kind === 'assistant' && e.text === 'child completed'), true);
+});
+
+test('O4 multi-provider: orchestrator on codex delegates to a muse profile; sessions JSON reports the mode', async t => {
+  const root = tmpRoot('bounce-o4-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  writeOrchestratorConfig(root, {profiles: {main: {adapter: 'codex'}, build: {adapter: 'muse'}}});
+  const session = await runOrchestratorSession(root, {adapters: {codex: completingAdapter(), muse: completingAdapter()}});
+
+  const submitted = session.events.find(e => e.kind === 'task.submitted');
+  assert.equal(submitted.from, 'orchestrator');
+  const started = session.events.find(e => e.kind === 'task.started' && e.task === submitted.task);
+  assert.equal(started.from, `worker:${submitted.task}`);
+  assert.equal(session.events.find(e => e.kind === 'peer.joined' && e.name === `worker:${submitted.task}`).adapter, 'muse');
+  assert.equal(session.events.some(e => e.kind === 'assistant' && e.text === 'child completed'), true);
+
+  const {code, stdout} = await run(['sessions'], bounceEnv(root));
+  assert.equal(code, 0);
+  const listed = JSON.parse(stdout).find(s => s.id === session.id);
+  assert.equal(listed.operation, 'orchestrator');
+  assert.equal(listed.orchestrator, 'main');
+});
+
+test('O5 invalid orchestration config: exit 1 with the validation error, and nothing is launched', async t => {
+  const root = tmpRoot('bounce-o5-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  writeOrchestratorConfig(root, {orchestrator: 'absent', profiles: {main: {adapter: 'codex'}}});
+  const {code, stderr} = await run(['run', 'go', '--json'], bounceEnv(root));
+  assert.equal(code, 1);
+  assert.match(stderr, /orchestrator must name a profile/);
+  const sessionsDir = path.join(root, 'sessions');
+  const ids = fs.existsSync(sessionsDir) ? fs.readdirSync(sessionsDir) : [];
+  for (const id of ids) {
+    assert.equal(fs.existsSync(path.join(sessionsDir, id, 'daemon.json')), false);
+    assert.equal(fs.existsSync(socketPathFor(path.join(sessionsDir, id))), false);
+  }
+});
+
+// A worker's token file, found the way anything outside the daemon must find it: by looking in
+// the session's own tokens directory. The daemon keeps the path in a Map of its own, not on the row.
+const workerTokenFile = (session, task) => {
+  const dir = path.join(session.dir, 'tokens');
+  const name = fs.existsSync(dir) ? fs.readdirSync(dir).find(f => f.startsWith(`worker_${task}`)) : undefined;
+  return name ? path.join(dir, name) : null;
+};
+
+// Drives one orchestrator-mode session whose worker is held open until `release()`, so a test can
+// observe the grant mid-flight and then decide how the task goes terminal.
+async function withRunningWorker(root, body) {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const gated = {
+    async launch() { return {}; },
+    async *events() { await gate; yield {kind: 'result', status: 'completed', text: 'child done'}; },
+    async cancel() { return {verified: true}; },
+  };
+  let session;
+  await withEnv({BOUNCE_HOME: root, FAKE_ORCH_MODE: 'submit', FAKE_ORCH_PROFILE: 'build'}, async () => {
+    const done = supervise(['run', 'go'], {adapters: {codex: gated}, onReady: async ({session: s}) => { session = s; }});
+    const started = await waitFor(() => session?.events.find(e => e.kind === 'task.started'), {timeout: 20000});
+    // The daemon runs in this process: a failed assertion must still let the worker finish and
+    // the daemon exit, or the leaked bus/child keeps the whole test runner alive.
+    try { await body({session, started, release}); }
+    finally { release(); await done; }
+  });
+}
+
+// Short on purpose: the daemon revokes every grant on its own exit too, so a revoke this test
+// only sees after the daemon tears down (≥20s, once the orchestrator's own wait times out)
+// would prove nothing about the terminal-row rule.
+const REVOKE_TIMEOUT = {timeout: 5000};
+
+test('O6 worker grant lifecycle: a token file exists from task.started and is revoked on task.completed', async t => {
+  const root = tmpRoot('bounce-o6-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  writeOrchestratorConfig(root, {profiles: {main: {adapter: 'codex'}, build: {adapter: 'codex'}}});
+  await withRunningWorker(root, async ({session, started, release}) => {
+    const tokenFile = workerTokenFile(session, started.task);
+    assert.equal(typeof tokenFile, 'string');
+    assert.equal(fs.existsSync(tokenFile), true);
+    assert.equal('tokenFile' in started, false, 'the token path is daemon-side state, never a journaled field');
+    release();
+    await waitFor(() => session.events.some(e => e.kind === 'task.completed'), {timeout: 20000});
+    await waitFor(() => workerTokenFile(session, started.task) === null, REVOKE_TIMEOUT);
+  });
+});
+
+// Rework round 1, item 2: task.deadline is the fourth terminal kind (reducers.js maps it to the
+// `timed_out` state); there is no `task.timed_out` row for the revoke to key on.
+test('O8 a task.deadline row revokes the worker grant just like a completion does', async t => {
+  const root = tmpRoot('bounce-o8-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  writeOrchestratorConfig(root, {profiles: {main: {adapter: 'codex'}, build: {adapter: 'codex'}}});
+  await withRunningWorker(root, async ({session, started}) => {
+    assert.equal(fs.existsSync(workerTokenFile(session, started.task)), true);
+    session.append({kind: 'task.deadline', task: started.task, context: started.context});
+    await waitFor(() => workerTokenFile(session, started.task) === null, REVOKE_TIMEOUT);
+    assert.equal(session.events.find(e => e.kind === 'task.deadline').task, started.task);
+  });
+});
+
+// Rework round 1, item 4: `tasks: []` is the grant's starting point, not its ceiling — the daemon
+// widens it in place as the orchestrator opens tasks, so it can report on its own work and no other.
+test('O9 the orchestrator may publish a milestone for the task it submitted, and never for a foreign id', async t => {
+  const root = tmpRoot('bounce-o9-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  writeOrchestratorConfig(root, {profiles: {main: {adapter: 'codex'}, build: {adapter: 'codex'}}});
+  const session = await runOrchestratorSession(root, {adapters: {codex: completingAdapter()}, env: {FAKE_ORCH_MILESTONE: '1'}});
+
+  const submitted = session.events.find(e => e.kind === 'task.submitted');
+  const tried = JSON.parse(session.events.filter(e => e.kind === 'assistant').map(e => e.text).find(text => text.includes('own')));
+  assert.deepEqual(tried, {own: 'accepted', foreign: 'refused -32001'});
+  const milestone = session.events.find(e => e.kind === 'task.milestone');
+  assert.equal(milestone.from, 'orchestrator');
+  assert.equal(milestone.task, submitted.task);
+  assert.equal(milestone.text, 'mine');
+  assert.equal(session.events.some(e => e.kind === 'task.milestone' && e.task === 'foreign-task-id'), false);
+});
