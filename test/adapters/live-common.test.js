@@ -71,9 +71,11 @@ test('spawnLive keepStdin leaves stdin open for a persistent peer; the default s
   assert.deepEqual(lines, ['got:a', 'eof']);
   const open = spawnLive({executable: process.execPath, args: ['-e', echo], keepStdin: true});
   open.child.stdin.write('b\n');
-  const first = await (async () => { for await (const e of open.events) if (e.kind === 'line') return e.text; })();
-  assert.equal(first, 'got:b');
+  const it = open.events[Symbol.asyncIterator]();
+  const next = async () => (await it.next()).value;
+  let e = await next(); while (e.kind !== 'line') e = await next();
+  assert.equal(e.text, 'got:b');
   open.child.stdin.end();
-  const rest = []; for await (const e of open.events) rest.push(e.kind === 'line' ? e.text : e.kind);
+  const rest = []; for (e = await next(); e; e = await next()) { rest.push(e.kind === 'line' ? e.text : e.kind); if (e.kind === 'exit') break; }
   assert.deepEqual(rest, ['eof', 'exit']);
 });
