@@ -452,3 +452,64 @@ test('T7 critic minors: a raw event without raw journals raw: null; a non-string
   assert.equal(session.events.find(e => e.kind === 'raw' && e.task === row.task).raw, null);
   assert.equal(session.events.find(e => e.kind === 'model' && e.task === row.task).model, '12345');
 });
+
+test('Z1 sized submission under limits: risk and size are stored and dispatch proceeds', async t => {
+  const {session} = setup(t);
+  const adapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done'}]);
+  const profiles = {A: {adapter: 'fake', model: 'x', mode: 'yolo', fallback: []}};
+  const scheduler = createScheduler({session, adapters: {fake: adapter}, profiles});
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null, risk: 'boundary', size: {lines: 120, probes: 5, minutes: 12}});
+
+  assert.equal(row.risk, 'boundary');
+  assert.deepEqual(row.size, {lines: 120, probes: 5, minutes: 12});
+  await waitFor(() => session.events.some(e => e.kind === 'task.started' && e.task === row.task));
+});
+
+test('Z2 unsized submission defaults risk to logic and size to zeroed, never refused', async t => {
+  const {session} = setup(t);
+  const adapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done'}]);
+  const profiles = {A: {adapter: 'fake', model: 'x', mode: 'yolo', fallback: []}};
+  const scheduler = createScheduler({session, adapters: {fake: adapter}, profiles});
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null});
+
+  assert.equal(row.risk, 'logic');
+  assert.deepEqual(row.size, {lines: 0, probes: 0, minutes: 0});
+  await waitFor(() => session.events.some(e => e.kind === 'task.started' && e.task === row.task));
+});
+
+test('Z3 oversized submission refuses at dispatch before launch, naming the first exceeding field', async t => {
+  const {session} = setup(t);
+  const adapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done'}]);
+  const profiles = {A: {adapter: 'fake', model: 'x', mode: 'yolo', fallback: []}};
+  const scheduler = createScheduler({session, adapters: {fake: adapter}, profiles});
+
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null, size: {lines: 151, probes: 1, minutes: 1}});
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'failed');
+  assert.equal(scheduler.tasks()[row.task].reason, 'size');
+  const failedRow = session.events.find(e => e.kind === 'task.failed' && e.task === row.task);
+  assert.equal(failedRow.text, 'lines 151 exceeds limit 150');
+  assert.equal(session.events.some(e => e.kind === 'budget.reserved' && e.task === row.task), false);
+  assert.equal(adapter.calls.launch, 0);
+
+  const row2 = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null, size: {lines: 1, probes: 7, minutes: 1}});
+  await waitFor(() => scheduler.tasks()[row2.task]?.state === 'failed');
+  assert.equal(scheduler.tasks()[row2.task].reason, 'size');
+  const failedRow2 = session.events.find(e => e.kind === 'task.failed' && e.task === row2.task);
+  assert.equal(failedRow2.text, 'probes 7 exceeds limit 6');
+  assert.equal(session.events.some(e => e.kind === 'budget.reserved' && e.task === row2.task), false);
+  assert.equal(adapter.calls.launch, 0);
+});
+
+test('Z4 malformed risk/size/limits throw and publish nothing', async t => {
+  const {session} = setup(t);
+  const profiles = {A: {adapter: 'fake', model: 'x', mode: 'yolo', fallback: []}};
+  const scheduler = createScheduler({session, adapters: {fake: fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'x'}])}, profiles});
+  const before = session.events.length;
+
+  assert.throws(() => scheduler.submit({parent: null, profile: 'A', orders: 'x', deadline: null, risk: 'huge'}), {message: 'malformed: risk'});
+  assert.equal(session.events.length, before);
+  assert.throws(() => scheduler.submit({parent: null, profile: 'A', orders: 'x', deadline: null, size: {lines: -1, probes: 0, minutes: 0}}), {message: 'malformed: size'});
+  assert.equal(session.events.length, before);
+  assert.throws(() => createScheduler({session, adapters: {}, profiles: {}, limits: {lines: 0, probes: 6, minutes: 15}}), {message: 'malformed: limits'});
+  assert.equal(session.events.length, before);
+});

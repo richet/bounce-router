@@ -4,11 +4,17 @@ import {takeCheckpoint, sameTree} from './checkpoint.js';
 
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'timed_out']);
 const FALLBACK_REASONS = new Set(['limited', 'missing', 'backend_unavailable']);
+const RISKS = new Set(['boundary', 'process-model', 'logic', 'extraction']);
+const SIZE_FIELDS = ['lines', 'probes', 'minutes'];
+
+const isNonNegativeInt = n => Number.isInteger(n) && n >= 0;
+const isPositiveInt = n => Number.isInteger(n) && n > 0;
 
 // Dispatch, fallback, permission ratchet, cancellation and reconcile as policies over the
 // log, driven by adapters. Everything the scheduler knows is re-derived from session.events
 // via the reducers — it keeps only a live-handle map, which cannot survive a restart by design.
-export function createScheduler({session, adapters, profiles, sessionMode = 'yolo', depthCap = 1, checkpointRunner}) {
+export function createScheduler({session, adapters, profiles, sessionMode = 'yolo', depthCap = 1, checkpointRunner, limits = {lines: 150, probes: 6, minutes: 15}}) {
+  if (SIZE_FIELDS.some(field => !isPositiveInt(limits[field]))) throw new Error('malformed: limits');
   const handles = new Map(); // task -> {adapter, handle}
   const workerFrom = task => `worker:${task}`;
   const submittedRow = task => session.events.find(e => e.kind === 'task.submitted' && e.task === task);
@@ -20,6 +26,8 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
     if (spec.parent != null && !view[spec.parent]) return 'parent';
     if (spec.budget !== undefined && spec.parent != null) return 'budget';
     if (spec.checkpoint != null && typeof spec.checkpoint !== 'object') return 'checkpoint';
+    if (spec.risk !== undefined && !RISKS.has(spec.risk)) return 'risk';
+    if (spec.size !== undefined && SIZE_FIELDS.some(field => !isNonNegativeInt(spec.size[field]))) return 'size';
     return null;
   };
 
@@ -39,6 +47,8 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
       replaces: spec.replaces ?? null,
       checkpoint: spec.checkpoint ?? null,
       ref: spec.ref,
+      risk: spec.risk ?? 'logic',
+      size: spec.size ?? {lines: 0, probes: 0, minutes: 0},
     });
   }
 
@@ -96,6 +106,15 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
 
   async function dispatch(row) {
     const {task, parent, context} = row;
+    // Sizing refusal, first of all: a task over the skill's sizing rule never launches,
+    // checked in a fixed field order so the reported field is deterministic.
+    // submit() always stores size; the fallback only covers rows journaled directly (legacy/test rows), never a defaulting path.
+    const size = row.size ?? {lines: 0, probes: 0, minutes: 0};
+    const oversizedField = SIZE_FIELDS.find(field => size[field] > limits[field]);
+    if (oversizedField) {
+      session.append({kind: 'task.failed', task, reason: 'size', text: `${oversizedField} ${size[oversizedField]} exceeds limit ${limits[oversizedField]}`, context});
+      return;
+    }
     const view = reducers.tasks(session.events);
     // Cycle-guarded: only a directly-journaled row (never submit(), which requires a
     // pre-existing parent) can make a task its own ancestor.
