@@ -19,6 +19,7 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
     if (spec.deadline !== null && spec.deadline !== undefined && !Number.isFinite(spec.deadline)) return 'deadline';
     if (spec.parent != null && !view[spec.parent]) return 'parent';
     if (spec.budget !== undefined && spec.parent != null) return 'budget';
+    if (spec.checkpoint != null && typeof spec.checkpoint !== 'object') return 'checkpoint';
     return null;
   };
 

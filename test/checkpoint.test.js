@@ -49,6 +49,24 @@ test('C2 takeCheckpoint: no summary lines yields tests null and check fail; a th
   const cp2 = await takeCheckpoint({cwd: '/does/not/matter', run: throwingRunner, git: fakeGit({head: 'abc', status: '', diff: ''})});
   assert.equal(cp2.tests, null);
   assert.equal(cp2.check, null);
+
+  // Partial summary: '# pass' and '# tests' present but '# fail' missing must still yield
+  // null, never a partial object built from the two present lines.
+  //
+  // Toggle (observed, then reverted — not part of src/checkpoint.js): a buggy parseTests that
+  // requires only 'pass' and 'total' and defaults a missing 'fail' to 0 —
+  //   function buggyParseTests(stdout) {
+  //     const pass = stdout.match(/^# pass (\d+)/m), total = stdout.match(/^# tests (\d+)/m), fail = stdout.match(/^# fail (\d+)/m);
+  //     if (!pass || !total) return null;
+  //     return {pass: Number(pass[1]), total: Number(total[1]), fail: fail ? Number(fail[1]) : 0};
+  //   }
+  // run against '# tests 5\n# pass 5\n' (no '# fail' line) returns {pass:5,total:5,fail:0} —
+  // non-null — which would make this test's `assert.equal(cp3.tests, null)` fail. That
+  // confirms the assertion below discriminates the all-three-lines-required behavior rather
+  // than passing on any input.
+  const run3 = fakeRunner({test: {status: 0, stdout: '# tests 5\n# pass 5\n'}, check: {status: 0, stdout: ''}});
+  const cp3 = await takeCheckpoint({cwd: '/does/not/matter', run: run3, git: fakeGit({head: 'abc', status: '', diff: ''})});
+  assert.equal(cp3.tests, null);
 });
 
 test('C3 sameTree: compares only head/status/diff, ignoring tests/check', () => {
@@ -105,4 +123,20 @@ test('C6 scheduler: submit without a checkpoint dispatches as today, never calli
   await waitFor(() => scheduler.tasks()[row.task]?.state === 'completed');
 
   assert.equal(calls, 0);
+});
+
+test('C7 submit: a non-object checkpoint is rejected as malformed; null/undefined still mean "none"', t => {
+  const {session} = setup(t);
+  const adapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done'}]);
+  const profiles = {A: {adapter: 'fake', model: 'x', mode: 'yolo', fallback: []}};
+  const scheduler = createScheduler({session, adapters: {fake: adapter}, profiles});
+
+  assert.throws(() => scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null, checkpoint: 'not-an-object'}),
+    {message: 'malformed: checkpoint'});
+  assert.throws(() => scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null, checkpoint: 42}),
+    {message: 'malformed: checkpoint'});
+
+  // null/undefined are explicitly "no checkpoint" and must not be rejected.
+  assert.doesNotThrow(() => scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null, checkpoint: null}));
+  assert.doesNotThrow(() => scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null}));
 });
