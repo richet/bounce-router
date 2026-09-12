@@ -15,19 +15,24 @@ import {emitKeypressEvents} from 'node:readline';
 import {parseArgs} from 'node:util';
 import {Session, Router, config, saveJSON, dataRoot} from './core.js';
 import {providers} from './providers.js';
-import {projectRoot, fingerprint, validate, supervise} from './reload.js';
+import {projectRoot, fingerprint, validate, supervise, pidAlive} from './reload.js';
+import {createRemoteSession} from './remote.js';
 import {version, checkUpdate, globalInstall, installUpdate} from './update.js';
 import {BOUNCE_LOGO} from './logo.js';
 
 const help = `bounce — one terminal, your coding agents
 
   bounce [--cwd PATH] [--resume ID] [--provider NAME] [--model ID]
-  bounce run "prompt" [--image PATH ...] [--cwd PATH] [--json] [--mode yolo|plan]
+  bounce run "prompt" [--image PATH ...] [--cwd PATH] [--json] [--mode yolo|plan] [--detach]
+  bounce attach ID [--json]     Stream a running session's daemon as text
+  bounce stop ID                Cancel a running session's task tree and exit its daemon
+  bounce publish --event JSON|@FILE [--json]     One-process bridge: publish an event
+  bounce wait --match JSON --timeout SECONDS [--after-seq N] [--json]     Bridge: wait for one
   bounce login claude|codex|muse
   bounce models [--json]
   bounce quota [--json]
   bounce skills [list|sync|new NAME|add PATH|remove NAME|import [NAME] [--list]|clear|reset] [--scope user|project]
-  bounce sessions
+  bounce sessions               Marks sessions with a live daemon: ● live PID
   bounce doctor
   bounce update [--check]  Check for or install the latest npm release
   bounce dev        Improve bounce itself; validate/reload after changes
@@ -76,7 +81,14 @@ function listSessions(root) {
   const dir = path.join(root, 'sessions');
   if (!fs.existsSync(dir)) return [];
   return fs.readdirSync(dir).flatMap(id => {
-    try { const s = new Session(process.cwd(), {root, id}); return [{id, cwd: s.cwd, updated: s.events.at(-1)?.time, prompt: s.events.find(e => e.kind === 'user')?.text?.slice(0, 80) ?? '(empty)'}]; }
+    try {
+      const s = new Session(process.cwd(), {root, id});
+      let daemon = null;
+      try { daemon = JSON.parse(fs.readFileSync(path.join(dir, id, 'daemon.json'), 'utf8')); } catch {}
+      const live = !!(daemon && pidAlive(daemon.pid));
+      return [{id, cwd: s.cwd, updated: s.events.at(-1)?.time, live, pid: live ? daemon.pid : undefined,
+        prompt: s.events.find(e => e.kind === 'user')?.text?.slice(0, 80) ?? '(empty)'}];
+    }
     catch { return []; }
   }).sort((a,b) => b.updated.localeCompare(a.updated));
 }
@@ -151,7 +163,15 @@ async function main() {
     try { if (skillsChanged(syncSkills({root, scope: settings.skills.scope, cwd}))) skillNotice = 'Skills installed to your agents.'; }
     catch (error) { skillNotice = `Skills not synced: ${error.message}`; }
   }
-  let session = new Session(cwd, {root, id: restarted?.id ?? values.resume});
+  // BOUNCE_REMOTE_SESSION is a distinct flag from BOUNCE_SUPERVISED (which also covers
+  // the legacy TUI restart loop, src/reload.js's legacySupervise, that hosts no real
+  // session over IPC): only src/reload.js's daemonSupervise sets it, for `run`. This
+  // child never receives BOUNCE_BUS/BOUNCE_BUS_TOKEN_FILE — those stay in daemon.json
+  // for attach/stop only, so a vendor CLI spawned as this process's own child can never
+  // inherit bus authority (see T3b rework round 2, BLOCKER).
+  let session = process.env.BOUNCE_REMOTE_SESSION === '1'
+    ? await createRemoteSession(process)
+    : new Session(cwd, {root, id: restarted?.id ?? values.resume});
   session.lock();
   let router = new Router(session, settings);
   if (restarted?.provider || values.provider) session.active = restarted?.provider || values.provider;
@@ -169,7 +189,15 @@ async function main() {
     process.on('SIGINT', cancel); process.on('SIGTERM', cancel);
     try { const result = await router.run(positionals.slice(1).join(' '), values.image || []); process.exitCode = result === 'completed' ? 0 : result === 'cancelled' ? 130 : 1; }
     finally { session.unlock(); process.off('SIGINT', cancel); process.off('SIGTERM', cancel); }
-    return;
+    // `run` is always this process's whole job, and under the supervisor's daemon
+    // apparatus this session is a RemoteSession that keeps the IPC channel actively
+    // ref'd (createRemoteSession sends/receives on it): without an explicit exit the
+    // process would never notice there is nothing left to do. flush() first, so the
+    // tail rows (attempt, turn) — appended right before this point — actually reach
+    // the parent's journal instead of being dropped by an exit that races their IPC
+    // round trip; a dropped/closed channel is not a reason to hang here.
+    try { await session.flush?.(); } catch {}
+    process.exit(process.exitCode ?? 0);
   }
   let input = '', busy = false, suspended = false, scroll = 0, historyIndex = -1;
   const pending = [];
@@ -364,7 +392,9 @@ async function main() {
     session.append({kind: 'status', text: 'Validation passed. Restarting into updated code.'});
     const state = {id: session.id, settings, provider: selected(), dev};
     await new Promise((resolve, reject) => process.send({type: 'restart', state}, error => error ? reject(error) : resolve()));
-    leave(); session.unlock(); process.exit(75);
+    leave(); session.unlock();
+    try { await session.flush?.(); } catch {}
+    process.exit(75);
   }
   async function update(checkOnly) {
     const release = await checkUpdate({root, force: true});
@@ -375,9 +405,11 @@ async function main() {
     await globalInstall();
     const state = {id: session.id, settings, provider: selected(), dev};
     await new Promise((resolve, reject) => process.send({type: 'restart', state, update: true}, error => error ? reject(error) : resolve()));
-    leave(); session.unlock(); process.exit(75);
+    leave(); session.unlock();
+    try { await session.flush?.(); } catch {}
+    process.exit(75);
   }
-  const quit = () => { leave(); session.unlock(); process.exit(0); };
+  const quit = () => { leave(); session.unlock(); void (async () => { try { await session.flush?.(); } catch {} process.exit(0); })(); };
   async function submit(text) {
     activityStarted = Date.now(); progress = '';
     activityTimer = setInterval(render, 150);
@@ -570,4 +602,15 @@ async function main() {
     }).catch(() => {});
   }
 }
-(process.env.BOUNCE_SUPERVISED === '1' && typeof process.send === 'function' ? main() : supervise()).catch(error => {console.error(`bounce: ${error.message}`); process.exitCode = 1;});
+// publish/wait are one-process bridge commands for workers: handled here, before any
+// session/config machinery, so they never spawn a supervisor and never read config.json.
+async function runBridge() {
+  const {bridgeCommand} = await import('./bridge.js');
+  const {stdout, exitCode} = await bridgeCommand(process.argv.slice(2), process.env);
+  process.stdout.write(stdout);
+  process.exitCode = exitCode;
+}
+const [bridgeCmd] = process.argv.slice(2);
+(bridgeCmd === 'publish' || bridgeCmd === 'wait' ? runBridge()
+  : process.env.BOUNCE_SUPERVISED === '1' && typeof process.send === 'function' ? main() : supervise()
+).catch(error => {console.error(`bounce: ${error.message}`); process.exitCode = 1;});

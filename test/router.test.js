@@ -168,3 +168,11 @@ test('normalizers retain reported models without adding transcript text', () => 
     assert.equal(event.text, undefined);
   }
 });
+
+test('vendor CLI processes never inherit bus credentials from the bounce environment', async () => {
+  process.env.BOUNCE_BUS_TOKEN_FILE = '/tmp/should-not-leak'; process.env.BOUNCE_BUS = '/tmp/should-not-leak.sock';
+  try {
+    const r = await fixture(`console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:(process.env.BOUNCE_BUS_TOKEN_FILE??'absent')+'|'+(process.env.BOUNCE_BUS??'absent')}}));console.log(JSON.stringify({type:'turn.completed',usage:{}}))`);
+    assert.equal(r.events.find(e => e.kind === 'assistant').text, 'absent|absent');
+  } finally { delete process.env.BOUNCE_BUS_TOKEN_FILE; delete process.env.BOUNCE_BUS; }
+});

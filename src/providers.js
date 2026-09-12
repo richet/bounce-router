@@ -17,7 +17,9 @@ export function normalize(provider, raw) {
 export function runProcess({provider, executable = provider, args, prompt, cwd, signal, emit}) {
   return new Promise(resolve => {
     let failed = false, limited = false, terminal = false, stderr = '', closed = false;
-    const child = spawn(executable, args, {cwd, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe']});
+    // A vendor CLI must never see the bus or a grant: it acts through its own adapter, not as a peer.
+    const {BOUNCE_BUS, BOUNCE_BUS_TOKEN_FILE, BOUNCE_REMOTE_SESSION, ...env} = process.env;
+    const child = spawn(executable, args, {cwd, env, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe']});
     const finish = result => { if (!closed) { closed = true; clearTimeout(killTimer); signal?.removeEventListener('abort', cancel); resolve(result); } };
     let killTimer;
     const kill = sig => { try { process.platform === 'win32' ? child.kill(sig) : process.kill(-child.pid, sig); } catch {} };
