@@ -10,15 +10,35 @@
 // An event shaped {kind: '__throw', message} makes events() throw mid-stream instead of
 // yielding, for testing a broken adapter stream.
 // calls.launch / calls.cancel / calls.events count invocations for assertions.
+// resume({peer, profile, native, message, cwd, dir, checkpoint}) calls the same `script` (so
+// a rework round can hand back a fresh sequence of events, e.g. an accept after a rework) and
+// produces a handle the same shape launch() does. calls.resume counts invocations; resumeCalls
+// records each call's full args for assertion (native, message, dir, checkpoint).
 export function fakeAdapter(script) {
-  const calls = {launch: 0, cancel: 0, events: 0};
+  const calls = {launch: 0, cancel: 0, events: 0, resume: 0};
+  const resumeCalls = [];
   return {
     calls,
+    resumeCalls,
     async launch(args) {
       calls.launch++;
       const outcome = await script(args);
       if (outcome && !Array.isArray(outcome) && outcome.launchError) {
         const error = new Error(`fake adapter launch failed: ${outcome.launchError}`);
+        error.code = outcome.launchError;
+        throw error;
+      }
+      const never = !Array.isArray(outcome) && outcome?.never === true;
+      const events = Array.isArray(outcome) ? outcome : outcome?.events ?? [];
+      const cancelResult = (!Array.isArray(outcome) && outcome?.cancel) ?? {verified: true};
+      return {events, never, cancelResult, ended: false, waiters: []};
+    },
+    async resume(args) {
+      calls.resume++;
+      resumeCalls.push(args);
+      const outcome = await script(args);
+      if (outcome && !Array.isArray(outcome) && outcome.launchError) {
+        const error = new Error(`fake adapter resume failed: ${outcome.launchError}`);
         error.code = outcome.launchError;
         throw error;
       }

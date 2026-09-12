@@ -47,4 +47,42 @@ for (const [name, {make, executable, env}] of Object.entries(adapters)) {
     assert.equal(await adapter.deliver(handle, {text: 'x'.repeat(1_000_001)}), 'queued');
     assert.deepEqual(await adapter.cancel(handle), {verified: true});
   });
+
+  // Phase 4: resume is scheduler-driven exactly like launch (docs/local-orchestration.md "Peers
+  // and adapters") — src/scheduler.js's resumeWorker() is the real caller now; this test stands
+  // in for it here, creating the task dir before calling resume the same way the scheduler does;
+  // the adapter must never create it itself, and must resolve to the bare handle with events
+  // ending in a result{status}, same as launch.
+  test(`${name}: resume resolves to the bare handle with a caller-created dir, and its events end with a result`, async t => {
+    const {root} = setup(t);
+    const saved = {...process.env}; Object.assign(process.env, env); t.after(() => { for (const k of Object.keys(env)) delete process.env[k]; Object.assign(process.env, saved); });
+    const adapter = make();
+    const dir = path.join(root, 'resume-d');
+    fs.mkdirSync(dir, {recursive: true, mode: 0o700}); // stands in for the scheduler's own pre-creation
+    const handle = await adapter.resume({
+      peer: {}, profile: {mode: 'yolo', executables: {[name]: executable}},
+      native: {sessionId: 'sess-conf'}, message: 'continue', cwd: root, dir,
+    });
+    assert.equal(typeof handle?.pid === 'number' || typeof handle?.child?.pid === 'number', true, 'resume resolves to the handle, not {handle}');
+    const events = [];
+    for await (const event of adapter.events(handle)) { events.push(event); if (event.kind === 'result') break; }
+    t.after(async () => { try { await adapter.cancel(handle); } catch {} });
+    assert.equal(events.at(-1)?.kind, 'result');
+    assert.equal(typeof events.at(-1)?.status, 'string');
+  });
 }
+
+// muse's resume used to re-create the task dir itself ("dir may not exist" — Phase 3 leftover,
+// since resume was not yet scheduler-driven). Phase 4 makes resume scheduler-driven like launch,
+// so that workaround must be gone: resume must fail rather than silently paper over a missing dir.
+test('muse: resume never creates the task dir itself — a missing dir is the caller\'s bug, not papered over', async t => {
+  const {root} = setup(t);
+  const adapter = createMuseLive({});
+  const dir = path.join(root, 'never-created');
+  assert.equal(fs.existsSync(dir), false);
+  await assert.rejects(adapter.resume({
+    peer: {}, profile: {mode: 'yolo', executables: {muse: helper('fake-muse.js')}},
+    native: null, message: 'continue', cwd: root, dir,
+  }));
+  assert.equal(fs.existsSync(dir), false, 'resume must not have created the dir as a side effect of failing');
+});

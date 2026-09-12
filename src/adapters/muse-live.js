@@ -83,8 +83,9 @@ export function createMuseLive({spawn = nodeSpawn, kill = process.kill} = {}) {
     // Re-launch, not a native continuation: the prompt is a compact checkpoint —
     // last milestone, blocker and the queued messages — never a transcript.
     async resume({native, message, cwd, dir, profile, checkpoint = {}}) {
-      // Kept here (unlike launch): resume is not yet scheduler-driven (Phase 4), so dir may not exist.
-      mkdirSync(dir, {recursive: true, mode: 0o700});
+      // Phase 4: resume is scheduler-driven like launch, so dir already exists (0700) before
+      // this runs — never re-create it here, unlike launch's own defensive case (C2 above),
+      // whose direct-call conformance test still pre-dates the scheduler owning that dir.
       // Every peer-supplied line is flattened: nothing queued may forge the template.
       const pending = takePending(join(dir, 'pending.jsonl')).map(promptSafe);
       const promptFile = join(dir, 'resume.txt');

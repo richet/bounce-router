@@ -9,7 +9,7 @@ import crypto from 'node:crypto';
 
 // Peers publish from a positive allowlist: everything a session, the scheduler or the daemon writes is refused regardless of `from`,
 // because handoff() folds user/note rows into every later prompt and Router reads cooldown rows.
-const PEER_KINDS = new Set(['task.submitted', 'task.milestone', 'task.blocked', 'task.input_required', 'task.usage', 'task.activity', 'message']);
+const PEER_KINDS = new Set(['task.submitted', 'task.milestone', 'task.blocked', 'task.input_required', 'task.usage', 'task.activity', 'message', 'task.accepted']);
 const USER_ONLY_PREFIX = 'control.';
 // The scheduler alone owns task lifecycle transitions; a peer may report progress
 // (milestone/blocked/input_required/usage/activity), ask for work (submitted) or
@@ -128,6 +128,13 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         if (problem) return refuse(id, -32602, `invalid event: ${problem}`);
       } else if (e.kind.startsWith('task.')) {
         if (!authenticated.tasks.includes(e.task)) return refuse(id, -32001, 'unauthorized');
+        // A peer may close out a task that has no completion reviewer of its own; one with
+        // review.completion set is only ever accepted by the review policy (task.rejected/
+        // task.rework/policy.* stay unpublishable to peers, so this is the one remaining gap).
+        if (e.kind === 'task.accepted') {
+          const submitted = session.events.find(row => row.kind === 'task.submitted' && row.task === e.task);
+          if (submitted?.review?.completion) return refuse(id, -32602, 'invalid event: review');
+        }
       } else if (e.kind === 'message') {
         if (typeof e.to !== 'string' || !e.to) return refuse(id, -32602, 'invalid event');
         // A worker is addressable only by a grant that owns its task (the scheduler turns the text into

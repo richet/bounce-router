@@ -186,7 +186,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
 
   const profiles = profileOverride ?? (orchestrating ? orchestration.profiles : buildProfiles(settings));
 
-  const scheduler = createScheduler({session, adapters, profiles, sessionMode: settings.mode});
+  const scheduler = createScheduler({session, adapters, profiles, sessionMode: settings.mode, strict: orchestration.strict});
   const bus = await createBus({session, dir: session.dir, validate: scheduler.validate});
   const userGrant = bus.grant({peer: 'user', canSubmit: true, tasks: [], context: session.id});
   writeDaemonJson(session.dir, {pid: process.pid, bus: bus.path, started: new Date().toISOString(), userToken: userGrant.file});

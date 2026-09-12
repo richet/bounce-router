@@ -7,6 +7,7 @@ import {createBus, connectBus, socketPathFor} from '../src/bus.js';
 import {Session, defaults} from '../src/core.js';
 import {createScheduler} from '../src/scheduler.js';
 import * as core from '../src/core.js';
+import * as reducers from '../src/reducers.js';
 
 // A short, fixed base (not os.tmpdir()'s deep per-user path) keeps the unix
 // socket path under the platform's sockaddr_un limit (~104 bytes on macOS) for
@@ -559,4 +560,60 @@ test('a message to a worker needs a grant that owns that task, and the owner\'s 
   assert.equal(delivered.tier, 'live');
   assert.deepEqual(seen, ['carry on']);
   assert.equal((await connect(bus, 'user', {tasks: [], canSubmit: true}).then(async u => { t.after(() => u.close()); return u.publish({kind: 'message', to: 'orchestrator', text: 'hi'}); })).kind, 'message');
+});
+
+// Phase 4: task.accepted joins PEER_KINDS (CONTRACT.md §2 bus paragraph). Ownership follows the
+// existing task.* check; the one extra rule is the review.completion refusal below.
+test('task.accepted: a grant not owning the task is refused with -32001', async t => {
+  const {bus} = await setup(t);
+  bus.grant({peer: 'worker:a', tasks: ['t1']});
+  const b = await connect(bus, 'worker:b', {tasks: ['t2']});
+  t.after(() => b.close());
+  await assert.rejects(
+    b.publish({kind: 'task.accepted', task: 't1', stage: 'completion', by: 'worker:b'}),
+    error => error.code === -32001
+  );
+});
+
+test('task.accepted: the owning grant is refused -32602 invalid event: review when the submitted row has review.completion', async t => {
+  const {session, bus} = await setup(t);
+  session.append({kind: 'task.submitted', task: 't1', parent: null, profile: 'p', orders: 'x', review: {completion: 'analyst'}});
+  const a = await connect(bus, 'orchestrator', {tasks: ['t1']});
+  t.after(() => a.close());
+  await assert.rejects(
+    a.publish({kind: 'task.accepted', task: 't1', stage: 'completion', by: 'orchestrator'}),
+    error => error.code === -32602 && error.message === 'invalid event: review'
+  );
+});
+
+test('task.accepted: the owning grant is journaled when the submitted row has review.prelaunch only, or no review at all', async t => {
+  const {session, bus} = await setup(t);
+  session.append({kind: 'task.submitted', task: 't1', parent: null, profile: 'p', orders: 'x', review: {prelaunch: 'critic'}});
+  session.append({kind: 'task.submitted', task: 't2', parent: null, profile: 'p', orders: 'x'});
+  const a = await connect(bus, 'orchestrator', {tasks: ['t1', 't2']});
+  t.after(() => a.close());
+  assert.equal((await a.publish({kind: 'task.accepted', task: 't1', stage: 'prelaunch', by: 'orchestrator'})).kind, 'task.accepted');
+  assert.equal((await a.publish({kind: 'task.accepted', task: 't2', stage: 'completion', by: 'orchestrator'})).kind, 'task.accepted');
+});
+
+test('task.accepted: owner grant may accept a completed no-reviewer task; the row is journaled and the fold reads accepted', async t => {
+  const {session, bus} = await setup(t);
+  session.append({kind: 'task.submitted', task: 't1', parent: null, profile: 'p', orders: 'x'});
+  session.append({kind: 'task.completed', task: 't1', summary: 'done'});
+  const a = await connect(bus, 'orchestrator', {tasks: ['t1']});
+  t.after(() => a.close());
+  const row = await a.publish({kind: 'task.accepted', task: 't1', stage: 'completion', by: 'orchestrator'});
+  assert.equal(row.kind, 'task.accepted');
+  assert.equal(row.task, 't1');
+  assert.equal(session.events.filter(e => e.kind === 'task.accepted' && e.task === 't1').length, 1);
+  // depends on builder-1: reducers 'accepted' state (TERMINAL/fold changes land with reducers.js)
+  assert.equal(reducers.tasks(session.events).t1.state, 'accepted');
+});
+
+test('a peer cannot publish review.finished or task.rework: those stay unauthorized like the rest of policy.*', async t => {
+  const {bus} = await setup(t);
+  const a = await connect(bus, 'worker:a', {tasks: ['t1']});
+  t.after(() => a.close());
+  await assert.rejects(a.publish({kind: 'review.finished', task: 't1', stage: 'completion', verdict: 'accept'}), error => error.code === -32001);
+  await assert.rejects(a.publish({kind: 'task.rework', task: 't1', round: 1, findings: ['x']}), error => error.code === -32001);
 });

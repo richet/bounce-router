@@ -12,10 +12,13 @@ export function peers(events) {
   return result;
 }
 
-const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'timed_out']);
-const emptyTask = id => ({id, parent: null, replaces: null, lastMilestone: null, blocker: null, reason: null, error: null, children: []});
+// TERMINAL is the one definition shared with src/scheduler.js (imported from here, never
+// redefined): completed/failed/cancelled/timed_out end a task with no review pending;
+// accepted/rejected end one that went through review policy.
+export const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'timed_out', 'accepted', 'rejected']);
+const emptyTask = id => ({id, parent: null, replaces: null, lastMilestone: null, blocker: null, reason: null, error: null, children: [], review: null, depends_on: [], steps: null, rounds: 0, accepted: false, prelaunch: null});
 
-// A task exists only once its own task.submitted is seen; any other task.* row for an unknown id is dropped. A parent stays waiting through its own progress events while any child is non-terminal, remembering which state (its last progress, or its own queued submission) to resume once every child terminates; terminal states never change again.
+// A task exists only once its own task.submitted is seen; any other task.* row for an unknown id is dropped. A parent stays waiting through its own progress events while any child is non-terminal, remembering which state (its last progress, or its own queued submission) to resume once every child terminates; terminal states never change again — except `task.accepted`, the one permitted exit from `completed`/`reviewing` into the frozen `accepted` state.
 export function tasks(events) {
   const result = {};
   const priorState = {};
@@ -31,6 +34,7 @@ export function tasks(events) {
       const t = ensure(e.task);
       if (TERMINAL.has(t.state)) continue;
       t.context = e.context; t.profile = e.profile; t.deadline = e.deadline; t.budget = e.budget && {...e.budget}; t.replaces = e.replaces ?? null;
+      t.review = e.review ?? null; t.depends_on = e.depends_on ? [...e.depends_on] : []; t.steps = e.steps ?? null;
       if (t.state === 'waiting') priorState[e.task] = 'queued'; else t.state = 'queued';
       if (e.parent) {
         t.parent = e.parent;
@@ -41,7 +45,9 @@ export function tasks(events) {
       continue;
     }
     const t = result[e.task];
-    if (!t || TERMINAL.has(t.state)) continue;
+    // task.accepted is the one row allowed to act on a task already in a terminal
+    // state (completed): every other kind is dropped once terminal, as before.
+    if (!t || (TERMINAL.has(t.state) && e.kind !== 'task.accepted')) continue;
     switch (e.kind) {
       case 'task.started':
         if (t.state === 'waiting') priorState[e.task] = 'running'; else t.state = 'running';
@@ -54,10 +60,29 @@ export function tasks(events) {
         else if (t.state === 'blocked' || t.state === 'input_required') t.state = 'running';
         t.lastMilestone = {time: e.time, text: e.text, evidence: e.evidence};
         break;
-      case 'task.completed': t.state = 'completed'; t.summary = e.summary; t.artifacts = e.artifacts && [...e.artifacts]; settleParent(t.parent); break;
+      case 'task.completed':
+        t.state = t.review?.completion ? 'reviewing' : 'completed';
+        t.summary = e.summary; t.artifacts = e.artifacts && [...e.artifacts];
+        if (t.state === 'completed') settleParent(t.parent);
+        break;
       case 'task.failed': t.state = 'failed'; t.reason = e.reason ?? null; t.error = e.text ?? null; settleParent(t.parent); break;
       case 'task.cancelled': t.state = 'cancelled'; settleParent(t.parent); break;
       case 'task.deadline': t.state = 'timed_out'; settleParent(t.parent); break;
+      case 'task.rejected':
+        if (t.state === 'queued') { t.state = 'rejected'; settleParent(t.parent); }
+        break;
+      case 'task.rework':
+        if (t.state === 'reviewing') { t.state = 'running'; t.rounds = (t.rounds || 0) + 1; }
+        break;
+      case 'task.accepted':
+        if (e.stage === 'prelaunch') { if (t.state === 'queued') t.prelaunch = 'accepted'; break; }
+        // completion (or an unstaged direct accept): reviewing→accepted is the actual
+        // terminal entry (reviewing is not terminal, so the parent is still `waiting`
+        // and must be settled); completed→accepted already settled its parent when it
+        // first went terminal at `completed`, so settleParent does not re-fire here.
+        if (t.state === 'reviewing') { t.state = 'accepted'; t.accepted = true; settleParent(t.parent); }
+        else if (t.state === 'completed') { t.state = 'accepted'; t.accepted = true; }
+        break;
     }
   }
   return result;
