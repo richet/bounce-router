@@ -50,6 +50,10 @@ export default {
     }
     return events;
   },
+  // resume:false means re-launch with a checkpoint, not native continuation, and
+  // live:false means no verified mid-turn delivery — `serve` is unprobed here, so
+  // the honest delivery tier is `queued`. See src/adapters/muse-live.js.
+  capabilities: () => ({live: false, resume: false, modelPin: true, policies: ['yolo', 'plan'], quota: 'none'}),
   catalog: {
     args: ['serve'],
     requests: [
