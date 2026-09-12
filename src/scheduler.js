@@ -1,4 +1,6 @@
 import {randomUUID} from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import * as reducers from './reducers.js';
 import {takeCheckpoint, sameTree} from './checkpoint.js';
 
@@ -154,10 +156,13 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
     }
     session.append({kind: 'budget.reserved', task, root, amount: {starts: 1}, context});
 
+    // The task dir is scheduler-owned: one place creates it, every adapter receives it.
+    const dir = path.join(session.dir, 'tasks', task);
+    fs.mkdirSync(dir, {recursive: true, mode: 0o700});
     const adapter = adapters[profile.adapter];
     let handle;
     try {
-      handle = await adapter.launch({peer: workerFrom(task), profile, orders: row.orders, cwd: session.cwd});
+      handle = await adapter.launch({peer: workerFrom(task), profile, orders: row.orders, cwd: session.cwd, dir});
     } catch (error) {
       if (error.code === 'missing' || error.code === 'backend_unavailable') session.append({kind: 'task.failed', task, reason: error.code, from: workerFrom(task), context});
       else session.append({kind: 'task.failed', task, reason: 'error', text: error.message, from: workerFrom(task), context});
@@ -182,6 +187,8 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
           // Worker transcript stays live-only: journaling it as assistant/tool would leak into handoff(), which filters by kind, not context.
           case 'assistant': case 'tool': case 'progress': session.publish({kind: 'task.activity', task, text: event.text, from, context}); break;
           case 'error': session.publish({kind: 'task.activity', task, text: `error: ${event.text}`, from, context}); break;
+          case 'diagnostic': case 'status': session.publish({kind: 'task.activity', task, text: event.text, from, context}); break;
+          case 'delta': break; // streaming fragments; the assembled text arrives as 'assistant'
           // Quota rides on the vendor stream; journaling the worker's raw lines with its provider lets recordQuota see them exactly as it sees the main provider's.
           case 'raw': session.append({kind: 'raw', raw: event.raw ?? null, provider: profile.adapter, task, from, context}); break;
           case 'model': session.append({kind: 'model', model: String(event.model), provider: profile.adapter, task, from, context}); break;
@@ -301,6 +308,8 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
   }
 
   return {
+    // The submit predicate, exposed so the bus refuses a malformed task.submitted before it is journaled.
+    validate: spec => validate(spec, reducers.tasks(session.events)),
     submit, cancel, stop,
     tasks: () => reducers.tasks(session.events),
     budgets: () => reducers.budgets(session.events),

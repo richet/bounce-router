@@ -34,7 +34,7 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
     if (fallback.includes(name)) throw new Error(`profile ${name}: fallback may not include itself`);
     if (mode === 'yolo' && settings.mode === 'plan') throw new Error(`profile ${name}: mode exceeds session mode`);
     if (READ_ONLY_ROLES.has(role) && policy === 'write') throw new Error(`profile ${name}: ${role} must be read-only`);
-    profiles[name] = {adapter: raw.adapter, model: typeof raw.model === 'string' ? raw.model : '', mode, policy, fallback: [...fallback], role};
+    profiles[name] = {adapter: raw.adapter, model: typeof raw.model === 'string' ? raw.model : '', mode, policy, fallback: [...fallback], role, executables: {...(settings.executables ?? {})}};
   }
 
   const orchestratorAdapter = profiles[settings.orchestrator].adapter;

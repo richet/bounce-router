@@ -41,7 +41,7 @@ export function socketPathFor(dir, {platform = process.platform, uid = process.g
 
 // Resolves once actually listening; rejects (never throws async/uncaught) on any
 // bind/chmod failure — a stale non-socket file at the chosen path, EADDRINUSE, etc.
-export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = AUTH_TIMEOUT}) {
+export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = AUTH_TIMEOUT, validate = () => null}) {
   const grants = new Map(); // peer -> {peer, tasks, canSubmit, context, token, file, sockets}
   const tokenToPeer = new Map();
   const tokensDir = path.join(dir, 'tokens');
@@ -124,6 +124,8 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         if (e.task === e.parent) return refuse(id, -32602, 'invalid event');
         if (session.events.some(row => row.kind === 'task.submitted' && row.task === e.task)) return refuse(id, -32602, 'invalid event');
         if (typeof e.profile !== 'string' || !e.profile) return refuse(id, -32602, 'invalid event');
+        const problem = validate(e);
+        if (problem) return refuse(id, -32602, `invalid event: ${problem}`);
       } else if (e.kind.startsWith('task.')) {
         if (!authenticated.tasks.includes(e.task)) return refuse(id, -32001, 'unauthorized');
       } else if (e.kind === 'message') {

@@ -1,4 +1,7 @@
 import fs from 'node:fs';
+import {createClaudeLive} from './adapters/claude-live.js';
+import {createCodexLive} from './adapters/codex-live.js';
+import {createMuseLive} from './adapters/muse-live.js';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {createHash} from 'node:crypto';
@@ -163,12 +166,12 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   const detachedDaemon = process.env.BOUNCE_DETACHED === '1';
   const root = dataRoot();
   const settings = config(root);
-  const adapters = {...extraAdapters};
+  // The live adapters are orchestrator mode's workers; a test may replace any of them by name.
+  // Classic mode never dispatches, so registering them costs it nothing.
+  const adapters = {claude: createClaudeLive(), codex: createCodexLive(), muse: createMuseLive(), ...extraAdapters};
   // Validated once, before anything is created: an invalid orchestration config throws out of
   // supervise() (cli.js prints it and exits 1) with no session, daemon.json or socket behind it.
-  // Adapter names are the task adapters plus the legacy provider names, so a production profile
-  // naming claude/codex/muse validates before its live adapter is registered; such a profile then
-  // fails at dispatch as task.failed{reason:'missing'}, which is the intended behavior.
+  // A profile whose vendor binary is absent fails at dispatch as task.failed{reason:'missing'}.
   const orchestration = validateOrchestration(settings, [...new Set([...Object.keys(adapters), ...Object.keys(providers)])]);
   const orchestrating = orchestration.operation === 'orchestrator';
   const cwd = fs.realpathSync(values.cwd || process.cwd());
@@ -177,8 +180,8 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
 
   const profiles = profileOverride ?? (orchestrating ? orchestration.profiles : buildProfiles(settings));
 
-  const bus = await createBus({session, dir: session.dir});
   const scheduler = createScheduler({session, adapters, profiles, sessionMode: settings.mode});
+  const bus = await createBus({session, dir: session.dir, validate: scheduler.validate});
   const userGrant = bus.grant({peer: 'user', canSubmit: true, tasks: [], context: session.id});
   writeDaemonJson(session.dir, {pid: process.pid, bus: bus.path, started: new Date().toISOString(), userToken: userGrant.file});
 

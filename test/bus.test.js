@@ -521,3 +521,12 @@ test('extendGrant adds tasks to a live grant without rotating its token', async 
   assert.deepEqual(again.tasks, ['t1']);
   await c.close(); await again.close();
 });
+
+test('task.submitted runs the scheduler validate predicate before it is journaled', async t => {
+  const {bus, session} = await setup(t, {validate: spec => (spec.orders ? null : 'orders')});
+  const a = await connect(bus, 'orchestrator', {tasks: [], canSubmit: true});
+  t.after(() => a.close());
+  await assert.rejects(a.publish({kind: 'task.submitted', task: 't1', parent: null, profile: 'p', orders: ''}), {code: -32602, message: 'invalid event: orders'});
+  assert.equal(session.events.filter(e => e.kind === 'task.submitted').length, 0);
+  assert.equal((await a.publish({kind: 'task.submitted', task: 't1', parent: null, profile: 'p', orders: 'go'})).kind, 'task.submitted');
+});
