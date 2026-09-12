@@ -56,20 +56,6 @@ function makeStream() {
   };
 }
 
-// spawnLive closes stdin once, which is right for a one-shot CLI and fatal for a peer whose
-// requests arrive over the whole life of the process. Only that close is suppressed; the rest
-// of spawnLive — drained stderr, `limited`, exactly one terminal event — is used as it is.
-const persistentStdin = spawn => (executable, args, options) => {
-  const child = spawn(executable, args, options);
-  const stdin = {write: chunk => child.stdin.write(chunk), end: () => {},
-    on: (event, listener) => child.stdin.on(event, listener),
-    get destroyed() { return child.stdin.destroyed; }};
-  return {stdin, stdout: child.stdout, stderr: child.stderr, pid: child.pid,
-    on: (event, listener) => child.on(event, listener),
-    once: (event, listener) => child.once(event, listener),
-    off: (event, listener) => child.off(event, listener)};
-};
-
 function finish(handle) {
   if (handle.exited) return;
   handle.exited = true;
@@ -161,7 +147,8 @@ export function createCodexLive({spawn = spawnProcess, kill = process.kill} = {}
 
   async function connect({profile = {}, peer, cwd, dir}) {
     const executable = resolveExecutable('codex', profile.executables?.codex);
-    const live = spawnLive({executable, args: ['app-server'], cwd, env: vendorEnv(), spawn: persistentStdin(spawn)});
+    // keepStdin: requests are written for the life of the peer, so the pipe is never ended early.
+    const live = spawnLive({executable, args: ['app-server'], cwd, env: vendorEnv(), keepStdin: true, spawn});
     const handle = {provider: 'codex', peer, child: live.child, pid: live.child.pid, cwd, dir,
       model: profile.model ?? null, threadId: null, queue: [], pending: new Map(), nextId: 1,
       running: false, exited: false, cancelled: false, lastAssistant: null, stream: makeStream()};
