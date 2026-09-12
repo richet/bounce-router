@@ -409,10 +409,13 @@ const completingAdapter = () => ({
 async function runOrchestratorSession(root, {adapters, env = {}}) {
   let session;
   await withEnv({BOUNCE_HOME: root, FAKE_ORCH_MODE: 'submit', FAKE_ORCH_PROFILE: 'build', ...env}, async () => {
-    await Promise.race([
-      supervise(['run', 'go'], {adapters, onReady: async ({session: s}) => { session = s; }}),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('orchestrator run did not finish within 25s')), 25000)),
-    ]);
+    let timer;
+    try {
+      await Promise.race([
+        supervise(['run', 'go'], {adapters, onReady: async ({session: s}) => { session = s; }}),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('orchestrator run did not finish within 25s')), 25000); }),
+      ]);
+    } finally { clearTimeout(timer); } // a live timer kept every daemon test file alive 25 s past its last test
   });
   return session;
 }
