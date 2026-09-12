@@ -6,6 +6,7 @@ const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'timed_out']);
 const FALLBACK_REASONS = new Set(['limited', 'missing', 'backend_unavailable']);
 const RISKS = new Set(['boundary', 'process-model', 'logic', 'extraction']);
 const SIZE_FIELDS = ['lines', 'probes', 'minutes'];
+const TIERS = new Set(['live', 'next-turn', 'queued']);
 
 const isNonNegativeInt = n => Number.isInteger(n) && n >= 0;
 const isPositiveInt = n => Number.isInteger(n) && n > 0;
@@ -178,6 +179,9 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
         const from = workerFrom(task);
         switch (event.kind) {
           case 'activity': session.publish({kind: 'task.activity', task, text: event.text, from, context}); break;
+          // Worker transcript stays live-only: journaling it as assistant/tool would leak into handoff(), which filters by kind, not context.
+          case 'assistant': case 'tool': case 'progress': session.publish({kind: 'task.activity', task, text: event.text, from, context}); break;
+          case 'error': session.publish({kind: 'task.activity', task, text: `error: ${event.text}`, from, context}); break;
           // Quota rides on the vendor stream; journaling the worker's raw lines with its provider lets recordQuota see them exactly as it sees the main provider's.
           case 'raw': session.append({kind: 'raw', raw: event.raw ?? null, provider: profile.adapter, task, from, context}); break;
           case 'model': session.append({kind: 'model', model: String(event.model), provider: profile.adapter, task, from, context}); break;
@@ -200,6 +204,43 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
     }
   }
 
+  // The delivery contract made observable: a message addressed to a worker goes through its
+  // adapter, and the tier the adapter reports is journaled so the sender knows whether the
+  // worker got it live, at its next turn, or only queued. "Live" means both a handle AND a
+  // non-terminal state re-derived from the log, as dispatch does: a worker that has already
+  // reported its result is not a delivery target even while its stream is still draining.
+  // A message that finds no live worker is queued and NOT replayed when a pending launch
+  // resolves: it stays in the journal, and picking it up belongs to resume (Phase 4), which
+  // reads pending work from the log rather than from memory here.
+  async function deliverTo(task, row) {
+    const entry = handles.get(task);
+    const delivered = (tier, text = null) => session.append({kind: 'task.delivered', task, tier, message: row.id, text, from: 'bounce', context: row.context});
+    if (!entry || TERMINAL.has(reducers.tasks(session.events)[task]?.state)) return delivered('queued', 'no live worker');
+    if (typeof row.text !== 'string') return delivered('queued', 'no text');
+    let outcome;
+    try {
+      const tier = await entry.adapter.deliver(entry.handle, {text: row.text});
+      outcome = TIERS.has(tier) ? [tier] : ['queued', `adapter reported an unknown tier: ${tier}`];
+    } catch (error) { outcome = ['queued', error.message]; }
+    delivered(...outcome);
+  }
+
+  // One delivery at a time per worker, so both the adapter calls and the journaled rows are
+  // FIFO for that task. An adapter may queue internally as well; the scheduler simply never
+  // overlaps two deliveries to the same worker.
+  const deliveryTails = new Map(); // task -> promise for the last delivery still in flight
+  function enqueueDelivery(task, row) {
+    const tail = (deliveryTails.get(task) ?? Promise.resolve())
+      .then(() => deliverTo(task, row))
+      .catch(error => {
+        // Only a failed journal write reaches here (deliverTo handles every adapter outcome).
+        // If recording that failure also throws, there is nowhere left to report it: swallow.
+        try { session.append({kind: 'task.delivered', task, tier: 'queued', message: row.id, text: error.message, from: 'bounce', context: row.context}); } catch {}
+      })
+      .finally(() => { if (deliveryTails.get(task) === tail) deliveryTails.delete(task); });
+    deliveryTails.set(task, tail);
+  }
+
   const unsubscribe = session.subscribe(row => {
     if (row.kind === 'task.submitted') {
       // Any throw here (including one from before the first `await`, which an async
@@ -208,6 +249,9 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
       dispatch(row).catch(error => session.append({kind: 'task.failed', task: row.task, reason: 'error', text: error.message, context: row.context}));
     }
     else if (row.kind === 'task.failed') maybeFallback(row);
+    // Messages to `user`/`orchestrator`/anyone else — and a malformed empty worker
+    // address — are not this subscriber's business.
+    else if (row.kind === 'message' && typeof row.to === 'string' && row.to.startsWith('worker:') && row.to.length > 'worker:'.length) enqueueDelivery(row.to.slice('worker:'.length), row);
   });
 
   // Reconcile: every task the reducer reports mid-flight has no live handle right after a

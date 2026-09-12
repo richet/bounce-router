@@ -513,3 +513,292 @@ test('Z4 malformed risk/size/limits throw and publish nothing', async t => {
   assert.throws(() => createScheduler({session, adapters: {}, profiles: {}, limits: {lines: 0, probes: 6, minutes: 15}}), {message: 'malformed: limits'});
   assert.equal(session.events.length, before);
 });
+
+// A fake adapter that also implements the delivery contract: `deliver` records its calls and
+// returns (or throws) whatever `respond` decides. Kept here rather than in the shared fake so
+// the existing helper's script contract stays exactly as every other test uses it.
+const deliveringAdapter = (script, respond) => {
+  const adapter = fakeAdapter(script);
+  adapter.calls.deliver = 0;
+  adapter.deliveries = [];
+  adapter.deliver = async (handle, event) => {
+    adapter.calls.deliver++;
+    adapter.deliveries.push({handle, event});
+    return respond(event);
+  };
+  return adapter;
+};
+
+test('V1 message to a live worker goes through the adapter and journals the reported tier', async t => {
+  const {session} = setup(t);
+  const adapter = deliveringAdapter(() => ({never: true}), () => 'live');
+  const profiles = {A: {adapter: 'fake', model: 'x', mode: 'yolo', fallback: []}};
+  const scheduler = createScheduler({session, adapters: {fake: adapter}, profiles});
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null});
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'running');
+
+  const message = session.append({kind: 'message', to: `worker:${row.task}`, text: 'hi', from: 'user'});
+  const delivered = await waitFor(() => session.events.find(e => e.kind === 'task.delivered'));
+
+  assert.equal(delivered.tier, 'live');
+  assert.equal(delivered.task, row.task);
+  assert.equal(delivered.message, message.id);
+  assert.equal(delivered.from, 'bounce');
+  assert.equal(delivered.text, null);
+  assert.equal(adapter.calls.deliver, 1);
+  assert.deepEqual(adapter.deliveries[0].event, {text: 'hi'});
+  await scheduler.cancel(row.task);
+});
+
+test('V2 an unknown tier from the adapter is recorded as queued, naming the value', async t => {
+  const {session} = setup(t);
+  const adapter = deliveringAdapter(() => ({never: true}), () => 'bogus');
+  const profiles = {A: {adapter: 'fake', model: 'x', mode: 'yolo', fallback: []}};
+  const scheduler = createScheduler({session, adapters: {fake: adapter}, profiles});
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null});
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'running');
+
+  session.append({kind: 'message', to: `worker:${row.task}`, text: 'hi', from: 'user'});
+  const delivered = await waitFor(() => session.events.find(e => e.kind === 'task.delivered'));
+
+  assert.equal(delivered.tier, 'queued');
+  assert.equal(delivered.text, 'adapter reported an unknown tier: bogus');
+  assert.equal(adapter.calls.deliver, 1);
+  await scheduler.cancel(row.task);
+});
+
+test('V3 message to a task with no live handle is queued, and the pending launch never delivers it retroactively', async t => {
+  const {session} = setup(t);
+  const deferred = {};
+  deferred.promise = new Promise(resolve => { deferred.resolve = resolve; });
+  const adapter = deliveringAdapter(() => deferred.promise.then(() => ({never: true})), () => 'live');
+  const profiles = {A: {adapter: 'fake', model: 'x', mode: 'yolo', fallback: []}};
+  const scheduler = createScheduler({session, adapters: {fake: adapter}, profiles});
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null});
+  await waitFor(() => adapter.calls.launch === 1);
+
+  const message = session.append({kind: 'message', to: `worker:${row.task}`, text: 'hi', from: 'user'});
+  const delivered = await waitFor(() => session.events.find(e => e.kind === 'task.delivered'));
+  assert.equal(delivered.tier, 'queued');
+  assert.equal(delivered.text, 'no live worker');
+  assert.equal(delivered.message, message.id);
+
+  deferred.resolve();
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'running');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(adapter.calls.deliver, 0);
+  assert.equal(session.events.filter(e => e.kind === 'task.delivered').length, 1);
+  await scheduler.cancel(row.task);
+});
+
+test('V4 a rejecting deliver is recorded as queued with the error text, with no unhandled rejection', async t => {
+  const {session} = setup(t);
+  let rejections = 0;
+  const onRejection = () => rejections++;
+  process.on('unhandledRejection', onRejection);
+  try {
+    const adapter = deliveringAdapter(() => ({never: true}), () => { throw new Error('socket gone'); });
+    const profiles = {A: {adapter: 'fake', model: 'x', mode: 'yolo', fallback: []}};
+    const scheduler = createScheduler({session, adapters: {fake: adapter}, profiles});
+    const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null});
+    await waitFor(() => scheduler.tasks()[row.task]?.state === 'running');
+
+    session.append({kind: 'message', to: `worker:${row.task}`, text: 'hi', from: 'user'});
+    const delivered = await waitFor(() => session.events.find(e => e.kind === 'task.delivered'));
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(delivered.tier, 'queued');
+    assert.equal(delivered.text, 'socket gone');
+    assert.equal(scheduler.tasks()[row.task].state, 'running');
+    assert.equal(rejections, 0);
+    await scheduler.cancel(row.task);
+  } finally {
+    process.off('unhandledRejection', onRejection);
+  }
+});
+
+test('V5 a message not addressed to a worker is ignored by the delivery subscriber', async t => {
+  const {session} = setup(t);
+  const adapter = deliveringAdapter(() => ({never: true}), () => 'live');
+  const profiles = {A: {adapter: 'fake', model: 'x', mode: 'yolo', fallback: []}};
+  const scheduler = createScheduler({session, adapters: {fake: adapter}, profiles});
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null});
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'running');
+
+  session.append({kind: 'message', to: 'orchestrator', text: 'hi', from: 'user'});
+  session.append({kind: 'message', to: 'user', text: 'hi', from: 'bounce'});
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(session.events.filter(e => e.kind === 'task.delivered').length, 0);
+  assert.equal(adapter.calls.deliver, 0);
+  await scheduler.cancel(row.task);
+});
+
+// A worker whose stream stays open after it has already reported a result: the handle is
+// still live while the task's derived state is terminal. release() ends the stream.
+const streamingAdapter = (events, respond) => {
+  const calls = {launch: 0, deliver: 0, cancel: 0};
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  return {
+    calls,
+    release: () => release(),
+    async launch() { calls.launch++; return {}; },
+    async *events() { for (const event of events) yield event; await gate; },
+    async deliver(handle, event) { calls.deliver++; return respond(event); },
+    async cancel() { calls.cancel++; release(); return {verified: true}; },
+  };
+};
+
+test('V6 a worker whose task has gone terminal is not live, even while its stream is still open', async t => {
+  const {session} = setup(t);
+  const adapter = streamingAdapter([{kind: 'result', status: 'completed', text: 'done'}], () => 'live');
+  const profiles = {A: {adapter: 'fake', model: 'x', mode: 'yolo', fallback: []}};
+  const scheduler = createScheduler({session, adapters: {fake: adapter}, profiles});
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null});
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'completed');
+
+  session.append({kind: 'message', to: `worker:${row.task}`, text: 'hi', from: 'user'});
+  const delivered = await waitFor(() => session.events.find(e => e.kind === 'task.delivered'));
+
+  assert.equal(delivered.tier, 'queued');
+  assert.equal(delivered.text, 'no live worker');
+  assert.equal(adapter.calls.deliver, 0);
+  adapter.release();
+});
+
+test('V7 a journal write that fails while recording a delivery never escapes as an unhandled rejection', async t => {
+  const {session} = setup(t);
+  let rejections = 0;
+  const onRejection = () => rejections++;
+  process.on('unhandledRejection', onRejection);
+  try {
+    const adapter = deliveringAdapter(() => ({never: true}), () => 'live');
+    const profiles = {A: {adapter: 'fake', model: 'x', mode: 'yolo', fallback: []}};
+    const scheduler = createScheduler({session, adapters: {fake: adapter}, profiles});
+    const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null});
+    await waitFor(() => scheduler.tasks()[row.task]?.state === 'running');
+
+    const realAppend = session.append.bind(session);
+    let broken = true;
+    session.append = event => {
+      if (event.kind === 'task.delivered' && broken) { broken = false; throw new Error('journal broke'); }
+      return realAppend(event);
+    };
+    session.append({kind: 'message', to: `worker:${row.task}`, text: 'hi', from: 'user'});
+    const delivered = await waitFor(() => session.events.find(e => e.kind === 'task.delivered'));
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(delivered.tier, 'queued');
+    assert.equal(delivered.text, 'journal broke');
+    assert.equal(rejections, 0);
+
+    // And when every attempt to record the delivery fails, there is nowhere left to report
+    // it: the failure is swallowed rather than escaping the subscriber.
+    session.append = event => { if (event.kind === 'task.delivered') throw new Error('journal down'); return realAppend(event); };
+    realAppend({kind: 'message', to: `worker:${row.task}`, text: 'again', from: 'user'});
+    await waitFor(() => adapter.calls.deliver === 2);
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(session.events.filter(e => e.kind === 'task.delivered').length, 1);
+    assert.equal(rejections, 0);
+
+    session.append = realAppend;
+    await scheduler.cancel(row.task);
+  } finally {
+    process.off('unhandledRejection', onRejection);
+  }
+});
+
+test('V8 deliveries to one worker are serialized: a slow first delivery still journals before the second', async t => {
+  const {session} = setup(t);
+  const gate = {};
+  gate.promise = new Promise(resolve => { gate.resolve = resolve; });
+  const adapter = deliveringAdapter(() => ({never: true}), event => event.text === 'one' ? gate.promise.then(() => 'live') : 'live');
+  const profiles = {A: {adapter: 'fake', model: 'x', mode: 'yolo', fallback: []}};
+  const scheduler = createScheduler({session, adapters: {fake: adapter}, profiles});
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null});
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'running');
+
+  const first = session.append({kind: 'message', to: `worker:${row.task}`, text: 'one', from: 'user'});
+  const second = session.append({kind: 'message', to: `worker:${row.task}`, text: 'two', from: 'user'});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(adapter.calls.deliver, 1); // the second delivery waits for the first to settle
+  gate.resolve();
+
+  await waitFor(() => session.events.filter(e => e.kind === 'task.delivered').length === 2);
+  const delivered = session.events.filter(e => e.kind === 'task.delivered');
+  assert.deepEqual(delivered.map(e => e.message), [first.id, second.id]);
+  assert.deepEqual(delivered.map(e => e.tier), ['live', 'live']);
+  assert.deepEqual(adapter.deliveries.map(d => d.event.text), ['one', 'two']);
+  await scheduler.cancel(row.task);
+});
+
+test('V9 a malformed worker address with an empty task id is ignored like any non-worker address', async t => {
+  const {session} = setup(t);
+  const adapter = deliveringAdapter(() => ({never: true}), () => 'live');
+  const profiles = {A: {adapter: 'fake', model: 'x', mode: 'yolo', fallback: []}};
+  const scheduler = createScheduler({session, adapters: {fake: adapter}, profiles});
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null});
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'running');
+
+  session.append({kind: 'message', to: 'worker:', text: 'hi', from: 'user'});
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(session.events.filter(e => e.kind === 'task.delivered').length, 0);
+  assert.equal(adapter.calls.deliver, 0);
+  await scheduler.cancel(row.task);
+});
+
+test('V10 a message with no text is queued as malformed and never reaches the adapter', async t => {
+  const {session} = setup(t);
+  const adapter = deliveringAdapter(() => ({never: true}), () => 'live');
+  const profiles = {A: {adapter: 'fake', model: 'x', mode: 'yolo', fallback: []}};
+  const scheduler = createScheduler({session, adapters: {fake: adapter}, profiles});
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null});
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'running');
+
+  const message = session.append({kind: 'message', to: `worker:${row.task}`, from: 'user'});
+  const delivered = await waitFor(() => session.events.find(e => e.kind === 'task.delivered'));
+
+  assert.equal(delivered.tier, 'queued');
+  assert.equal(delivered.text, 'no text');
+  assert.equal(delivered.message, message.id);
+  assert.equal(adapter.calls.deliver, 0);
+  await scheduler.cancel(row.task);
+});
+
+test('V4b a deliver that throws synchronously is recorded as queued with its message', async t => {
+  const {session} = setup(t);
+  const adapter = deliveringAdapter(() => ({never: true}), () => 'live');
+  adapter.deliver = () => { adapter.calls.deliver++; throw new Error('no socket'); };
+  const profiles = {A: {adapter: 'fake', model: 'x', mode: 'yolo', fallback: []}};
+  const scheduler = createScheduler({session, adapters: {fake: adapter}, profiles});
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null});
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'running');
+
+  session.append({kind: 'message', to: `worker:${row.task}`, text: 'hi', from: 'user'});
+  const delivered = await waitFor(() => session.events.find(e => e.kind === 'task.delivered'));
+
+  assert.equal(delivered.tier, 'queued');
+  assert.equal(delivered.text, 'no socket');
+  assert.equal(adapter.calls.deliver, 1);
+  await scheduler.cancel(row.task);
+});
+
+test('adapter transcript events (assistant, tool, progress, error) become live task.activity rows, never journaled, never dropped', async t => {
+  const {session} = setup(t);
+  const live = [];
+  session.subscribe(e => { if (e.kind === 'task.activity') live.push(e.text); });
+  const adapter = fakeAdapter(() => [
+    {kind: 'assistant', text: 'thinking aloud'}, {kind: 'tool', text: 'ls -la'}, {kind: 'progress', text: 'Bash · 3s'}, {kind: 'error', text: 'ECONN reset'},
+    {kind: 'result', status: 'completed', text: 'ok'},
+  ]);
+  const scheduler = createScheduler({session, adapters: {a: adapter}, profiles: {p: {adapter: 'a', mode: 'yolo', fallback: []}}});
+  const row = scheduler.submit({parent: null, profile: 'p', orders: 'x'});
+  await waitFor(() => scheduler.tasks()[row.task].state === 'completed');
+  assert.deepEqual(live, ['thinking aloud', 'ls -la', 'Bash · 3s', 'error: ECONN reset']);
+  const journal = fs.readFileSync(session.file, 'utf8');
+  assert.equal(journal.includes('thinking aloud'), false);
+  assert.equal(session.events.some(e => e.kind === 'assistant' && e.task === row.task), false);
+});
