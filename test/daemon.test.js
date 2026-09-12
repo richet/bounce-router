@@ -17,7 +17,7 @@ function tmpRoot(prefix) { return fs.mkdtempSync(path.join(os.tmpdir(), prefix))
 function writeConfig(root, order = ['codex']) {
   fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify({
     order, mode: 'yolo', models: {}, cooldownMinutes: 30, contextChars: 48000,
-    executables: Object.fromEntries(order.map(p => [p, fakeCli])), skills: {scope: 'user', autoSync: true},
+    executables: Object.fromEntries(order.map(p => [p, fakeCli])), skills: {scope: 'user', autoSync: false}, // never the real user scope: autosync from an empty tmp store removes the user's installed skills
   }));
 }
 

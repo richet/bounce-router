@@ -130,6 +130,9 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         if (!authenticated.tasks.includes(e.task)) return refuse(id, -32001, 'unauthorized');
       } else if (e.kind === 'message') {
         if (typeof e.to !== 'string' || !e.to) return refuse(id, -32602, 'invalid event');
+        // A worker is addressable only by a grant that owns its task (the scheduler turns the text into
+        // adapter input): the same boundary as reporting on it. The user peer addresses anyone.
+        if (e.to.startsWith('worker:') && peer !== 'user' && !authenticated.tasks.includes(e.to.slice('worker:'.length))) return refuse(id, -32001, 'unauthorized');
       }
       const row = session.publish(e);
       send({jsonrpc: '2.0', id, result: row});
