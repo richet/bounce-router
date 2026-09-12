@@ -15,6 +15,8 @@ import {providers} from './providers.js';
 import {createScheduler} from './scheduler.js';
 import {hostSession} from './remote.js';
 
+const CHILD_KILL_GRACE_MS = 1500; // same grace as runProcess's cancel and live-common's verifiedCancel
+
 export const projectRoot = fileURLToPath(new URL('../', import.meta.url));
 const cliPath = fileURLToPath(new URL('./cli.js', import.meta.url));
 
@@ -62,8 +64,12 @@ function readDaemonJson(dir) {
   catch { return null; }
 }
 
+// Written whole then renamed into place: `stop`, `attach`, `sessions` and the tests read this
+// file while the daemon may be rewriting it (observed as a torn JSON.parse under six parallel D5 runs).
 function writeDaemonJson(dir, info) {
-  fs.writeFileSync(daemonJsonPath(dir), JSON.stringify(info, null, 2) + '\n', {mode: 0o600});
+  const tmp = `${daemonJsonPath(dir)}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(info, null, 2) + '\n', {mode: 0o600});
+  fs.renameSync(tmp, daemonJsonPath(dir));
 }
 
 function removeDaemonJson(dir) {
@@ -210,6 +216,18 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
 
   let unverifiedOnStop = [];
   let currentChild = null;
+  // Teardown terminates the main child the way a vendor process is terminated (runProcess,
+  // verifiedCancel): SIGTERM, then SIGKILL after a grace period. A child that never exits
+  // would otherwise hold the IPC channel, and with it this daemon and whoever waits on its
+  // pipes, forever (Phase 3 gate incident: D5's child survived SIGTERM under load).
+  const terminateChild = () => {
+    const child = currentChild;
+    if (!child) return;
+    try { child.kill('SIGTERM'); } catch {}
+    const timer = setTimeout(() => { if (currentChild === child) try { child.kill('SIGKILL'); } catch {} }, CHILD_KILL_GRACE_MS);
+    timer.unref?.();
+    child.once('close', () => clearTimeout(timer));
+  };
   const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'timed_out']);
   const allRootsTerminal = () => Object.values(scheduler.tasks()).every(t => t.parent || TERMINAL.has(t.state));
 
@@ -239,7 +257,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
       unverifiedOnStop = unverified;
       if (unverified.length) console.error(`bounce: could not verify termination of: ${unverified.join(', ')}`);
       session.publish({kind: 'control.stopped', cancelled, unverified});
-      if (currentChild) try { currentChild.kill('SIGTERM'); } catch {}
+      terminateChild();
       // Give the just-published row's socket write a tick to actually flush to the
       // `stop` client before bus.close() destroys every open socket — publish() only
       // queues the write; destroying the socket immediately after can race it and
@@ -262,7 +280,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
       const {unverified} = await scheduler.stop();
       unverifiedOnStop = unverified;
       if (unverified.length) console.error(`bounce: could not verify termination of: ${unverified.join(', ')}`);
-      if (currentChild) try { currentChild.kill('SIGTERM'); } catch {}
+      terminateChild();
       await finish(143);
       process.exit(143);
     })();

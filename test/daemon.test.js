@@ -364,6 +364,49 @@ test('D5 stop with unverifiable termination exits 1, lists the unverified id, ke
   assert.equal(info.unverified.length, 1);
 });
 
+// Incident (Phase 3 gate, 2026-09-12): under load the D5 daemon's main child survived the
+// supervisor's SIGTERM and, holding the IPC channel, kept the daemon — and every runner
+// waiting on the daemon's pipes — alive for minutes. Termination of the child is verified
+// the same way a vendor process is (runProcess, verifiedCancel): SIGTERM, then SIGKILL.
+test('D11 stop escalates to SIGKILL when the main child ignores SIGTERM, so a stuck child cannot hold the daemon', async t => {
+  const root = tmpRoot('bounce-d11-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  writeConfig(root);
+  const {EventEmitter} = await import('node:events');
+  const adapter = {
+    async launch() { return {}; },
+    async *events() { await new Promise(() => {}); },
+    async cancel() { return {verified: true}; },
+  };
+  const kills = [];
+  const spawnChild = () => {
+    const child = new EventEmitter();
+    child.send = () => {};
+    // Ignores SIGTERM; only SIGKILL makes it close.
+    child.kill = signal => { kills.push({signal, at: Date.now()}); if (signal === 'SIGKILL') setImmediate(() => child.emit('close', null, 'SIGKILL')); };
+    return child;
+  };
+  await withEnv({BOUNCE_HOME: root}, async () => {
+    let session;
+    const done = supervise(['run', 'hi'], {
+      spawnChild,
+      adapters: {fake: adapter},
+      profiles: {main: {adapter: 'fake', mode: 'yolo', fallback: []}},
+      onReady: async ({session: s, scheduler}) => {
+        session = s;
+        scheduler.submit({parent: null, profile: 'main', orders: 'x', deadline: null});
+      },
+    });
+    await waitFor(() => kills.length === 0 && session);
+    session.publish({kind: 'control.stop', from: 'user'});
+    const outcome = await Promise.race([done.then(() => 'finished'), new Promise(r => setTimeout(r, 6000, 'still running after 6 s'))]);
+    assert.equal(outcome, 'finished');
+    assert.deepEqual(kills.map(k => k.signal), ['SIGTERM', 'SIGKILL']);
+    const grace = kills[1].at - kills[0].at;
+    assert.ok(grace >= 1400 && grace <= 3000, `SIGKILL must follow the ignored SIGTERM after the grace period, got ${grace} ms`);
+  });
+});
+
 test('D10 SIGTERM to a daemon with a running task cancels it and removes bus.sock/daemon.json', async t => {
   const root = tmpRoot('bounce-d10-');
   t.after(() => fs.rmSync(root, {recursive: true, force: true}));
