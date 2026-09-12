@@ -140,12 +140,15 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
     try {
       session.append({kind: 'peer.joined', name: workerFrom(task), role: 'worker', adapter: profile.adapter, profile: row.profile, from: workerFrom(task), context});
       const attempt = session.events.filter(e => e.kind === 'task.started' && e.task === task).length + 1;
-      session.append({kind: 'task.started', task, attempt, from: workerFrom(task), context});
+      session.append({kind: 'task.started', task, attempt, requested: profile.model ?? '', from: workerFrom(task), context});
 
       for await (const event of adapter.events(handle)) {
         const from = workerFrom(task);
         switch (event.kind) {
           case 'activity': session.publish({kind: 'task.activity', task, text: event.text, from, context}); break;
+          // Quota rides on the vendor stream; journaling the worker's raw lines with its provider lets recordQuota see them exactly as it sees the main provider's.
+          case 'raw': session.append({kind: 'raw', raw: event.raw, provider: profile.adapter, task, from, context}); break;
+          case 'model': session.append({kind: 'model', model: event.model, provider: profile.adapter, task, from, context}); break;
           case 'milestone': session.append({kind: 'task.milestone', task, text: event.text, evidence: event.evidence, from, context}); break;
           case 'blocked': session.append({kind: 'task.blocked', task, text: event.text, from, context}); break;
           case 'usage': session.append({kind: 'task.usage', task, usage: event.usage, from, context}); break;

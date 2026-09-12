@@ -422,3 +422,23 @@ test('legacy: constructing a scheduler on a session with no task rows appends no
   assert.equal(session.events.length, before);
 });
 
+test('T7: worker raw and model events reach the journal with provider and task; task.started records the requested model', async t => {
+  const {session} = setup(t);
+  const adapter = fakeAdapter(() => [
+    {kind: 'raw', raw: {type: 'rate_limit_event', rate_limit_info: {status: 'allowed', unifiedWindows: {five_hour: {utilization: 0.4, resetsAt: 1000}}}}},
+    {kind: 'model', model: 'claude-sonnet-5'},
+    {kind: 'result', status: 'completed', text: 'ok'},
+  ]);
+  const scheduler = createScheduler({session, adapters: {a: adapter}, profiles: {p: {adapter: 'a', model: 'sonnet', mode: 'yolo', fallback: []}}});
+  const row = scheduler.submit({parent: null, profile: 'p', orders: 'x'});
+  await waitFor(() => scheduler.tasks()[row.task].state === 'completed');
+  const raw = session.events.find(e => e.kind === 'raw' && e.task === row.task);
+  assert.equal(raw.provider, 'a');
+  assert.equal(raw.from, `worker:${row.task}`);
+  assert.equal(raw.raw.rate_limit_info.unifiedWindows.five_hour.utilization, 0.4);
+  const model = session.events.find(e => e.kind === 'model' && e.task === row.task);
+  assert.equal(model.model, 'claude-sonnet-5');
+  assert.equal(model.provider, 'a');
+  assert.equal(session.events.find(e => e.kind === 'task.started' && e.task === row.task).requested, 'sonnet');
+  assert.equal(fs.readFileSync(session.file, 'utf8').split('\n').filter(l => l.includes('"kind":"raw"')).length, 1);
+});
