@@ -16,9 +16,10 @@
     "node": ">=22"
   },
   "license": "MIT",
+  "private": true,
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/richet/bounce-router.git"
+    "url": "git+https://github.com/Arecius/bounce-router.git"
   },
   "files": [
     "src/"
