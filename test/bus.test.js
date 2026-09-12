@@ -1,0 +1,482 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import {createBus, connectBus, socketPathFor} from '../src/bus.js';
+import {Session, defaults} from '../src/core.js';
+import * as core from '../src/core.js';
+
+// A short, fixed base (not os.tmpdir()'s deep per-user path) keeps the unix
+// socket path under the platform's sockaddr_un limit (~104 bytes on macOS) for
+// the common case; the fallback itself is exercised by the G3 tests below.
+// `setup` registers its own cleanup (tmp root + bus.close) so tests don't repeat it.
+const setup = async (t, opts = {}) => {
+  const root = fs.mkdtempSync('/tmp/bb-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const session = new Session(root, {root});
+  const bus = await createBus({session, dir: session.dir, ...opts});
+  t.after(() => bus.close());
+  return {root, session, bus};
+};
+
+const connect = async (bus, peer, opts = {}) => {
+  const {token} = bus.grant({peer, ...opts});
+  return connectBus({path: bus.path, token});
+};
+
+// Polls for an async, server-side effect that has no direct signal on the client
+// API (e.g. a client-initiated close reaching the server's socket 'close' event).
+// Not wall-clock logic — bounded test synchronization only.
+const waitFor = async (condition, {timeout = 1000, interval = 5} = {}) => {
+  const deadline = Date.now() + timeout;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error('waitFor: condition not met in time');
+    await new Promise(resolve => setTimeout(resolve, interval));
+  }
+};
+
+// A raw JSON-RPC-lines client that doesn't go through connectBus's auth handshake,
+// for tests that need to see the wire directly (bad first lines, unknown methods,
+// malformed lines). Resolves deterministically on line count, never on a sleep.
+const rawConnect = async (bus, t) => {
+  const net = await import('node:net');
+  const socket = net.default.createConnection(bus.path);
+  t.after(() => socket.destroy());
+  // The server may destroy this socket mid-write (auth timeout, buffer-overflow
+  // guard); the resulting EPIPE/ECONNRESET on this side is expected, not a failure.
+  socket.on('error', () => {});
+  await new Promise(resolve => socket.once('connect', resolve));
+  let buffer = '';
+  const lines = [];
+  const waiters = [];
+  socket.on('data', chunk => {
+    buffer += chunk;
+    let idx;
+    while ((idx = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 1);
+      if (!line) continue;
+      lines.push(JSON.parse(line));
+      while (waiters.length && lines.length >= waiters[0].count) waiters.shift().resolve();
+    }
+  });
+  const waitForLines = count => new Promise(resolve => {
+    if (lines.length >= count) return resolve();
+    waiters.push({count, resolve});
+  });
+  return {
+    socket, lines, waitForLines,
+    write: obj => socket.write(JSON.stringify(obj) + '\n'),
+    writeRaw: line => socket.write(line),
+  };
+};
+
+test('legacy: importing src/bus.js does not change Session exports or defaults()', () => {
+  const before = ['order', 'mode', 'models', 'cooldownMinutes', 'contextChars', 'executables', 'skills'];
+  assert.deepEqual(Object.keys(defaults()).sort(), before.sort());
+  assert.deepEqual(Object.keys(core).sort(), ['LIVE_KINDS', 'Router', 'Session', 'config', 'dataRoot', 'defaults', 'gitSnapshot', 'handoff', 'saveJSON'].sort());
+});
+
+test('P1 round trip: publish as the granted peer lands in the journal', async t => {
+  const {session, bus} = await setup(t);
+  const client = await connect(bus, 'worker:a', {tasks: ['t1']});
+  t.after(() => client.close());
+  const row = await client.publish({kind: 'task.milestone', task: 't1', text: 'm'});
+  assert.equal(row.from, 'worker:a');
+  assert.equal(row.seq, 2); // 1 is the constructor's own 'session' row
+  assert.equal(session.events.at(-1).id, row.id);
+});
+
+test('P2 sibling forgery: a peer cannot publish a task.* event about a task it was not granted', async t => {
+  const {session, bus} = await setup(t);
+  bus.grant({peer: 'worker:a', tasks: ['t1']});
+  const b = await connect(bus, 'worker:b', {tasks: ['t2']});
+  t.after(() => b.close());
+  const before = session.events.length;
+  await assert.rejects(
+    b.publish({kind: 'task.milestone', task: 't1', text: 'x'}),
+    error => error.code === -32001
+  );
+  assert.equal(session.events.length, before);
+});
+
+test('P3 impersonation: from that does not match the peer is refused', async t => {
+  const {bus} = await setup(t);
+  const b = await connect(bus, 'worker:b', {tasks: ['t2']});
+  t.after(() => b.close());
+  await assert.rejects(
+    b.publish({from: 'worker:a', kind: 'note', text: 'x'}),
+    error => error.code === -32001
+  );
+});
+
+test('P4 budget/policy/peer kinds are forbidden to peers', async t => {
+  const {bus} = await setup(t);
+  const a = await connect(bus, 'worker:a', {tasks: ['t1']});
+  t.after(() => a.close());
+  await assert.rejects(a.publish({kind: 'budget.reserved', task: 't1', amount: {starts: 1}}), error => error.code === -32001);
+  await assert.rejects(a.publish({kind: 'policy.fallback', task: 't1'}), error => error.code === -32001);
+  await assert.rejects(a.publish({kind: 'peer.joined', text: 'x'}), error => error.code === -32001);
+});
+
+test('P5 submit authority: canSubmit and parent membership both required', async t => {
+  const {bus} = await setup(t);
+  const noSubmit = await connect(bus, 'worker:a', {tasks: ['t1'], canSubmit: false});
+  t.after(() => noSubmit.close());
+  await assert.rejects(
+    noSubmit.publish({kind: 'task.submitted', task: 't9', parent: 't1', profile: 'p'}),
+    error => error.code === -32001
+  );
+  const canSubmit = await connect(bus, 'worker:a', {tasks: ['t1'], canSubmit: true});
+  t.after(() => canSubmit.close());
+  const row = await canSubmit.publish({kind: 'task.submitted', task: 't9', parent: 't1', profile: 'p'});
+  assert.equal(row.kind, 'task.submitted');
+  await assert.rejects(
+    canSubmit.publish({kind: 'task.submitted', task: 't10', parent: 't2', profile: 'p'}),
+    error => error.code === -32001
+  );
+});
+
+test('P6 wait resolves an already-present row, then a future row, then times out', async t => {
+  const {bus} = await setup(t);
+  const a = await connect(bus, 'worker:a', {tasks: ['t1']});
+  t.after(() => a.close());
+  const blocked = await a.publish({kind: 'task.blocked', task: 't1', text: 'b'});
+  assert.equal(blocked.seq, 2); // 1 is the constructor's own 'session' row
+  const present = await a.wait({match: {kind: 'task.blocked', task: 't1'}, timeout: 1000});
+  assert.equal(present.id, blocked.id);
+
+  // task.completed is scheduler-owned (peers cannot publish it, see the lifecycle
+  // authority tests below); task.milestone is a kind a peer may legitimately publish.
+  const waitPromise = a.wait({match: {kind: 'task.milestone', task: 't1', text: 'done'}, timeout: 1000});
+  await new Promise(resolve => setTimeout(resolve, 50));
+  const completed = await a.publish({kind: 'task.milestone', task: 't1', text: 'done'});
+  assert.equal(completed.seq, 3);
+  const resolved = await waitPromise;
+  assert.equal(resolved.seq, 3);
+
+  const timedOut = await a.wait({match: {kind: 'task.milestone', task: 'nope'}, timeout: 100});
+  assert.equal(timedOut, null);
+});
+
+test('P7 a connection whose first line is not auth is refused and closed', async t => {
+  const {bus} = await setup(t);
+  bus.grant({peer: 'worker:a', tasks: ['t1']});
+  const {socket, waitForLines, lines, write} = await rawConnect(bus, t);
+  const ended = new Promise(resolve => socket.once('close', resolve));
+  write({jsonrpc: '2.0', id: 0, method: 'publish', params: {event: {kind: 'note'}}});
+  await waitForLines(1);
+  await ended;
+  assert.equal(lines[0].error.code, -32001);
+});
+
+test('P8 ref dedupe through the bus returns the same row twice', async t => {
+  const {session, bus} = await setup(t);
+  const a = await connect(bus, 'worker:a', {tasks: ['t1']});
+  t.after(() => a.close());
+  const first = await a.publish({kind: 'task.milestone', task: 't1', ref: 'm-1', text: 'x'});
+  const second = await a.publish({kind: 'task.milestone', task: 't1', ref: 'm-1', text: 'x'});
+  assert.equal(second.id, first.id);
+  assert.equal(session.events.filter(e => e.ref === 'm-1').length, 1);
+});
+
+test('P9 revoke closes connections and invalidates the token', async t => {
+  const {bus} = await setup(t);
+  const {token} = bus.grant({peer: 'worker:a', tasks: ['t1']});
+  const a = await connectBus({path: bus.path, token});
+  await bus.revoke('worker:a');
+  await a.close().catch(() => {});
+  await assert.rejects(connectBus({path: bus.path, token}), error => error.code === -32001);
+});
+
+test('P10 a live kind resolves a row with no seq and does not touch the journal file', async t => {
+  const {session, bus} = await setup(t);
+  const a = await connect(bus, 'worker:a', {tasks: ['t1']});
+  t.after(() => a.close());
+  const before = fs.readFileSync(session.file, 'utf8').split('\n').filter(Boolean).length;
+  const row = await a.publish({kind: 'task.activity', task: 't1', text: 'tick'});
+  assert.equal('seq' in row, false);
+  assert.equal(fs.readFileSync(session.file, 'utf8').split('\n').filter(Boolean).length, before);
+});
+
+test('G1 a peer cannot forge id, time or context; context comes from the grant, defaulting to session.id', async t => {
+  const {session, bus} = await setup(t);
+  const {token} = bus.grant({peer: 'worker:a', tasks: ['t1'], context: 'ctx-a'});
+  const a = await connectBus({path: bus.path, token});
+  t.after(() => a.close());
+  const row = await a.publish({kind: 'task.milestone', task: 't1', id: 'FORGED', time: '1999-01-01T00:00:00.000Z', context: 'OTHER', text: 'x'});
+  assert.notEqual(row.id, 'FORGED');
+  assert.notEqual(row.time, '1999-01-01T00:00:00.000Z');
+  assert.equal(row.context, 'ctx-a');
+
+  const noContext = await connect(bus, 'worker:b', {tasks: ['t2']});
+  t.after(() => noContext.close());
+  const row2 = await noContext.publish({kind: 'task.milestone', task: 't2', context: 'OTHER', text: 'y'});
+  assert.equal(row2.context, session.id);
+});
+
+test('G2 a non-object line after auth (bare null, malformed JSON) is refused, not a crash', async t => {
+  const {bus} = await setup(t);
+  const a = await connect(bus, 'worker:a', {tasks: ['t1']});
+  t.after(() => a.close());
+  const {token} = bus.grant({peer: 'worker:raw', tasks: ['t3']});
+  const {waitForLines, lines, write, writeRaw} = await rawConnect(bus, t);
+
+  write({jsonrpc: '2.0', id: 0, method: 'auth', params: {token}});
+  await waitForLines(1);
+  writeRaw('null\n');
+  await waitForLines(2);
+  writeRaw('{"id":\n');
+  await waitForLines(3);
+
+  assert.equal(lines[1].error.code, -32600);
+  assert.equal(lines[2].error.code, -32600);
+  // the server must have survived: another client can still publish
+  const row = await a.publish({kind: 'task.milestone', task: 't1', text: 'still alive'});
+  assert.equal(row.kind, 'task.milestone');
+});
+
+test('an unknown method after auth is refused with -32601', async t => {
+  const {bus} = await setup(t);
+  const {token} = bus.grant({peer: 'worker:a', tasks: ['t1']});
+  const {waitForLines, lines, write} = await rawConnect(bus, t);
+  write({jsonrpc: '2.0', id: 0, method: 'auth', params: {token}});
+  await waitForLines(1);
+  write({jsonrpc: '2.0', id: 1, method: 'frobnicate', params: {}});
+  await waitForLines(2);
+  assert.equal(lines[1].error.code, -32601);
+});
+
+test('the auth timeout closes a connection that never authenticates', async t => {
+  const {bus} = await setup(t, {authTimeout: 30});
+  const {socket} = await rawConnect(bus, t);
+  const closed = new Promise(resolve => socket.once('close', resolve));
+  await closed;
+});
+
+test('the bus socket is mode 0600 and the tokens dir is mode 0700', async t => {
+  const {session, bus} = await setup(t);
+  assert.equal(fs.statSync(bus.path).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(path.join(session.dir, 'tokens')).mode & 0o777, 0o700);
+});
+
+test('a 2 MiB newline-free write before auth gets the connection destroyed (unbounded buffer guard)', async t => {
+  const {bus} = await setup(t);
+  const {socket} = await rawConnect(bus, t);
+  const closed = new Promise(resolve => socket.once('close', resolve));
+  socket.write('x'.repeat(2 * 1024 * 1024));
+  await closed;
+});
+
+test('a wait subscription and timer are torn down when the client closes, not left for the wait timeout', async t => {
+  const {session, bus} = await setup(t);
+  const baseline = session.listeners.size;
+  const a = await connect(bus, 'worker:a', {tasks: ['t1']});
+  a.wait({match: {kind: 'task.completed', task: 'never'}, timeout: 600000}).catch(() => {});
+  // wait() is a request/response round trip; the subscription registers server-side
+  // only once the request arrives, so poll for it rather than asserting immediately.
+  await waitFor(() => session.listeners.size === baseline + 1);
+  assert.equal(session.listeners.size, baseline + 1);
+  await a.close();
+  await waitFor(() => session.listeners.size === baseline);
+  assert.equal(session.listeners.size, baseline);
+});
+
+test('a wait subscription and timer are torn down on revoke', async t => {
+  const {session, bus} = await setup(t);
+  const baseline = session.listeners.size;
+  const {token} = bus.grant({peer: 'worker:a', tasks: ['t1']});
+  const a = await connectBus({path: bus.path, token});
+  a.wait({match: {kind: 'task.completed', task: 'never'}, timeout: 600000}).catch(() => {});
+  await waitFor(() => session.listeners.size === baseline + 1);
+  assert.equal(session.listeners.size, baseline + 1);
+  await bus.revoke('worker:a');
+  assert.equal(session.listeners.size, baseline);
+});
+
+test('a wait subscription and timer are torn down on bus.close', async t => {
+  const {session, bus} = await setup(t);
+  const baseline = session.listeners.size;
+  const a = await connect(bus, 'worker:a', {tasks: ['t1']});
+  a.wait({match: {kind: 'task.completed', task: 'never'}, timeout: 600000}).catch(() => {});
+  await waitFor(() => session.listeners.size === baseline + 1);
+  assert.equal(session.listeners.size, baseline + 1);
+  await bus.close();
+  assert.equal(session.listeners.size, baseline);
+});
+
+test('a wait in flight rejects with code closed when the peer is revoked, within 100ms', async t => {
+  const {bus} = await setup(t);
+  const {token} = bus.grant({peer: 'worker:a', tasks: ['t1']});
+  const a = await connectBus({path: bus.path, token});
+  const waitPromise = a.wait({match: {kind: 'task.completed', task: 'never'}, timeout: 600000});
+  const start = Date.now();
+  await bus.revoke('worker:a');
+  await assert.rejects(waitPromise, error => error.code === 'closed');
+  assert.ok(Date.now() - start < 100);
+});
+
+test('revoke and close unlink the peer token file', async t => {
+  const {bus} = await setup(t);
+  const {file} = bus.grant({peer: 'worker:a', tasks: ['t1']});
+  assert.equal(fs.existsSync(file), true);
+  await bus.revoke('worker:a');
+  assert.equal(fs.existsSync(file), false);
+
+  const {file: file2} = bus.grant({peer: 'worker:b', tasks: ['t2']});
+  assert.equal(fs.existsSync(file2), true);
+  await bus.close();
+  assert.equal(fs.existsSync(file2), false);
+});
+
+test('grant filenames disambiguate peers that sanitize to the same string', async t => {
+  const {bus} = await setup(t);
+  const {file: fileA} = bus.grant({peer: 'worker:a', tasks: []});
+  const {file: fileB} = bus.grant({peer: 'worker/a', tasks: []});
+  assert.notEqual(fileA, fileB);
+  assert.equal(fs.existsSync(fileA), true);
+  assert.equal(fs.existsSync(fileB), true);
+});
+
+test('a peer cannot publish task lifecycle kinds owned by the scheduler', async t => {
+  const {bus} = await setup(t);
+  const a = await connect(bus, 'worker:a', {tasks: ['t1']});
+  t.after(() => a.close());
+  for (const kind of ['task.started', 'task.completed', 'task.failed', 'task.cancelled', 'task.deadline']) {
+    await assert.rejects(a.publish({kind, task: 't1', text: 'x'}), error => error.code === -32001);
+  }
+});
+
+test('a peer can still publish the task kinds it owns', async t => {
+  const {bus} = await setup(t);
+  const a = await connect(bus, 'worker:a', {tasks: ['t1'], canSubmit: true});
+  t.after(() => a.close());
+  assert.equal((await a.publish({kind: 'task.milestone', task: 't1', text: 'm'})).kind, 'task.milestone');
+  assert.equal((await a.publish({kind: 'task.blocked', task: 't1', text: 'b'})).kind, 'task.blocked');
+  assert.equal((await a.publish({kind: 'task.input_required', task: 't1', text: 'i'})).kind, 'task.input_required');
+  assert.equal((await a.publish({kind: 'task.usage', task: 't1', usage: {tokens: 5}})).kind, 'task.usage');
+  assert.equal((await a.publish({kind: 'message', to: 'orchestrator', text: 'hi'})).kind, 'message');
+});
+
+test('task.submitted from a peer strips replaces and budget', async t => {
+  const {bus} = await setup(t);
+  const a = await connect(bus, 'worker:a', {tasks: ['t1'], canSubmit: true});
+  t.after(() => a.close());
+  const row = await a.publish({kind: 'task.submitted', task: 't9', parent: 't1', profile: 'p', replaces: 't1', budget: {starts: 999}});
+  assert.equal('replaces' in row, false);
+  assert.equal('budget' in row, false);
+});
+
+test('task.submitted from a peer is refused when task equals parent', async t => {
+  const {bus} = await setup(t);
+  const a = await connect(bus, 'worker:a', {tasks: ['t1'], canSubmit: true});
+  t.after(() => a.close());
+  await assert.rejects(a.publish({kind: 'task.submitted', task: 't1', parent: 't1', profile: 'p'}), error => error.code === -32602);
+});
+
+test('task.submitted from a peer is refused when the task id was already submitted', async t => {
+  const {bus} = await setup(t);
+  const a = await connect(bus, 'worker:a', {tasks: ['t1'], canSubmit: true});
+  t.after(() => a.close());
+  await a.publish({kind: 'task.submitted', task: 't9', parent: 't1', profile: 'p'});
+  await assert.rejects(a.publish({kind: 'task.submitted', task: 't9', parent: 't1', profile: 'p'}), error => error.code === -32602);
+});
+
+test('task.submitted from a peer is refused when profile is missing, empty, or not a string', async t => {
+  const {bus} = await setup(t);
+  const a = await connect(bus, 'worker:a', {tasks: ['t1'], canSubmit: true});
+  t.after(() => a.close());
+  await assert.rejects(a.publish({kind: 'task.submitted', task: 't9', parent: 't1'}), error => error.code === -32602);
+  await assert.rejects(a.publish({kind: 'task.submitted', task: 't10', parent: 't1', profile: ''}), error => error.code === -32602);
+  await assert.rejects(a.publish({kind: 'task.submitted', task: 't11', parent: 't1', profile: 42}), error => error.code === -32602);
+});
+
+test('G3 socketPathFor: a short dir keeps dir/bus.sock', () => {
+  const dir = '/tmp/bb-short';
+  assert.equal(socketPathFor(dir), path.join(dir, 'bus.sock'));
+});
+
+test('G3 socketPathFor: a long dir falls back to /tmp/bounce-<uid>/<basename>.sock, and a client can connect and publish through it', async t => {
+  const tmpRoot = fs.mkdtempSync('/tmp/bb-root-');
+  t.after(() => fs.rmSync(tmpRoot, {recursive: true, force: true}));
+  // A deep BOUNCE_HOME makes the dir itself long while its basename (the session
+  // id) stays short, same as production; the fallback filename must stay short too.
+  const longDir = path.join(tmpRoot, 'x'.repeat(150), 'sessions', 'session-abc123');
+  fs.mkdirSync(longDir, {recursive: true});
+  const uid = process.getuid();
+  const chosen = socketPathFor(longDir, {tmpRoot});
+  assert.ok(Buffer.byteLength(path.join(longDir, 'bus.sock')) > 100, 'fixture must actually exceed the limit');
+  assert.equal(chosen, path.join(tmpRoot, `bounce-${uid}`, `${path.basename(longDir)}.sock`));
+
+  const shortRoot = fs.mkdtempSync('/tmp/bb-');
+  t.after(() => fs.rmSync(shortRoot, {recursive: true, force: true}));
+  const session = new Session(shortRoot, {root: shortRoot});
+  const bus = await createBus({session, dir: longDir, tmpRoot});
+  t.after(() => bus.close());
+  assert.equal(bus.path, chosen);
+  const {token} = bus.grant({peer: 'worker:a', tasks: ['t1']});
+  const client = await connectBus({path: bus.path, token});
+  t.after(() => client.close());
+  const row = await client.publish({kind: 'task.milestone', task: 't1', text: 'via fallback socket'});
+  assert.equal(row.from, 'worker:a');
+  assert.equal(session.events.at(-1).id, row.id);
+});
+
+test('G3 socketPathFor: an existing socket directory that is not mode 0700 is refused', () => {
+  const tmpRoot = fs.mkdtempSync('/tmp/bb-root-');
+  try {
+    const uid = process.getuid();
+    const unsafeDir = path.join(tmpRoot, `bounce-${uid}`);
+    fs.mkdirSync(unsafeDir, {mode: 0o755});
+    const longDir = path.join(tmpRoot, 'y'.repeat(120));
+    fs.mkdirSync(longDir, {recursive: true});
+    assert.throws(() => socketPathFor(longDir, {tmpRoot}), /unsafe socket directory/);
+  } finally {
+    fs.rmSync(tmpRoot, {recursive: true, force: true});
+  }
+});
+
+test('G3 socketPathFor hashes the filename when even the per-uid fallback would be too long', () => {
+  const tmpRoot = fs.mkdtempSync('/tmp/bb-root-');
+  try {
+    const longBasename = 'z'.repeat(120);
+    const longDir = path.join(tmpRoot, 'sessions', longBasename);
+    fs.mkdirSync(longDir, {recursive: true});
+    const chosen = socketPathFor(longDir, {tmpRoot});
+    const uid = process.getuid();
+    assert.ok(Buffer.byteLength(chosen) <= 100);
+    const expectedHash = crypto.createHash('sha256').update(longBasename).digest('hex').slice(0, 16);
+    assert.equal(chosen, path.join(tmpRoot, `bounce-${uid}`, `${expectedHash}.sock`));
+  } finally {
+    fs.rmSync(tmpRoot, {recursive: true, force: true});
+  }
+});
+
+test('G3 a hashed fallback socket path is connectable', async t => {
+  const tmpRoot = fs.mkdtempSync('/tmp/bb-root-');
+  t.after(() => fs.rmSync(tmpRoot, {recursive: true, force: true}));
+  const longBasename = 'z'.repeat(120);
+  const longDir = path.join(tmpRoot, 'sessions', longBasename);
+  fs.mkdirSync(longDir, {recursive: true});
+  const shortRoot = fs.mkdtempSync('/tmp/bb-');
+  t.after(() => fs.rmSync(shortRoot, {recursive: true, force: true}));
+  const session = new Session(shortRoot, {root: shortRoot});
+  const bus = await createBus({session, dir: longDir, tmpRoot});
+  t.after(() => bus.close());
+  assert.ok(Buffer.byteLength(bus.path) <= 100);
+  const {token} = bus.grant({peer: 'worker:a', tasks: ['t1']});
+  const client = await connectBus({path: bus.path, token});
+  t.after(() => client.close());
+  const row = await client.publish({kind: 'task.milestone', task: 't1', text: 'hashed'});
+  assert.equal(row.from, 'worker:a');
+});
+
+test('G3 createBus rejects (not crashes) when the socket path is blocked by a stale non-socket file', async t => {
+  const root = fs.mkdtempSync('/tmp/bb-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const session = new Session(root, {root});
+  const stale = path.join(session.dir, 'bus.sock');
+  fs.mkdirSync(stale); // a directory sitting where the socket file belongs
+  await assert.rejects(createBus({session, dir: session.dir}), error => typeof error.code === 'string');
+});
