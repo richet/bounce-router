@@ -10,14 +10,15 @@ export const vendorEnv = (env = process.env) => Object.fromEntries(Object.entrie
 
 // Yields {kind:'line', text} per stdout line (the adapter normalizes), {kind:'diagnostic', text} per
 // stderr line, then exactly one terminal event: {kind:'exit', code, signal, limited} or {kind:'error', code, text}.
-export function spawnLive({executable, args, cwd, env = vendorEnv(), stdin, spawn = spawnProcess}) {
+// keepStdin: a persistent peer (an app-server) is fed requests for its whole life; one-shot CLIs get their prompt and EOF.
+export function spawnLive({executable, args, cwd, env = vendorEnv(), stdin, keepStdin = false, spawn = spawnProcess}) {
   const child = spawn(executable, args, {cwd, env, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe']});
   const queue = []; let wake = null, done = false, tail = '';
   const push = e => { queue.push(e); const w = wake; wake = null; w?.(); };
   const end = e => { if (!done) { done = true; push(e); } };
   child.on('error', error => end({kind: 'error', code: error.code === 'ENOENT' ? 'missing' : error.code ?? 'error', text: error.message}));
   child.stdin?.on('error', () => {});
-  child.stdin?.end(stdin);
+  if (!keepStdin) child.stdin?.end(stdin); else if (stdin !== undefined) child.stdin?.write(stdin);
   if (child.stdout) createInterface({input: child.stdout}).on('line', text => push({kind: 'line', text}));
   if (child.stderr) createInterface({input: child.stderr}).on('line', text => { tail = (tail + '\n' + text).slice(-16000); push({kind: 'diagnostic', text}); });
   child.on('close', (code, signal) => end({kind: 'exit', code, signal, limited: limitPattern.test(tail)}));

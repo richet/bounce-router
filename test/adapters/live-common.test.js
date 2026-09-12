@@ -63,3 +63,17 @@ test('verifiedCancel: SIGTERM suffices for a cooperative child; a SIGTERM-trappi
   assert.ok(kills.includes('SIGTERM') && kills.includes('SIGKILL'));
   assert.deepEqual(await verifiedCancel(stubborn.child, {kill: spy}), {verified: true});
 });
+
+test('spawnLive keepStdin leaves stdin open for a persistent peer; the default still sends EOF', async () => {
+  const echo = "process.stdin.on('data', d => process.stdout.write('got:' + d)); process.stdin.on('end', () => { console.log('eof'); process.exit(0); })";
+  const closed = spawnLive({executable: process.execPath, args: ['-e', echo], stdin: 'a\n'});
+  const lines = []; for await (const e of closed.events) if (e.kind === 'line') lines.push(e.text);
+  assert.deepEqual(lines, ['got:a', 'eof']);
+  const open = spawnLive({executable: process.execPath, args: ['-e', echo], keepStdin: true});
+  open.child.stdin.write('b\n');
+  const first = await (async () => { for await (const e of open.events) if (e.kind === 'line') return e.text; })();
+  assert.equal(first, 'got:b');
+  open.child.stdin.end();
+  const rest = []; for await (const e of open.events) rest.push(e.kind === 'line' ? e.text : e.kind);
+  assert.deepEqual(rest, ['eof', 'exit']);
+});
