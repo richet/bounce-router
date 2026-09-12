@@ -7,11 +7,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-const FORBIDDEN_PREFIXES = ['budget.', 'policy.', 'peer.'];
+// Peers publish from a positive allowlist: everything a session, the scheduler or the daemon writes is refused regardless of `from`,
+// because handoff() folds user/note rows into every later prompt and Router reads cooldown rows.
+const PEER_KINDS = new Set(['task.submitted', 'task.milestone', 'task.blocked', 'task.input_required', 'task.usage', 'task.activity', 'message']);
+const USER_ONLY_PREFIX = 'control.';
 // The scheduler alone owns task lifecycle transitions; a peer may report progress
 // (milestone/blocked/input_required/usage/activity), ask for work (submitted) or
 // talk (message), but never assert that a task started, finished or died.
-const FORBIDDEN_TASK_KINDS = new Set(['task.started', 'task.completed', 'task.failed', 'task.cancelled', 'task.deadline']);
 const AUTH_TIMEOUT = 30000;
 const MAX_LINE_BUFFER = 1024 * 1024; // 1 MiB: a partial line past this is abuse, not a slow write.
 
@@ -114,8 +116,7 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
       if (e.from === undefined) e.from = peer;
       else if (e.from !== peer) return refuse(id, -32001, 'unauthorized');
       if (typeof e.kind !== 'string') return refuse(id, -32602, 'invalid event');
-      if (FORBIDDEN_PREFIXES.some(prefix => e.kind.startsWith(prefix))) return refuse(id, -32001, 'unauthorized');
-      if (FORBIDDEN_TASK_KINDS.has(e.kind)) return refuse(id, -32001, 'unauthorized');
+      if (e.kind.startsWith(USER_ONLY_PREFIX) ? peer !== 'user' : !PEER_KINDS.has(e.kind)) return refuse(id, -32001, 'unauthorized');
       if (e.kind === 'task.submitted') {
         // A canSubmit grant may open a root (parent explicitly null); anything with a parent needs that parent in its own tasks.
         if (!authenticated.canSubmit || !(e.parent === null || authenticated.tasks.includes(e.parent))) return refuse(id, -32001, 'unauthorized');
@@ -175,6 +176,9 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
   // Resolves once every socket that was open under this grant has actually closed
   // (not merely destroyed), so a caller can rely on server-side teardown (wait
   // subscriptions, timers) having run by the time this settles.
+  // Widens a grant in place (the orchestrator learns of each task it opens); the token is not rotated, so open connections keep working.
+  function extendGrant(peer, tasks) { const entry = grants.get(peer); if (entry) for (const task of tasks) if (!entry.tasks.includes(task)) entry.tasks.push(task); }
+
   function revoke(peer) {
     const entry = grants.get(peer);
     if (!entry) return Promise.resolve();
@@ -209,7 +213,7 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
       }
       if (settled) return;
       settled = true;
-      resolve({path: spath, grant, revoke, close});
+      resolve({path: spath, grant, extendGrant, revoke, close});
     });
   });
 }

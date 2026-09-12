@@ -494,3 +494,30 @@ test('a canSubmit grant may submit a ROOT task (parent null); child submits stil
   await assert.rejects(c.publish({kind: 'task.submitted', task: 'root-2', profile: 'p', orders: 'x'}), e => e.code === -32001, 'parent omitted is not a root submit; it must be explicitly null');
   await c.close();
 });
+
+test('peers may publish only the allowlisted kinds; session-owned kinds are refused even without a from field; control.* is the user peer only', async t => {
+  const {session, bus, cleanup} = await setup(t);
+  t.after(cleanup);
+  const c = await connectBus({path: bus.path, token: bus.grant({peer: 'orchestrator', tasks: [], canSubmit: true}).token});
+  for (const kind of ['user', 'note', 'cooldown', 'checkpoint', 'route', 'attempt', 'turn', 'session', 'assistant', 'control.stopped', 'control.stop', 'operation', 'peer.joined'])
+    await assert.rejects(c.publish({kind, text: 'x', provider: 'claude'}), e => e.code === -32001, kind);
+  assert.equal(session.events.filter(e => e.kind === 'user').length, 0);
+  const ok = await c.publish({kind: 'message', to: 'user', text: 'hello'});
+  assert.equal(ok.kind, 'message');
+  const u = await connectBus({path: bus.path, token: bus.grant({peer: 'user', tasks: [], canSubmit: true}).token});
+  assert.equal((await u.publish({kind: 'control.stop'})).kind, 'control.stop');
+  await c.close(); await u.close();
+});
+
+test('extendGrant adds tasks to a live grant without rotating its token', async t => {
+  const {bus, cleanup} = await setup(t);
+  t.after(cleanup);
+  const {token} = bus.grant({peer: 'orchestrator', tasks: [], canSubmit: true});
+  const c = await connectBus({path: bus.path, token});
+  await assert.rejects(c.publish({kind: 'task.milestone', task: 't1', text: 'm'}), e => e.code === -32001);
+  bus.extendGrant('orchestrator', ['t1']);
+  assert.equal((await c.publish({kind: 'task.milestone', task: 't1', text: 'm'})).task, 't1');
+  const again = await connectBus({path: bus.path, token});
+  assert.deepEqual(again.tasks, ['t1']);
+  await c.close(); await again.close();
+});
