@@ -63,6 +63,20 @@ test('P4 error messages, one case each', () => {
     {message: 'profile build: fallback may not include itself'});
 });
 
+test('role orchestrator is derived from settings.orchestrator, never declared', () => {
+  const declaredOnWorker = {
+    operation: 'orchestrator', mode: 'yolo', orchestrator: 'main',
+    profiles: {main: {adapter: 'claude'}, build: {adapter: 'claude', role: 'orchestrator'}},
+  };
+  assert.throws(() => validateOrchestration(declaredOnWorker), {message: 'profile build: role orchestrator is derived, not declared'});
+
+  const declaredOnOrchestratorProfile = {
+    operation: 'orchestrator', mode: 'yolo', orchestrator: 'main',
+    profiles: {main: {adapter: 'claude', role: 'orchestrator'}, build: {adapter: 'claude'}},
+  };
+  assert.throws(() => validateOrchestration(declaredOnOrchestratorProfile), {message: 'profile main: role orchestrator is derived, not declared'});
+});
+
 test('P5 ratchet: session mode caps profile mode, read-only roles cannot be write', () => {
   const settingsMode = {
     operation: 'orchestrator', mode: 'plan', orchestrator: 'main',

@@ -23,6 +23,7 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
     if (!adapterNames.includes(raw.adapter)) throw new Error(`profile ${name}: adapter must be one of ${adapterNames.join(', ')}`);
     const mode = raw.mode ?? settings.mode;
     if (!['yolo', 'plan'].includes(mode)) throw new Error(`profile ${name}: mode must be yolo or plan`);
+    if (raw.role === 'orchestrator') throw new Error(`profile ${name}: role orchestrator is derived, not declared`);
     let role = raw.role ?? 'builder';
     if (!ROLES.includes(role)) throw new Error(`profile ${name}: role must be one of ${ROLES.join(', ')}`);
     if (name === settings.orchestrator) role = 'orchestrator';
