@@ -10,7 +10,10 @@ export default {
       ...(mode === 'yolo' ? ['--dangerously-bypass-approvals-and-sandbox'] : ['--sandbox', 'read-only']), '-'];
   },
   stdin: prompt => prompt,
-  normalize(raw) {
+  normalize(message) {
+    // `codex exec` names a row `type: 'turn.completed'`; the app-server peer sends the same
+    // payload as a notification `method: 'turn/completed'`. One protocol, two spellings.
+    const raw = typeof message.method === 'string' ? {...message.params, type: message.method.replace('/', '.')} : message;
     const events = [];
     const add = (kind, text, extra = {}) => events.push({kind, text: describe(text), ...extra});
     const model = raw.message?.model ?? raw.model ?? raw.payload?.model ?? raw.payload?.model_id;
