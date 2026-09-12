@@ -39,6 +39,43 @@ export function socketPathFor(dir, {platform = process.platform, uid = process.g
   return path.join(safeDir, `${hash}.sock`);
 }
 
+// Probes a unix socket path: 'live' if something is listening (or the connect hangs
+// past the short timeout — treated as live, never reaped on doubt), 'dead' if the path
+// has no listener (ECONNREFUSED) or is not a socket at all (ENOTSOCK).
+function probeSocket(p, timeout) {
+  return new Promise(resolve => {
+    const sock = net.connect(p);
+    const finish = verdict => { try { sock.destroy(); } catch {} resolve(verdict); };
+    const timer = setTimeout(() => finish('live'), timeout); timer.unref?.();
+    sock.once('connect', () => { clearTimeout(timer); finish('live'); });
+    sock.once('error', error => { clearTimeout(timer); finish(error.code === 'ECONNREFUSED' || error.code === 'ENOTSOCK' ? 'dead' : 'live'); });
+  });
+}
+
+// Sweeps the shared per-uid fallback directory (/tmp/bounce-<uid>/) of orphaned bus
+// sockets: a daemon killed with SIGKILL never runs close(), so its socket file survives
+// with no listener. Each new daemon reaps the dead ones (ECONNREFUSED/ENOTSOCK) so the
+// directory does not accumulate forever; a live socket, a non-.sock file and the caller's
+// own `keep` path are left untouched, and the sweep never throws. Returns the paths reaped.
+export async function reapStaleSockets({platform = process.platform, uid = process.getuid?.(), tmpRoot = '/tmp', keep, connectTimeout = 200} = {}) {
+  if (platform === 'win32') return [];
+  const safeDir = path.join(tmpRoot, `bounce-${uid}`);
+  let stat;
+  try { stat = fs.statSync(safeDir); }
+  catch { return []; } // no fallback dir yet: nothing to sweep
+  if (!stat.isDirectory() || stat.uid !== uid || (stat.mode & 0o777) !== 0o700) return []; // not a directory we own safely
+  const keepName = keep ? path.basename(keep) : null;
+  let names;
+  try { names = fs.readdirSync(safeDir); }
+  catch { return []; }
+  const reaped = [];
+  await Promise.all(names.filter(name => name.endsWith('.sock') && name !== keepName).map(async name => {
+    const target = path.join(safeDir, name);
+    if (await probeSocket(target, connectTimeout) === 'dead') { try { fs.unlinkSync(target); reaped.push(target); } catch {} }
+  }));
+  return reaped.sort();
+}
+
 // Resolves once actually listening; rejects (never throws async/uncaught) on any
 // bind/chmod failure — a stale non-socket file at the chosen path, EADDRINUSE, etc.
 export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = AUTH_TIMEOUT, validate = () => null}) {
@@ -48,6 +85,9 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
   fs.mkdirSync(tokensDir, {recursive: true, mode: 0o700});
   const spath = socketPathFor(dir, {platform, uid, tmpRoot});
   if (process.platform !== 'win32') { try { fs.unlinkSync(spath); } catch {} }
+  // Reap any orphaned fallback sockets a SIGKILLed daemon left behind (never our own spath).
+  // Fire-and-forget: sweeping must never delay or fail this daemon coming up.
+  void reapStaleSockets({platform, uid, tmpRoot, keep: spath});
   const server = net.createServer(socket => handleConnection(socket));
 
   function handleConnection(socket) {

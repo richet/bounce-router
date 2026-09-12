@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import {createBus, connectBus, socketPathFor} from '../src/bus.js';
+import {createBus, connectBus, socketPathFor, reapStaleSockets} from '../src/bus.js';
 import {Session, defaults} from '../src/core.js';
 import {createScheduler} from '../src/scheduler.js';
 import * as core from '../src/core.js';
@@ -616,4 +616,46 @@ test('a peer cannot publish review.finished or task.rework: those stay unauthori
   t.after(() => a.close());
   await assert.rejects(a.publish({kind: 'review.finished', task: 't1', stage: 'completion', verdict: 'accept'}), error => error.code === -32001);
   await assert.rejects(a.publish({kind: 'task.rework', task: 't1', round: 1, findings: ['x']}), error => error.code === -32001);
+});
+
+// A daemon killed with SIGKILL never runs bus.close(), so its unix socket file is
+// never unlinked. For the short path (${dir}/bus.sock) that dies with the session dir,
+// but a fallback socket under the shared /tmp/bounce-<uid>/ directory (used when the
+// session-dir path would overflow sockaddr_un) is orphaned forever. reapStaleSockets
+// sweeps that directory: a socket with no live listener (ECONNREFUSED / ENOTSOCK) is
+// removed; a live one is kept, and non-.sock files are never touched.
+test('reapStaleSockets removes dead fallback sockets, keeps live ones and non-socket files', async t => {
+  const netmod = await import('node:net');
+  const uid = process.getuid();
+  const tmpRoot = fs.mkdtempSync('/tmp/reap-');
+  t.after(() => fs.rmSync(tmpRoot, {recursive: true, force: true}));
+  const safeDir = path.join(tmpRoot, `bounce-${uid}`);
+  fs.mkdirSync(safeDir, {mode: 0o700});
+  const dead1 = path.join(safeDir, 'dead1.sock'); fs.writeFileSync(dead1, '');
+  const dead2 = path.join(safeDir, 'dead2.sock'); fs.writeFileSync(dead2, '');
+  const other = path.join(safeDir, 'keep.txt'); fs.writeFileSync(other, 'notes');
+  const live = path.join(safeDir, 'live.sock');
+  const server = netmod.createServer(); await new Promise(r => server.listen(live, r));
+  t.after(() => new Promise(r => server.close(r)));
+
+  const reaped = await reapStaleSockets({tmpRoot, uid});
+  assert.deepEqual(reaped, [dead1, dead2].sort());
+  assert.equal(fs.existsSync(dead1), false);
+  assert.equal(fs.existsSync(dead2), false);
+  assert.equal(fs.existsSync(live), true, 'a live listener is never reaped');
+  assert.equal(fs.existsSync(other), true, 'a non-socket file is never touched');
+});
+
+test('reapStaleSockets skips its own keep path and a missing/foreign directory', async t => {
+  const uid = process.getuid();
+  const tmpRoot = fs.mkdtempSync('/tmp/reap-');
+  t.after(() => fs.rmSync(tmpRoot, {recursive: true, force: true}));
+  // missing safeDir: nothing to do, no throw
+  assert.deepEqual(await reapStaleSockets({tmpRoot, uid}), []);
+  const safeDir = path.join(tmpRoot, `bounce-${uid}`);
+  fs.mkdirSync(safeDir, {mode: 0o700});
+  const mine = path.join(safeDir, 'mine.sock'); fs.writeFileSync(mine, '');
+  const reaped = await reapStaleSockets({tmpRoot, uid, keep: mine});
+  assert.deepEqual(reaped, [], 'the keep path is never reaped even if it looks dead');
+  assert.equal(fs.existsSync(mine), true);
 });
