@@ -5,6 +5,7 @@ import {Chalk} from 'chalk';
 import wrapAnsi from 'wrap-ansi';
 import sliceAnsi from 'slice-ansi';
 import stripAnsi from 'strip-ansi';
+import {tasks, budgets} from './reducers.js';
 
 // Only renderer-owned terminal escapes may reach the display.
 export const clean = text => stripAnsi(String(text ?? ''))
@@ -181,4 +182,107 @@ export function createWorkSummary() {
 export function workReview(items) {
   if (!items.length) return 'No completed turns yet.';
   return items.map((item, index) => `${index + 1}. ${item}`).join('\n\n');
+}
+
+// Phase 6 §A1 — the TUI as a peer. Pure view reducers over session.events, exactly like every
+// other reducer in src/reducers.js: no IO, no clock. src/cli.js's /tasks and /attach panes are a
+// thin map over these; they carry no business logic of their own.
+
+// Same rootOf rule as reducers.js budgets()/spend(): a replacement belongs to the root of the
+// task it replaces; otherwise walk up parent links; a cycle (only possible from a directly
+// journaled row) ends at the first revisited id.
+function rootOf(taskView, id, seen = new Set()) {
+  const t = taskView[id];
+  if (!t || seen.has(id)) return id;
+  seen.add(id);
+  if (t.replaces && taskView[t.replaces]) return rootOf(taskView, t.replaces, seen);
+  if (t.parent && taskView[t.parent]) return rootOf(taskView, t.parent, seen);
+  return id;
+}
+
+// taskTree(events) → an ordered array (parents before children, depth-first, submit order
+// within a level) of task-tree pane rows. remainingStarts/remainingRounds come from the task's
+// root's budget remainder; null when that root has no allowance for the key at all (as opposed
+// to zero, which means the allowance is simply spent).
+export function taskTree(events) {
+  const taskView = tasks(events);
+  const budgetView = budgets(events);
+  const tierByTask = {};
+  for (const e of events) if (e.kind === 'task.delivered') tierByTask[e.task] = e.tier;
+  const order = [];
+  const seen = new Set();
+  for (const e of events) if (e.kind === 'task.submitted' && !seen.has(e.task)) { seen.add(e.task); order.push(e.task); }
+  const roots = order.filter(id => !taskView[id].parent);
+  const rows = [];
+  const visit = (id, depth) => {
+    const t = taskView[id];
+    const remaining = budgetView.roots[rootOf(taskView, id)]?.remaining ?? {};
+    rows.push({
+      task: id, depth, profile: t.profile, state: t.state,
+      lastMilestone: t.lastMilestone?.text ?? null,
+      deadline: t.deadline ?? null,
+      remainingStarts: Object.prototype.hasOwnProperty.call(remaining, 'starts') ? remaining.starts : null,
+      remainingRounds: Object.prototype.hasOwnProperty.call(remaining, 'rounds') ? remaining.rounds : null,
+      blocker: t.state === 'blocked' ? t.blocker : null,
+      tier: tierByTask[id] ?? null,
+    });
+    for (const child of t.children) visit(child, depth + 1);
+  };
+  for (const id of roots) visit(id, 0);
+  return rows;
+}
+
+// The legacy conversation kinds a context pane shows directly; every other kind either folds
+// (task.submitted, into a single row) or is invisible here (task.activity and friends are live-
+// only and never reach session.events at all — see src/core.js LIVE_KINDS).
+const FOLDED_THREAD_KINDS = new Set(['user', 'assistant', 'delta', 'tool', 'error', 'note', 'route', 'turn', 'status', 'review']);
+// A row with no context at all predates the context field (pre-Phase-1 journals) and only ever
+// occurred at the session root, so it always belongs wherever it is asked for.
+const belongsToContext = (row, context) => row.context === context || row.context === undefined;
+function foldRowText(t) {
+  const detail = t.lastMilestone?.text ?? (t.state === 'blocked' ? t.blocker : null) ?? 'queued';
+  return `${t.profile} · ${t.state} · ${detail}`;
+}
+
+// foldedThread(events, context) → the rows to show in the transcript pane for one context: every
+// legacy conversation row belonging to it, plus one `task.fold` row per child task submitted
+// from it, inserted at the position of that task's own task.submitted and always reflecting the
+// task's CURRENT (not submit-time) state — this is what keeps a blocker visible without ever
+// showing the child's own transcript (A3).
+export function foldedThread(events, context) {
+  const taskView = tasks(events);
+  const folded = new Set();
+  const rows = [];
+  for (const e of events) {
+    if (e.kind === 'task.submitted') {
+      if (!folded.has(e.task) && belongsToContext(e, context)) {
+        folded.add(e.task);
+        const t = taskView[e.task];
+        rows.push({kind: 'task.fold', task: e.task, state: t.state, text: foldRowText(t)});
+      }
+      continue;
+    }
+    if (FOLDED_THREAD_KINDS.has(e.kind) && belongsToContext(e, context)) rows.push(e);
+  }
+  return rows;
+}
+
+// Phase 6 §A2 — pure command parsing, shared by src/cli.js's submit() dispatch and directly
+// testable without a terminal. A line that is not a slash command returns null.
+export function parseCommand(text) {
+  if (!/^\/[a-z]+(?:\s|$)/i.test(text)) return null;
+  const [command, ...parts] = text.slice(1).split(/\s+/);
+  return {command, parts, arg: parts.join(' ')};
+}
+
+// The ONLY logic that decides whether /continue <profile> may start a new main turn. Pure: it
+// takes the orchestration profile table and the requested name, nothing shaped like a
+// session event — so nothing that folds session.events (a subscriber) could call it even by
+// accident. Only the keyboard's /continue handler in src/cli.js calls it, after the user
+// presses Enter; see CONTRACT.md A2/U5 and docs/local-orchestration.md "Reducers and policies".
+export function continueMain(profiles, name) {
+  if (!name || !Object.prototype.hasOwnProperty.call(profiles || {}, name) || profiles[name].policy === 'read-only') {
+    return {ok: false, error: 'no such profile'};
+  }
+  return {ok: true, profile: name};
 }

@@ -5,7 +5,8 @@ import {PassThrough} from 'node:stream';
 import {completions, typedCommand, frameDiff, createMouseInput, mouseTracking, createPasteInput, createKeyInput, inputLayout, windowAround, modelRows, checklistRows, suspendTerminal, resumeTerminal} from './terminal.js';
 import {modelCatalog, modelEntries, catalogNotes} from './models.js';
 import stringWidth from 'string-width';
-import {clean, createFormatter, createTranscriptRenderer, createWorkSummary, workReview, activeModel} from './format.js';
+import {clean, createFormatter, createTranscriptRenderer, createWorkSummary, workReview, activeModel, taskTree, parseCommand, continueMain} from './format.js';
+import {validateOrchestration} from './profiles.js';
 import {loadQuota, recordQuota, refreshQuota, quotaSnapshot, quotaShort, quotaPanel, quotaReport, quotaUnavailable} from './quota.js';
 import {skillsCommand, syncSkills, inspectSkills, skillsChanged, importCandidates, importSelected, importSummary, syncSummary, skillAreas} from './skills.js';
 import fs from 'node:fs';
@@ -258,6 +259,15 @@ async function main() {
   }
   let input = '', busy = false, suspended = false, scroll = 0, historyIndex = -1;
   const pending = [];
+  // Phase 6 §A2: /tasks toggles the task-tree pane; /attach focuses one worker's live activity.
+  // Both are TUI-local — plain variables, never journaled (see CONTRACT.md A2/U6).
+  let showTasks = false, attachedTask = null;
+  // The orchestration profile table this session was configured with, if any — read once here
+  // so /continue can validate a profile name without touching the bus. A malformed config never
+  // breaks the TUI: it just means /continue always reports 'no such profile'.
+  let orchestration;
+  try { orchestration = validateOrchestration(settings); }
+  catch { orchestration = {operation: 'classic', orchestrator: null, profiles: {}, shape: 'none', strict: false}; }
   let activityTimer, activityStarted = 0, progress = '';
   const activity = () => `${['◐', '◓', '◑', '◒'][Math.floor((Date.now() - activityStarted) / 150) % 4]} Working · ${Math.floor((Date.now() - activityStarted) / 1000)}s`;
   let loadedFingerprint = fingerprint();
@@ -398,27 +408,42 @@ async function main() {
         rows: Math.max(2, nextFrame.length - top.length - 5), cooldowns: router.cooldowns,
         paint: {title: style.title, text: plain, muted: style.muted, ok: style.result,
           warn: style.status, high: style.error, tick: style.note}});
-      const side = [...top, ...usage, style.muted('─'.repeat(sidebarWidth)), style.title('WORK DONE')];
-      const work = workSummary(session.events);
+      const side = [...top, ...usage, style.muted('─'.repeat(sidebarWidth)), style.title(showTasks ? 'TASKS' : 'WORK DONE')];
       const available = Math.max(0, nextFrame.length - side.length);
-      if (!work.length && available) side.push(style.muted('No completed turns yet'));
-      else if (available) {
-        let remaining = available, shown = 0;
-        for (const item of [...work].reverse()) {
-          // Reserve a row for the count of older entries that will not fit.
-          const budget = remaining - (shown + 1 < work.length ? 1 : 0);
-          if (budget <= 0) break;
-          const lines = wrap(singleLine(item), sidebarWidth - 2);
-          const count = Math.min(3, budget, lines.length);
-          for (let i = 0; i < count; i++) {
-            const text = i === count - 1 && count < lines.length
-              ? clip(lines[i], sidebarWidth - 3) + '…' : lines[i];
-            side.push((i === 0 ? '• ' : '  ') + text);
-          }
-          remaining -= count;
-          shown++;
+      // §A2: /tasks toggles this pane in place of WORK DONE. Thin map: each taskTree() row
+      // becomes exactly one formatted line; no state-deriving logic lives here.
+      if (showTasks) {
+        const rows = taskTree(session.events);
+        if (!rows.length && available) side.push(style.muted('No tasks yet'));
+        for (const row of rows.slice(0, available)) {
+          const bits = [row.state, row.lastMilestone, row.deadline != null ? `deadline ${row.deadline}` : null,
+            row.remainingStarts != null ? `${row.remainingStarts} starts left` : null,
+            row.remainingRounds != null ? `${row.remainingRounds} rounds left` : null,
+            row.blocker, row.tier ? `tier ${row.tier}` : null].filter(Boolean).join(' · ');
+          const marker = row.task === attachedTask ? '➤ ' : '  ';
+          side.push(clip(marker + singleLine(`${'  '.repeat(row.depth)}${row.profile} (${row.task.slice(0, 8)}) ${bits}`), sidebarWidth - 1));
         }
-        if (shown < work.length) side.push(style.muted(`+ ${work.length - shown} earlier`));
+      } else {
+        const work = workSummary(session.events);
+        if (!work.length && available) side.push(style.muted('No completed turns yet'));
+        else if (available) {
+          let remaining = available, shown = 0;
+          for (const item of [...work].reverse()) {
+            // Reserve a row for the count of older entries that will not fit.
+            const budget = remaining - (shown + 1 < work.length ? 1 : 0);
+            if (budget <= 0) break;
+            const lines = wrap(singleLine(item), sidebarWidth - 2);
+            const count = Math.min(3, budget, lines.length);
+            for (let i = 0; i < count; i++) {
+              const text = i === count - 1 && count < lines.length
+                ? clip(lines[i], sidebarWidth - 3) + '…' : lines[i];
+              side.push((i === 0 ? '• ' : '  ') + text);
+            }
+            remaining -= count;
+            shown++;
+          }
+          if (shown < work.length) side.push(style.muted(`+ ${work.length - shown} earlier`));
+        }
       }
       for (let i = 0; i < nextFrame.length; i++) {
         const left = clip(nextFrame[i], width);
@@ -471,8 +496,9 @@ async function main() {
     activityStarted = Date.now(); progress = '';
     activityTimer = setInterval(render, 150);
     try {
-      if (/^\/[a-z]+(?:\s|$)/i.test(text)) {
-        const [command, ...parts] = text.slice(1).split(/\s+/); const arg = parts.join(' ');
+      const parsedCommand = parseCommand(text);
+      if (parsedCommand) {
+        const {command, parts, arg} = parsedCommand;
         if (command === 'quit') return quit();
         if (command === 'update') {
           if (arg && arg !== 'check') throw new Error('Use /update or /update check');
@@ -526,6 +552,30 @@ async function main() {
           // The vendor's output is on the main screen bounce just left, so say what happened.
           session.append({kind: 'status', text: outcome});
           notice = outcome;
+          return;
+        } else if (command === 'tasks') {
+          showTasks = !showTasks;
+        } else if (command === 'attach') {
+          if (!arg) { attachedTask = null; }
+          else if (!reducers.tasks(session.events)[arg]) { session.append({kind: 'status', text: 'no such task'}); return; }
+          else { attachedTask = arg; }
+        } else if (command === 'continue') {
+          // §A2/U5: this is the ONLY place a main turn can be started on an orchestration
+          // profile, and it is reached only from here — the keyboard's Enter handler calling
+          // this function with the typed command. continueMain is pure and takes no
+          // session/event, so nothing that folds session.events (scheduleRender, any bus
+          // subscriber) could reach it.
+          const decision = continueMain(orchestration.profiles, arg);
+          if (!decision.ok) { session.append({kind: 'status', text: decision.error}); return; }
+          const profile = orchestration.profiles[decision.profile];
+          settings.order = [profile.adapter, ...settings.order.filter(p => p !== profile.adapter)];
+          settings.models[profile.adapter] = profile.model; session.active = profile.adapter; save();
+          scroll = 0;
+          notice = 'Running · Esc or Ctrl+C cancels the agent process group';
+          render();
+          const result = await router.run(orchestratorBrief + 'Continue.');
+          notice = `Turn ${result}. Session saved.`;
+          void refreshQuota(settings, {root, store: quotas, cwd: session.cwd}).then(render, () => {});
           return;
         } else throw new Error('Unknown command. Type /help');
         notice = 'Updated.';
