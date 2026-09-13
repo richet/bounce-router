@@ -52,12 +52,27 @@ function probeSocket(p, timeout) {
   });
 }
 
-// Sweeps the shared per-uid fallback directory (/tmp/bounce-<uid>/) of orphaned bus
-// sockets: a daemon killed with SIGKILL never runs close(), so its socket file survives
-// with no listener. Each new daemon reaps the dead ones (ECONNREFUSED/ENOTSOCK) so the
-// directory does not accumulate forever; a live socket, a non-.sock file and the caller's
-// own `keep` path are left untouched, and the sweep never throws. Returns the paths reaped.
-export async function reapStaleSockets({platform = process.platform, uid = process.getuid?.(), tmpRoot = '/tmp', keep, connectTimeout = 200} = {}) {
+// A socket is "dead" only if it refuses on EVERY probe of a short retry series: a live
+// daemon that is momentarily not accepting (starting up, or its listen backlog full under
+// heavy parallel load) refuses one connect then accepts the next, and must never be reaped.
+async function probeDead(p, timeout, tries = 3, gap = 60) {
+  for (let i = 0; i < tries; i++) {
+    if (await probeSocket(p, timeout) === 'live') return false;
+    if (i < tries - 1) await new Promise(r => { const t = setTimeout(r, gap); t.unref?.(); });
+  }
+  return true;
+}
+
+// Sweeps the shared per-uid fallback directory (/tmp/bounce-<uid>/) of orphaned bus sockets:
+// a daemon killed with SIGKILL never runs close(), so its socket file survives with no
+// listener. Reaping is deliberately conservative — deleting a socket another live daemon
+// owns breaks that daemon's peers with ENOENT (observed: a sibling reaper unlinked a live
+// orchestrator's socket under parallel load, so its main peer's connectBus failed). So a
+// socket is reaped only when it is BOTH older than `minAgeMs` (a freshly-created socket
+// belongs to a starting/live daemon and is never touched — this is the load-race guard) AND
+// refuses every probe in a retry series (a live-but-busy daemon accepts on a retry). A live
+// socket, a non-.sock file and the caller's own `keep` path are left untouched; never throws.
+export async function reapStaleSockets({platform = process.platform, uid = process.getuid?.(), tmpRoot = '/tmp', keep, connectTimeout = 200, minAgeMs = 3000} = {}) {
   if (platform === 'win32') return [];
   const safeDir = path.join(tmpRoot, `bounce-${uid}`);
   let stat;
@@ -68,10 +83,14 @@ export async function reapStaleSockets({platform = process.platform, uid = proce
   let names;
   try { names = fs.readdirSync(safeDir); }
   catch { return []; }
+  const now = Date.now();
   const reaped = [];
   await Promise.all(names.filter(name => name.endsWith('.sock') && name !== keepName).map(async name => {
     const target = path.join(safeDir, name);
-    if (await probeSocket(target, connectTimeout) === 'dead') { try { fs.unlinkSync(target); reaped.push(target); } catch {} }
+    let mtime;
+    try { mtime = fs.statSync(target).mtimeMs; } catch { return; } // vanished between readdir and stat
+    if (now - mtime < minAgeMs) return; // fresh: a starting/live daemon's socket, never reap
+    if (await probeDead(target, connectTimeout)) { try { fs.unlinkSync(target); reaped.push(target); } catch {} }
   }));
   return reaped.sort();
 }

@@ -631,19 +631,41 @@ test('reapStaleSockets removes dead fallback sockets, keeps live ones and non-so
   t.after(() => fs.rmSync(tmpRoot, {recursive: true, force: true}));
   const safeDir = path.join(tmpRoot, `bounce-${uid}`);
   fs.mkdirSync(safeDir, {mode: 0o700});
-  const dead1 = path.join(safeDir, 'dead1.sock'); fs.writeFileSync(dead1, '');
-  const dead2 = path.join(safeDir, 'dead2.sock'); fs.writeFileSync(dead2, '');
-  const other = path.join(safeDir, 'keep.txt'); fs.writeFileSync(other, 'notes');
+  // Real orphans (a SIGKILLed daemon's leftovers) are older than minAgeMs; backdate them so
+  // this exercises the reap path under the age gate rather than the fresh-socket guard below.
+  const old = Date.now() / 1000 - 3600;
+  const dead1 = path.join(safeDir, 'dead1.sock'); fs.writeFileSync(dead1, ''); fs.utimesSync(dead1, old, old);
+  const dead2 = path.join(safeDir, 'dead2.sock'); fs.writeFileSync(dead2, ''); fs.utimesSync(dead2, old, old);
+  const other = path.join(safeDir, 'keep.txt'); fs.writeFileSync(other, 'notes'); fs.utimesSync(other, old, old);
   const live = path.join(safeDir, 'live.sock');
   const server = netmod.createServer(); await new Promise(r => server.listen(live, r));
+  fs.utimesSync(live, old, old); // even an OLD live socket must be kept (it still accepts)
   t.after(() => new Promise(r => server.close(r)));
 
   const reaped = await reapStaleSockets({tmpRoot, uid});
   assert.deepEqual(reaped, [dead1, dead2].sort());
   assert.equal(fs.existsSync(dead1), false);
   assert.equal(fs.existsSync(dead2), false);
-  assert.equal(fs.existsSync(live), true, 'a live listener is never reaped');
+  assert.equal(fs.existsSync(live), true, 'a live listener is never reaped, even when old');
   assert.equal(fs.existsSync(other), true, 'a non-socket file is never touched');
+});
+
+// Regression (the O9 flake): under parallel load a sibling reaper probed a live orchestrator
+// daemon's freshly-created socket, caught a transient ECONNREFUSED, and unlinked it — the
+// daemon's own main peer then failed connectBus with ENOENT. A socket younger than minAgeMs
+// is a starting/live daemon's and must never be reaped, even if a probe finds it refusing.
+test('reapStaleSockets never reaps a freshly-created socket (the load-race guard)', async t => {
+  const uid = process.getuid();
+  const tmpRoot = fs.mkdtempSync('/tmp/reap-');
+  t.after(() => fs.rmSync(tmpRoot, {recursive: true, force: true}));
+  const safeDir = path.join(tmpRoot, `bounce-${uid}`);
+  fs.mkdirSync(safeDir, {mode: 0o700});
+  // A fresh file that refuses connection (not a live listener) — stands in for a starting
+  // daemon's socket in the window before it accepts. It is young, so it must be kept.
+  const fresh = path.join(safeDir, 'fresh.sock'); fs.writeFileSync(fresh, '');
+  const reaped = await reapStaleSockets({tmpRoot, uid});
+  assert.deepEqual(reaped, []);
+  assert.equal(fs.existsSync(fresh), true, 'a socket younger than minAgeMs is never reaped');
 });
 
 test('reapStaleSockets skips its own keep path and a missing/foreign directory', async t => {
