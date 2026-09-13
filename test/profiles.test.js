@@ -2,12 +2,16 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {validateOrchestration, profileFor} from '../src/profiles.js';
 import {defaults} from '../src/core.js';
+import {defaultStrategy} from '../src/strategy.js';
 
 test('P1 legacy config is untouched and classic', () => {
   const input = {order: ['claude'], mode: 'yolo'};
   const before = structuredClone(input);
   const view = validateOrchestration(input);
-  assert.deepEqual(view, {operation: 'classic', orchestrator: null, profiles: {}, shape: 'none', strict: false});
+  // Phase 8 §3: a resolved `strategy` rides along even in classic mode (absent settings.strategy
+  // resolves to defaultStrategy) — classic mode never engages review/dispatch reactions, so this
+  // is inert for it, but createScheduler always receives a strategy value either way.
+  assert.deepEqual(view, {operation: 'classic', orchestrator: null, profiles: {}, shape: 'none', strict: false, strategy: defaultStrategy});
   assert.deepEqual(input, before);
 });
 
@@ -57,10 +61,20 @@ test('P4 error messages, one case each', () => {
     {message: 'profile main: policy must be write or read-only'});
   assert.throws(() => validateOrchestration({...base, profiles: {main: {adapter: 'claude'}, build: {adapter: 'claude', fallback: ['ghost']}}}),
     {message: 'profile build: fallback must list known profiles'});
-  assert.throws(() => validateOrchestration({...base, profiles: {main: {adapter: 'claude', role: 'manager'}}}),
-    {message: 'profile main: role must be one of orchestrator, builder, critic, verifier, analyst, extractor'});
+  // Phase 8 §4: the role vocabulary is free-form now (any non-empty label except the reserved
+  // `orchestrator`) — 'manager' validates rather than throwing; the remaining role error case
+  // is the type/emptiness check.
+  assert.throws(() => validateOrchestration({...base, profiles: {main: {adapter: 'claude', role: ''}}}),
+    {message: 'profile main: role must be a non-empty string'});
   assert.throws(() => validateOrchestration({...base, profiles: {main: {adapter: 'claude'}, build: {adapter: 'claude', fallback: ['build']}}}),
     {message: 'profile build: fallback may not include itself'});
+});
+
+test('Phase 8 §4: a free-form role like "manager" validates and defaults to policy write', () => {
+  const settings = {operation: 'orchestrator', mode: 'yolo', orchestrator: 'main', profiles: {main: {adapter: 'claude'}, other: {adapter: 'claude', role: 'manager'}}};
+  const view = validateOrchestration(settings);
+  assert.equal(view.profiles.other.role, 'manager');
+  assert.equal(view.profiles.other.policy, 'write');
 });
 
 test('role orchestrator is derived from settings.orchestrator, never declared', () => {

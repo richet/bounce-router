@@ -4,6 +4,7 @@ import path from 'node:path';
 import * as reducers from './reducers.js';
 import {takeCheckpoint, sameTree} from './checkpoint.js';
 import {POLICY_RANK, effectivePolicy} from './profiles.js';
+import {defaultStrategy} from './strategy.js';
 
 const FALLBACK_REASONS = new Set(['limited', 'missing', 'backend_unavailable']);
 const RISKS = new Set(['boundary', 'process-model', 'logic', 'extraction']);
@@ -11,9 +12,9 @@ const SIZE_FIELDS = ['lines', 'probes', 'minutes'];
 const LIMIT_FIELDS = [...SIZE_FIELDS, 'rounds'];
 const TIERS = new Set(['live', 'next-turn', 'queued']);
 const READONLY_ROLES = new Set(['critic', 'verifier', 'analyst']);
-// Only these dependency states fail a dependent outright (A1): `completed` (no reviewer yet
-// accepted) and `reviewing` are NOT in this set — they hold the dependent until `task.accepted`.
-const DEPENDENCY_FAIL_STATES = new Set(['failed', 'cancelled', 'timed_out', 'rejected']);
+// The depends_on hold/fail decision (which dependency states fail a dependent outright vs.
+// merely hold it — A1) now lives in the strategy (src/strategy.js's DEPENDENCY_FAIL_STATES),
+// not here: this scheduler only executes the intent onSubmitted returns.
 
 const isNonNegativeInt = n => Number.isInteger(n) && n >= 0;
 const isPositiveInt = n => Number.isInteger(n) && n > 0;
@@ -39,7 +40,7 @@ function parseVerdict(status, text) {
 // Dispatch, fallback, permission ratchet, cancellation, review and reconcile as policies over
 // the log, driven by adapters. Everything the scheduler knows is re-derived from session.events
 // via the reducers — it keeps only a live-handle map, which cannot survive a restart by design.
-export function createScheduler({session, adapters, profiles, sessionMode = 'yolo', depthCap = 1, checkpointRunner, limits: suppliedLimits = {}, strict = false, clock = () => Date.now(), watchdog: suppliedWatchdog = {}}) {
+export function createScheduler({session, adapters, profiles, sessionMode = 'yolo', depthCap = 1, checkpointRunner, limits: suppliedLimits = {}, strict = false, clock = () => Date.now(), watchdog: suppliedWatchdog = {}, strategy = defaultStrategy}) {
   const limits = {lines: 150, probes: 6, minutes: 15, rounds: 2, ...suppliedLimits};
   if (LIMIT_FIELDS.some(field => !isPositiveInt(limits[field]))) throw new Error('malformed: limits');
   const watchdogConfig = {interval: 5000, silence: 120000, stall: 600000, grace: 120000, ...suppliedWatchdog};
@@ -104,14 +105,21 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
       if (typeof review !== 'object' || review === null || Array.isArray(review)) return 'review';
       const {prelaunch, completion, ...rest} = review;
       if (Object.keys(rest).length) return 'review';
+      // Phase 8: a stage may name one profile (today's only shape) or, for a quorum strategy,
+      // an array of several — every named profile must still be a review-role profile.
       for (const name of [prelaunch, completion]) {
         if (name === undefined) continue;
-        const p = profiles[name];
-        if (!p || !READONLY_ROLES.has(p.role)) return 'review';
+        const names = Array.isArray(name) ? name : [name];
+        if (!names.length) return 'review';
+        for (const n of names) {
+          const p = profiles[n];
+          if (!p || !READONLY_ROLES.has(p.role)) return 'review';
+        }
       }
     }
     if (strict && (!review || !review.prelaunch || !review.completion)) return 'review';
-    const completionProfile = review?.completion && profiles[review.completion];
+    const completionName = Array.isArray(review?.completion) ? review.completion[0] : review?.completion;
+    const completionProfile = completionName && profiles[completionName];
     if (completionProfile?.role === 'verifier' && (typeof spec.steps !== 'string' || !spec.steps)) return 'steps';
     return null;
   };
@@ -202,6 +210,52 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
       const row = submittedRow(task);
       if (!row) continue;
       dispatch(row).catch(error => append({kind: 'task.failed', task, reason: 'error', text: error.message, context: row.context}));
+    }
+  }
+
+  // STRATEGY (CONTRACT.md §2 onCompleted): fires on every task.completed row (even a second/
+  // later one on the same task). `defaultStrategy` reproduces the exact pre-Phase-8 condition
+  // (only a row whose review.completion is set ever entered a completion review) via its own
+  // onCompleted hook — the CORE here just executes whatever intent comes back.
+  async function handleCompleted(task) {
+    const view = reducers.tasks(session.events);
+    const t = view[task];
+    if (!t) return;
+    const row = submittedRow(task);
+    const context = row?.context;
+    const hook = invokeHook(() => strategy.onCompleted(task, view, api), task, context);
+    if (!hook.ok) return;
+    const intent = hook.intent;
+    if (intent === 'none') return;
+    if (intent && typeof intent === 'object' && intent.action === 'accept') {
+      // Only meaningful while the task is still sitting in `completed`/`reviewing` awaiting a
+      // completion decision — a task that moved on for an unrelated reason (e.g. already
+      // accepted directly) gets no further row from this stale trigger (A3-style guard).
+      const state = reducers.tasks(session.events)[task]?.state;
+      if (state !== 'completed' && state !== 'reviewing') return;
+      append({kind: 'task.accepted', task, stage: 'completion', by: 'strategy', context});
+      return;
+    }
+    if (intent && typeof intent === 'object' && intent.action === 'review') {
+      await runCompletionReview(task, intent);
+      return;
+    }
+    append({kind: 'task.failed', task, reason: 'strategy', text: 'malformed onCompleted intent', context});
+  }
+
+  // STRATEGY (CONTRACT.md §1 onTerminal): fires after a task actually leaves the tree for good
+  // (accepted/failed/cancelled/timed_out/rejected — NOT a bare `completed`, which may still be
+  // heading into review). Held-task re-evaluation is CORE and always runs regardless of what
+  // the strategy decides; the strategy only adds an optional next-wave fan-out.
+  function handleTerminal(row) {
+    reevaluateHeld();
+    const view = reducers.tasks(session.events);
+    const hook = invokeHook(() => strategy.onTerminal(row.task, view, api), row.task, row.context);
+    if (!hook.ok) return;
+    if (!hook.intent || typeof hook.intent !== 'object' || !Array.isArray(hook.intent.submit)) return;
+    for (const spec of hook.intent.submit) {
+      try { submit(spec); }
+      catch { /* a malformed fan-out spec is dropped: a strategy can never crash the daemon */ }
     }
   }
 
@@ -330,8 +384,7 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
   // its own `reviews` map (A3, separate from a worker's `handles`) for the window between
   // launch and the stream ending, so cancel()/stop() can reach it; a throwing stream (A4) ends
   // the same way a broken worker stream does — unreadable, handle cancelled, never left open.
-  async function runReview({task, stage, round, profileName, profile, orders, dir, context}) {
-    const peer = reviewFrom(task);
+  async function runReview({task, stage, round, profileName, profile, orders, dir, context, peer = reviewFrom(task)}) {
     append({kind: 'review.started', task, stage, round, profile: profileName, from: peer, context});
     const adapter = adapters[profile.adapter];
     let handle;
@@ -343,7 +396,10 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
       // reserved for this review (§4) — unlike an unreadable verdict from a review that did run.
       return {verdict: 'unreadable', launchFailed: true};
     }
-    reviews.set(task, {adapter, handle});
+    // Keyed by peer (not task): the CORE runs multi-reviewer rounds one reviewer at a time
+    // (CONTRACT §5), so at most one entry per task ever exists at once — for the single-
+    // reviewer default this key IS `review:${task}`, byte-identical to before Phase 8.
+    reviews.set(peer, {adapter, handle, task});
     let resultStatus = null, resultText = null;
     try {
       for await (const event of adapter.events(handle)) {
@@ -365,7 +421,7 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
       await adapter.cancel(handle).catch(() => {});
       return {verdict: 'unreadable'};
     } finally {
-      reviews.delete(task);
+      reviews.delete(peer);
     }
     const verdict = parseVerdict(resultStatus, resultText);
     append({kind: 'review.finished', task, stage, round, verdict: verdict.verdict, text: resultText ?? null, from: peer, context});
@@ -380,7 +436,149 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
     append({kind: 'task.blocked', task, text: 'root budget exhausted', context});
   }
 
-  async function runCompletionReview(task) {
+  // CONTRACT.md §1: the read-only helper set every strategy hook receives as its third
+  // argument. `roundsCap` is a small addition beyond the literal list in CONTRACT §1 — it is
+  // what lets defaultStrategy's onReviewVerdict reproduce today's per-root `budget.rounds`
+  // override (P4/policy.test.js) rather than only the scheduler's own `limits.rounds` default;
+  // without it the rounds-cap decision cannot be expressed faithfully by a pure hook.
+  const api = {
+    submittedRow,
+    reviewsUsed: id => session.events.filter(e => e.kind === 'review.finished' && e.task === id).length,
+    roundsUsed: id => {
+      const root = budgetRootOf(id, reducers.tasks(session.events));
+      return reducers.budgets(session.events).roots[root]?.reserved?.rounds || 0;
+    },
+    roundsCap: id => {
+      const root = budgetRootOf(id, reducers.tasks(session.events));
+      return submittedRow(root)?.budget?.rounds ?? limits.rounds;
+    },
+    limits,
+    sessionEffective,
+    budgets: () => reducers.budgets(session.events),
+  };
+
+  // Executes an {action:'escalate', reason, text?, findings?} intent exactly the way every
+  // escalation was journaled pre-Phase-8: `text`/`findings` are included on policy.escalated
+  // only when the intent actually carries them (today's 'review' escalate has text, no
+  // findings; 'rounds' has findings, no text) — task.blocked always gets a human string,
+  // falling back to a generic one for a reason with no text of its own (a custom strategy's
+  // escalate, e.g. 'quorum').
+  function applyEscalate(task, intent, context) {
+    const row = {kind: 'policy.escalated', task, reason: intent.reason, context};
+    if (intent.text !== undefined) row.text = intent.text;
+    if (intent.findings !== undefined) row.findings = intent.findings;
+    append(row);
+    const blockedText = intent.text ?? (intent.reason === 'rounds' ? 'rounds exhausted' : `${intent.reason} escalated`);
+    append({kind: 'task.blocked', task, text: blockedText, context});
+  }
+
+  // Runs a strategy hook and turns a throw into the fixed invariant every hook shares
+  // (CONTRACT §1): a hook that throws never escapes as an unhandled rejection or crashes the
+  // scheduler — it fails just this task, reason 'strategy'. Returns {ok:false} on failure so
+  // the caller can bail out of its own decision immediately, or {ok:true, intent} otherwise.
+  function invokeHook(fn, task, context) {
+    try { return {ok: true, intent: fn()}; }
+    catch (error) { append({kind: 'task.failed', task, reason: 'strategy', text: error.message, context}); return {ok: false}; }
+  }
+
+  // The CORE side of a review round, shared by the prelaunch gate (dispatch) and the
+  // completion gate (runCompletionReview) below: launches every reviewer in `reviewers`
+  // (sequentially — the CORE runs a multi-reviewer round one at a time, CONTRACT §5, so
+  // `reviews` never holds more than one entry per task), collecting one parsed verdict per
+  // reviewer. The single-reviewer case (today's only case) is byte-identical to before Phase
+  // 8: one dir `review-<stage>-<round>`, one peer `review:<task>`.
+  //
+  // `reserveFirst: false` means the caller already made the first reviewer's own start
+  // reservation before calling in (dispatch's shared review-or-worker reservation, §4);
+  // `reserveFirst: true` means this function reserves it too (the completion path, which has
+  // no such shared reservation).
+  async function runReviewers({task, stage, round, reviewers, row, context, root, reserveFirst}) {
+    const verdicts = [];
+    for (let i = 0; i < reviewers.length; i++) {
+      const profileName = reviewers[i];
+      const reviewProfile = profiles[profileName];
+      // A review profile is a profile too (CONTRACT.md §3): the same shared check runs before
+      // its launch. The first reviewer's refusal handling differs by stage (matches pre-Phase-8
+      // behavior exactly): prelaunch (`reserveFirst: false`) releases its already-made shared
+      // reservation and fails the task outright; completion (`reserveFirst: true`) has reserved
+      // nothing yet at this point and escalates instead. Every reviewer past the first makes
+      // (and, on refusal, releases) its own start reservation, regardless of stage.
+      const reviewRefusal = policyRefusal(reviewProfile);
+      if (i === 0 && !reserveFirst) {
+        if (reviewRefusal) {
+          append({kind: 'budget.released', task, root, amount: {starts: 1}, text: reviewRefusal.reason, context});
+          append({kind: 'task.failed', task, reason: reviewRefusal.reason, text: reviewRefusal.text, context});
+          return null;
+        }
+      } else if (i === 0 && !reviewRefusal) {
+        // completion's own first-reviewer reservation (dispatch's prelaunch path already made
+        // this one before calling in; this branch only runs when reserveFirst is true).
+        if (availableStarts(root) < 1) { escalateBudget(task, context); return null; }
+        append({kind: 'budget.reserved', task, root, amount: {starts: 1}, context});
+      } else if (i === 0) { // reviewRefusal, reserveFirst true: nothing reserved yet
+        append({kind: 'policy.escalated', task, reason: reviewRefusal.reason, text: reviewRefusal.text, context});
+        append({kind: 'task.blocked', task, text: reviewRefusal.text, context});
+        return null;
+      } else {
+        // i > 0: always its own fresh reservation, released on refusal (no precedent pre-Phase-8;
+        // generalized consistently with the per-reviewer reservation rule of CONTRACT §5).
+        if (availableStarts(root) < 1) { escalateBudget(task, context); return null; }
+        append({kind: 'budget.reserved', task, root, amount: {starts: 1}, context});
+        if (reviewRefusal) {
+          append({kind: 'budget.released', task, root, amount: {starts: 1}, text: reviewRefusal.reason, context});
+          append({kind: 'policy.escalated', task, reason: reviewRefusal.reason, text: reviewRefusal.text, context});
+          append({kind: 'task.blocked', task, text: reviewRefusal.text, context});
+          return null;
+        }
+      }
+      const single = reviewers.length === 1;
+      const dir = path.join(session.dir, 'tasks', task, single ? `review-${stage}-${round}` : `review-${stage}-${round}-${i}`);
+      fs.mkdirSync(dir, {recursive: true, mode: 0o700});
+      const peer = single ? reviewFrom(task) : `${reviewFrom(task)}:${i}`;
+      const orders = stage === 'completion'
+        ? (reviewProfile.role === 'verifier' ? row.steps : `${row.orders}\n\n--- worker report ---\n${reducers.tasks(session.events)[task]?.summary ?? ''}`)
+        : row.orders;
+      const verdict = await runReview({task, stage, round, profileName, profile: reviewProfile, orders, dir, context, peer});
+      if (verdict.launchFailed) append({kind: 'budget.released', task, root, amount: {starts: 1}, text: 'review launch failed', context});
+      verdicts.push(verdict);
+    }
+    return verdicts;
+  }
+
+  // Executes an onReviewVerdict intent, shared by the prelaunch and completion callers: only
+  // 'accept' behaves differently by stage (prelaunch also launches the worker), everything else
+  // is identical. Returns nothing; every branch is terminal for this dispatch/review pass.
+  async function applyVerdictIntent(intent, {task, stage, row, round, context, root}) {
+    if (intent.action === 'reject') {
+      append({kind: 'task.rejected', task, questions: intent.questions ?? [], context});
+      return;
+    }
+    if (intent.action === 'escalate') { applyEscalate(task, intent, context); return; }
+    if (intent.action === 'rework') {
+      if (stage === 'prelaunch') {
+        // No worker has ever launched yet at prelaunch — there is nothing to resume: a
+        // strategy asking to rework here is malformed, not a real transition (defaultStrategy
+        // never returns this at prelaunch).
+        append({kind: 'task.failed', task, reason: 'strategy', text: 'rework at prelaunch is not supported', context});
+        return;
+      }
+      const findings = intent.findings ?? [];
+      append({kind: 'budget.reserved', task, root, amount: {rounds: 1}, context});
+      append({kind: 'task.rework', task, round, findings, context});
+      await resumeWorker({task, row, round, findings, context});
+      return;
+    }
+    // accept
+    append({kind: 'task.accepted', task, stage, by: reviewFrom(task), context});
+    if (stage === 'prelaunch') {
+      if (availableStarts(root) < 1) return escalateBudget(task, context);
+      await launchWorker(row);
+    }
+  }
+
+  const VERDICT_ACTIONS = new Set(['accept', 'reject', 'rework', 'escalate']);
+
+  async function runCompletionReview(task, reviewIntent) {
     const view = reducers.tasks(session.events);
     const t = view[task];
     if (!t || t.state !== 'reviewing') return; // stale trigger (already handled, or never entered review)
@@ -388,56 +586,25 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
     const context = row.context;
     const root = budgetRootOf(task, view);
     const round = (t.rounds || 0) + 1;
-
-    const profileName = row.review.completion;
-    const profile = profiles[profileName];
-    // A completion review is a review launch too (CONTRACT.md §3, Amendment A1): the same
-    // shared check runs before it reserves its own start — no reservation, no launch on refusal.
-    const refusal = policyRefusal(profile);
-    if (refusal) {
-      append({kind: 'policy.escalated', task, reason: refusal.reason, text: refusal.text, context});
-      append({kind: 'task.blocked', task, text: refusal.text, context});
+    const reviewers = reviewIntent.reviewers ?? [];
+    if (!reviewers.length) {
+      append({kind: 'task.failed', task, reason: 'strategy', text: 'review intent named no reviewers', context});
       return;
     }
 
-    if (availableStarts(root) < 1) return escalateBudget(task, context);
-    append({kind: 'budget.reserved', task, root, amount: {starts: 1}, context});
-
-    const dir = path.join(session.dir, 'tasks', task, `review-completion-${round}`);
-    fs.mkdirSync(dir, {recursive: true, mode: 0o700});
-    const orders = profile.role === 'verifier' ? row.steps : `${row.orders}\n\n--- worker report ---\n${t.summary ?? ''}`;
-
-    const verdict = await runReview({task, stage: 'completion', round, profileName, profile, orders, dir, context});
-    // F1/A4: same release as the prelaunch path (§4) — a review launch that throws never ran
-    // a process, so the start it reserved above is released, one text for both stages.
-    if (verdict.launchFailed) append({kind: 'budget.released', task, root, amount: {starts: 1}, text: 'review launch failed', context});
+    const verdicts = await runReviewers({task, stage: 'completion', round, reviewers, row, context, root, reserveFirst: true});
+    if (!verdicts) return;
     // Same guard as the prelaunch path: a review that finishes after the task left `reviewing`
     // for an unrelated reason journals its verdict but drives no accept/reject/rework (A3).
     if (reducers.tasks(session.events)[task]?.state !== 'reviewing') return;
 
-    if (verdict.verdict === 'accept') {
-      append({kind: 'task.accepted', task, stage: 'completion', by: reviewFrom(task), context});
+    const hook = invokeHook(() => strategy.onReviewVerdict(task, verdicts, reducers.tasks(session.events), api), task, context);
+    if (!hook.ok) return;
+    if (!hook.intent || typeof hook.intent !== 'object' || !VERDICT_ACTIONS.has(hook.intent.action)) {
+      append({kind: 'task.failed', task, reason: 'strategy', text: 'malformed onReviewVerdict intent', context});
       return;
     }
-    if (verdict.verdict === 'unreadable') {
-      append({kind: 'policy.escalated', task, reason: 'review', text: 'unreadable review verdict', context});
-      append({kind: 'task.blocked', task, text: 'unreadable review verdict', context});
-      return;
-    }
-    // reject or rework: bounded by the root's rounds allowance (its own budget.rounds, or
-    // the scheduler's limits.rounds default) before spending another one on a resume.
-    const findings = verdict.findings ?? verdict.questions ?? [];
-    const rootRow = submittedRow(root);
-    const roundsCap = rootRow?.budget?.rounds ?? limits.rounds;
-    const roundsUsed = reducers.budgets(session.events).roots[root]?.reserved?.rounds || 0;
-    if (roundsUsed >= roundsCap) {
-      append({kind: 'policy.escalated', task, reason: 'rounds', findings, context});
-      append({kind: 'task.blocked', task, text: 'rounds exhausted', context});
-      return;
-    }
-    append({kind: 'budget.reserved', task, root, amount: {rounds: 1}, context});
-    append({kind: 'task.rework', task, round, findings, context});
-    await resumeWorker({task, row, round, findings, context});
+    await applyVerdictIntent(hook.intent, {task, stage: 'completion', row, round, context, root});
   }
 
   async function dispatch(row) {
@@ -475,27 +642,33 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
         return;
       }
     }
-    // depends_on holds before any reservation: a dependency still pending (queued/running/
-    // waiting/blocked/input_required, OR merely `completed`/`reviewing` — completed with no
-    // reviewer yet accepted is NOT itself a failure, A1) leaves the task queued and journals
-    // nothing (re-evaluated once per terminal row on any task, below); only a dependency that
-    // actually failed/cancelled/timed_out/rejected fails this task outright.
-    if (Array.isArray(row.depends_on) && row.depends_on.length) {
-      const badDep = row.depends_on.find(id => DEPENDENCY_FAIL_STATES.has(view[id]?.state));
-      if (badDep) {
-        append({kind: 'task.failed', task, reason: 'dependency', text: badDep, context});
-        return;
-      }
-      if (!row.depends_on.every(id => view[id]?.state === 'accepted')) {
-        heldTasks.add(task);
-        return;
-      }
+    // STRATEGY (CONTRACT.md §0/§1): the depends_on hold/fail decision and the prelaunch-review
+    // decision both come from onSubmitted now — the CORE only executes the returned intent, it
+    // never re-derives the decision itself. `defaultStrategy.onSubmitted` reproduces exactly
+    // the depends_on/review logic that lived here before Phase 8.
+    const hook = invokeHook(() => strategy.onSubmitted(task, view, api), task, context);
+    if (!hook.ok) return;
+    const intent = hook.intent;
+    if (intent === 'hold') { heldTasks.add(task); return; }
+    if (intent && typeof intent === 'object' && intent.action === 'fail') {
+      append({kind: 'task.failed', task, reason: intent.reason ?? 'strategy', text: intent.text, context});
+      return;
     }
+    if (intent && typeof intent === 'object' && intent.action === 'reject') {
+      append({kind: 'task.rejected', task, questions: intent.questions ?? [], context});
+      return;
+    }
+    const reviewIntent = (intent && typeof intent === 'object' && intent.action === 'review') ? intent : null;
+    if (intent !== 'dispatch' && !reviewIntent) {
+      append({kind: 'task.failed', task, reason: 'strategy', text: 'malformed onSubmitted intent', context});
+      return;
+    }
+
     const root = budgetRootOf(task, view);
     // A prelaunch-review task treats budget exhaustion as an escalation throughout its path
     // (the review's own start, and — after an accept — the worker's), never a bare
     // task.failed: the review path always reports to the orchestrator, never silently drops.
-    const reviewGate = !!row.review?.prelaunch;
+    const reviewGate = !!reviewIntent;
     if (availableStarts(root) < 1) {
       if (reviewGate) return escalateBudget(task, context);
       append({kind: 'task.failed', task, reason: 'budget', text: 'root budget exhausted', context});
@@ -521,37 +694,26 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
     }
 
     if (reviewGate) {
-      const profileName = row.review.prelaunch;
-      const reviewProfile = profiles[profileName];
-      // A review profile is a profile too (CONTRACT.md §3): the same shared check runs before
-      // its launch, on the same reservation this dispatch already made above.
-      const reviewRefusal = policyRefusal(reviewProfile);
-      if (reviewRefusal) {
-        append({kind: 'budget.released', task, root, amount: {starts: 1}, text: reviewRefusal.reason, context});
-        append({kind: 'task.failed', task, reason: reviewRefusal.reason, text: reviewRefusal.text, context});
+      const reviewers = reviewIntent.reviewers ?? [];
+      if (!reviewers.length) {
+        append({kind: 'budget.released', task, root, amount: {starts: 1}, text: 'malformed strategy review intent', context});
+        append({kind: 'task.failed', task, reason: 'strategy', text: 'review intent named no reviewers', context});
         return;
       }
-      const dir = path.join(session.dir, 'tasks', task, 'review-prelaunch-1');
-      fs.mkdirSync(dir, {recursive: true, mode: 0o700});
-      const verdict = await runReview({task, stage: 'prelaunch', round: 1, profileName, profile: reviewProfile, orders: row.orders, dir, context});
-      if (verdict.launchFailed) append({kind: 'budget.released', task, root, amount: {starts: 1}, text: 'review launch failed', context});
+      const verdicts = await runReviewers({task, stage: 'prelaunch', round: 1, reviewers, row, context, root, reserveFirst: false});
+      if (!verdicts) return;
       // The review stream can end after the task moved on for an unrelated reason (cancelled
       // mid-review): review.finished is already journaled above with its verdict; drive no
       // further policy on a task that is no longer sitting here waiting on this decision (A3).
       if (reducers.tasks(session.events)[task]?.state !== 'queued') return;
 
-      if (verdict.verdict === 'unreadable') {
-        append({kind: 'policy.escalated', task, reason: 'review', text: 'unreadable review verdict', context});
-        append({kind: 'task.blocked', task, text: 'unreadable review verdict', context});
+      const verdictHook = invokeHook(() => strategy.onReviewVerdict(task, verdicts, reducers.tasks(session.events), api), task, context);
+      if (!verdictHook.ok) return;
+      if (!verdictHook.intent || typeof verdictHook.intent !== 'object' || !VERDICT_ACTIONS.has(verdictHook.intent.action)) {
+        append({kind: 'task.failed', task, reason: 'strategy', text: 'malformed onReviewVerdict intent', context});
         return;
       }
-      if (verdict.verdict !== 'accept') {
-        append({kind: 'task.rejected', task, questions: verdict.questions ?? verdict.findings ?? [], context});
-        return;
-      }
-      append({kind: 'task.accepted', task, stage: 'prelaunch', by: reviewFrom(task), context});
-      if (availableStarts(root) < 1) return escalateBudget(task, context);
-      await launchWorker(row);
+      await applyVerdictIntent(verdictHook.intent, {task, stage: 'prelaunch', row, round: 1, context, root});
       return;
     }
 
@@ -718,15 +880,13 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
       dispatch(row).catch(error => append({kind: 'task.failed', task: row.task, reason: 'error', text: error.message, context: row.context}));
     }
     else if (row.kind === 'task.completed') {
-      // A second (and later) task.completed on the same task re-enters review exactly the
-      // same way — runCompletionReview reads state fresh off the log every time.
-      const t = reducers.tasks(session.events)[row.task];
-      if (t?.review?.completion) {
-        runCompletionReview(row.task).catch(error => append({kind: 'task.failed', task: row.task, reason: 'error', text: error.message, context: row.context}));
-      }
+      // STRATEGY (CONTRACT.md §2 onCompleted): a second (and later) task.completed on the same
+      // task re-enters review exactly the same way — the hook and runCompletionReview both
+      // read state fresh off the log every time.
+      handleCompleted(row.task).catch(error => append({kind: 'task.failed', task: row.task, reason: 'error', text: error.message, context: row.context}));
     }
-    else if (row.kind === 'task.failed') { maybeFallback(row); reevaluateHeld(); }
-    else if (row.kind === 'task.accepted' || row.kind === 'task.cancelled' || row.kind === 'task.deadline' || row.kind === 'task.rejected') reevaluateHeld();
+    else if (row.kind === 'task.failed') { maybeFallback(row); handleTerminal(row); }
+    else if (row.kind === 'task.accepted' || row.kind === 'task.cancelled' || row.kind === 'task.deadline' || row.kind === 'task.rejected') handleTerminal(row);
     // Messages to `user`/`orchestrator`/anyone else — and a malformed empty worker
     // address — are not this subscriber's business.
     else if (row.kind === 'message' && typeof row.to === 'string' && row.to.startsWith('worker:') && row.to.length > 'worker:'.length) enqueueDelivery(row.to.slice('worker:'.length), row);
@@ -761,13 +921,16 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
 
   async function cancelOne(id, view) {
     // A review handle (A3) is cancelled before the worker's — a task can only have one of the
-    // two live at a time (review during queued/reviewing, worker otherwise), and a review that
-    // reports unverified blocks the task exactly like an unverified worker termination.
-    const reviewEntry = reviews.get(id);
-    if (reviewEntry) {
+    // two live at a time (review during queued/reviewing, worker otherwise: the CORE runs a
+    // multi-reviewer round one reviewer at a time, CONTRACT §5, so at most one entry per task
+    // is ever in `reviews`), and a review that reports unverified blocks the task exactly like
+    // an unverified worker termination.
+    const reviewFound = [...reviews.entries()].find(([, entry]) => entry.task === id);
+    if (reviewFound) {
+      const [peer, reviewEntry] = reviewFound;
       const reviewResult = await reviewEntry.adapter.cancel(reviewEntry.handle);
       if (reviewResult.verified === false) {
-        append({kind: 'task.blocked', task: id, text: 'termination unverified', from: reviewFrom(id), context: view[id].context});
+        append({kind: 'task.blocked', task: id, text: 'termination unverified', from: peer, context: view[id].context});
         return false;
       }
     }

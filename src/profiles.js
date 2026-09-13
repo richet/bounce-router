@@ -1,7 +1,25 @@
 // The persisted shape of `operation` and profile tables (docs/local-orchestration.md,
 // "Operation modes", D2): validated once, opt-in, and legacy configs untouched by construction.
-const ROLES = ['orchestrator', 'builder', 'critic', 'verifier', 'analyst', 'extractor'];
+// Phase 8 §4: the role vocabulary is free-form (any non-empty label); `orchestrator` stays
+// reserved (derived from `settings.orchestrator`, never declared). READ_ONLY_ROLES is now only
+// a back-compat DEFAULT for `policy` on these historically-read-only labels — the read-only/
+// write ratchet itself keys on `policy`, never on the label (CONTRACT.md §4).
+import {defaultStrategy, noReviewStrategy, quorumStrategy} from './strategy.js';
+
 const READ_ONLY_ROLES = new Set(['critic', 'verifier', 'analyst']);
+
+// Phase 8 §3: `strategy` is a declarative Tier-1 setting — a string preset resolved to the
+// actual strategy object here, so callers (reload.js) never parse the string themselves.
+function resolveStrategy(spec) {
+  if (spec === undefined || spec === 'default') return defaultStrategy;
+  if (spec === 'no-review') return noReviewStrategy;
+  if (typeof spec === 'string' && spec.startsWith('quorum:')) {
+    const n = Number(spec.slice('quorum:'.length));
+    if (!Number.isInteger(n) || n < 1) throw new Error('strategy must be default, no-review, or quorum:<n>');
+    return quorumStrategy(n);
+  }
+  throw new Error('strategy must be default, no-review, or quorum:<n>');
+}
 
 // Phase 7 execution-policy ladder (docs/local-orchestration.md "Permissions", CONTRACT.md §1):
 // least to most privileged. `write` exists for adapters to declare and future profiles to
@@ -17,8 +35,9 @@ export function effectivePolicy(profile) {
 }
 
 export function validateOrchestration(settings, adapterNames = ['claude', 'codex', 'muse']) {
+  const strategy = resolveStrategy(settings.strategy);
   if (settings.operation === undefined || settings.operation === 'classic') {
-    return {operation: 'classic', orchestrator: null, profiles: {}, shape: 'none', strict: false};
+    return {operation: 'classic', orchestrator: null, profiles: {}, shape: 'none', strict: false, strategy};
   }
   if (settings.operation !== 'orchestrator') throw new Error('operation must be classic or orchestrator');
 
@@ -38,7 +57,7 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
     if (!['yolo', 'plan'].includes(mode)) throw new Error(`profile ${name}: mode must be yolo or plan`);
     if (raw.role === 'orchestrator') throw new Error(`profile ${name}: role orchestrator is derived, not declared`);
     let role = raw.role ?? 'builder';
-    if (!ROLES.includes(role)) throw new Error(`profile ${name}: role must be one of ${ROLES.join(', ')}`);
+    if (typeof role !== 'string' || !role) throw new Error(`profile ${name}: role must be a non-empty string`);
     if (name === settings.orchestrator) role = 'orchestrator';
     const policy = raw.policy ?? (READ_ONLY_ROLES.has(role) ? 'read-only' : 'write');
     if (!['write', 'read-only'].includes(policy)) throw new Error(`profile ${name}: policy must be write or read-only`);
@@ -53,7 +72,7 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
   const orchestratorAdapter = profiles[settings.orchestrator].adapter;
   const shape = names.every(name => profiles[name].adapter === orchestratorAdapter) ? 'single-provider' : 'multi-provider';
 
-  return {operation: 'orchestrator', orchestrator: settings.orchestrator, profiles, shape, strict};
+  return {operation: 'orchestrator', orchestrator: settings.orchestrator, profiles, shape, strict, strategy};
 }
 
 export function profileFor(view, name) {
