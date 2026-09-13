@@ -13,7 +13,9 @@ export const clean = text => stripAnsi(String(text ?? ''))
   .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '')
   .replace(/\t/g, '    ');
 
-export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in process.env) && process.env.TERM !== 'dumb'} = {}) {
+// `role(row)` (optional) names who a row belongs to — the orchestrator profile, a worker's
+// profile — and is shown before the provider: `main · claude · Tool`. Classic never passes it.
+export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in process.env) && process.env.TERM !== 'dumb', compact = false, role = null} = {}) {
   const c = new Chalk({level: color ? 1 : 0});
   const style = {
     title: c.bold.cyan, muted: c.gray, user: c.bold.cyan, assistant: c.bold.green,
@@ -79,12 +81,24 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
   };
   // Short bookkeeping events read as one line; only real content earns a block of its own.
   const inline = ['status', 'progress', 'route', 'cooldown', 'attempt', 'turn', 'diagnostic', 'note'];
+  const who = e => [role?.(e) ?? null, e.provider || 'Bounce'].filter(Boolean).join(' · ');
   function event(e, width) {
+    // Compact mode (the orchestrator transcript): a coordinator's tool mechanics and pasted file
+    // output are noise — fold each tool row to one summary line, and render foldedThread's delegation
+    // rows as one line each. Classic transcript never sets compact, so it is unchanged.
+    if (compact && e.kind === 'tool') {
+      const t = clean(e.text).trim();
+      const m = /^([A-Za-z_][\w.-]*): (\{[\s\S]*\})$/.exec(t);
+      let summary = t.split('\n')[0];
+      if (m) { try { const o = JSON.parse(m[2]); summary = `${m[1]}: ${o.description || o.path || (typeof o.command === 'string' ? o.command.split('\n')[0] : '') || ''}`.trim(); } catch { summary = m[1]; } }
+      return [clip(`${style.tool(clean(`${who(e)} · Tool`))}  ${clean(summary)}`, width)];
+    }
+    if (compact && e.kind === 'task.fold') return [clip(`${style.title('→')}  ${clean(e.text)}`, width)];
     const names = {user: 'You', assistant: 'Response', delta: 'Response', result: 'Result',
       status: 'Activity', route: 'Agent selected', tool: 'Tool output', error: 'Error',
       diagnostic: 'Diagnostics', note: 'Saved note', cooldown: 'Retry delay', attempt: 'Agent finished',
       turn: 'Turn finished', quota: 'Reported quota', skills: 'Skills', review: 'Work Done review'};
-    const label = e.kind === 'user' ? 'You' : `${e.provider || 'Bounce'} · ${names[e.kind] || e.kind}`;
+    const label = e.kind === 'user' ? 'You' : `${who(e)} · ${names[e.kind] || e.kind}`;
     const paint = style[e.kind] || style.muted;
     if (inline.includes(e.kind)) return wrap(`${paint(clean(label))}  ${clean(e.text)}`, width);
     const source = e.kind === 'tool' ? (toolLines(clean(e.text)) ?? [clean(e.text)]).join('\n') : clean(e.text);
@@ -204,11 +218,29 @@ function rootOf(taskView, id, seen = new Set()) {
 // within a level) of task-tree pane rows. remainingStarts/remainingRounds come from the task's
 // root's budget remainder; null when that root has no allowance for the key at all (as opposed
 // to zero, which means the allowance is simply spent).
+// Why a task ended, for the fold row / AGENTS pane / board: a scheduler refusal (task.failed
+// reason + text) must be visible — two real submissions were once refused for size and the
+// TUI showed nothing but 'queued'.
+function outcomeOf(t) {
+  if (t.state === 'failed') return `${t.reason ?? 'failed'}${t.error ? `: ${t.error}` : ''}`;
+  if (t.state === 'timed_out') return 'deadline exceeded';
+  if (t.state === 'cancelled') return 'cancelled';
+  if (t.state === 'rejected') return 'rejected';
+  if ((t.state === 'completed' || t.state === 'accepted') && t.summary) return t.summary;
+  return null;
+}
 export function taskTree(events) {
   const taskView = tasks(events);
   const budgetView = budgets(events);
   const tierByTask = {};
   for (const e of events) if (e.kind === 'task.delivered') tierByTask[e.task] = e.tier;
+  // Per-worker meta for the AGENTS pane: which adapter is running it (peer.joined), the model it
+  // was launched on and when it first started (task.started). Pure — read straight off the log.
+  const metaByTask = {};
+  for (const e of events) {
+    if (e.kind === 'peer.joined' && typeof e.name === 'string' && e.name.startsWith('worker:')) (metaByTask[e.name.slice(7)] ??= {}).adapter = e.adapter ?? null;
+    if (e.kind === 'task.started') { const m = (metaByTask[e.task] ??= {}); if (m.startedAt == null) m.startedAt = e.time; m.model = e.requested || null; }
+  }
   const order = [];
   const seen = new Set();
   for (const e of events) if (e.kind === 'task.submitted' && !seen.has(e.task)) { seen.add(e.task); order.push(e.task); }
@@ -225,6 +257,10 @@ export function taskTree(events) {
       remainingRounds: Object.prototype.hasOwnProperty.call(remaining, 'rounds') ? remaining.rounds : null,
       blocker: t.state === 'blocked' ? t.blocker : null,
       tier: tierByTask[id] ?? null,
+      adapter: metaByTask[id]?.adapter ?? null,
+      model: metaByTask[id]?.model ?? null,
+      startedAt: metaByTask[id]?.startedAt ?? null,
+      outcome: outcomeOf(t),
     });
     for (const child of t.children) visit(child, depth + 1);
   };
@@ -240,7 +276,7 @@ const FOLDED_THREAD_KINDS = new Set(['user', 'assistant', 'delta', 'tool', 'erro
 // occurred at the session root, so it always belongs wherever it is asked for.
 const belongsToContext = (row, context) => row.context === context || row.context === undefined;
 function foldRowText(t) {
-  const detail = t.lastMilestone?.text ?? (t.state === 'blocked' ? t.blocker : null) ?? 'queued';
+  const detail = (t.state === 'blocked' ? t.blocker : null) ?? outcomeOf(t) ?? t.lastMilestone?.text ?? 'queued';
   return `${t.profile} · ${t.state} · ${detail}`;
 }
 
@@ -265,6 +301,85 @@ export function foldedThread(events, context) {
     if (FOLDED_THREAD_KINDS.has(e.kind) && belongsToContext(e, context)) rows.push(e);
   }
   return rows;
+}
+
+// workerThread(events, task, activity) → the rows to show when one worker is attached or zoomed:
+// that task's own journaled lifecycle rows (submitted, started, milestones, blockers, deliveries,
+// rework, terminal outcome), every message addressed to it (as `user` rows), and its live
+// activity — which is never journaled (task.activity is a LIVE_KIND), so the caller keeps it in
+// memory and passes it in as [{time, text}] — merged by time. Rows use the formatter's own kinds,
+// labelled with the worker's profile, so the classic formatter renders the full detail (zoom) and
+// the compact one folds it (attach). Pure: no focus state, no session, no I/O.
+const WORKER_ROW = {
+  'task.submitted': e => ({kind: 'note', text: `Task submitted · ${e.profile}${e.orders ? `\n${e.orders}` : ''}`}),
+  'task.started': e => ({kind: 'status', text: `started · attempt ${e.attempt}${e.requested ? ` · model ${e.requested}` : ''}`}),
+  'task.milestone': e => ({kind: 'note', text: `milestone · ${e.text}`}),
+  'task.blocked': e => ({kind: 'error', text: `blocked · ${e.text}`}),
+  'task.delivered': e => ({kind: 'status', text: `delivered (${e.tier})${e.text ? ` · ${e.text}` : ''}`}),
+  'task.rework': e => ({kind: 'status', text: `rework round ${e.round}${Array.isArray(e.findings) && e.findings.length ? `\n${e.findings.map(f => `- ${typeof f === 'string' ? f : f.text ?? JSON.stringify(f)}`).join('\n')}` : ''}`}),
+  'task.deadline': e => ({kind: 'error', text: e.text}),
+  'task.completed': e => ({kind: 'assistant', text: e.summary || 'completed'}),
+  'task.failed': e => ({kind: 'error', text: `failed · ${e.reason}${e.text ? ` · ${e.text}` : ''}`}),
+  'task.cancelled': () => ({kind: 'status', text: 'cancelled'}),
+  'task.accepted': e => ({kind: 'status', text: `accepted · ${e.stage}`}),
+  'task.rejected': e => ({kind: 'status', text: `rejected${Array.isArray(e.questions) && e.questions.length ? `\n${e.questions.map(q => `- ${q}`).join('\n')}` : ''}`}),
+};
+export function workerThread(events, task, activity = []) {
+  const submitted = events.find(e => e.kind === 'task.submitted' && e.task === task);
+  const adapter = events.find(e => e.kind === 'peer.joined' && e.name === `worker:${task}`)?.adapter;
+  const profile = [submitted?.profile ?? 'worker', adapter].filter(Boolean).join(' · ');
+  const rows = [];
+  for (const e of events) {
+    if (e.kind === 'message' && e.to === `worker:${task}`) { rows.push({kind: 'user', time: e.time, text: e.text}); continue; }
+    if (e.task !== task) continue;
+    const make = WORKER_ROW[e.kind];
+    if (make) rows.push({provider: profile, time: e.time, ...make(e)});
+  }
+  for (const a of activity) rows.push({kind: 'status', provider: profile, time: a.time, text: a.text});
+  // Stable by time (ISO strings compare lexically); rows without a time keep their position.
+  return rows.map((row, i) => [row, i]).sort(([a, i], [b, j]) => (a.time && b.time && a.time !== b.time) ? (a.time < b.time ? -1 : 1) : i - j).map(([row]) => row);
+}
+
+// agentsBoard(events, activityByTask) → every agent for the central-area board (/zoom with no
+// task): each taskTree() row plus that worker's last live activity lines (never journaled, kept in
+// memory by the caller as task -> [{time, text}]) and, once terminal, its outcome as the final
+// line. Pure; the terminal draw only decides how many lines of each fit.
+const TERMINAL_LINE = {
+  'task.completed': e => `→ completed${e.summary ? ` · ${e.summary}` : ''}`,
+  'task.failed': e => `→ failed · ${e.reason}${e.text ? ` · ${e.text}` : ''}`,
+  'task.cancelled': () => '→ cancelled',
+  'task.accepted': e => `→ accepted · ${e.stage}`,
+  'task.rejected': () => '→ rejected',
+};
+export function agentsBoard(events, activityByTask = new Map(), {tail = 40} = {}) {
+  const outcome = {};
+  for (const e of events) if (TERMINAL_LINE[e.kind] && e.task) outcome[e.task] = TERMINAL_LINE[e.kind](e);
+  return taskTree(events).map(row => {
+    const activity = activityByTask.get(row.task) ?? [];
+    const lines = activity.slice(-tail).map(a => a.text.split('\n')[0]);
+    if (outcome[row.task]) lines.push(outcome[row.task]);
+    return {...row, lines, lastActivityAt: activity.at(-1)?.time ?? null};
+  });
+}
+
+// boardLayout(agentCount, lineCounts, height) → how many activity lines each agent gets on a
+// board of `height` rows where every shown agent costs one header row: agents share the rest
+// evenly (an agent with fewer lines than its share yields the rest to the others, greedily in
+// order); when not every agent fits with at least one line, `shown` is how many lead agents
+// are drawn and the last row announces the rest. Pure.
+export function boardLayout(lineCounts, height) {
+  const n = lineCounts.length;
+  if (!n || height <= 0) return {shown: 0, lines: [], more: n};
+  let shown = n, more = 0;
+  if (n * 2 > height) { shown = Math.max(1, Math.floor((height - 1) / 2)); more = n - shown; }
+  const budgetRows = height - shown - (more ? 1 : 0);
+  const lines = new Array(shown).fill(0);
+  let left = Math.max(0, budgetRows);
+  // Even share first, then hand any yielded rows to agents that still have lines to show.
+  const share = Math.floor(left / shown);
+  for (let i = 0; i < shown; i++) { lines[i] = Math.min(share, lineCounts[i]); left -= lines[i]; }
+  for (let i = 0; i < shown && left > 0; i++) { const extra = Math.min(left, lineCounts[i] - lines[i]); lines[i] += extra; left -= extra; }
+  return {shown, lines, more};
 }
 
 // Phase 6 §A2 — pure command parsing, shared by src/cli.js's submit() dispatch and directly

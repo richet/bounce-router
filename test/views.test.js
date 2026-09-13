@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {taskTree, foldedThread, parseCommand, continueMain} from '../src/format.js';
+import {taskTree, foldedThread, workerThread, agentsBoard, boardLayout, parseCommand, continueMain} from '../src/format.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const cliSource = fs.readFileSync(path.join(__dirname, '../src/cli.js'), 'utf8');
@@ -23,9 +23,9 @@ test('U1: taskTree reports exact rows, order and budget remainders for a two-lev
     {kind: 'task.blocked', task: 'childB', time: 't6', text: 'need approval'},
   ];
   assert.deepEqual(taskTree(events), [
-    {task: 'root1', depth: 0, profile: 'orchestrate', state: 'waiting', lastMilestone: 'scanning repo', deadline: 5000, remainingStarts: 1, remainingRounds: null, blocker: null, tier: null},
-    {task: 'childA', depth: 1, profile: 'build', state: 'queued', lastMilestone: null, deadline: null, remainingStarts: 1, remainingRounds: null, blocker: null, tier: null},
-    {task: 'childB', depth: 1, profile: 'critic', state: 'blocked', lastMilestone: null, deadline: null, remainingStarts: 1, remainingRounds: null, blocker: 'need approval', tier: null},
+    {task: 'root1', depth: 0, profile: 'orchestrate', state: 'waiting', lastMilestone: 'scanning repo', deadline: 5000, remainingStarts: 1, remainingRounds: null, blocker: null, tier: null, adapter: null, model: null, startedAt: 't1', outcome: null},
+    {task: 'childA', depth: 1, profile: 'build', state: 'queued', lastMilestone: null, deadline: null, remainingStarts: 1, remainingRounds: null, blocker: null, tier: null, adapter: null, model: null, startedAt: null, outcome: null},
+    {task: 'childB', depth: 1, profile: 'critic', state: 'blocked', lastMilestone: null, deadline: null, remainingStarts: 1, remainingRounds: null, blocker: 'need approval', tier: null, adapter: null, model: null, startedAt: 't5', outcome: null},
   ]);
 });
 
@@ -157,4 +157,120 @@ test('U6: taskTree/foldedThread have no focus parameter, and /attach never appen
   const appends = [...attachBlock.matchAll(/session\.append\(\{[^}]*\}\)/g)].map(m => m[0]);
   assert.equal(appends.length, 1);
   assert.match(appends[0], /no such task/);
+});
+
+test('U7: taskTree carries the worker adapter, model and start time for the AGENTS pane', () => {
+  const events = [
+    {kind: 'task.submitted', task: 't1', parent: null, profile: 'build', context: 'c', deadline: null},
+    {kind: 'peer.joined', name: 'worker:t1', role: 'worker', adapter: 'codex', context: 'c'},
+    {kind: 'task.started', task: 't1', attempt: 1, requested: 'o4-mini', time: '2026-09-13T00:00:00.000Z', context: 'c'},
+  ];
+  const [row] = taskTree(events);
+  assert.equal(row.adapter, 'codex');
+  assert.equal(row.model, 'o4-mini');
+  assert.equal(row.startedAt, '2026-09-13T00:00:00.000Z');
+});
+
+// U8: workerThread — one worker's own thread: lifecycle rows, messages to it as `user` rows,
+// live activity merged by time, other tasks and the main transcript excluded.
+test('U8: workerThread yields exactly one worker\'s lifecycle, messages and live activity, merged by time', () => {
+  const events = [
+    {kind: 'user', context: 'ctx-1', time: '2026-09-13T10:00:00.000Z', text: 'main turn'},
+    {kind: 'task.submitted', task: 'w1', context: 'ctx-1', time: '2026-09-13T10:00:01.000Z', parent: null, profile: 'build', orders: 'write the parser'},
+    {kind: 'task.submitted', task: 'w2', context: 'ctx-1', time: '2026-09-13T10:00:01.500Z', parent: null, profile: 'critic', orders: 'review it'},
+    {kind: 'task.started', task: 'w1', time: '2026-09-13T10:00:02.000Z', attempt: 1, requested: 'sonnet'},
+    {kind: 'task.milestone', task: 'w2', time: '2026-09-13T10:00:02.500Z', text: 'not mine'},
+    {kind: 'task.milestone', task: 'w1', time: '2026-09-13T10:00:04.000Z', text: 'parser scaffolded'},
+    {kind: 'message', to: 'worker:w1', from: 'user', time: '2026-09-13T10:00:05.000Z', text: 'use recursive descent'},
+    {kind: 'message', to: 'worker:w2', from: 'user', time: '2026-09-13T10:00:05.500Z', text: 'not for w1'},
+    {kind: 'task.delivered', task: 'w1', time: '2026-09-13T10:00:05.100Z', tier: 'live'},
+    {kind: 'task.usage', task: 'w1', time: '2026-09-13T10:00:06.000Z', usage: {input: 1}},
+    {kind: 'task.completed', task: 'w1', time: '2026-09-13T10:00:07.000Z', summary: 'parser done'},
+  ];
+  const activity = [
+    {time: '2026-09-13T10:00:03.000Z', text: 'Reading src/parse.js'},
+    {time: '2026-09-13T10:00:06.500Z', text: 'Running tests'},
+  ];
+  assert.deepEqual(workerThread(events, 'w1', activity), [
+    {kind: 'note', provider: 'build', time: '2026-09-13T10:00:01.000Z', text: 'Task submitted · build\nwrite the parser'},
+    {kind: 'status', provider: 'build', time: '2026-09-13T10:00:02.000Z', text: 'started · attempt 1 · model sonnet'},
+    {kind: 'status', provider: 'build', time: '2026-09-13T10:00:03.000Z', text: 'Reading src/parse.js'},
+    {kind: 'note', provider: 'build', time: '2026-09-13T10:00:04.000Z', text: 'milestone · parser scaffolded'},
+    {kind: 'user', time: '2026-09-13T10:00:05.000Z', text: 'use recursive descent'},
+    {kind: 'status', provider: 'build', time: '2026-09-13T10:00:05.100Z', text: 'delivered (live)'},
+    {kind: 'status', provider: 'build', time: '2026-09-13T10:00:06.500Z', text: 'Running tests'},
+    {kind: 'assistant', provider: 'build', time: '2026-09-13T10:00:07.000Z', text: 'parser done'},
+  ]);
+  assert.deepEqual(workerThread(events, 'nope'), []);
+  assert.equal(workerThread.length, 2, 'activity is an optional third argument; no focus parameter');
+});
+
+// U9: the zoom view steers, never drives — typed text while zoomed becomes a message to that
+// worker; nothing in the zoom paths can start a main turn, and /zoom appends no event on its
+// happy path (only the 'no such task' status).
+test('U9: zoomed plain text appends a worker message and never reaches router.run; /zoom appends nothing on the happy path', () => {
+  const zoomText = cliSource.indexOf('} else if (zoomTask) {');
+  assert.notEqual(zoomText, -1, 'expected the zoomed plain-text branch in src/cli.js');
+  const zoomTextBlock = cliSource.slice(zoomText, cliSource.indexOf('} else {', zoomText));
+  assert.equal(/router\.run\(/.test(zoomTextBlock), false);
+  assert.match(zoomTextBlock, /session\.append\(\{kind: 'message', to: `worker:\$\{zoomTask\}`, text\}\)/);
+
+  const markerIndex = cliSource.indexOf("command === 'zoom'");
+  assert.notEqual(markerIndex, -1);
+  const braceStart = cliSource.indexOf('{', markerIndex);
+  let depth = 0, i = braceStart;
+  for (; i < cliSource.length; i++) {
+    if (cliSource[i] === '{') depth++;
+    else if (cliSource[i] === '}' && --depth === 0) { i++; break; }
+  }
+  const zoomBlock = cliSource.slice(braceStart, i);
+  const appends = [...zoomBlock.matchAll(/session\.append\(\{[^}]*\}\)/g)].map(m => m[0]);
+  assert.equal(appends.length, 1);
+  assert.match(appends[0], /no such task/);
+  assert.equal(/router\.run\(/.test(zoomBlock), false);
+});
+
+// U10: agentsBoard — every agent with its last live activity lines (first line of each) and,
+// once terminal, its outcome as the final line; workers with no activity have no lines.
+test('U10: agentsBoard lists every agent with its tail of live activity and a terminal outcome line', () => {
+  const events = [
+    {kind: 'task.submitted', task: 'w1', context: 'c', time: 't0', parent: null, profile: 'build', deadline: null},
+    {kind: 'task.submitted', task: 'w2', context: 'c', time: 't1', parent: 'w1', profile: 'critic', deadline: null},
+    {kind: 'task.started', task: 'w1', time: 't2', attempt: 1, requested: 'sonnet'},
+    {kind: 'task.milestone', task: 'w1', time: 't3', text: 'scaffolded'},
+    {kind: 'task.completed', task: 'w1', time: 't4', summary: 'parser done'},
+  ];
+  const activity = new Map([['w1', [
+    {time: 'a1', text: 'Reading src/parse.js'},
+    {time: 'a2', text: 'Running tests\nsecond line dropped'},
+  ]]]);
+  const board = agentsBoard(events, activity, {tail: 1});
+  assert.deepEqual(board.map(a => [a.task, a.profile, a.state, a.lines, a.lastActivityAt]), [
+    ['w1', 'build', 'completed', ['Running tests', '→ completed · parser done'], 'a2'],
+    ['w2', 'critic', 'queued', [], null],
+  ]);
+  assert.equal(board[0].model, 'sonnet');
+  assert.deepEqual(agentsBoard([], new Map()), []);
+});
+
+// U11: boardLayout — exact line shares: even split, yielded rows go to agents with more lines,
+// and when agents outnumber the rows the lead ones are drawn with a "+ more" row reserved.
+test('U11: boardLayout shares the board height exactly', () => {
+  assert.deepEqual(boardLayout([10, 10], 12), {shown: 2, lines: [5, 5], more: 0});         // 2 headers + 10 rows
+  assert.deepEqual(boardLayout([1, 10, 10], 15), {shown: 3, lines: [1, 7, 4], more: 0});   // 3 headers + 12 rows; agent 1 yields 3
+  assert.deepEqual(boardLayout([0, 0], 6), {shown: 2, lines: [0, 0], more: 0});
+  assert.deepEqual(boardLayout([5, 5, 5, 5, 5], 6), {shown: 2, lines: [2, 1], more: 3});   // 2 headers + the "+3 more" row leave 3 activity rows
+  assert.deepEqual(boardLayout([], 10), {shown: 0, lines: [], more: 0});
+  assert.deepEqual(boardLayout([3], 0), {shown: 0, lines: [], more: 1});
+});
+
+// U12: a scheduler refusal is visible: taskTree carries the failure as `outcome`, and the fold row
+// shows it instead of 'queued' (the real incident: two size refusals the TUI never surfaced).
+test('U12: a refused task shows its reason in taskTree.outcome and in the fold row', () => {
+  const events = [
+    {kind: 'task.submitted', task: 'w1', context: 'c', time: 't0', parent: null, profile: 'build', deadline: null},
+    {kind: 'task.failed', task: 'w1', time: 't1', reason: 'size', text: 'lines 400 exceeds limit 150'},
+  ];
+  assert.equal(taskTree(events)[0].outcome, 'size: lines 400 exceeds limit 150');
+  assert.deepEqual(foldedThread(events, 'c'), [{kind: 'task.fold', task: 'w1', state: 'failed', text: 'build · failed · size: lines 400 exceeds limit 150'}]);
 });

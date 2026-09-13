@@ -465,7 +465,7 @@ test('Z1 sized submission under limits: risk and size are stored and dispatch pr
   await waitFor(() => session.events.some(e => e.kind === 'task.started' && e.task === row.task));
 });
 
-test('Z2 unsized submission defaults risk to logic and size to zeroed, never refused', async t => {
+test('Z2 unsized submission defaults risk to logic and size to zeroed, never refused; without configured limits a large size dispatches too', async t => {
   const {session} = setup(t);
   const adapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done'}]);
   const profiles = {A: {adapter: 'fake', model: 'x', mode: 'yolo', fallback: []}};
@@ -475,13 +475,16 @@ test('Z2 unsized submission defaults risk to logic and size to zeroed, never ref
   assert.equal(row.risk, 'logic');
   assert.deepEqual(row.size, {lines: 0, probes: 0, minutes: 0});
   await waitFor(() => session.events.some(e => e.kind === 'task.started' && e.task === row.task));
+  const big = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null, size: {lines: 400, probes: 9, minutes: 40}});
+  await waitFor(() => session.events.some(e => e.kind === 'task.started' && e.task === big.task));
+  assert.equal(session.events.some(e => e.kind === 'task.failed' && e.task === big.task), false);
 });
 
-test('Z3 oversized submission refuses at dispatch before launch, naming the first exceeding field', async t => {
+test('Z3 with configured limits, an oversized submission refuses at dispatch before launch, naming the first exceeding field', async t => {
   const {session} = setup(t);
   const adapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done'}]);
   const profiles = {A: {adapter: 'fake', model: 'x', mode: 'yolo', fallback: []}};
-  const scheduler = createScheduler({session, adapters: {fake: adapter}, profiles});
+  const scheduler = createScheduler({session, adapters: {fake: adapter}, profiles, limits: {lines: 150, probes: 6}});
 
   const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null, size: {lines: 151, probes: 1, minutes: 1}});
   await waitFor(() => scheduler.tasks()[row.task]?.state === 'failed');

@@ -9,7 +9,7 @@ import {defaultStrategy} from './strategy.js';
 const FALLBACK_REASONS = new Set(['limited', 'missing', 'backend_unavailable']);
 const RISKS = new Set(['boundary', 'process-model', 'logic', 'extraction']);
 const SIZE_FIELDS = ['lines', 'probes', 'minutes'];
-const LIMIT_FIELDS = [...SIZE_FIELDS, 'rounds'];
+const DEFAULT_DEADLINE_MINUTES = 60; // a worker with no declared deadline; the watchdog ladder still catches silence
 const TIERS = new Set(['live', 'next-turn', 'queued']);
 const READONLY_ROLES = new Set(['critic', 'verifier', 'analyst']);
 // The depends_on hold/fail decision (which dependency states fail a dependent outright vs.
@@ -41,8 +41,11 @@ function parseVerdict(status, text) {
 // the log, driven by adapters. Everything the scheduler knows is re-derived from session.events
 // via the reducers — it keeps only a live-handle map, which cannot survive a restart by design.
 export function createScheduler({session, adapters, profiles, sessionMode = 'yolo', depthCap = 1, checkpointRunner, limits: suppliedLimits = {}, strict = false, clock = () => Date.now(), watchdog: suppliedWatchdog = {}, strategy = defaultStrategy}) {
-  const limits = {lines: 150, probes: 6, minutes: 15, rounds: 2, ...suppliedLimits};
-  if (LIMIT_FIELDS.some(field => !isPositiveInt(limits[field]))) throw new Error('malformed: limits');
+  // Sizing limits (lines/probes/minutes) gate dispatch ONLY when the caller configures them: a
+  // task's declared size is otherwise informational. The old built-in 150/6/15 defaults refused
+  // real orchestrations (a 400-line brief) with no way to see why — a shallow rule, removed.
+  const limits = {rounds: 2, ...suppliedLimits};
+  if (!isPositiveInt(limits.rounds) || SIZE_FIELDS.some(field => limits[field] !== undefined && !isPositiveInt(limits[field]))) throw new Error('malformed: limits');
   const watchdogConfig = {interval: 5000, silence: 120000, stall: 600000, grace: 120000, ...suppliedWatchdog};
   const intervalOk = watchdogConfig.interval === null || isPositiveInt(watchdogConfig.interval);
   if (!intervalOk || !isPositiveInt(watchdogConfig.silence) || !isPositiveInt(watchdogConfig.stall) || !isPositiveInt(watchdogConfig.grace)) throw new Error('malformed: watchdog');
@@ -613,7 +616,7 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
     // checked in a fixed field order so the reported field is deterministic.
     // submit() always stores size; the fallback only covers rows journaled directly (legacy/test rows), never a defaulting path.
     const size = row.size ?? {lines: 0, probes: 0, minutes: 0};
-    const oversizedField = SIZE_FIELDS.find(field => size[field] > limits[field]);
+    const oversizedField = SIZE_FIELDS.find(field => limits[field] !== undefined && size[field] > limits[field]);
     if (oversizedField) {
       append({kind: 'task.failed', task, reason: 'size', text: `${oversizedField} ${size[oversizedField]} exceeds limit ${limits[oversizedField]}`, context});
       return;
@@ -764,7 +767,7 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
   // declared `deadline` (ms from its first task.started), or `limits.minutes * 60000` when
   // `deadline` is null. `deadlineAtFor` needs the task's actual first-start time, so it reads
   // nothing until at least one task.started row exists.
-  function taskDeadlineMs(submitted) { return submitted?.deadline ?? (limits.minutes * 60000); }
+  function taskDeadlineMs(submitted) { return submitted?.deadline ?? ((limits.minutes ?? DEFAULT_DEADLINE_MINUTES) * 60000); }
   function deadlineAtFor(task) {
     const startedRows = session.events.filter(e => e.kind === 'task.started' && e.task === task);
     if (!startedRows.length) return null;
@@ -853,7 +856,7 @@ export function createScheduler({session, adapters, profiles, sessionMode = 'yol
   // the same log/activity/now is idempotent beyond the dedupe rules §3 already specifies.
   async function tick() {
     const now = clock();
-    const rows = reducers.watchdog(session.events, now, {activity, watchdog: {...watchdogConfig, defaultDeadlineMs: limits.minutes * 60000}});
+    const rows = reducers.watchdog(session.events, now, {activity, watchdog: {...watchdogConfig, defaultDeadlineMs: (limits.minutes ?? DEFAULT_DEADLINE_MINUTES) * 60000}});
     for (const r of rows) {
       if (r.verdicts.includes('blocked')) { await handleBlocked(r); continue; }
       if (r.verdicts.includes('deadline')) { await handleDeadline(r); continue; } // no correction, no grace (§3)

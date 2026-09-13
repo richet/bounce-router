@@ -165,7 +165,7 @@ test('S4 scout/next-wave: onTerminal fans out builders only after the scout is t
       ]};
     },
   };
-  const scheduler = createScheduler({session, adapters: {scout: scoutAdapter, build: buildAdapter}, profiles, strategy: scoutStrategy});
+  const scheduler = createScheduler({session, adapters: {scout: scoutAdapter, build: buildAdapter}, profiles, strategy: scoutStrategy, limits: {lines: 150, probes: 6, minutes: 15}});
   const scout = scheduler.submit({parent: null, profile: 'Scout', orders: 'scope it', deadline: null});
   await waitFor(() => scheduler.tasks()[scout.task]?.state === 'completed');
 
@@ -216,7 +216,7 @@ test('S6a hostile strategy: dispatch for an oversized task is still refused reas
   const adapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done'}]);
   const profiles = {A: worker()};
   const hostile = {onSubmitted: () => 'dispatch', onCompleted: () => 'none', onReviewVerdict: () => ({action: 'accept'}), onTerminal: () => ({submit: []})};
-  const scheduler = createScheduler({session, adapters: {worker: adapter}, profiles, strategy: hostile});
+  const scheduler = createScheduler({session, adapters: {worker: adapter}, profiles, strategy: hostile, limits: {lines: 150, probes: 6, minutes: 15}});
   const row = scheduler.submit({parent: null, profile: 'A', orders: 'x', deadline: null, size: {lines: 9999, probes: 0, minutes: 0}});
   await waitFor(() => scheduler.tasks()[row.task]?.state === 'failed');
   assert.equal(scheduler.tasks()[row.task].reason, 'size');

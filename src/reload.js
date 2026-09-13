@@ -98,17 +98,30 @@ const ORCHESTRATOR_ENV = ['BOUNCE_BUS', 'BOUNCE_BUS_TOKEN_FILE', 'BOUNCE_ROLE', 
 
 // The orchestrator profile's standing brief, written once per daemon start: where its skill
 // lives and how to reach the bridge. The prompt line cli.js prepends points at this file.
-function writeOrders({session, root, bus, grant}) {
+function writeOrders({session, root, bus, grant, profiles = {}, orchestrator}) {
   const dir = path.join(session.dir, 'orchestrator');
   fs.mkdirSync(dir, {recursive: true, mode: 0o700});
   const file = path.join(dir, 'ORDERS.md');
   fs.writeFileSync(file, [
     `# Orchestrator orders — session ${session.id}`, '',
+    'You coordinate; workers implement. Delegate every implementation task to a worker profile below.',
+    'Do not edit the repository yourself and do not read bounce\'s own source to learn the bridge — everything you need is here.', '',
     `Skill: ${path.join(root, 'skills', 'agent-orchestrator', 'SKILL.md')}`, '',
     'Bridge (already in your environment):',
     `    BOUNCE_BUS=${bus.path}`,
     `    BOUNCE_BUS_TOKEN_FILE=${grant.file}`, '',
+    'Worker profiles you can submit to (name → adapter/model):',
+    ...Object.entries(profiles).filter(([name]) => name !== orchestrator).map(([name, p]) => `    ${name} → ${[p.adapter, p.model].filter(Boolean).join('/')}${p.role ? ` (${p.role})` : ''}`),
+    '',
     'Submit work with `bounce publish --event <json>` and wait for it with `bounce wait --match <json>`.',
+    'Example — submit one task, then wait for it to end:',
+    `    bounce publish --event '{"kind":"task.submitted","parent":null,"profile":"${Object.keys(profiles).find(n => n !== orchestrator) ?? 'build'}","orders":"<goal, owned paths, acceptance, how to verify>","deadline":3600000}'`,
+    `    bounce wait --match '{"kind":"task.completed","task":"<task id from the publish reply>"}' --timeout 3600`,
+    'Fields: parent (null for a root task), profile (a name above), orders (the brief, required), deadline (ms, optional),',
+    'depends_on (task ids, optional), review ({"prelaunch": <profile>, "completion": <profile>}, optional, review-role profiles only).',
+    'The publish reply carries the task id. A refusal arrives as a task.failed row naming the reason — read it before retrying.',
+    'Terminal rows: task.completed, task.failed, task.cancelled, task.rejected. Steer a running worker with',
+    `    bounce publish --event '{"kind":"message","to":"worker:<task id>","text":"..."}'`, '',
     'You may publish only: task.submitted, task.milestone, task.blocked, task.input_required, task.usage, task.activity, message.',
     'Everything else is refused — `user`, `control.*`, and every task lifecycle row the scheduler owns.',
   ].join('\n') + '\n', {mode: 0o600});
@@ -203,7 +216,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // to run on, and a standing brief on disk; classic mode reaches none of this.
   const orchestratorProfile = orchestrating ? orchestration.profiles[orchestration.orchestrator] : null;
   const orchestratorGrant = orchestrating ? bus.grant({peer: 'orchestrator', canSubmit: true, tasks: [], context: session.id}) : null;
-  if (orchestrating) writeOrders({session, root, bus, grant: orchestratorGrant});
+  if (orchestrating) writeOrders({session, root, bus, grant: orchestratorGrant, profiles: orchestration.profiles, orchestrator: orchestration.orchestrator});
   if (orchestrating) session.append({kind: 'operation', operation: 'orchestrator', orchestrator: orchestration.orchestrator, shape: orchestration.shape, text: `Operation: orchestrator on ${orchestration.orchestrator} (${orchestration.shape})`});
 
   // Worker grants are the dispatch policy expressed on the bus: a task that starts gets a grant
@@ -343,7 +356,16 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
       });
       currentChild = child;
       const host = hostSession({session, child});
-      child.on('message', message => { if (message?.type === 'restart') { request = message.state; update = message.update === true; } });
+      child.on('message', message => {
+        if (message?.type === 'restart') { request = message.state; update = message.update === true; }
+        // Phase 9.3 steering: the interactive orchestrator child (the TUI) asks the daemon to
+        // cancel one task or the whole tree over its own IPC channel — the scheduler owns cancel,
+        // and the resulting task.cancelled rows flow back to the TUI's AGENTS pane.
+        else if (message?.type === 'control') {
+          if (message.action === 'stop') scheduler.stop().catch(() => {});
+          else if (message.action === 'cancel' && message.task) scheduler.cancel(message.task).catch(() => {});
+        }
+      });
       child.once('error', error => { console.error(error.message); });
       child.once('close', (code, signal) => {
         currentChild = null;
@@ -478,7 +500,15 @@ export async function supervise(args = process.argv.slice(2), {spawnChild = spaw
   if (command === 'stop') return stopCommand(args);
   if (command === 'run' && args.includes('--detach')) return detachRun(args, {spawnChild});
   if (command === 'run') return daemonSupervise(args, {spawnChild, updateInstall, adapters, profiles, strategy, onReady});
-  // Bare/`dev` TUI keeps the pre-Phase-2 supervisor loop unchanged (Phase 6 gives the TUI
-  // its own bus client); only `run` gets the per-session daemon apparatus in Phase 2.
+  // Phase 9 (interactive orchestrator): the interactive TUI whose config is orchestrator gets the
+  // full daemon apparatus (bus + scheduler + orchestrator grant) with an INTERACTIVE child — the
+  // args carry no `run`, so cli.js enters its multi-turn TUI branch as the orchestrator peer and
+  // each user turn delegates over the bridge. Classic config keeps the pre-Phase-2 legacySupervise
+  // loop, byte-identical. We read only the raw `operation` field (not full validateOrchestration,
+  // which would reject a `local` profile under the default adapter list) and let daemonSupervise
+  // do the real validation and surface any error.
+  let operation = 'classic';
+  try { operation = config(dataRoot()).operation ?? 'classic'; } catch { /* a broken config surfaces in the classic TUI below */ }
+  if (operation === 'orchestrator') return daemonSupervise(args, {spawnChild, updateInstall, adapters, profiles, strategy, onReady});
   return legacySupervise(args, {spawnChild, updateInstall});
 }

@@ -5,7 +5,7 @@ import {PassThrough} from 'node:stream';
 import {completions, typedCommand, frameDiff, createMouseInput, mouseTracking, createPasteInput, createKeyInput, inputLayout, windowAround, modelRows, checklistRows, suspendTerminal, resumeTerminal} from './terminal.js';
 import {modelCatalog, modelEntries, catalogNotes} from './models.js';
 import stringWidth from 'string-width';
-import {clean, createFormatter, createTranscriptRenderer, createWorkSummary, workReview, activeModel, taskTree, parseCommand, continueMain} from './format.js';
+import {clean, createFormatter, createTranscriptRenderer, createWorkSummary, workReview, activeModel, taskTree, foldedThread, workerThread, agentsBoard, boardLayout, parseCommand, continueMain} from './format.js';
 import {validateOrchestration} from './profiles.js';
 import {loadQuota, recordQuota, refreshQuota, quotaSnapshot, quotaShort, quotaPanel, quotaReport, quotaUnavailable} from './quota.js';
 import {skillsCommand, syncSkills, inspectSkills, skillsChanged, importCandidates, importSelected, importSummary, syncSummary, skillAreas} from './skills.js';
@@ -35,6 +35,7 @@ const help = `bounce — one terminal, your coding agents
   bounce quota [--json]
   bounce skills [list|sync|new NAME|add PATH|remove NAME|import [NAME] [--list]|clear|reset] [--scope user|project]
   bounce sessions               Marks sessions with a live daemon: ● live PID
+  bounce task compare SESSION A B   Built-in A/B: compare two tasks (tokens, wall, rounds) from the log
   bounce doctor
   bounce update [--check]  Check for or install the latest npm release
   bounce dev        Improve bounce itself; validate/reload after changes
@@ -46,6 +47,13 @@ TUI commands:
   /model refresh        Re-ask each agent for its catalog, then pick
   /order claude,codex,muse  Save the fallback order
   /mode yolo|plan       YOLO default; plan uses restrictive provider flags
+  /operation [NAME]     Switch/pick classic|orchestrator — no arg opens a menu, Ctrl+O toggles
+  /stop [TASK]          Orchestrator: cancel one task, or every running task with no arg
+  /msg TASK TEXT        Orchestrator: send a message to a running worker
+  /zoom                 Orchestrator: every agent's live activity in the central area; toggle, Esc closes
+  /zoom TASK            Orchestrator: one worker full-screen; typing messages it; /zoom or Esc returns
+  /attach [TASK]        Orchestrator: show one worker's folded thread in the transcript; no arg returns
+  /tasks                Toggle the task tree in the sidebar
   /login NAME           Open the vendor's native login flow
   /new                  Start a new session in this workspace
   /note TEXT            Save a durable handoff note
@@ -261,7 +269,18 @@ async function main() {
   const pending = [];
   // Phase 6 §A2: /tasks toggles the task-tree pane; /attach focuses one worker's live activity.
   // Both are TUI-local — plain variables, never journaled (see CONTRACT.md A2/U6).
-  let showTasks = false, attachedTask = null;
+  let showTasks = false, attachedTask = null, zoomTask = null, boardOpen = false;
+  // Live worker activity is never journaled (task.activity is a LIVE_KIND), so the pane that
+  // shows one worker keeps the last rows per task in memory; workerThread merges them by time.
+  const liveActivity = new Map();
+  const LIVE_ACTIVITY_MAX = 400;
+  function recordActivity(event) {
+    if (event?.kind !== 'task.activity' || !event.task || !event.text) return;
+    const rows = liveActivity.get(event.task) ?? [];
+    rows.push({time: event.time ?? new Date().toISOString(), text: event.text});
+    if (rows.length > LIVE_ACTIVITY_MAX) rows.splice(0, rows.length - LIVE_ACTIVITY_MAX);
+    liveActivity.set(event.task, rows);
+  }
   // The orchestration profile table this session was configured with, if any — read once here
   // so /continue can validate a profile name without touching the bus. A malformed config never
   // breaks the TUI: it just means /continue always reports 'no such profile'.
@@ -282,6 +301,18 @@ async function main() {
   const save = () => saveJSON(path.join(root, 'config.json'), settings);
   const {style, clip, wrap, event: formatEvent} = createFormatter();
   const transcriptRows = createTranscriptRenderer(formatEvent);
+  // Orchestrator sessions render a folded, compact thread (delegation + milestones, tool noise and
+  // child-worker transcript collapsed) instead of the raw firehose; classic keeps transcriptRows.
+  // Built only in orchestrator mode: a classic run must not pay the extra formatter's startup cost
+  // (a second Chalk/Marked/highlight setup), which under heavy parallel load slowed classic child
+  // startup enough to race the subprocess tests (O1/D1b).
+  // Rows of the orchestrator's own turn carry from:'main'; label them with its profile name so a
+  // line reads `main · claude · Tool …`, not just the vendor.
+  const roleOf = row => row.from === 'main' ? orchestration.orchestrator : null;
+  const foldedTranscript = orchestration.operation === 'orchestrator' ? createTranscriptRenderer(createFormatter({compact: true, role: roleOf}).event) : null;
+  // /zoom shows one worker in full detail with the classic formatter; its own renderer instance so
+  // the main transcript's incremental cache is not invalidated by switching views.
+  const zoomTranscript = orchestration.operation === 'orchestrator' ? createTranscriptRenderer(createFormatter({role: roleOf}).event) : null;
   const workSummary = createWorkSummary();
   // Picking a model also picks the agent that reported it.
   const applyModel = entry => {
@@ -292,6 +323,30 @@ async function main() {
     session.append({kind: 'status', text: `Model: ${entry.provider} · ${entry.label}${entry.id ? ` (${entry.id})` : ''}`});
     notice = `${entry.provider} · ${entry.label}. Saved as the default.`;
   };
+  // Shared by the /operation command, its picker (menu) and the Ctrl+O toggle (shortcut) — one
+  // place applies a mode change: bootstrap a default team on the first switch to orchestrator,
+  // validate the whole config, persist, and reflect it in the sidebar. Never throws (the shortcut
+  // path has no surrounding try) — it reports problems via `notice`.
+  function applyOperation(arg) {
+    if (!['classic', 'orchestrator'].includes(arg)) { notice = 'Use /operation classic or /operation orchestrator'; return; }
+    const previous = {operation: settings.operation, profiles: settings.profiles, orchestrator: settings.orchestrator};
+    settings.operation = arg;
+    if (arg === 'orchestrator' && !(settings.profiles && typeof settings.profiles === 'object' && Object.keys(settings.profiles).length)) {
+      const build = settings.order[1] ?? settings.order[0];
+      settings.profiles = {main: {adapter: settings.order[0]}, build: {adapter: build}};
+      settings.orchestrator = 'main';
+    }
+    try { orchestration = validateOrchestration(settings); }
+    catch (error) { Object.assign(settings, previous); notice = `Cannot switch to ${arg}: ${error.message}`; return; }
+    save();
+    session.append({kind: 'status', text: arg === 'orchestrator'
+      ? `Operation: orchestrator · ${orchestration.orchestrator} · ${Object.entries(orchestration.profiles).map(([n, pr]) => `${n}(${pr.adapter})`).join(', ')} — saved; applies to the next \`bounce run\`.`
+      : 'Operation: classic — saved.'});
+  }
+  function openOperationPicker() {
+    picker = {kind: 'operation', entries: ['classic', 'orchestrator'], index: orchestration.operation === 'orchestrator' ? 1 : 0, notes: []};
+    notice = 'Pick an operation mode. Esc cancels · Ctrl+O toggles.';
+  }
   async function openModelPicker(refresh) {
     notice = 'Asking each signed-in agent for its models…'; render();
     const catalogs = await modelCatalog(settings, refresh ? {maxAge: 0} : {});
@@ -334,10 +389,40 @@ async function main() {
     session.append({kind: 'skills', text: [importSummary(report), syncSummary(synced)].filter(Boolean).join('\n')});
     notice = `Imported ${selection.length} skill${selection.length === 1 ? '' : 's'}.`;
   }
+  // The zoom banner: who this worker is and how to leave. Thin map over one taskTree() row.
+  function zoomHeader(task, line) {
+    const row = taskTree(session.events).find(r => r.task === task);
+    const elapsed = row?.startedAt ? `${Math.floor((Date.now() - Date.parse(row.startedAt)) / 1000)}s` : null;
+    const who = row ? [row.profile, [row.adapter, row.model].filter(Boolean).join('/') || null, row.state, elapsed, row.lastMilestone, row.blocker].filter(Boolean).join(' · ') : task;
+    return [
+      style.title(clean(`ZOOM · ${task.slice(0, 8)} · ${who}`)),
+      style.muted('Type to message this worker · /zoom or Esc returns · /stop ' + task.slice(0, 8) + ' cancels it'),
+      style.muted(line),
+    ];
+  }
+  // The agents board (/zoom with no task): every worker in the central area, one header line
+  // each plus its last live activity lines, height shared by boardLayout. Thin map over
+  // agentsBoard(); nothing here derives state.
+  function boardRows(width, height) {
+    const board = agentsBoard(session.events, liveActivity);
+    if (!board.length) return [style.muted('No agents running yet · type to give the orchestrator a task · /zoom or Esc returns')];
+    const {shown, lines, more} = boardLayout(board.map(a => a.lines.length), height);
+    const out = [];
+    for (let i = 0; i < shown; i++) {
+      const a = board[i];
+      const elapsed = a.startedAt ? `${Math.floor((Date.now() - Date.parse(a.startedAt)) / 1000)}s` : null;
+      const am = [a.adapter, a.model].filter(Boolean).join('/');
+      const bits = [am || null, a.state, elapsed, a.lastMilestone, a.blocker, a.outcome, a.tier ? `tier ${a.tier}` : null].filter(Boolean).join(' · ');
+      out.push(clip(style.title(clean(`${'  '.repeat(a.depth)}${a.task === attachedTask ? '➤ ' : ''}${a.profile} (${a.task.slice(0, 8)})`)) + '  ' + style.status(clean(bits)), width));
+      for (const text of a.lines.slice(a.lines.length - lines[i])) out.push(clip('  ' + style.muted(clean(text)), width));
+    }
+    if (more) out.push(style.muted(`+ ${more} more agent${more === 1 ? '' : 's'} · /zoom <task> to open one`));
+    return out;
+  }
   function render() {
     if (suspended || copyPaused) return;
     const totalWidth = Math.max(4, (process.stdout.columns || 80) - 2);
-    const sidebarWidth = totalWidth >= 100 && (process.stdout.rows || 24) >= 22 ? 30 : 0;
+    const sidebarWidth = !zoomTask && totalWidth >= 100 && (process.stdout.rows || 24) >= 22 ? 30 : 0;
     const width = totalWidth - (sidebarWidth ? sidebarWidth + 3 : 0);
     const terminalRows = process.stdout.rows || 24;
     // Sidebar branding leaves the conversation pane free of header rows.
@@ -354,6 +439,10 @@ async function main() {
       for (let i = start; i < end; i++) menu.push([rows[i], i === picker.index ? style.selected : picker.chosen.has(i) ? style.result : plain]);
       for (const note of picker.notes) menu.push([note, style.diagnostic]);
       menu.push(['↑/↓ move · Space tick · a all · n none · Enter import · Esc cancel', style.muted]);
+    } else if (picker?.kind === 'operation') {
+      menu.push(['Operation mode', style.title]);
+      picker.entries.forEach((name, i) => menu.push([`${i === picker.index ? '\u203a' : ' '} ${name}${name === orchestration.operation ? '  (current)' : ''}`, i === picker.index ? style.selected : plain]));
+      menu.push(['\u2191/\u2193 choose \u00b7 Enter switch \u00b7 Esc cancel \u00b7 Ctrl+O toggles', style.muted]);
     } else if (picker) {
       const rows = modelRows(picker.entries, picker.index, width - 1);
       const {start, end} = windowAround(rows.length, picker.index, Math.max(1, menuBudget - 2 - picker.notes.length));
@@ -369,13 +458,19 @@ async function main() {
     }
     menu.length = Math.min(menu.length, menuBudget);
     const bodyHeight = Math.max(1, terminalRows - headerRows - 4 - draft.rows.length - menu.length);
-    const rows = transcriptRows(session.events, width);
+    // Orchestrator views: zoom = one worker, full detail, full width; attach = one worker folded
+    // in place of the main thread; otherwise the folded main thread. Classic is unchanged.
+    const rows = orchestration.operation !== 'orchestrator' ? transcriptRows(session.events, width)
+      : zoomTask ? zoomTranscript(workerThread(session.events, zoomTask, liveActivity.get(zoomTask) ?? []), width)
+      : boardOpen ? boardRows(width, bodyHeight)
+      : attachedTask ? foldedTranscript(workerThread(session.events, attachedTask, liveActivity.get(attachedTask) ?? []), width)
+      : foldedTranscript(foldedThread(session.events, session.context), width);
     scroll = Math.min(scroll, Math.max(0, rows.length - bodyHeight));
     const end = rows.length - scroll;
     const body = rows.slice(Math.max(0, end - bodyHeight), end);
     while (body.length < bodyHeight) body.push('');
     const line = '─'.repeat(width);
-    const header = sidebarWidth ? [] : [
+    const header = zoomTask ? zoomHeader(zoomTask, line) : sidebarWidth ? [] : [
       style.title(BOUNCE_LOGO),
       style.status(clean(`${selected()} · Model: ${activeModel(session.events, selected(), settings.models[selected()])} · ${settings.mode.toUpperCase()}${settings.mode === 'yolo' ? ' (approvals + sandbox bypassed)' : ''} · ${busy ? `RUNNING${pending.length ? ` · ${pending.length} QUEUED` : ''}` : 'READY'}`)),
       style.muted(clean(`${session.cwd} · session ${session.id.slice(0, 8)}`)),
@@ -395,6 +490,7 @@ async function main() {
         style.title(BOUNCE_LOGO),
         style.status(singleLine(`${selected()} · ${settings.mode.toUpperCase()}`)),
         singleLine(`Model: ${activeModel(session.events, selected(), settings.models[selected()])}`),
+        style.status(`Operation: ${orchestration.operation}${orchestration.orchestrator ? ` · ${orchestration.orchestrator}` : ''}`),
         style.status(busy ? `RUNNING${pending.length ? ` · ${pending.length} QUEUED` : ''}` : 'READY'),
         ...(settings.mode === 'yolo' ? [style.muted('Approvals + sandbox bypassed')] : []),
         style.muted(singleLine(session.cwd)),
@@ -408,18 +504,21 @@ async function main() {
         rows: Math.max(2, nextFrame.length - top.length - 5), cooldowns: router.cooldowns,
         paint: {title: style.title, text: plain, muted: style.muted, ok: style.result,
           warn: style.status, high: style.error, tick: style.note}});
-      const side = [...top, ...usage, style.muted('─'.repeat(sidebarWidth)), style.title(showTasks ? 'TASKS' : 'WORK DONE')];
+      const tasksPane = orchestration.operation === 'orchestrator' || showTasks;
+      const side = [...top, ...usage, style.muted('─'.repeat(sidebarWidth)), style.title(tasksPane ? 'AGENTS' : 'WORK DONE')];
       const available = Math.max(0, nextFrame.length - side.length);
       // §A2: /tasks toggles this pane in place of WORK DONE. Thin map: each taskTree() row
       // becomes exactly one formatted line; no state-deriving logic lives here.
-      if (showTasks) {
+      if (tasksPane) {
         const rows = taskTree(session.events);
-        if (!rows.length && available) side.push(style.muted('No tasks yet'));
+        if (!rows.length && available) side.push(style.muted(orchestration.operation === 'orchestrator' ? 'No agents running yet' : 'No tasks yet'));
         for (const row of rows.slice(0, available)) {
-          const bits = [row.state, row.lastMilestone, row.deadline != null ? `deadline ${row.deadline}` : null,
+          const elapsed = row.startedAt ? `${Math.floor((Date.now() - Date.parse(row.startedAt)) / 1000)}s` : null;
+          const am = [row.adapter, row.model].filter(Boolean).join('/');
+          const bits = [am || null, row.state, elapsed, row.lastMilestone, row.deadline != null ? `deadline ${row.deadline}` : null,
             row.remainingStarts != null ? `${row.remainingStarts} starts left` : null,
             row.remainingRounds != null ? `${row.remainingRounds} rounds left` : null,
-            row.blocker, row.tier ? `tier ${row.tier}` : null].filter(Boolean).join(' · ');
+            row.blocker, row.outcome, row.tier ? `tier ${row.tier}` : null].filter(Boolean).join(' · ');
           const marker = row.task === attachedTask ? '➤ ' : '  ';
           side.push(clip(marker + singleLine(`${'  '.repeat(row.depth)}${row.profile} (${row.task.slice(0, 8)}) ${bits}`), sidebarWidth - 1));
         }
@@ -461,6 +560,7 @@ async function main() {
   let renderTimer;
   function scheduleRender(event) {
     if (event?.kind === 'progress') progress = clean(event.text);
+    recordActivity(event);
     // Vendor streams repeat quota many times per turn; only a changed reading redraws.
     if (event?.kind === 'raw' && !recordQuota(quotas, root, quotaSnapshot(event.provider, event.raw))) return;
     if (renderTimer) return;
@@ -520,6 +620,21 @@ async function main() {
           settings.models[selected()] = arg === 'default' ? '' : arg; save();
         } else if (command === 'mode') {
           if (!['yolo','plan'].includes(arg)) throw new Error('Use /mode yolo or /mode plan'); settings.mode = arg; save();
+        } else if (command === 'operation') {
+          if (!arg) { openOperationPicker(); return; }
+          applyOperation(arg);
+        } else if (command === 'stop') {
+          if (orchestration.operation !== 'orchestrator') throw new Error('/stop is only available in orchestrator mode');
+          if (!process.send) throw new Error('/stop needs the orchestrator daemon (run bounce with an orchestrator config)');
+          const task = arg.trim();
+          process.send({type: 'control', action: task ? 'cancel' : 'stop', task: task || undefined});
+          session.append({kind: 'status', text: task ? `Requested cancel of task ${task.slice(0, 8)}` : 'Requested stop of every running task'});
+        } else if (command === 'msg') {
+          if (orchestration.operation !== 'orchestrator') throw new Error('/msg is only available in orchestrator mode');
+          const [task, ...rest] = arg.split(/\s+/); const text = rest.join(' ');
+          if (!task || !text) throw new Error('Use /msg <task> <text>');
+          session.append({kind: 'message', to: `worker:${task}`, text});
+          session.append({kind: 'status', text: `Message queued for worker ${task.slice(0, 8)}`});
         } else if (command === 'order') {
           const order = arg.split(',').map(p => p.trim());
           if (!order.length || order.some(p => !providers[p]) || new Set(order).size !== order.length) throw new Error('Use unique provider names separated by commas');
@@ -555,6 +670,19 @@ async function main() {
           return;
         } else if (command === 'tasks') {
           showTasks = !showTasks;
+        } else if (command === 'zoom') {
+          if (orchestration.operation !== 'orchestrator') throw new Error('/zoom is only available in orchestrator mode');
+          if (!arg) {
+            if (zoomTask) { zoomTask = null; boardOpen = true; notice = 'Agents board · every worker in the centre · /zoom or Esc returns'; }
+            else { boardOpen = !boardOpen; notice = boardOpen ? 'Agents board · every worker in the centre · /zoom or Esc returns' : 'Board closed'; }
+            scroll = 0; return;
+          }
+          const known = reducers.tasks(session.events);
+          const task = known[arg] ? arg : Object.keys(known).find(id => id.startsWith(arg));
+          if (!task) { session.append({kind: 'status', text: 'no such task'}); return; }
+          zoomTask = task; scroll = 0;
+          notice = `Zoomed into ${task.slice(0, 8)} · type to message it · /zoom or Esc returns`;
+          return;
         } else if (command === 'attach') {
           if (!arg) { attachedTask = null; }
           else if (!reducers.tasks(session.events)[arg]) { session.append({kind: 'status', text: 'no such task'}); return; }
@@ -579,6 +707,12 @@ async function main() {
           return;
         } else throw new Error('Unknown command. Type /help');
         notice = 'Updated.';
+      } else if (zoomTask) {
+        // Zoomed in: plain text is a message to that worker, never a main turn.
+        history.push(text); historyIndex = -1; scroll = 0;
+        if (reducers.TERMINAL.has(reducers.tasks(session.events)[zoomTask]?.state)) throw new Error('This worker has finished · /zoom returns to the orchestrator');
+        session.append({kind: 'message', to: `worker:${zoomTask}`, text});
+        notice = `Message queued for worker ${zoomTask.slice(0, 8)}`;
       } else {
         history.push(text); historyIndex = -1; scroll = 0;
         notice = 'Running · Esc or Ctrl+C cancels the agent process group';
@@ -648,13 +782,14 @@ async function main() {
       render(); return;
     }
     if (key.ctrl && key.name === 'c') { if (busy) {router.cancel(); notice = 'Cancelling…'; render();} else quit(); return; }
+    if (key.ctrl && key.name === 'o') { applyOperation(orchestration.operation === 'classic' ? 'orchestrator' : 'classic'); render(); return; }
     if (key.name === 'escape' && busy) {router.cancel(); return;}
     if (key.name === 'pageup') {scroll += 8; render(); return;}
     if (key.name === 'pagedown') {scroll = Math.max(0, scroll - 8); render(); return;}
     if (picker) {
       const move = key.name === 'up' ? -1 : key.name === 'down' ? 1 : 0;
       if (move) picker.index = (picker.index + move + picker.entries.length) % picker.entries.length;
-      else if (key.name === 'escape') {const kind = picker.kind; picker = null; notice = kind === 'import' ? 'Import cancelled. Nothing changed.' : 'Model unchanged.';}
+      else if (key.name === 'escape') {const kind = picker.kind; picker = null; notice = kind === 'import' ? 'Import cancelled. Nothing changed.' : kind === 'operation' ? 'Operation unchanged.' : 'Model unchanged.';}
       else if (picker.kind === 'import') {
         if (str === ' ' || key.name === 'space') {picker.chosen.has(picker.index) ? picker.chosen.delete(picker.index) : picker.chosen.add(picker.index);}
         else if (str === 'a') for (let i = 0; i < picker.entries.length; i++) picker.chosen.add(i);
@@ -662,7 +797,7 @@ async function main() {
         else if (key.name === 'return') applyImport();
       }
       else if (str && !key.ctrl && !key.meta && /^[1-9]$/.test(str) && Number(str) <= picker.entries.length) picker.index = Number(str) - 1;
-      else if (key.name === 'return') {const entry = picker.entries[picker.index]; picker = null; applyModel(entry);}
+      else if (key.name === 'return') {const entry = picker.entries[picker.index]; const kind = picker.kind; picker = null; if (kind === 'operation') applyOperation(entry); else applyModel(entry);}
       render(); return;
     }
     // Enter alone submits; Shift+Enter — or any other modifier, or Ctrl+J — drops down a line.
@@ -672,7 +807,7 @@ async function main() {
     if (options.length && key.name === 'tab') {acceptCompletion(); render(); return;}
     // Enter only completes a half-typed command; a complete one falls through and is run.
     if (options.length && key.name === 'return' && !typedCommand(input)) {acceptCompletion(); render(); return;}
-    if (key.name === 'escape') {menuDismissed = true; render(); return;}
+    if (key.name === 'escape') {menuDismissed = true; if (!input && (zoomTask || boardOpen)) {zoomTask = null; boardOpen = false; notice = 'Board closed'; scroll = 0;} render(); return;}
     const beforeInput = input;
     if (key.name === 'return') {
       const text = input.trim(); input = '';
@@ -695,6 +830,9 @@ async function main() {
   emitKeypressEvents(keyboard);
   keyboard.on('keypress', handleKey);
   session.onEvent = scheduleRender;
+  // Orchestrator sessions tick once a second so the AGENTS pane's elapsed times advance between
+  // events; unref'd so it never keeps the process alive, and render() is a no-op while suspended.
+  if (orchestration.operation === 'orchestrator') { const t = setInterval(() => render(), 1000); t.unref?.(); }
   void refreshQuota(settings, {root, store: quotas, cwd: session.cwd}).then(render, () => {});
   process.stdout.on('resize', render);
   process.on('SIGTERM', () => { if (busy) {router.cancel(); const timer = setInterval(() => {if (!busy) {clearInterval(timer); quit();}}, 100);} else quit(); });

@@ -26,7 +26,14 @@ test('reload validation rejects failing checks before running tests', async t =>
   assert.deepEqual(messages, ['Checking syntax…', 'Syntax checks passed.', 'Running tests…', 'Tests passed.']);
 });
 
-test('supervisor installs only after child exits and resumes session on success or failure', async () => {
+test('supervisor installs only after child exits and resumes session on success or failure', async t => {
+  // Isolate BOUNCE_HOME: since Phase 9, a bare supervise() consults config to decide classic vs
+  // interactive-orchestrator. An empty home resolves to classic defaults → legacySupervise, the
+  // install/restart loop this test exercises (without this it would read the real ~/.bounce).
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-sv-'));
+  const prevHome = process.env.BOUNCE_HOME;
+  process.env.BOUNCE_HOME = home;
+  t.after(() => { if (prevHome === undefined) delete process.env.BOUNCE_HOME; else process.env.BOUNCE_HOME = prevHome; fs.rmSync(home, {recursive: true, force: true}); });
   const {EventEmitter} = await import('node:events');
   const {supervise} = await import('../src/reload.js');
   for (const fail of [false, true]) {

@@ -161,3 +161,22 @@ test('work review preserves all item text and orders oldest first without mutati
   assert.deepEqual(items, ['First item', long, 'Last item']);
   assert.equal(workReview([]), 'No completed turns yet.');
 });
+
+test('compact formatter folds a tool row and a delegation row to one line each (orchestrator transcript)', () => {
+  const {event} = createFormatter({color: false, compact: true});
+  const tool = event({kind: 'tool', provider: 'claude', text: 'Bash: {"command":"npm test","description":"Run the suite"}'}, 200);
+  assert.equal(tool.length, 1, 'a tool row folds to exactly one line');
+  assert.match(tool[0], /claude · Tool\s+Bash: Run the suite/);
+  const {event: labelled} = createFormatter({color: false, compact: true, role: row => row.from === 'main' ? 'main' : null});
+  assert.match(labelled({kind: 'tool', provider: 'claude', from: 'main', text: 'Bash: {"command":"npm test","description":"Run the suite"}'}, 200)[0], /^main · claude · Tool\s+Bash: Run the suite$/);
+  assert.match(labelled({kind: 'tool', provider: 'claude', from: 'bounce', text: 'Bash: {"command":"npm test","description":"Run the suite"}'}, 200)[0], /^claude · Tool\s+Bash: Run the suite$/);
+  const fold = event({kind: 'task.fold', task: 't1', text: 'build · running · writing tests'}, 200);
+  assert.equal(fold.length, 1);
+  assert.match(fold[0], /→\s+build · running · writing tests/);
+});
+
+test('classic formatter (no compact) still renders a tool row as a full block', () => {
+  const {event} = createFormatter({color: false});
+  const tool = event({kind: 'tool', provider: 'claude', text: 'Bash: {"command":"npm test","description":"Run the suite"}'}, 200);
+  assert.ok(tool.length > 1, 'classic keeps the multi-line tool block (byte-identical path unchanged)');
+});

@@ -8,6 +8,8 @@ export const commands = [
   ['review', 'Show full session work items'], ['quota', 'Show reported quota'], ['retry', 'Clear quota cooldowns'],
   ['update', 'Install latest npm release'],
   ['restart', 'Validate and reload'],
+  ['operation', 'Switch classic/orchestrator'], ['stop', 'Cancel a task or all'], ['msg', 'Message a worker'],
+  ['zoom', 'Agents board, or one worker'], ['attach', 'Fold one worker in the transcript'], ['tasks', 'Toggle task tree'],
   ['help', 'Show help'], ['quit', 'Exit bounce'],
 ];
 export function completions(input) {

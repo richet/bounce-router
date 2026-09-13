@@ -188,17 +188,20 @@ test('deliver: text is coerced, oversize text is queued, tier is one of live/nex
 
 test('deliver at the tool boundary reaches the model live', async () => {
   const cwd = setup();
-  let released;
+  let released, reached;
   const gate = new Promise(resolve => { released = resolve; });
+  const atBoundary = new Promise(resolve => { reached = resolve; });
   const script = [
     [{kind: 'tool_call', id: 't1', name: 'read_file', arguments: {path: 'README.md'}}],
-    [{kind: 'wait', wait: () => gate}, {kind: 'done', text: 'ok'}],
+    // wait() runs the moment the backend is parked before its first item of turn 2 — exactly
+    // when the adapter is at the tool boundary. A fixed sleep here flaked under CPU starvation.
+    [{kind: 'wait', wait: () => { reached(); return gate; }}, {kind: 'done', text: 'ok'}],
   ];
   fs.writeFileSync(path.join(cwd, 'README.md'), 'hi');
   const adapter = createLocalLive({backends: {fake: createFakeBackend()}});
   const handle = await adapter.launch({peer: {}, profile: {backend: 'fake', model: 'x', script}, orders: 'x', cwd, dir: dirFor(cwd)});
   const iterator = adapter.events(handle);
-  await new Promise(resolve => setTimeout(resolve, 20)); // let the loop reach the boundary and pause on the gate
+  await atBoundary;
   const tier = await adapter.deliver(handle, {text: 'inject me'});
   assert.equal(tier, 'live');
   assert.equal(handle.messages.some(m => m.role === 'user' && m.content === 'inject me'), true);
@@ -217,9 +220,10 @@ test('cancel on an already-finished handle still resolves {verified:true}', asyn
 
 test('concurrency 1: a second launch on the same adapter instance queues and runs after the first completes', async () => {
   const cwd = setup();
-  let released;
+  let released, reached;
   const gate = new Promise(resolve => { released = resolve; });
-  const scriptA = [[{kind: 'wait', wait: () => gate}, {kind: 'done', text: 'a-done'}]];
+  const aRunning = new Promise(resolve => { reached = resolve; });
+  const scriptA = [[{kind: 'wait', wait: () => { reached(); return gate; }}, {kind: 'done', text: 'a-done'}]];
   const scriptB = [[{kind: 'done', text: 'b-done'}]];
   const adapter = createLocalLive({backends: {fake: createFakeBackend()}});
   const handleA = await adapter.launch({peer: {}, profile: {backend: 'fake', model: 'x', script: scriptA}, orders: 'x', cwd, dir: dirFor(cwd)});
@@ -227,7 +231,8 @@ test('concurrency 1: a second launch on the same adapter instance queues and run
   const bIterator = adapter.events(handleB);
   let bResolved = false;
   const bNext = bIterator.next().then(v => { bResolved = true; return v; });
-  await new Promise(resolve => setTimeout(resolve, 30));
+  await aRunning; // A is parked mid-turn on its gate: B cannot have started (concurrency 1)
+  await new Promise(resolve => setImmediate(resolve)); // give B every chance to wrongly resolve
   assert.equal(bResolved, false, 'B must not produce any event while A is still running');
   released();
   const aEvents = await drain(adapter, handleA);
