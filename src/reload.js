@@ -160,7 +160,7 @@ async function legacySupervise(args, {spawnChild, updateInstall}) {
 
 // ---- daemon path: `run` (with or without --detach) and the bare/dev TUI ----
 
-async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extraAdapters = {}, profiles: profileOverride, onReady} = {}) {
+async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extraAdapters = {}, profiles: profileOverride, strategy: strategyOverride, onReady} = {}) {
   const {values, positionals} = parseArgs({args, allowPositionals: true, strict: false, options: {
     cwd: {type: 'string'}, resume: {type: 'string'}, detach: {type: 'boolean'},
   }});
@@ -187,10 +187,16 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
 
   const profiles = profileOverride ?? (orchestrating ? orchestration.profiles : buildProfiles(settings));
 
-  const scheduler = createScheduler({session, adapters, profiles, sessionMode: settings.mode, strict: orchestration.strict});
+  // Phase 8: the strategy seam, same shape as `adapters`/`profiles` above — a test (or, later, a
+  // config-driven caller) may inject a strategy object directly; absent, the declarative
+  // `strategy:` setting resolved by validateOrchestration (default: defaultStrategy) applies.
+  const scheduler = createScheduler({session, adapters, profiles, sessionMode: settings.mode, strict: orchestration.strict, strategy: strategyOverride ?? orchestration.strategy});
   const bus = await createBus({session, dir: session.dir, validate: scheduler.validate});
   const userGrant = bus.grant({peer: 'user', canSubmit: true, tasks: [], context: session.id});
-  writeDaemonJson(session.dir, {pid: process.pid, bus: bus.path, started: new Date().toISOString(), userToken: userGrant.file});
+  // daemon.json is written AFTER the SIGTERM/SIGINT handlers are installed (below), never here:
+  // it is the daemon's discovery record, so the moment it exists a `stop`/SIGTERM can arrive, and
+  // a signal landing before the handler is installed would hit Node's default terminate — the
+  // daemon dies with no cleanup, leaving the socket and daemon.json behind (the D10 flake).
 
   // Orchestrator mode: the main conversation is a peer, not a plain vendor session. It gets the
   // orchestrator grant (canSubmit, its own context, no tasks — never the user grant), its profile
@@ -233,24 +239,36 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   const allRootsTerminal = () => Object.values(scheduler.tasks()).every(t => t.parent || TERMINAL.has(t.state));
 
   let finished = false;
-  async function finish(code) {
-    if (finished) return;
+  let finishPromise = null;
+  // Single-flight AND single-completion. Two teardown paths can fire together: the SIGTERM
+  // handler's finish(143), and the run loop's finish() once a cancel makes the task tree
+  // terminal and waitForDrain() resolves. The old `if (finished) return` guarded double-
+  // EXECUTION but the second caller returned immediately, so the run loop could break and let
+  // main() return — Node then empties the loop and exits between bus.close() (socket unlinked)
+  // and removeDaemonJson (daemon.json left on disk): the intermittent D5/D10 flake. Memoizing
+  // the promise makes every caller await the SAME completion, so no exit path proceeds until
+  // removeDaemonJson has run. `finished` is still set synchronously for waitForDrain's check.
+  const finish = code => {
+    if (finishPromise) return finishPromise;
     finished = true;
-    process.exitCode = code;
-    stopUnsubscribe();
-    grantsUnsubscribe();
-    scheduler.close();
-    process.off('SIGTERM', onSigterm); process.off('SIGINT', onSigterm);
-    // Every grant this daemon minted goes away with it: the worker and orchestrator grants
-    // explicitly here, the user grant with bus.close(), which unlinks every remaining token file.
-    for (const peer of workerTokens.keys()) await bus.revoke(peer).catch(() => {});
-    workerTokens.clear();
-    if (orchestratorGrant) await bus.revoke('orchestrator').catch(() => {});
-    await bus.close().catch(() => {});
-    session.unlock();
-    if (unverifiedOnStop.length) writeDaemonJson(session.dir, {pid: process.pid, bus: bus.path, started: new Date().toISOString(), userToken: userGrant.file, unverified: unverifiedOnStop});
-    else removeDaemonJson(session.dir);
-  }
+    finishPromise = (async () => {
+      process.exitCode = code;
+      stopUnsubscribe();
+      grantsUnsubscribe();
+      scheduler.close();
+      process.off('SIGTERM', onSigterm); process.off('SIGINT', onSigterm);
+      // Every grant this daemon minted goes away with it: the worker and orchestrator grants
+      // explicitly here, the user grant with bus.close(), which unlinks every remaining token file.
+      for (const peer of workerTokens.keys()) await bus.revoke(peer).catch(() => {});
+      workerTokens.clear();
+      if (orchestratorGrant) await bus.revoke('orchestrator').catch(() => {});
+      await bus.close().catch(() => {});
+      session.unlock();
+      if (unverifiedOnStop.length) writeDaemonJson(session.dir, {pid: process.pid, bus: bus.path, started: new Date().toISOString(), userToken: userGrant.file, unverified: unverifiedOnStop});
+      else removeDaemonJson(session.dir);
+    })();
+    return finishPromise;
+  };
 
   const stopUnsubscribe = installControlAuthority({
     session, scheduler,
@@ -288,6 +306,8 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   };
   process.on('SIGTERM', onSigterm);
   process.on('SIGINT', onSigterm);
+  // Now discoverable: a signal from here on is caught by onSigterm and torn down cleanly.
+  writeDaemonJson(session.dir, {pid: process.pid, bus: bus.path, started: new Date().toISOString(), userToken: userGrant.file});
 
   // Detached daemon only: waits for every root task to go terminal (or for `finish`
   // to already have run, via control.stop/SIGTERM) before the daemon is allowed to
@@ -452,12 +472,12 @@ async function waitFor(fn, {timeout = 5000, interval = 20} = {}) {
 
 // ---- dispatcher -------------------------------------------------------
 
-export async function supervise(args = process.argv.slice(2), {spawnChild = spawn, updateInstall = installUpdate, adapters, profiles, onReady} = {}) {
+export async function supervise(args = process.argv.slice(2), {spawnChild = spawn, updateInstall = installUpdate, adapters, profiles, strategy, onReady} = {}) {
   const command = args[0];
   if (command === 'attach') return attachCommand(args);
   if (command === 'stop') return stopCommand(args);
   if (command === 'run' && args.includes('--detach')) return detachRun(args, {spawnChild});
-  if (command === 'run') return daemonSupervise(args, {spawnChild, updateInstall, adapters, profiles, onReady});
+  if (command === 'run') return daemonSupervise(args, {spawnChild, updateInstall, adapters, profiles, strategy, onReady});
   // Bare/`dev` TUI keeps the pre-Phase-2 supervisor loop unchanged (Phase 6 gives the TUI
   // its own bus client); only `run` gets the per-session daemon apparatus in Phase 2.
   return legacySupervise(args, {spawnChild, updateInstall});
