@@ -90,6 +90,9 @@ test('model display tracks the latest attempt and configuration changes', () => 
   assert.equal(activeModel(events, 'codex'), 'Default (not reported)');
   events.push({kind: 'route', provider: 'claude', model: 'default'});
   assert.equal(activeModel(events, 'claude'), 'Default (not reported)');
+  // The reported model feeds the header; as a transcript row it was a bare label over two blank rows.
+  assert.deepEqual(plain.event(events[1], 80), []);
+  assert.deepEqual(createFormatter({color: false, compact: true}).event(events[1], 80), []);
 });
 
 test('bookkeeping events stay on one line while content keeps its own block', () => {

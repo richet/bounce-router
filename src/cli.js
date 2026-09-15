@@ -70,8 +70,9 @@ TUI commands:
   /local setup [loaded]  Guided local worker setup here; loaded limits choices to loaded models
   /local cancel          Cancel setup without interrupting agents
   /details [on|off]      Expand or fold tool output and worker dispatch details
+  /sidebar [on|off]      Show or hide the status sidebar (saved; needs a 100-column terminal)
   /local activate [NAME] Activate saved local workers in this session without restarting
-  /order claude,codex,muse  Save the fallback order
+  /order [claude,codex,muse]  Show the fallback order, or save a new one
   /mode yolo|plan       YOLO default; plan uses restrictive provider flags
   /operation [NAME]     Switch/pick classic|orchestrator — no arg opens a menu, Ctrl+O toggles
   /stop [TASK]          Orchestrator: cancel one task, or every running task with no arg
@@ -585,7 +586,7 @@ async function main() {
         session.append({kind: 'note', text: `Unsent draft for ${previous}:\n${unsent}`});
       }
     }
-    const {content: width} = workspaceColumns(process.stdout.columns || 80);
+    const {content: width} = workspaceColumns(process.stdout.columns || 80, {sidebar: settings.sidebar});
     const terminalRows = process.stdout.rows || 24;
     const headerRows = 1;
     const target = localSetup ? 'setup › ' : agentsOpen ? `${inputTarget()} › ` : '';
@@ -637,7 +638,7 @@ async function main() {
     }
     menu.length = Math.min(menu.length, menuBudget);
     terminal.update({
-      agentsOpen, details, selectedId: selectedAgentPane, input, inputCursor: clampCursor(input, inputCursor), inputTarget: localSetup ? 'setup' : inputTarget(), scroll, busy, progress,
+      agentsOpen, details, sidebar: settings.sidebar, selectedId: selectedAgentPane, input, inputCursor: clampCursor(input, inputCursor), inputTarget: localSetup ? 'setup' : inputTarget(), scroll, busy, progress,
       paneScrolls: {...Object.fromEntries([...paneInputs].map(([id, value]) => [id, value.scroll])), [selectedAgentPane]: scroll},
       main: {...session.main, text: progress || notice, operation: orchestration.operation},
       notice: localSetup?.state.question || notice, paused: copyPaused, mouseScroll,
@@ -798,9 +799,23 @@ async function main() {
           session.append({kind: 'message', to: `worker:${task}`, text});
           session.append({kind: 'status', text: `Message queued for worker ${task.slice(0, 8)}`});
         } else if (command === 'order') {
-          const order = arg.split(',').map(p => p.trim());
-          if (!order.length || order.some(p => !providers[p]) || new Set(order).size !== order.length) throw new Error('Use unique provider names separated by commas');
-          settings.order = order; router.select(order[0]); save();
+          if (arg) {
+            const order = arg.split(',').map(p => p.trim());
+            if (!order.length || order.some(p => !providers[p]) || new Set(order).size !== order.length) throw new Error('Use unique provider names separated by commas');
+            settings.order = order; router.select(order[0]); save();
+          }
+          // In orchestrator operation the order was narrowed to the orchestrator's adapter above.
+          const reading = settings.order.map(p => `${p} (${settings.models[p] || 'default'})`).join(' → ');
+          const note = arg ? 'saved' : orchestrating ? 'orchestrator profile decides · /order claude,codex,muse saves the classic order' : '/order claude,codex,muse changes it';
+          session.append({kind: 'status', text: `Fallback order: ${reading} · ${note}`});
+        } else if (command === 'sidebar') {
+          if (!['', 'on', 'off'].includes(arg)) throw new Error('Use /sidebar [on|off]');
+          settings.sidebar = arg ? arg === 'on' : !settings.sidebar; save();
+          notice = settings.sidebar
+            ? `Sidebar shown${(process.stdout.columns || 80) < 100 ? ' once the terminal is 100 columns wide' : ''} · /sidebar to hide`
+            : 'Sidebar hidden · /sidebar to show';
+          render();
+          return;
         } else if (command === 'quota') {
           await refreshQuota(settings, {root, store: quotas, cwd: session.cwd});
           session.append({kind: 'quota', text: quotaReport(quotas, quotaOrder())});

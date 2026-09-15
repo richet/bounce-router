@@ -129,7 +129,7 @@ test('P6 purity: repeated validation is stable and results are deep copies', () 
 });
 
 test('legacy defaults() is unchanged by this task', () => {
-  assert.deepEqual(Object.keys(defaults()), ['order', 'mode', 'models', 'cooldownMinutes', 'contextChars', 'executables', 'skills']);
+  assert.deepEqual(Object.keys(defaults()), ['order', 'mode', 'models', 'cooldownMinutes', 'contextChars', 'executables', 'skills', 'sidebar']);
 });
 
 test('profileFor returns a profile from a validated view', () => {

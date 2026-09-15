@@ -7,7 +7,7 @@ export const commands = [
   ['note', 'Save handoff note'], ['btw', 'Aside for the next turn'], ['rename', 'Name this session'], ['resume', 'Resume a session'], ['sessions', 'List sessions here'], ['skills', 'Manage and install skills'],
   ['review', 'Show full session work items'], ['quota', 'Show reported quota'], ['retry', 'Clear quota cooldowns'],
   ['update', 'Install latest npm release'],
-  ['details', 'Expand or fold transcript details'],
+  ['details', 'Expand or fold transcript details'], ['sidebar', 'Show or hide the status sidebar'],
   ['restart', 'Validate and reload'],
   ['operation', 'Switch classic/orchestrator'], ['stop', 'Cancel a task or all'], ['msg', 'Message a worker'],
   ['agents', 'Interactive orchestrator and worker panes'], ['tasks', 'Toggle task tree'], ['continue', 'Start an orchestrator turn'],

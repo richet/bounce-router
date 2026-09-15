@@ -68,6 +68,20 @@ test('CLI commands and live steering work while the daemon main turn is held', {
   child.stdin.write('/details off\r');
   await waitFor(() => output.includes('Details folded'));
   assert.equal(calls.filter(([kind]) => kind === 'cancel').length, 0);
+  // Bare /order reads the order in effect (narrowed to the orchestrator's adapter here) without saving.
+  child.stdin.write('/order\r');
+  await waitFor(() => session.events.some(row => row.kind === 'status' && row.text?.startsWith('Fallback order: codex (default) · orchestrator profile decides')));
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root, 'config.json'))).order, ['codex']);
+  // The sidebar is on by default at 120 columns, /sidebar hides it and the choice is saved.
+  assert.match(output, /BOUNCE/);
+  output = '';
+  child.stdin.write('/sidebar\r');
+  await waitFor(() => output.includes('Sidebar hidden'));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'config.json'))).sidebar, false);
+  assert.doesNotMatch(output, /BOUNCE/);
+  child.stdin.write('/sidebar on\r');
+  await waitFor(() => output.includes('Sidebar shown'));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'config.json'))).sidebar, true);
   child.stdin.write('/btw urgent correction\r');
   await waitFor(() => calls.some(([kind]) => kind === 'deliver'));
   const delivery = calls.find(([kind]) => kind === 'deliver')[1];

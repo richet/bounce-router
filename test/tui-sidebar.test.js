@@ -5,18 +5,51 @@ import * as Ink from 'ink';
 import stripAnsi from 'strip-ansi';
 import stringWidth from 'string-width';
 import {PassThrough} from 'node:stream';
-import {createWorkspace} from '../src/tui/Workspace.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {config} from '../src/core.js';
+import {createWorkspace, workspaceColumns} from '../src/tui/Workspace.js';
 import {createInkTerminal} from '../src/tui/ink-terminal.js';
 
 const Workspace = createWorkspace(React, Ink);
 const model = {panes: [{id: 'worker:abc', task: 'abc', profile: 'build', state: 'running', activity: ['worker output']}], transcript: []};
 const metadata = {provider: 'claude', model: 'sonnet', mode: 'plan', operation: 'orchestrator', sessionId: 'session-123', cwd: '/project', pendingTurns: 1, quotaLines: ['CLAUDE usage 9%', 'CODEX usage 2%']};
 
-function frame(columns, agentsOpen) {
+function frame(columns, agentsOpen, view = {}) {
   return stripAnsi(Ink.renderToString(React.createElement(Workspace, {
-    model, transcriptRows: ['conversation evidence'], view: {columns, rows: 28, agentsOpen, selectedId: 'orchestrator', input: 'my draft', notice: 'Working', metadata},
+    model, transcriptRows: ['conversation evidence'], view: {columns, rows: 28, agentsOpen, selectedId: 'orchestrator', input: 'my draft', notice: 'Working', metadata, ...view},
   }), {columns}));
 }
+
+test('the sidebar is on by default and /sidebar off gives its columns back to the conversation', () => {
+  assert.deepEqual(workspaceColumns(120), {total: 120, sidebar: 32, content: 87});
+  assert.deepEqual(workspaceColumns(120, {sidebar: false}), {total: 120, sidebar: 0, content: 120});
+  assert.deepEqual(workspaceColumns(90, {sidebar: true}), {total: 90, sidebar: 0, content: 90});
+  for (const agentsOpen of [false, true]) {
+    const shown = frame(120, agentsOpen);
+    const hidden = frame(120, agentsOpen, {sidebar: false});
+    assert.match(shown, /BOUNCE/);
+    assert.doesNotMatch(hidden, /BOUNCE|CLAUDE usage 9%/);
+    // The compact header carries the provider and mode once the rail is gone.
+    assert.match(hidden, /bounce · claude · plan/);
+    assert.match(hidden, /my draft/);
+    assert.ok(hidden.split('\n').every(line => stringWidth(line) <= 120));
+  }
+});
+
+test('config keeps the sidebar on unless told otherwise, and rejects a non-boolean', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-sidebar-config-'));
+  try {
+    assert.equal(config(root).sidebar, true);
+    fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify({sidebar: false}));
+    assert.equal(config(root).sidebar, false);
+    fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify({sidebar: 'off'}));
+    assert.throws(() => config(root), {message: 'config.sidebar must be true or false'});
+  } finally {
+    fs.rmSync(root, {recursive: true, force: true});
+  }
+});
 
 test('right status rail stays beside conversation and split panes, never below input', () => {
   for (const [columns, agentsOpen] of [[100, false], [100, true], [140, false], [140, true]]) {

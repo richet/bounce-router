@@ -1,9 +1,11 @@
 import {clean, createFormatter, paneGrid} from '../format.js';
 import {promptLayout} from './prompt-layout.js';
 
-export function workspaceColumns(columns = 80) {
+// The status rail is on unless switched off (`/sidebar off`), and even then only fits a terminal
+// wide enough to leave a readable conversation beside it.
+export function workspaceColumns(columns = 80, {sidebar: wanted = true} = {}) {
   const total = Math.max(20, columns);
-  const sidebar = total >= 100 ? 32 : 0;
+  const sidebar = wanted && total >= 100 ? 32 : 0;
   return {total, sidebar, content: total - sidebar - (sidebar ? 1 : 0)};
 }
 
@@ -84,7 +86,7 @@ export function createWorkspace(React, Ink) {
       ...rows.map((text, index) => React.createElement(Text, {key: `${index}:${text}`, wrap: 'truncate-end'}, text || ' ')));
   }
   function Workspace({model, transcriptRows, view}) {
-    const {total, content: columns, sidebar} = workspaceColumns(view.columns);
+    const {total, content: columns, sidebar} = workspaceColumns(view.columns, {sidebar: view.sidebar});
     const height = Math.max(8, view.rows ?? 24);
     const draft = promptLayout(view.input ?? '', view.inputCursor, columns - 4, Math.max(1, Math.floor(height / 3)));
     const menu = (view.menu ?? []).slice(0, Math.max(0, height - draft.length - 6))

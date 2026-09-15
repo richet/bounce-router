@@ -45,6 +45,24 @@ test('streamed deltas read as one answer block and the result that repeats them 
   assert.equal(conversationEvents([{id: 'd1', kind: 'delta', provider: 'muse', text: 'Hi'}, {id: 'd2', kind: 'delta', provider: 'muse', text: '!'}], {details: true}).length, 2);
 });
 
+test('a run of progress readings for the same thing collapses to its latest value', () => {
+  const tick = (id, text, provider = 'claude') => ({id, kind: 'progress', provider, text});
+  const rows = conversationEvents([
+    tick('p1', 'Thinking · ~50 tokens'), tick('p2', 'Thinking · ~150 tokens'),
+    {id: 'm1', kind: 'model', provider: 'claude', model: 'claude-opus-5'},
+    tick('p3', 'Thinking · ~265 tokens'),
+    tick('p4', 'Bash · 2s'), tick('p5', 'Bash · 5s'),
+    tick('p6', 'Thinking · ~40 tokens'),
+    tick('p7', 'Thinking · ~90 tokens', 'codex'),
+  ]);
+  // Same label, same provider → one row in the first reading's place, id moving with each tick
+  // so the cached rendering is replaced; a model report between readings does not split the run.
+  assert.deepEqual(rows.map(row => [row.id, row.text]), [
+    ['p1+3', 'Thinking · ~265 tokens'], ['p4+2', 'Bash · 5s'], ['p6', 'Thinking · ~40 tokens'], ['p7', 'Thinking · ~90 tokens'],
+  ]);
+  assert.equal(conversationEvents([tick('p1', 'Thinking · ~50 tokens'), tick('p2', 'Thinking · ~150 tokens')], {details: true}).length, 1);
+});
+
 test('a terminal-only answer is retained and rendered as Markdown', () => {
   const rows = conversationEvents([events[6]]);
   const text = rows.flatMap(row => createFormatter({color: false}).event(row, 80)).join('\n');

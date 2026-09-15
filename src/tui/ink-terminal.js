@@ -6,7 +6,7 @@ import {createWorkspaceProjection} from './projection.js';
 import {workspaceColumns} from './Workspace.js';
 import {conversationEvents} from './transcript.js';
 
-const EMPTY_VIEW = {agentsOpen: false, selectedId: 'orchestrator', input: '', scroll: 0, notice: '', menu: [], metadata: {}, busy: false, progress: '', columns: 80, rows: 24};
+const EMPTY_VIEW = {agentsOpen: false, selectedId: 'orchestrator', input: '', scroll: 0, notice: '', menu: [], metadata: {}, busy: false, progress: '', columns: 80, rows: 24, sidebar: true};
 
 // CLI owns commands, drafts and focus policy. This adapter owns terminal mode, parses input once,
 // and turns the incremental event log projection into an Ink frame.
@@ -75,7 +75,7 @@ export function createInkTerminal({stdin = process.stdin, stdout = process.stdou
 
   function renderNow() {
     if (!app || suspended || frozen || outputBlocked) return;
-    const contentWidth = workspaceColumns(view.columns).content;
+    const contentWidth = workspaceColumns(view.columns, {sidebar: view.sidebar}).content;
     const width = view.agentsOpen && contentWidth >= 60
       ? paneGrid(projection.model().panes.length + 1, contentWidth, 10).panes[0].width - 4
       : contentWidth - 2;
@@ -148,7 +148,7 @@ export function createInkTerminal({stdin = process.stdin, stdout = process.stdou
     };
     drainListener = () => { outputBlocked = false; render(); };
     stdout.on?.('drain', drainListener);
-    const contentWidth = workspaceColumns(view.columns).content;
+    const contentWidth = workspaceColumns(view.columns, {sidebar: view.sidebar}).content;
     const width = view.agentsOpen && contentWidth >= 60
       ? paneGrid(projection.model().panes.length + 1, contentWidth, 10).panes[0].width - 4
       : contentWidth - 2;

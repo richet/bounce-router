@@ -12,6 +12,8 @@ const WORKER_STATES = {
 };
 const WORKER_PROGRESS = new Set(['task.milestone', 'task.reported']);
 const HIDDEN = new Set(['turn', 'attempt', 'main.starting', 'main.started', 'main.delivery']);
+// The part of a progress reading that names what is happening: `Thinking` of `Thinking · ~50 tokens`.
+const progressLabel = event => String(event.text ?? '').split(' · ')[0];
 
 // Display-only reduction: retain the journal verbatim for diagnostics and handoffs.
 export function conversationEvents(events, {details = false} = {}) {
@@ -21,6 +23,8 @@ export function conversationEvents(events, {details = false} = {}) {
   let lastProvider;
 
   for (const event of events) {
+    // A reported model is header metadata with no text; it would only split a progress run.
+    if (event.kind === 'model') continue;
     if (event.kind === 'user' || event.kind === 'main.starting') lastAnswer = null;
     if (event.kind === 'assistant') {
       lastAnswer = event.text?.trim();
@@ -36,6 +40,17 @@ export function conversationEvents(events, {details = false} = {}) {
       } else rows.push({...event, first: event.id, merged: 1});
       lastAnswer = rows.at(-1).text.trim();
       lastProvider = event.provider;
+      continue;
+    }
+    // Live progress arrives as a counter that ticks every few tokens or seconds (`Thinking ·
+    // ~50 tokens`, `~100`, `~265`…). A run of readings for the same thing is one row showing
+    // the latest; the id changes with each reading so the row cache re-renders it.
+    if (event.kind === 'progress') {
+      const previous = rows.at(-1);
+      if (previous?.kind === 'progress' && previous.provider === event.provider && progressLabel(previous) === progressLabel(event)) {
+        previous.text = event.text;
+        previous.id = `${previous.first}+${++previous.merged}`;
+      } else rows.push({...event, first: event.id, merged: 1});
       continue;
     }
     if (event.kind === 'main.terminal') {

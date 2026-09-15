@@ -88,6 +88,43 @@ test('worker panes show tool descriptions instead of serialized tool arguments',
   assert.doesNotMatch(output, /"description"|"command"/);
 });
 
+test('live thinking counters collapse to one row that keeps up with the latest reading', async () => {
+  const stdin = new PassThrough(), stdout = new PassThrough();
+  stdin.setRawMode = () => {};
+  stdout.columns = 100;
+  stdout.rows = 24;
+  stdout.isTTY = true;
+  let output = '';
+  stdout.on('data', chunk => {output += chunk;});
+  let resolveFrame, requestedRevision = Infinity;
+  const terminal = createInkTerminal({stdin, stdout, onFrame: event => {
+    if (event.revision >= requestedRevision) resolveFrame?.();
+  }});
+  const tick = async (id, text) => {
+    output = '';
+    const frame = new Promise(resolve => {resolveFrame = resolve;});
+    terminal.ingest({id, kind: 'progress', provider: 'claude', text});
+    requestedRevision = terminal.debugState().revision;
+    await frame;
+    return stripAnsi(output);
+  };
+  try {
+    await terminal.mount({events: [
+      {id: 'tool', kind: 'tool', provider: 'claude', text: 'Bash: {"description":"List commits"}'},
+      {id: 'model', kind: 'model', provider: 'claude', model: 'claude-opus-5'},
+    ]});
+    assert.doesNotMatch(stripAnsi(output), /claude · model/);
+    await tick('p1', 'Thinking · ~50 tokens');
+    await tick('p2', 'Thinking · ~150 tokens');
+    const frame = await tick('p3', 'Thinking · ~265 tokens');
+    assert.match(frame, /Thinking · ~265 tokens/);
+    assert.doesNotMatch(frame, /~50 tokens|~150 tokens|claude · model/);
+    assert.equal(frame.split('Thinking').length - 1, 1);
+  } finally {
+    terminal.unmount();
+  }
+});
+
 test('details expand tool output and folding restores the compact view without stale cached rows', async () => {
   const stdin = new PassThrough(), stdout = new PassThrough();
   stdin.setRawMode = () => {};
