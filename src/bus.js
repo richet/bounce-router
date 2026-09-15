@@ -97,7 +97,7 @@ export async function reapStaleSockets({platform = process.platform, uid = proce
 
 // Resolves once actually listening; rejects (never throws async/uncaught) on any
 // bind/chmod failure — a stale non-socket file at the chosen path, EADDRINUSE, etc.
-export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = AUTH_TIMEOUT, validate = () => null}) {
+export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = AUTH_TIMEOUT, validate = () => null, report: receiveReport = null}) {
   const grants = new Map(); // peer -> {peer, tasks, canSubmit, context, token, file, sockets}
   const tokenToPeer = new Map();
   const tokensDir = path.join(dir, 'tokens');
@@ -155,9 +155,13 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
 
     function dispatch(msg) {
       const {id, method, params = {}} = msg;
+      // A reporting token is write-only and task/attempt bound. In particular it cannot read
+      // the session journal or wait on another actor's events.
+      if (authenticated.report && method !== 'report') return refuse(id, -32001, 'unauthorized');
       if (method === 'publish') return handlePublish(id, params.event ?? {});
       if (method === 'wait') return handleWait(id, params);
       if (method === 'events') return handleEvents(id, params);
+      if (method === 'report') return handleReport(id, params.report);
       send({jsonrpc: '2.0', id, error: {code: -32601, message: 'method not found'}});
     }
 
@@ -165,6 +169,7 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
 
     function handlePublish(id, event) {
       const peer = authenticated.peer;
+      if (authenticated.report) return refuse(id, -32001, 'unauthorized');
       const e = {...event};
       // A peer never sets its own id/time/seq (Session.append/publish would keep a
       // forged one), and never picks its own context — that's the grant's job, so
@@ -180,6 +185,9 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         // A canSubmit grant may open a root (parent explicitly null); anything with a parent needs that parent in its own tasks.
         if (!authenticated.canSubmit || !(e.parent === null || authenticated.tasks.includes(e.parent))) return refuse(id, -32001, 'unauthorized');
         delete e.replaces; delete e.budget;
+        // A peer may leave the id to the bus (scheduler.submit does the same): a journaled
+        // task.submitted always carries one — a row without it crashed every task view.
+        if (typeof e.task !== 'string' || !e.task) e.task = crypto.randomUUID();
         if (e.task === e.parent) return refuse(id, -32602, 'invalid event');
         if (session.events.some(row => row.kind === 'task.submitted' && row.task === e.task)) return refuse(id, -32602, 'invalid event');
         if (typeof e.profile !== 'string' || !e.profile) return refuse(id, -32602, 'invalid event');
@@ -204,9 +212,39 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
       send({jsonrpc: '2.0', id, result: row});
     }
 
+    function handleReport(id, report) {
+      if (!authenticated.report || typeof receiveReport !== 'function') return refuse(id, -32001, 'unauthorized');
+      try {
+        const row = receiveReport({task: authenticated.report.task, attempt: authenticated.report.attempt,
+          report, from: authenticated.peer, context: authenticated.context});
+        send({jsonrpc: '2.0', id, result: row});
+      } catch (error) { refuse(id, -32602, error.message); }
+    }
+
+    // A wait for one task's outcome (`{kind: 'task.<terminal>', task}`) resolves on ANY terminal row
+    // of that task: a peer waiting for task.completed on a task that has already failed was
+    // observed sitting the full timeout — six minutes of "doing nothing" — for a row that could
+    // never come. The caller reads `kind` to learn which outcome it got.
+    const TASK_TERMINAL = new Set(['task.completed', 'task.failed', 'task.cancelled', 'task.deadline', 'task.rejected', 'task.accepted']);
     function handleWait(id, {match = {}, timeout, afterSeq = 0}) {
       if (!Number.isInteger(timeout) || timeout > 600000) return refuse(id, -32602, 'invalid params');
-      const matches = row => Object.entries(match).every(([key, value]) => row[key] === value)
+      const outcomeWait = typeof match.task === 'string' && TASK_TERMINAL.has(match.kind);
+      const latestReplacement = task => {
+        let current = task;
+        const visited = new Set();
+        while (!visited.has(current)) {
+          visited.add(current);
+          const replacement = session.events.findLast(e => e.kind === 'task.submitted' && e.replaces === current);
+          if (!replacement || visited.has(replacement.task)) break;
+          current = replacement.task;
+        }
+        return current;
+      };
+      const matches = row => (outcomeWait
+        ? row.task === latestReplacement(match.task) && TASK_TERMINAL.has(row.kind)
+          && !(row.kind === 'task.completed' && session.events.find(event => event.kind === 'task.submitted' && event.task === row.task)?.review?.completion)
+          && Object.entries(match).every(([key, value]) => key === 'kind' || key === 'task' || row[key] === value)
+        : Object.entries(match).every(([key, value]) => row[key] === value))
         && (row.seq !== undefined ? row.seq > afterSeq : afterSeq === 0);
       let settled = false;
       const cleanup = () => { clearTimeout(timer); unsubscribe(); pendingWaits.delete(cleanup); };
@@ -229,7 +267,7 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
     }
   }
 
-  function grant({peer, tasks = [], canSubmit = false, context}) {
+  function grant({peer, tasks = [], canSubmit = false, context, report = null}) {
     const previous = grants.get(peer);
     if (previous) { tokenToPeer.delete(previous.token); for (const socket of previous.sockets) socket.destroy(); try { fs.unlinkSync(previous.file); } catch {} }
     const token = crypto.randomBytes(32).toString('hex');
@@ -239,7 +277,8 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
     const suffix = crypto.createHash('sha256').update(peer).digest('hex').slice(0, 8);
     const file = path.join(tokensDir, `${sanitized}-${suffix}`);
     fs.writeFileSync(file, token, {mode: 0o600});
-    grants.set(peer, {peer, tasks: [...tasks], canSubmit, context, token, file, sockets: new Set()});
+    if (report && (!tasks.includes(report.task) || !Number.isInteger(report.attempt) || report.attempt < 1)) throw new Error('invalid report grant');
+    grants.set(peer, {peer, tasks: [...tasks], canSubmit, context, report, token, file, sockets: new Set()});
     tokenToPeer.set(token, peer);
     return {token, file};
   }
@@ -354,6 +393,7 @@ export function connectBus({path, token}) {
               resolve({
                 peer, tasks,
                 publish: event => call('publish', {event}),
+                report: report => call('report', {report}),
                 wait: ({match, timeout, afterSeq = 0} = {}) => call('wait', {match, timeout, afterSeq}),
                 events: ({afterSeq = 0} = {}) => call('events', {afterSeq}),
                 close: () => new Promise(r => socket.end(r)),

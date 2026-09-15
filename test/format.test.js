@@ -4,6 +4,13 @@ import stripAnsi from 'strip-ansi';
 import {clean, createFormatter, displayEvents, createTranscriptRenderer, activeModel} from '../src/format.js';
 
 const plain = createFormatter({color: false});
+
+test('main start is not labelled finished and internal transport rows stay hidden', () => {
+  assert.match(plain.event({kind: 'attempt', status: 'started', provider: 'codex'}, 80).join('\n'), /Starting/);
+  assert.deepEqual(plain.event({kind: 'peer.native', sessionId: 'private-id'}, 80), []);
+  assert.match(plain.event({kind: 'main.started', state: 'running'}, 80).join('\n'), /Running/);
+  assert.match(plain.event({kind: 'policy.fallback.skipped', reason: 'no_profile_configured'}, 80).join('\n'), /no_profile_configured/);
+});
 const color = createFormatter({color: true});
 test('Markdown preserves content while formatting headings, lists, links and emphasis', () => {
   const out = plain.markdown('# Heading\n\n**bold** and `code`\n\n- first\n- second\n\n[Docs](https://example.com)', 60).join('\n');
@@ -119,6 +126,18 @@ test('Inline Markdown inside list items is parsed, not shown as literal markers'
   assert.match(color.markdown('- item with **bold**', 80).join('\n'), /\x1b\[1mbold/);
 });
 
+test('compact answers fold long code and tables with a readable expandable preview', () => {
+  const source = '## Verification\n\n```sh\none\ntwo\nthree\nfour\nFIFTH_CODE_LINE\n```\n\n| File | Result |\n| --- | --- |\n| a | `ok:` |\n| b | ok |\n| c | ok |\n| FOURTH_ROW | ok |';
+  const compact = createFormatter({color: false, compact: true}).markdown(source, 50).join('\n');
+  assert.match(compact, /Verification/);
+  assert.match(compact, /File: a.*Result: ok:/);
+  assert.match(compact, /\/details/);
+  assert.doesNotMatch(compact, /FIFTH_CODE_LINE|FOURTH_ROW|\| ---/);
+  const expanded = plain.markdown(source, 50).join('\n');
+  assert.match(expanded, /FIFTH_CODE_LINE/);
+  assert.match(expanded, /FOURTH_ROW/);
+});
+
 test('work recap includes only completed turns, uses final response and survives resume', async () => {
   const {createWorkSummary} = await import('../src/format.js');
   const events = [
@@ -162,17 +181,19 @@ test('work review preserves all item text and orders oldest first without mutati
   assert.equal(workReview([]), 'No completed turns yet.');
 });
 
-test('compact formatter folds a tool row and a delegation row to one line each (orchestrator transcript)', () => {
+test('compact formatter: a tool call is a ⏺ line, a tool result a ⎿ line, a delegation row a glyph line with a next step on failure', () => {
   const {event} = createFormatter({color: false, compact: true});
-  const tool = event({kind: 'tool', provider: 'claude', text: 'Bash: {"command":"npm test","description":"Run the suite"}'}, 200);
-  assert.equal(tool.length, 1, 'a tool row folds to exactly one line');
-  assert.match(tool[0], /claude · Tool\s+Bash: Run the suite/);
-  const {event: labelled} = createFormatter({color: false, compact: true, role: row => row.from === 'main' ? 'main' : null});
-  assert.match(labelled({kind: 'tool', provider: 'claude', from: 'main', text: 'Bash: {"command":"npm test","description":"Run the suite"}'}, 200)[0], /^main · claude · Tool\s+Bash: Run the suite$/);
-  assert.match(labelled({kind: 'tool', provider: 'claude', from: 'bounce', text: 'Bash: {"command":"npm test","description":"Run the suite"}'}, 200)[0], /^claude · Tool\s+Bash: Run the suite$/);
-  const fold = event({kind: 'task.fold', task: 't1', text: 'build · running · writing tests'}, 200);
-  assert.equal(fold.length, 1);
-  assert.match(fold[0], /→\s+build · running · writing tests/);
+  const call = event({kind: 'tool', provider: 'claude', text: 'Bash: {"command":"npm test","description":"Run the suite"}'}, 200);
+  assert.deepEqual(call, ['⏺ Bash  Run the suite']);
+  const result = event({kind: 'tool', provider: 'claude', text: '# pass 12\n# fail 0\nok'}, 200);
+  assert.deepEqual(result, ['   ⎿  # pass 12 (+2 lines)']);
+  assert.deepEqual(event({kind: 'tool', provider: 'claude', text: '<persisted-output>\nOutput too large'}, 200), ['   ⎿  output saved to a file (+1 lines)']);
+  assert.deepEqual(event({kind: 'task.fold', task: 't1', state: 'running', reason: null, text: 'build · running · writing tests'}, 200), ['● build · running · writing tests']);
+  assert.deepEqual(event({kind: 'task.fold', task: 't1', state: 'failed', reason: 'error', text: 'build · failed · error: Invalid request: invalid type: null, expected a string'}, 200), [
+    '✗ build · failed · error: Invalid request: invalid type: null, expected a string',
+    '   ⎿  next: the vendor CLI speaks a different protocol version than bounce expects · update bounce (or the vendor), then resubmit',
+  ]);
+  assert.deepEqual(event({kind: 'user', text: 'You are the orchestrator peer of session s; see x.\ncontinue with the handoff'}, 200), ['You', 'continue with the handoff', '']);
 });
 
 test('classic formatter (no compact) still renders a tool row as a full block', () => {

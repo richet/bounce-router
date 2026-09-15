@@ -46,6 +46,31 @@ test('S1 happy path: dispatch, milestone, usage, completion, budget debit, worke
   for (const e of session.events) if (workerKinds.has(e.kind) && e.task === row.task) assert.equal(e.from, `worker:${row.task}`);
 });
 
+test('final report is staged until the provider terminal outcome', async t => {
+  const {session} = setup(t);
+  const adapter = fakeAdapter(() => ({never: true}));
+  const scheduler = createScheduler({session, adapters: {A: adapter}, profiles: {A: {adapter: 'A', mode: 'yolo', fallback: []}}, requireFinalReport: true});
+  const submitted = scheduler.submit({parent: null, profile: 'A', orders: 'inspect'});
+  await waitFor(() => scheduler.tasks()[submitted.task]?.state === 'running');
+  const attempt = scheduler.tasks()[submitted.task].attempt;
+  scheduler.report({task: submitted.task, attempt, report: {op: 'final', outcome: 'blocked', phase: 'database', text: 'cannot connect', next: 'supply credentials', summary: 'database credentials required', evidence: ['test/log.txt']}});
+  const state = scheduler.tasks()[submitted.task];
+  assert.equal(state.state, 'running');
+  assert.equal(session.events.some(e => e.kind === 'task.reported' && e.outcome === 'blocked'), true);
+  assert.equal(session.events.some(e => e.kind === 'task.completed'), false);
+});
+
+test('a clean worker exit without final report requests it once then fails incomplete_report', async t => {
+  const {session} = setup(t);
+  const adapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'opening intention'}]);
+  const scheduler = createScheduler({session, adapters: {A: adapter}, profiles: {A: {adapter: 'A', mode: 'yolo', fallback: []}}, requireFinalReport: true});
+  const submitted = scheduler.submit({parent: null, profile: 'A', orders: 'inspect'});
+  await waitFor(() => scheduler.tasks()[submitted.task]?.state === 'failed');
+  assert.equal(scheduler.tasks()[submitted.task].reason, 'incomplete_report');
+  assert.equal(session.events.filter(e => e.kind === 'task.report_requested' && e.task === submitted.task).length, 1);
+  assert.equal(session.events.some(e => e.kind === 'task.completed' && e.task === submitted.task), false);
+});
+
 test('S2 fallback: limited result retries under next profile, replaces original, root budget shared', async t => {
   const {session} = setup(t);
   const adapterA = fakeAdapter(() => [{kind: 'result', status: 'limited', text: 'quota'}]);
@@ -184,16 +209,20 @@ test('S9 unverifiable termination: an unverified child is blocked, not cancelled
   assert.equal(blockedRow.text, 'termination unverified');
 });
 
-test('S10 reconcile: a running task with no live handle is marked blocked at construction', t => {
+test('S10 reconcile: a running task with no live handle is blocked as orphaned, and its consumed start stays consumed', t => {
   const {session} = setup(t);
-  session.append({kind: 'task.submitted', task: 'orphan', parent: null, profile: 'A', orders: 'x', deadline: null});
+  session.append({kind: 'task.submitted', task: 'orphan', parent: null, profile: 'A', orders: 'x', deadline: null, budget: {starts: 3}});
+  session.append({kind: 'budget.reserved', task: 'orphan', root: 'orphan', amount: {starts: 1}});
   session.append({kind: 'task.started', task: 'orphan', attempt: 1});
   const profiles = {A: {adapter: 'fake', model: 'x', mode: 'yolo', fallback: []}};
   const scheduler = createScheduler({session, adapters: {fake: fakeAdapter(() => [])}, profiles});
 
-  const blockedRow = session.events.find(e => e.kind === 'task.blocked' && e.task === 'orphan');
-  assert.equal(blockedRow.text.startsWith('interrupted'), true);
+  const rows = session.events.filter(e => e.task === 'orphan' && (e.kind === 'task.failed' || e.kind === 'task.blocked'));
+  assert.deepEqual(rows.map(e => [e.kind, e.reason, e.text]), [['task.blocked', 'orphaned', 'termination unverified after daemon restart; inspect the previous worker process before resubmitting']]);
   assert.equal(scheduler.tasks().orphan.state, 'blocked');
+  // The worker ran, so its start was spent: 3 allowed, 1 consumed, 2 remaining — no release row.
+  assert.deepEqual(scheduler.budgets().roots.orphan.remaining, {starts: 2});
+  assert.equal(session.events.some(e => e.kind === 'budget.released' && e.task === 'orphan'), false);
 });
 
 test('S11 missing adapter fails then falls back to the next profile', async t => {
@@ -220,11 +249,14 @@ test('S12 live activity is delivered live and never journaled', async t => {
   const profiles = {A: {adapter: 'fake', model: 'x', mode: 'yolo', fallback: []}};
   const scheduler = createScheduler({session, adapters: {fake: adapter}, profiles});
   const seen = [];
-  session.subscribe(e => seen.push(e.kind));
+  session.subscribe(e => seen.push(e));
   const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null});
   await waitFor(() => scheduler.tasks()[row.task]?.state === 'completed');
 
-  assert.equal(seen.includes('task.activity'), true);
+  const activity = seen.filter(event => event.kind === 'task.activity');
+  assert.deepEqual(activity.map(event => event.text), ['Worker started · waiting for first activity', 'tick']);
+  assert.equal(activity[0].startup, true);
+  assert.equal(activity[1].startup, undefined);
   const journalText = fs.readFileSync(session.file, 'utf8');
   assert.equal(journalText.includes('task.activity'), false);
 });
@@ -263,8 +295,9 @@ test('G2 cancelling a task while its launch is still pending prevents the late l
   await waitFor(() => scheduler.tasks()[row.task]?.state === 'queued');
 
   const result = await scheduler.cancel(row.task);
-  assert.deepEqual(result, {verified: true});
-  assert.equal(session.events.some(e => e.kind === 'task.cancelled' && e.task === row.task), true);
+  assert.deepEqual(result, {verified: false});
+  assert.equal(scheduler.tasks()[row.task].state, 'blocked');
+  assert.equal(session.events.some(e => e.kind === 'task.cancelled' && e.task === row.task), false);
 
   deferred.resolve();
   await waitFor(() => adapter.calls.cancel === 1);
@@ -273,6 +306,7 @@ test('G2 cancelling a task while its launch is still pending prevents the late l
 
   assert.equal(adapter.calls.cancel, 1);
   assert.equal(adapter.calls.events, 0);
+  assert.equal(session.events.some(e => e.kind === 'task.cancelled' && e.task === row.task), true);
   assert.equal(session.events.some(e => e.kind === 'task.started' && e.task === row.task), false);
   assert.equal(session.events.some(e => e.kind === 'task.completed' && e.task === row.task), false);
 });
@@ -367,13 +401,12 @@ test('cycle guard: a self-replacing failed task still resolves a lineage root an
 
 test('cycle guard: mutually-parented tasks cancel each member exactly once instead of crashing', async t => {
   const {session} = setup(t);
-  // Constructed directly (not via submit()/dispatch) and BEFORE the scheduler exists, so
-  // reconcile is what makes them non-terminal ('blocked', no live handle) — deterministic,
-  // with no real launch racing against the log construction.
+  // Constructed directly (not via submit()/dispatch) and BEFORE the scheduler exists: never
+  // started, so they stay queued (dispatch fires only from a live task.submitted subscription,
+  // never from history, and the constructor only orphans mid-flight tasks) — deterministic,
+  // no handle, no launch racing the log; cancel walks the cycle over queued members.
   session.append({kind: 'task.submitted', task: 'a', parent: null, profile: 'A', orders: 'x', deadline: null});
-  session.append({kind: 'task.started', task: 'a', attempt: 1});
   session.append({kind: 'task.submitted', task: 'b', parent: 'a', profile: 'A', orders: 'x', deadline: null});
-  session.append({kind: 'task.started', task: 'b', attempt: 1});
   session.append({kind: 'task.submitted', task: 'a', parent: 'b', profile: 'A', orders: 'x', deadline: null}); // a and b now each other's child
   const profiles = {A: {adapter: 'fake', model: 'x', mode: 'yolo', fallback: []}};
   const scheduler = createScheduler({session, adapters: {fake: fakeAdapter(() => ({never: true}))}, profiles});
@@ -713,6 +746,26 @@ test('V7 a journal write that fails while recording a delivery never escapes as 
   }
 });
 
+test('queued delivery cannot silently retarget a newer vendor turn', async t => {
+  const {session} = setup(t);
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const adapter = deliveringAdapter(() => ({never: true}), event => event.text === 'one' ? gate : 'live');
+  const scheduler = createScheduler({session, adapters: {fake: adapter}, profiles: {A: {adapter: 'fake', mode: 'plan'}}, watchdog: {interval: null}});
+  t.after(() => scheduler.close());
+  const row = scheduler.submit({profile: 'A', orders: 'work'});
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'running');
+  session.append({kind: 'message', to: `worker:${row.task}`, text: 'one'});
+  session.append({kind: 'message', to: `worker:${row.task}`, text: 'two'});
+  await waitFor(() => adapter.calls.deliver === 1);
+  adapter.deliveries[0].handle.turnId = 'new-turn';
+  release('live');
+  await waitFor(() => session.events.filter(e => e.kind === 'task.delivered').length === 2);
+  assert.equal(adapter.calls.deliver, 1);
+  assert.equal(session.events.findLast(e => e.kind === 'task.delivered').tier, 'failed');
+  await scheduler.cancel(row.task);
+});
+
 test('V8 deliveries to one worker are serialized: a slow first delivery still journals before the second', async t => {
   const {session} = setup(t);
   const gate = {};
@@ -800,8 +853,31 @@ test('adapter transcript events (assistant, tool, progress, error) become live t
   const scheduler = createScheduler({session, adapters: {a: adapter}, profiles: {p: {adapter: 'a', mode: 'yolo', fallback: []}}});
   const row = scheduler.submit({parent: null, profile: 'p', orders: 'x'});
   await waitFor(() => scheduler.tasks()[row.task].state === 'completed');
-  assert.deepEqual(live, ['thinking aloud', 'ls -la', 'Bash · 3s', 'error: ECONN reset']);
+  assert.deepEqual(live, ['Worker started · waiting for first activity', 'thinking aloud', 'ls -la', 'Bash · 3s', 'error: ECONN reset']);
   const journal = fs.readFileSync(session.file, 'utf8');
   assert.equal(journal.includes('thinking aloud'), false);
   assert.equal(session.events.some(e => e.kind === 'assistant' && e.task === row.task), false);
+});
+
+test('R1 reconcile after a daemon restart blocks unknown writers and holds queued work', async t => {
+  const {session} = setup(t);
+  // The log of a daemon that died mid-flight: a running root with a running child, and a root
+  // that was submitted but never launched.
+  session.append({kind: 'task.submitted', task: 'p', parent: null, profile: 'A', orders: 'x', deadline: null, context: 'c'});
+  session.append({kind: 'task.started', task: 'p', attempt: 1});
+  session.append({kind: 'task.submitted', task: 'ch', parent: 'p', profile: 'A', orders: 'y', deadline: null, context: 'c'});
+  session.append({kind: 'task.started', task: 'ch', attempt: 1});
+  session.append({kind: 'task.submitted', task: 'q', parent: null, profile: 'A', orders: 'z', deadline: null, context: 'c'});
+  const adapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done'}]);
+  const scheduler = createScheduler({session, adapters: {fake: adapter}, profiles: {A: {adapter: 'fake', model: 'x', mode: 'yolo', fallback: []}}});
+  scheduler.reconcile();
+  const blocked = session.events.filter(e => e.kind === 'task.blocked' && e.reason === 'orphaned');
+  assert.deepEqual(blocked.map(e => [e.task, e.reason, e.text]).sort(), [
+    ['ch', 'orphaned', 'termination unverified after daemon restart; inspect the previous worker process before resubmitting'],
+    ['p', 'orphaned', 'termination unverified after daemon restart; inspect the previous worker process before resubmitting'],
+  ]);
+  assert.equal(adapter.calls.launch, 0, 'no overlapping writer is launched');
+  assert.equal(scheduler.tasks().q.state, 'blocked');
+  assert.equal(scheduler.tasks().p.state, 'blocked');
+  assert.equal(scheduler.tasks().ch.state, 'blocked');
 });

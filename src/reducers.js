@@ -30,6 +30,7 @@ export function tasks(events) {
   };
   for (const e of events) {
     if (!e.kind?.startsWith('task.')) continue;
+    if (typeof e.task !== 'string' || !e.task) continue; // a malformed row never becomes a task
     if (e.kind === 'task.submitted') {
       const t = ensure(e.task);
       if (TERMINAL.has(t.state)) continue;
@@ -61,6 +62,10 @@ export function tasks(events) {
         t.lastMilestone = {time: e.time, text: e.text, evidence: e.evidence};
         break;
       case 'task.completed':
+        // A worker-authored final report is the task verdict. Transport can finish cleanly
+        // afterwards (or duplicate an event), but it must never turn a visible blocker into
+        // success just because the process exited 0.
+        if (t.state === 'blocked' || t.state === 'input_required') break;
         t.state = t.review?.completion ? 'reviewing' : 'completed';
         t.summary = e.summary; t.artifacts = e.artifacts && [...e.artifacts];
         if (t.state === 'completed') settleParent(t.parent);
@@ -184,14 +189,20 @@ export function spend(events) {
 // zeroed, so the caller (scheduler tick()) only ever iterates actionable rows.
 export function watchdog(events, now, {activity = new Map(), watchdog: cfg} = {}) {
   const taskView = tasks(events);
+  const lineageRoot = (id, seen = new Set()) => {
+    if (seen.has(id)) return id;
+    seen.add(id);
+    return taskView[id]?.replaces && taskView[taskView[id].replaces] ? lineageRoot(taskView[id].replaces, seen) : id;
+  };
   const result = [];
   for (const t of Object.values(taskView)) {
     if (t.state === 'blocked') { result.push({task: t.id, verdicts: ['blocked']}); continue; }
     if (t.state !== 'running') continue;
-    const startedRows = events.filter(e => e.kind === 'task.started' && e.task === t.id);
+    const root = lineageRoot(t.id);
+    const startedRows = events.filter(e => e.kind === 'task.started' && e.task === root);
     if (!startedRows.length) continue;
     const startedAt = Date.parse(startedRows[0].time);
-    const submitted = events.find(e => e.kind === 'task.submitted' && e.task === t.id);
+    const submitted = events.find(e => e.kind === 'task.submitted' && e.task === root);
     const deadlineMs = submitted?.deadline ?? cfg.defaultDeadlineMs;
     const deadlineAt = startedAt + deadlineMs;
     let progressAt = Date.parse(startedRows.at(-1).time);
@@ -230,4 +241,17 @@ export function cooldowns(events, now) {
   for (const e of events) if (e.kind === 'cooldown') result[e.provider] = e.until;
   for (const provider in result) if (result[provider] <= now) delete result[provider];
   return result;
+}
+
+// A session's name: the last `session.renamed` row wins; otherwise the first line of its first
+// prompt (the orchestrator brief line stripped), cut to 48 characters; null for an empty log.
+export function sessionName(events) {
+  const renamed = events.findLast(e => e.kind === 'session.renamed' && typeof e.name === 'string' && e.name.trim());
+  if (renamed) return renamed.name.trim();
+  const first = events.find(e => e.kind === 'user' && typeof e.text === 'string');
+  if (!first) return null;
+  const line = first.text.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('You are the orchestrator peer of session'))[0];
+  if (!line) return null;
+  const compact = line.replace(/\s+/g, ' ');
+  return compact.length > 48 ? `${compact.slice(0, 47).trimEnd()}…` : compact;
 }

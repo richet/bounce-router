@@ -19,6 +19,11 @@ export function dataRoot() {
 export const defaults = () => ({order: ['claude', 'codex', 'muse'], mode: 'yolo', models: {}, cooldownMinutes: 30, contextChars: 48000, executables: {}, skills: {scope: 'user', autoSync: true}});
 // Kinds folded in memory only: never journaled, delivered straight to onEvent.
 export const LIVE_KINDS = new Set(['progress', 'task.activity', 'tool.started', 'tool.finished']);
+export function pidAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; }
+  catch { return false; }
+}
 const defaultFrom = e => e.from ?? (e.kind === 'user' ? 'user' : e.provider ? 'main' : 'bounce');
 export function saveJSON(file, value) {
   fs.mkdirSync(path.dirname(file), {recursive: true, mode: 0o700});
@@ -125,17 +130,27 @@ export function handoff(session, prompt, budget = 48000) {
   return packet;
 }
 export class Router {
-  constructor(session, settings, {runner = runProcess} = {}) {
-    this.session = session; this.settings = settings; this.runner = runner;
-    this.cooldowns = {};
+  // `extraArgs(provider)` appends argv to a provider's invocation for this router only — the
+  // orchestrator's TUI uses it to switch the vendor's own subagent tools off (see cli.js).
+  constructor(session, settings, {runner = runProcess, extraArgs = () => []} = {}) {
+    this.session = session; this.settings = settings; this.runner = runner; this.extraArgs = extraArgs;
+    this.cooldowns = {}; this.selectionVersion = 0;
     for (const e of session.events) if (e.kind === 'cooldown') this.cooldowns[e.provider] = e.until;
   }
+  // Interactive preference changes can arrive while run() is awaiting a vendor. Version them so
+  // that turn's fallback may finish without overwriting the provider chosen for the next turn.
+  select(provider) { this.selectionVersion++; this.session.active = provider; }
   cancel() { this.controller?.abort(); }
   async run(prompt, files = []) {
     if (this.controller) throw new Error('A turn is already running');
     this.controller = new AbortController();
     const {signal} = this.controller;
-    const s = this.session, cfg = this.settings;
+    const s = this.session;
+    // TUI configuration commands remain interactive during a turn, but their changes apply to
+    // the next turn. Snapshot every routing input before the first provider attempt so a fallback
+    // cannot silently switch model, mode or order halfway through the current request.
+    const cfg = {...this.settings, order: [...this.settings.order], models: {...this.settings.models}, executables: {...this.settings.executables}};
+    const selectionVersion = this.selectionVersion;
     try {
       const images = saveImages([...new Set([...imagePaths(prompt, s.cwd), ...files.map(file => path.resolve(s.cwd, file))])], s);
       s.append({kind: 'user', text: prompt, ...(images.length ? {images} : {})});
@@ -145,13 +160,13 @@ export class Router {
       for (const provider of order) {
         if (signal.aborted) break;
         if (this.cooldowns[provider] > Date.now()) { s.append({kind: 'status', provider, text: 'Skipping provider in local cooldown'}); continue; }
-        s.active = provider;
+        if (this.selectionVersion === selectionVersion) s.active = provider;
         s.append({kind: 'route', provider, model: cfg.models[provider] || 'default', mode: cfg.mode, text: `Using ${provider} / ${cfg.models[provider] || 'provider default'} / ${cfg.mode}`});
         const packet = handoff(s, prompt, cfg.contextChars) + (images.length ? '\nCurrent prompt images (attached in this order):\n' + images.map(i => i.name).join('\n') : '');
         const promptFile = path.join(s.dir, 'handoff.txt');
         fs.writeFileSync(promptFile, packet, {mode: 0o600});
         const result = await this.runner({provider, executable: resolveExecutable(provider, cfg.executables[provider]),
-          args: invocation(provider, {model: cfg.models[provider], mode: cfg.mode, images}, promptFile),
+          args: [...invocation(provider, {model: cfg.models[provider], mode: cfg.mode, images}, promptFile), ...(this.extraArgs(provider) ?? [])],
           cwd: s.cwd, prompt: providerInput(provider, packet, images), signal,
           // Live kinds (progress, etc.) are shown while the turn runs and never journaled; see Session.publish.
           emit: e => s.publish({...e, provider})});

@@ -1,0 +1,116 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {fork} from 'node:child_process';
+import {fileURLToPath} from 'node:url';
+import {Session} from '../src/core.js';
+import {hostSession} from '../src/remote.js';
+import http from 'node:http';
+
+test('CLI commands and live steering work while the daemon main turn is held', {timeout: 15000}, async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-tui-cli-'));
+  let catalogResponse;
+  const catalogServer = http.createServer((request, response) => {catalogResponse = response;});
+  await new Promise(resolve => catalogServer.listen(0, '127.0.0.1', resolve));
+  t.after(() => {catalogResponse?.end('{"models":[]}'); catalogServer.closeAllConnections(); catalogServer.close();});
+  const settings = {
+    operation: 'orchestrator', orchestrator: 'main', mode: 'plan', order: ['codex'], models: {},
+    profiles: {main: {adapter: 'codex'}, build: {adapter: 'codex'}, local_build: {adapter: 'local'}},
+    local: {endpoints: {lmstudio: {backend: 'lmstudio', url: `http://127.0.0.1:${catalogServer.address().port}`}}},
+    executables: {codex: '/nonexistent/bounce-test-codex', claude: '/nonexistent/bounce-test-claude'},
+    skills: {scope: 'user', autoSync: false},
+  };
+  fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify(settings));
+  const session = new Session(root, {root});
+  const listeners = new Set(), calls = [];
+  let running = false;
+  const main = {
+    state: () => ({state: running ? 'running' : 'idle', currentTurnId: running ? 'held-turn' : null}),
+    subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
+    async run(params) {
+      calls.push(['run', params]); running = true;
+      for (const fn of listeners) fn({kind: 'main.started', requestId: params.id, turnId: 'held-turn'});
+      return {accepted: true, requestId: params.id};
+    },
+    async deliver(params) { calls.push(['deliver', params]); return {state: 'acknowledged', tier: 'live'}; },
+    async cancel(params) { calls.push(['cancel', params]); return {accepted: true}; },
+  };
+  const child = fork(fileURLToPath(new URL('./helpers/tui-process.js', import.meta.url)), [], {
+    env: {...process.env, BOUNCE_HOME: root, BOUNCE_SUPERVISED: '1', BOUNCE_REMOTE_SESSION: '1',
+      BOUNCE_ROLE: 'orchestrator', BOUNCE_ORCHESTRATOR_PROFILE: JSON.stringify({adapter: 'codex', model: '', mode: 'plan'}),
+      BOUNCE_NO_UPDATE_CHECK: '1', FORCE_COLOR: '1'},
+    stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
+  });
+  let output = '';
+  child.stdout.on('data', chunk => { output += chunk; });
+  child.stderr.on('data', chunk => { output += chunk; });
+  const hosted = hostSession({session, child, main});
+  t.after(async () => {
+    hosted.detach();
+    if (child.exitCode === null) { child.kill('SIGKILL'); await new Promise(resolve => child.once('close', resolve)); }
+    fs.rmSync(root, {recursive: true, force: true});
+  });
+  async function waitFor(check) {
+    const started = Date.now();
+    while (!check()) {
+      if (Date.now() - started > 4000) throw new Error(`Timed out waiting for CLI evidence:\n${output.slice(-2500)}`);
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  }
+  await waitFor(() => output.includes('Ready.'));
+  child.stdin.write('work\r');
+  await waitFor(() => calls.some(([kind]) => kind === 'run'));
+  child.stdin.write('/details on\r');
+  await waitFor(() => output.includes('Details expanded'));
+  assert.equal(calls.filter(([kind]) => kind === 'run').length, 1);
+  child.stdin.write('/details off\r');
+  await waitFor(() => output.includes('Details folded'));
+  assert.equal(calls.filter(([kind]) => kind === 'cancel').length, 0);
+  child.stdin.write('/btw urgent correction\r');
+  await waitFor(() => calls.some(([kind]) => kind === 'deliver'));
+  const delivery = calls.find(([kind]) => kind === 'deliver')[1];
+  assert.equal(delivery.text, 'urgent correction');
+  assert.equal(delivery.expectedTurnId, 'held-turn');
+  child.stdin.write('/model worker local_build refresh\r');
+  await waitFor(() => catalogResponse);
+  child.stdin.write('editable during discovery');
+  await waitFor(() => output.includes('editable during discovery'));
+  child.stdin.write('\u0015/help\r');
+  await waitFor(() => session.events.some(row => row.kind === 'status' && row.text?.includes('TUI commands:')));
+  catalogResponse.setHeader('content-type', 'application/json');
+  catalogResponse.end('{"models":[]}');
+  await waitFor(() => output.includes('pins for this session'));
+  child.stdin.write('\u001b');
+  await waitFor(() => output.includes('Model unchanged.'));
+  child.stdin.write('/model worker local_build lmstudio/fixture\r');
+  await waitFor(() => session.events.some(row => row.kind === 'control.local_model' && row.model === 'lmstudio/fixture'));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'config.json'))).profiles.local_build.model, undefined, 'session pin is not persisted');
+  child.stdin.write('/model worker local_build prefer lmstudio/fixture --save\r');
+  await waitFor(() => session.events.some(row => row.kind === 'control.local_preferences'));
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root, 'config.json'))).profiles.local_build.prefer, ['lmstudio/fixture']);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'config.json'))).orchestrator, 'main');
+  child.stdin.write('/agents\r');
+  await waitFor(() => output.includes('Agent workspace'));
+  child.stdin.write('/help\r');
+  await waitFor(() => session.events.some(row => row.kind === 'status' && row.text?.includes('TUI commands:')));
+  assert.equal(calls.filter(([kind]) => kind === 'run').length, 1, 'commands never start a second model turn');
+  assert.equal(running, true, 'commands completed before the held provider turn ended');
+  session.append({kind: 'task.submitted', task: 'aaa', profile: 'build', orders: 'first'});
+  session.append({kind: 'task.started', task: 'aaa', attempt: 1});
+  session.append({kind: 'task.failed', task: 'aaa', reason: 'limited'});
+  session.append({kind: 'task.submitted', task: 'bbb', profile: 'build', replaces: 'aaa', orders: 'replacement'});
+  session.append({kind: 'task.started', task: 'bbb', attempt: 1});
+  // IPC replay and terminal input are separate channels; wait for the view to receive the task.
+  await waitFor(() => output.includes('build · bbb'));
+  child.stdin.write('/agents bbb\r');
+  await waitFor(() => output.includes('Focused bbb'));
+  child.stdin.write('worker correction\r');
+  await waitFor(() => session.events.some(row => row.kind === 'message' && row.to === 'worker:bbb' && row.text === 'worker correction'));
+  child.stdin.write('unsent draft');
+  await waitFor(() => output.includes('unsent draft'));
+  session.append({kind: 'task.completed', task: 'bbb', summary: 'Done'});
+  await waitFor(() => session.events.some(row => row.kind === 'note' && row.text?.includes('Unsent draft for worker:aaa')));
+  assert.equal(calls.filter(([kind]) => kind === 'run').length, 1, 'retired pane draft never becomes an orchestrator prompt');
+});

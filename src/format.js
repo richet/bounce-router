@@ -5,7 +5,7 @@ import {Chalk} from 'chalk';
 import wrapAnsi from 'wrap-ansi';
 import sliceAnsi from 'slice-ansi';
 import stripAnsi from 'strip-ansi';
-import {tasks, budgets} from './reducers.js';
+import {tasks, budgets, TERMINAL} from './reducers.js';
 
 // Only renderer-owned terminal escapes may reach the display.
 export const clean = text => stripAnsi(String(text ?? ''))
@@ -48,9 +48,24 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     heading({tokens}) { return c.bold.cyan(this.parser.parseInline(tokens)) + '\n\n'; },
     code({text, lang}) {
       const language = lang?.trim().split(/\s+/)[0].toLowerCase();
-      const code = codeColors(text, language);
-      return c.gray(`  ┌─ ${lang || 'code'}`) + '\n' + code.split('\n').map(line => '  ' + line).join('\n') + '\n\n';
+      const lines = text.split('\n');
+      const visible = compact ? lines.slice(0, 4) : lines;
+      const code = codeColors(visible.join('\n'), language);
+      const folded = lines.length - visible.length;
+      const more = folded ? '\n' + c.gray(`  ▸ ${folded} more lines · /details to expand`) : '';
+      return c.gray(`  ┌─ ${lang || 'code'}`) + '\n' + code.split('\n').map(line => '  ' + line).join('\n') + more + '\n\n';
     },
+    ...(compact ? {
+      // Compact tables do not use marked-terminal's colon-delimited table transport.
+      codespan({text}) { return c.yellow(text); },
+      table({header, rows}) {
+        const labels = header.map(cell => this.parser.parseInline(cell.tokens));
+        const preview = rows.slice(0, 3).map(row => row.map((cell, index) =>
+          `${c.gray(labels[index] + ':')} ${this.parser.parseInline(cell.tokens)}`).join(' · '));
+        const more = rows.length > 3 ? `\n${c.gray(`  ▸ ${rows.length - 3} more rows · /details to expand`)}` : '';
+        return preview.join('\n') + more + '\n\n';
+      },
+    } : {}),
     link({href, tokens}) { return c.blue(this.parser.parseInline(tokens)) + c.underline(` (${clean(href)})`); },
     // marked-terminal's text renderer emits a token's raw source instead of parsing its
     // inline tokens, so bold, emphasis and code spans inside list items reach the display
@@ -80,25 +95,54 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     return lines.length > 40 ? [...lines.slice(0, 40), `… ${lines.length - 40} more lines`] : lines;
   };
   // Short bookkeeping events read as one line; only real content earns a block of its own.
-  const inline = ['status', 'progress', 'route', 'cooldown', 'attempt', 'turn', 'diagnostic', 'note'];
+  const inline = ['status', 'progress', 'route', 'cooldown', 'attempt', 'turn', 'diagnostic', 'note', 'aside'];
   const who = e => [role?.(e) ?? null, e.provider || 'Bounce'].filter(Boolean).join(' · ');
   function event(e, width) {
+    if (['raw', 'usage', 'peer.native', 'peer.joined', 'task.attempt.ended', 'task.report.staged', 'checkpoint'].includes(e.kind) || e.kind.startsWith('budget.')) return [];
+    if (e.kind === 'attempt' && e.status === 'started') return event({...e, kind: 'status', text: 'Starting provider…'}, width);
+    if (e.kind.startsWith('main.')) {
+      const label = {'main.starting': 'Starting', 'main.started': 'Running', 'main.terminal': 'Finished', 'main.blocked': 'Blocked', 'main.delivery': 'Message'}[e.kind] ?? 'Orchestrator';
+      return event({...e, kind: 'status', text: `${label} · ${e.text || e.status || e.state || ''}`}, width);
+    }
+    if ((e.kind.startsWith('task.') && e.kind !== 'task.fold') || e.kind.startsWith('policy.fallback')) {
+      const label = e.kind === 'policy.fallback' ? `Recovery: ${e.from_profile} → ${e.to_profile}` : e.kind === 'policy.fallback.skipped' ? 'Recovery unavailable' : e.kind.slice(5).replaceAll('_', ' ');
+      return event({...e, kind: ['task.failed', 'task.blocked'].includes(e.kind) ? 'error' : 'status', provider: e.profile || `worker ${e.task?.slice(0, 8) ?? ''}`,
+        text: [label, e.summary || e.text || e.reason, e.next ? `next: ${e.next}` : ''].filter(Boolean).join(' · ')}, width);
+    }
     // Compact mode (the orchestrator transcript): a coordinator's tool mechanics and pasted file
     // output are noise — fold each tool row to one summary line, and render foldedThread's delegation
     // rows as one line each. Classic transcript never sets compact, so it is unchanged.
     if (compact && e.kind === 'tool') {
+      // A tool CALL (`Name: {json}`) is one ⏺ line naming the tool and what it was for; a tool
+      // RESULT is one ⎿ line with its first line and how much more there was — the shape Claude
+      // Code and Codex use, so the eye can skip mechanics and land on responses and outcomes.
       const t = clean(e.text).trim();
       const m = /^([A-Za-z_][\w.-]*): (\{[\s\S]*\})$/.exec(t);
-      let summary = t.split('\n')[0];
-      if (m) { try { const o = JSON.parse(m[2]); summary = `${m[1]}: ${o.description || o.path || (typeof o.command === 'string' ? o.command.split('\n')[0] : '') || ''}`.trim(); } catch { summary = m[1]; } }
-      return [clip(`${style.tool(clean(`${who(e)} · Tool`))}  ${clean(summary)}`, width)];
+      if (m) {
+        let summary = '';
+        try { const o = JSON.parse(m[2]); summary = String(o.description || o.path || o.file_path || (typeof o.command === 'string' ? o.command.split('\n')[0] : '') || o.pattern || o.query || ''); } catch {}
+        return [clip(`${style.tool('⏺')} ${style.tool(m[1])}${summary ? `  ${summary}` : ''}`, width)];
+      }
+      const lines = t.split('\n');
+      const first = /^<persisted-output>/.test(lines[0]) ? 'output saved to a file' : lines[0];
+      const more = lines.length > 1 ? style.muted(` (+${lines.length - 1} lines)`) : '';
+      return [clip(`   ${style.muted('⎿')}  ${style.muted(first)}${more}`, width)];
     }
-    if (compact && e.kind === 'task.fold') return [clip(`${style.title('→')}  ${clean(e.text)}`, width)];
+    if (compact && e.kind === 'task.fold') {
+      const paint = ['failed', 'timed_out', 'cancelled', 'rejected'].includes(e.state) ? style.error
+        : ['completed', 'accepted'].includes(e.state) ? style.result
+        : ['blocked', 'input_required'].includes(e.state) ? style.status : style.title;
+      const head = clip(`${paint(stateGlyph(e.state))} ${paint(clean(e.text))}`, width);
+      const preview = e.preview ? [clip(`   ${style.muted(clean(e.preview))}`, width)] : [];
+      if (e.state === 'failed' || e.state === 'timed_out') return [head, ...preview, clip(`   ${style.muted('⎿')}  ${style.muted(`next: ${failureHint(e.reason, e.text)}`)}`, width)];
+      return [head, ...preview];
+    }
+    if (compact && e.kind === 'user') return [clip(style.user('You'), width), ...wrap(clean(withoutBrief(e.text)), width), ''];
     const names = {user: 'You', assistant: 'Response', delta: 'Response', result: 'Result',
       status: 'Activity', route: 'Agent selected', tool: 'Tool output', error: 'Error',
       diagnostic: 'Diagnostics', note: 'Saved note', cooldown: 'Retry delay', attempt: 'Agent finished',
-      turn: 'Turn finished', quota: 'Reported quota', skills: 'Skills', review: 'Work Done review'};
-    const label = e.kind === 'user' ? 'You' : `${who(e)} · ${names[e.kind] || e.kind}`;
+      turn: 'Turn finished', quota: 'Reported quota', skills: 'Skills', review: 'Work Done review', aside: 'By the way'};
+    const label = e.kind === 'user' ? 'You' : e.kind === 'aside' ? 'You · By the way' : `${who(e)} · ${names[e.kind] || e.kind}`;
     const paint = style[e.kind] || style.muted;
     if (inline.includes(e.kind)) return wrap(`${paint(clean(label))}  ${clean(e.text)}`, width);
     const source = e.kind === 'tool' ? (toolLines(clean(e.text)) ?? [clean(e.text)]).join('\n') : clean(e.text);
@@ -199,7 +243,7 @@ export function workReview(items) {
 }
 
 // Phase 6 §A1 — the TUI as a peer. Pure view reducers over session.events, exactly like every
-// other reducer in src/reducers.js: no IO, no clock. src/cli.js's /tasks and /attach panes are a
+// other reducer in src/reducers.js: no IO, no clock. src/cli.js's /tasks and /agents panes are a
 // thin map over these; they carry no business logic of their own.
 
 // Same rootOf rule as reducers.js budgets()/spend(): a replacement belongs to the root of the
@@ -243,7 +287,7 @@ export function taskTree(events) {
   }
   const order = [];
   const seen = new Set();
-  for (const e of events) if (e.kind === 'task.submitted' && !seen.has(e.task)) { seen.add(e.task); order.push(e.task); }
+  for (const e of events) if (e.kind === 'task.submitted' && typeof e.task === 'string' && e.task && !seen.has(e.task)) { seen.add(e.task); order.push(e.task); }
   const roots = order.filter(id => !taskView[id].parent);
   const rows = [];
   const visit = (id, depth) => {
@@ -271,7 +315,7 @@ export function taskTree(events) {
 // The legacy conversation kinds a context pane shows directly; every other kind either folds
 // (task.submitted, into a single row) or is invisible here (task.activity and friends are live-
 // only and never reach session.events at all — see src/core.js LIVE_KINDS).
-const FOLDED_THREAD_KINDS = new Set(['user', 'assistant', 'delta', 'tool', 'error', 'note', 'route', 'turn', 'status', 'review']);
+const FOLDED_THREAD_KINDS = new Set(['user', 'assistant', 'delta', 'tool', 'error', 'note', 'aside', 'route', 'turn', 'status', 'review']);
 // A row with no context at all predates the context field (pre-Phase-1 journals) and only ever
 // occurred at the session root, so it always belongs wherever it is asked for.
 const belongsToContext = (row, context) => row.context === context || row.context === undefined;
@@ -291,10 +335,10 @@ export function foldedThread(events, context) {
   const rows = [];
   for (const e of events) {
     if (e.kind === 'task.submitted') {
-      if (!folded.has(e.task) && belongsToContext(e, context)) {
+      if (typeof e.task === 'string' && e.task && !folded.has(e.task) && belongsToContext(e, context)) {
         folded.add(e.task);
         const t = taskView[e.task];
-        rows.push({kind: 'task.fold', task: e.task, state: t.state, text: foldRowText(t)});
+        rows.push({kind: 'task.fold', task: e.task, state: t.state, reason: t.reason ?? null, text: foldRowText(t)});
       }
       continue;
     }
@@ -303,7 +347,7 @@ export function foldedThread(events, context) {
   return rows;
 }
 
-// workerThread(events, task, activity) → the rows to show when one worker is attached or zoomed:
+// workerThread(events, task, activity) → the rows to show inside one worker's agent pane:
 // that task's own journaled lifecycle rows (submitted, started, milestones, blockers, deliveries,
 // rework, terminal outcome), every message addressed to it (as `user` rows), and its live
 // activity — which is never journaled (task.activity is a LIVE_KIND), so the caller keeps it in
@@ -340,7 +384,7 @@ export function workerThread(events, task, activity = []) {
   return rows.map((row, i) => [row, i]).sort(([a, i], [b, j]) => (a.time && b.time && a.time !== b.time) ? (a.time < b.time ? -1 : 1) : i - j).map(([row]) => row);
 }
 
-// agentsBoard(events, activityByTask) → every agent for the central-area board (/zoom with no
+// agentsBoard(events, activityByTask) → every worker for the central agent workspace
 // task): each taskTree() row plus that worker's last live activity lines (never journaled, kept in
 // memory by the caller as task -> [{time, text}]) and, once terminal, its outcome as the final
 // line. Pure; the terminal draw only decides how many lines of each fit.
@@ -358,8 +402,64 @@ export function agentsBoard(events, activityByTask = new Map(), {tail = 40} = {}
     const activity = activityByTask.get(row.task) ?? [];
     const lines = activity.slice(-tail).map(a => a.text.split('\n')[0]);
     if (outcome[row.task]) lines.push(outcome[row.task]);
-    return {...row, lines, lastActivityAt: activity.at(-1)?.time ?? null};
+    return {...row, lines, lastActivityAt: activity.findLast(item => !item.startup)?.time ?? null};
   });
+}
+
+// agentsWorkspace(events, activityByTask, orchestrator) → the complete /agents view model.
+// The orchestrator has a stable first pane; each non-terminal worker is then represented once,
+// with the same lifecycle state and live-activity tail used by agentsBoard(). Panes are ephemeral:
+// completed/cancelled/failed work remains in the normal task history but leaves this live workspace.
+// Rendering and focus stay outside this reducer, so a resize cannot discard a checkpoint or
+// fabricate progress.
+export function agentsWorkspace(events, activityByTask = new Map(), orchestrator = {}) {
+  const panes = [{id: 'orchestrator', kind: 'orchestrator', ...orchestrator}];
+  const checkpoints = new Map();
+  for (const event of events) if (event.kind === 'task.milestone' && event.task) checkpoints.set(event.task, event);
+  for (const worker of agentsBoard(events, activityByTask).filter(row => !TERMINAL.has(row.state))) {
+    const checkpoint = checkpoints.get(worker.task);
+    panes.push({id: `worker:${worker.task}`, kind: 'worker', ...worker,
+      phase: checkpoint?.phase ?? null, next: checkpoint?.next ?? null,
+      evidence: checkpoint?.evidence ?? null, checkpointAt: checkpoint?.time ?? null});
+  }
+  return {panes};
+}
+
+function paneSplit(size) {
+  const first = Math.max(0, Math.floor((size - 1) / 2));
+  return [first, Math.max(0, size - first - 1)];
+}
+
+// paneGrid(count, width, height) → exact rectangles for the readable /agents workspace. One
+// character is reserved between adjacent panes. The fifth and later panes remain in the model but
+// are reported as overflow, rather than squeezing every pane below a usable size.
+export function paneGrid(count, width, height) {
+  const total = Math.max(0, Math.floor(Number(count) || 0));
+  const columns = Math.max(0, Math.floor(Number(width) || 0));
+  const rows = Math.max(0, Math.floor(Number(height) || 0));
+  const visible = Math.min(total, 4);
+  const remaining = total - visible;
+  if (!visible) return {visible: 0, remaining, panes: []};
+  if (visible === 1) return {visible, remaining, panes: [{x: 0, y: 0, width: columns, height: rows}]};
+
+  const [leftWidth, rightWidth] = paneSplit(columns);
+  if (visible === 2) return {visible, remaining, panes: [
+    {x: 0, y: 0, width: leftWidth, height: rows},
+    {x: leftWidth + 1, y: 0, width: rightWidth, height: rows},
+  ]};
+
+  const [topHeight, bottomHeight] = paneSplit(rows);
+  if (visible === 3) return {visible, remaining, panes: [
+    {x: 0, y: 0, width: leftWidth, height: rows},
+    {x: leftWidth + 1, y: 0, width: rightWidth, height: topHeight},
+    {x: leftWidth + 1, y: topHeight + 1, width: rightWidth, height: bottomHeight},
+  ]};
+  return {visible, remaining, panes: [
+    {x: 0, y: 0, width: leftWidth, height: topHeight},
+    {x: leftWidth + 1, y: 0, width: rightWidth, height: topHeight},
+    {x: 0, y: topHeight + 1, width: leftWidth, height: bottomHeight},
+    {x: leftWidth + 1, y: topHeight + 1, width: rightWidth, height: bottomHeight},
+  ]};
 }
 
 // boardLayout(agentCount, lineCounts, height) → how many activity lines each agent gets on a
@@ -380,6 +480,52 @@ export function boardLayout(lineCounts, height) {
   for (let i = 0; i < shown; i++) { lines[i] = Math.min(share, lineCounts[i]); left -= lines[i]; }
   for (let i = 0; i < shown && left > 0; i++) { const extra = Math.min(left, lineCounts[i] - lines[i]); lines[i] += extra; left -= extra; }
   return {shown, lines, more};
+}
+
+// withAsides(text, asides) → the prompt for the next turn with the user's /btw notes folded in
+// front of it. /btw never starts a turn of its own: it is for the thing you want the agent to
+// know without interrupting what it is doing. Pure.
+export function withAsides(text, asides = []) {
+  if (!asides.length) return text;
+  return `By the way — notes from the user while you were working:\n${asides.map(a => `- ${a}`).join('\n')}\n\n${text}`;
+}
+
+// One glyph per task state, shared by the transcript's delegation rows and the AGENTS pane
+// (the way Claude Code marks ⏺ steps and Codex marks • actions): a reader sees the outcome
+// before reading a word. Pure.
+export function stateGlyph(state) {
+  if (state === 'queued') return '◌';
+  if (state === 'running' || state === 'waiting' || state === 'reviewing') return '●';
+  if (state === 'blocked' || state === 'input_required') return '◐';
+  if (state === 'completed' || state === 'accepted') return '✔';
+  if (state === 'failed' || state === 'timed_out' || state === 'cancelled' || state === 'rejected') return '✗';
+  return '·';
+}
+
+// What a person can do about a failed task, from the scheduler's reason and the vendor's text.
+// A failure with no next step reads as "bounce is broken"; this is the line under the ✗. Pure.
+export function failureHint(reason, text = '') {
+  const t = String(text || '');
+  if (reason === 'missing') return 'that vendor CLI is not installed or not signed in · /login <vendor>, or change the profile\'s adapter';
+  if (reason === 'limited') return 'the vendor is out of quota · /quota shows the windows; add a `fallback` profile or wait for the reset';
+  if (reason === 'size') return 'the task exceeds a configured size limit · split it, or raise `limits` in the config';
+  if (reason === 'depth') return 'the delegation tree is deeper than allowed · submit from the root instead';
+  if (reason === 'dependency') return 'a task it depends on failed · fix that one first, then resubmit';
+  if (reason === 'unsupported' || reason === 'policy') return 'the profile\'s execution policy is not supported by its adapter · change `policy` or the adapter';
+  if (reason === 'orphaned') return 'the daemon restarted while it ran · resubmit the task';
+  if (reason === 'baseline') return 'the workspace no longer matches the submitted baseline · resubmit against the current tree';
+  if (reason === 'strategy') return 'the orchestration strategy returned a malformed decision · check the strategy config';
+  if (/invalid request|missing field|invalid type|method not found|clientInfo/i.test(t)) return 'the vendor CLI speaks a different protocol version than bounce expects · update bounce (or the vendor), then resubmit';
+  if (/ENOENT|not found|spawn/i.test(t)) return 'the vendor executable could not be started · check `executables` in the config and /login';
+  if (/EACCES|permission/i.test(t)) return 'a permission problem starting the worker · check the workspace and the profile\'s mode';
+  return 'see the full row with /agents <task>, then resubmit or /stop';
+}
+
+const BRIEF_LINE = /^You are the orchestrator peer of session /;
+// The typed turn without the orchestrator's brief line in front of it (the reader typed only the rest).
+export function withoutBrief(text) {
+  const lines = String(text ?? '').split('\n');
+  return (lines.length > 1 && BRIEF_LINE.test(lines[0]) ? lines.slice(1) : lines).join('\n');
 }
 
 // Phase 6 §A2 — pure command parsing, shared by src/cli.js's submit() dispatch and directly

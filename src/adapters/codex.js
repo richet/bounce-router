@@ -18,10 +18,15 @@ export default {
     const add = (kind, text, extra = {}) => events.push({kind, text: describe(text), ...extra});
     const model = raw.message?.model ?? raw.model ?? raw.payload?.model ?? raw.payload?.model_id;
     if (typeof model === 'string' && model.trim()) events.push({kind: 'model', model});
-    const item = raw.item;
+    // codex-cli 0.154's app-server names items in camelCase (`agentMessage`, `commandExecution`);
+    // `codex exec --json` and older servers use snake_case. Normalise once so both read the same —
+    // the assistant's answer was being dropped (result read "turn completed") on the camelCase server.
+    const item = raw.item && typeof raw.item.type === 'string' ? {...raw.item, type: raw.item.type.replace(/[A-Z]/g, ch => `_${ch.toLowerCase()}`)} : raw.item;
     if (raw.type === 'item.completed' && item) {
       if (item.type === 'agent_message') add('assistant', item.text);
-      else add('tool', item.command ? `${item.command}\n${item.aggregated_output ?? ''}` : item);
+      else if (item.type === 'user_message') { /* the orders echoed back: not a tool row */ }
+      else if (item.type === 'dynamic_tool_call') add('tool', `${item.tool ?? 'Tool'} · ${item.success === true ? 'accepted' : item.success === false ? 'rejected' : item.status ?? 'completed'}`);
+      else if (item.type !== 'reasoning') add('tool', item.command ? `${item.command}\n${item.aggregatedOutput ?? item.aggregated_output ?? ''}` : item);
     }
     if (raw.type === 'item.started' && item?.command) add('progress', `Running · ${describe(item.command).split('\n')[0]}`);
     if (raw.type === 'error' || raw.type === 'turn.failed') add('error', raw.error?.message ?? raw.message ?? raw.error ?? raw);

@@ -59,7 +59,7 @@ test('bounce sessions prints spend recomputed from the journal (depends on build
   t.after(() => { fs.rmSync(root, {recursive: true, force: true}); fs.rmSync(cwd, {recursive: true, force: true}); });
   writeConfig(root);
   const session = seedSession(root, cwd);
-  const {code, stdout, stderr} = await run(['sessions'], bounceEnv(root));
+  const {code, stdout, stderr} = await run(['sessions', '--json'], bounceEnv(root));
   assert.equal(code, 0, stderr);
   const rows = JSON.parse(stdout);
   const row = rows.find(r => r.id === session.id);
@@ -74,7 +74,7 @@ test('bounce sessions reads spend: null for a session with no task rows', async 
   writeConfig(root);
   const session = new Session(cwd, {root});
   session.append({kind: 'user', text: 'hi'});
-  const {code, stdout, stderr} = await run(['sessions'], bounceEnv(root));
+  const {code, stdout, stderr} = await run(['sessions', '--json'], bounceEnv(root));
   assert.equal(code, 0, stderr);
   const rows = JSON.parse(stdout);
   const row = rows.find(r => r.id === session.id);

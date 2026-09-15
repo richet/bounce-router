@@ -5,11 +5,16 @@
 import {randomUUID} from 'node:crypto';
 import {LIVE_KINDS} from './core.js';
 
+const MAIN_RPC_TIMEOUT = 5000;
+
 const defaultFrom = e => e.from ?? (e.kind === 'user' ? 'user' : e.provider ? 'main' : 'bounce');
 
 // Parent side: forwards every row the session emits, answers append/publish/active
 // requests from the child by calling straight into the real Session.
-export function hostSession({session, child}) {
+// `main` is deliberately an explicit daemon capability, rather than exposing Router or its
+// process handle to the view.  This keeps the provider alive when the view detaches and gives
+// every command a bounded request/reply path over the existing IPC channel.
+export function hostSession({session, child, main = null}) {
   const forward = row => { try { child.send({type: 'session.event', row}); } catch {} };
   const unsubscribe = session.subscribe(forward);
   const onMessage = msg => {
@@ -20,11 +25,26 @@ export function hostSession({session, child}) {
       catch (error) { child.send({type: 'session.error', seq: msg.seq, message: error.message}); }
     } else if (msg.type === 'session.active') {
       session.active = msg.provider;
+    } else if (msg.type?.startsWith('main.')) {
+      const method = msg.type.slice('main.'.length);
+      const fn = ['run', 'deliver', 'cancel'].includes(method) ? main?.[method] : null;
+      if (typeof fn !== 'function') {
+        child.send({type: 'main.error', seq: msg.seq, message: 'main provider is unavailable'});
+        return;
+      }
+      Promise.resolve().then(() => fn(msg.params ?? {})).then(result => {
+        try { child.send({type: 'main.result', seq: msg.seq, result}); } catch {}
+      }, error => { try { child.send({type: 'main.error', seq: msg.seq, message: error.message}); } catch {} });
     }
   };
   child.on('message', onMessage);
-  child.send({type: 'session.replay', id: session.id, dir: session.dir, file: session.file, cwd: session.cwd, context: session.context, events: session.events, active: session.active});
-  return {detach() { unsubscribe(); child.off('message', onMessage); }};
+  child.send({type: 'session.replay', id: session.id, dir: session.dir, file: session.file, cwd: session.cwd, context: session.context, events: session.events, active: session.active,
+    mainState: main?.state ? main.state() : {state: 'unavailable', currentTurnId: null}});
+  const unsubscribeMain = main?.subscribe ? main.subscribe(event => {
+    try { child.send({type: 'main.event', event}); } catch {}
+  }) : () => {};
+  if (main?.state) child.send({type: 'main.state', state: main.state()});
+  return {detach() { unsubscribe(); unsubscribeMain(); child.off('message', onMessage); }};
 }
 
 // Child side: a synchronous proxy with the same public shape as Session. append/publish
@@ -56,12 +76,28 @@ export function createRemoteSession(channel) {
       flushWaiters.clear();
     }
 
+    const pendingMain = new Map();
+    const callMain = (method, params = {}) => new Promise((resolveCall, rejectCall) => {
+      const seq = ++clientSeq;
+      const timer = setTimeout(() => {
+        if (pendingMain.delete(seq)) rejectCall(Object.assign(new Error(`main ${method} request timed out`), {code: 'timeout'}));
+      }, MAIN_RPC_TIMEOUT);
+      timer.unref?.();
+      pendingMain.set(seq, {resolve: resolveCall, reject: rejectCall, timer});
+      channel.send({type: `main.${method}`, seq, params});
+    });
     const remote = {
       id: undefined, dir: undefined, file: undefined, cwd: undefined, context: undefined,
       events: [], onEvent: undefined,
       append: event => doJournaled('session.append', event),
       publish: event => LIVE_KINDS.has(event.kind) ? doLive(event) : doJournaled('session.publish', event),
       subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
+      // Immediate daemon commands: accepted responses are intentionally distinct from a later
+      // `main.event` terminal outcome. Consumers must never await provider completion here.
+      runMain: params => callMain('run', params),
+      deliverMain: params => callMain('deliver', params),
+      cancelMain: params => callMain('cancel', params),
+      main: {state: 'unknown', currentTurnId: null},
       flush,
       lock() {}, unlock() {},
     };
@@ -144,6 +180,7 @@ export function createRemoteSession(channel) {
     function applyReplay(msg) {
       remote.id = msg.id; remote.dir = msg.dir; remote.file = msg.file; remote.cwd = msg.cwd; remote.context = msg.context;
       activeValue = msg.active;
+      remote.main = {...remote.main, ...(msg.mainState ?? {})};
       remote.events = [...msg.events];
       refIndex.clear();
       for (const e of remote.events) if (typeof e.ref === 'string' && !refIndex.has(e.ref)) refIndex.set(e.ref, e);
@@ -174,6 +211,28 @@ export function createRemoteSession(channel) {
       }
       if (msg.type === 'session.appended' || msg.type === 'session.published') return settle(msg.seq, msg.row);
       if (msg.type === 'session.error') return settleError(msg.seq, msg.message);
+      if (msg.type === 'main.state') {
+        remote.main = {...remote.main, ...msg.state};
+        return;
+      }
+      if (msg.type === 'main.event') {
+        const event = msg.event;
+        if (event?.turnId !== undefined) remote.main.currentTurnId = event.turnId;
+        if (event?.state !== undefined) remote.main.state = event.state;
+        if (event?.requestId !== undefined) remote.main.requestId = event.requestId;
+        if (event?.kind === 'main.terminal') remote.main.currentTurnId = null;
+        // Keep the domain kind intact; wrapping by overwriting it loses terminal events.
+        if (event && !remote.events.some(row => row.id && row.id === event.id)) emit(event);
+        return;
+      }
+      if (msg.type === 'main.result' || msg.type === 'main.error') {
+        const pending = pendingMain.get(msg.seq);
+        if (!pending) return;
+        pendingMain.delete(msg.seq);
+        clearTimeout(pending.timer);
+        if (msg.type === 'main.error') pending.reject(Object.assign(new Error(msg.message), {code: 'main'}));
+        else pending.resolve(msg.result);
+      }
     });
 
     // A disconnected channel will never deliver the acks flush() is waiting on;
@@ -182,6 +241,11 @@ export function createRemoteSession(channel) {
       const error = Object.assign(new Error('remote session channel disconnected'), {code: 'closed'});
       for (const waiter of flushWaiters) waiter.reject(error);
       flushWaiters.clear();
+      for (const pending of pendingMain.values()) { clearTimeout(pending.timer); pending.reject(error); }
+      pendingMain.clear();
+      // A main-client wait is event-driven; without this final notification a detached view
+      // could wait forever for a terminal event from a daemon it can no longer reach.
+      emit({kind: 'main.disconnected', text: error.message, state: 'disconnected'});
     });
   });
 }

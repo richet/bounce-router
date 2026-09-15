@@ -21,6 +21,31 @@ test('quota fallback transfers partial work and remains sticky across turns', as
   assert.equal(attempts[2].provider, 'codex');
   assert.match(attempts[2].prompt, /Build a parser/);
 });
+test('an active turn snapshots routing settings before immediate TUI configuration changes', async t => {
+  const {session} = setup(t);
+  const settings = defaults();
+  settings.models.claude = 'claude-before';
+  settings.models.codex = 'codex-before';
+  const attempts = [];
+  const router = new Router(session, settings, {runner: async options => {
+    attempts.push(options);
+    if (options.provider === 'claude') {
+      settings.mode = 'plan';
+      settings.models.codex = 'codex-after';
+      settings.order = ['muse', 'claude', 'codex'];
+      router.select('muse');
+      return {status: 'limited'};
+    }
+    return {status: 'completed'};
+  }});
+  assert.equal(await router.run('keep this turn stable'), 'completed');
+  assert.deepEqual(attempts.map(({provider}) => provider), ['claude', 'codex']);
+  assert.equal(attempts[1].args.includes('codex-before'), true);
+  assert.equal(attempts[1].args.includes('codex-after'), false);
+  assert.equal(attempts[1].args.includes('--dangerously-bypass-approvals-and-sandbox'), true);
+  assert.equal(await router.run('use the preference selected during that turn'), 'completed');
+  assert.equal(attempts[2].provider, 'muse');
+});
 test('unrelated failures stop and cancellation never falls through', async t => {
   const {session} = setup(t); let calls = 0;
   const router = new Router(session, defaults(), {runner: async () => {calls++; return {status:'failed'};}});
@@ -60,6 +85,8 @@ test('normalizers capture vendor results, tools and usage', () => {
   assert.equal(normalize('claude',{type:'assistant',message:{content:[{type:'text',text:'hello'}]}})[0].text,'hello');
   assert.equal(normalize('claude',{type:'result',is_error:true,result:'usage limit'})[0].kind,'error');
   assert.equal(normalize('codex',{type:'item.completed',item:{type:'command_execution',command:'npm test',aggregated_output:'passed'}})[0].kind,'tool');
+  assert.match(normalize('codex',{method:'item/completed',params:{item:{type:'commandExecution',command:'npm test',aggregatedOutput:'VISIBLE_OUTPUT',exitCode:1}}})[0].text, /VISIBLE_OUTPUT/);
+  assert.equal(normalize('codex', {method: 'item/completed', params: {item: {type: 'dynamicToolCall', tool: 'bounce_report', success: true, arguments: {summary: 'not raw JSON'}}}})[0].text, 'bounce_report · accepted');
   assert.equal(normalize('codex',{type:'turn.completed',usage:{input_tokens:42}})[0].usage.input_tokens,42);
   assert.equal(normalize('muse',{payload_type:'run.output.delta',payload:{text:'hello'}})[0].text,'hello');
   assert.equal(normalize('muse',{payload_type:'run.terminal.completed',payload:{terminal:'completed',text:'hello'}})[0].success,true);
@@ -175,4 +202,21 @@ test('vendor CLI processes never inherit bus credentials from the bounce environ
     const r = await fixture(`console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:(process.env.BOUNCE_BUS_TOKEN_FILE??'absent')+'|'+(process.env.BOUNCE_BUS??'absent')}}));console.log(JSON.stringify({type:'turn.completed',usage:{}}))`);
     assert.equal(r.events.find(e => e.kind === 'assistant').text, 'absent|absent');
   } finally { delete process.env.BOUNCE_BUS_TOKEN_FILE; delete process.env.BOUNCE_BUS; }
+});
+
+test('extraArgs(provider) is appended to the vendor invocation for this router only', async t => {
+  const {Session, Router, defaults} = await import('../src/core.js');
+  const fs = await import('node:fs'); const os = await import('node:os'); const path = await import('node:path');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-extra-'));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const session = new Session(root, {root});
+  const seen = [];
+  const runner = async options => { seen.push(options.args); return {status: 'completed'}; };
+  const plain = new Router(session, defaults(), {runner});
+  await plain.run('hi');
+  const guarded = new Router(session, defaults(), {runner, extraArgs: provider => provider === 'claude' ? ['--disallowedTools', 'Agent,Task'] : []});
+  await guarded.run('hi');
+  assert.equal(seen.length, 2);
+  assert.deepEqual(seen[1], [...seen[0], '--disallowedTools', 'Agent,Task']);
+  assert.equal(seen[0].includes('--disallowedTools'), false);
 });

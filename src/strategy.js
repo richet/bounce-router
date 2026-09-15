@@ -15,12 +15,13 @@ const DEPENDENCY_FAIL_STATES = new Set(['failed', 'cancelled', 'timed_out', 'rej
 // Shared by every stock strategy's onSubmitted: a depends_on member that has actually failed
 // fails this task outright; one merely not yet accepted holds it; no depends_on at all (or
 // all accepted) falls through to the caller's own review/dispatch decision.
-function dependsOnIntent(row, view) {
+function dependsOnIntent(row, view, api) {
   const deps = row?.depends_on ?? [];
   if (!deps.length) return null;
-  const badDep = deps.find(id => DEPENDENCY_FAIL_STATES.has(view[id]?.state));
+  const stateOf = id => api?.dependencyState ? api.dependencyState(id) : view[id]?.state;
+  const badDep = deps.find(id => DEPENDENCY_FAIL_STATES.has(stateOf(id)));
   if (badDep) return {action: 'fail', reason: 'dependency', text: badDep};
-  if (!deps.every(id => view[id]?.state === 'accepted')) return 'hold';
+  if (!deps.every(id => stateOf(id) === 'accepted')) return 'hold';
   return null;
 }
 
@@ -32,7 +33,7 @@ const reviewersFor = spec => Array.isArray(spec) ? spec : [spec];
 export const defaultStrategy = {
   onSubmitted(task, view, api) {
     const row = api.submittedRow(task);
-    const held = dependsOnIntent(row, view);
+    const held = dependsOnIntent(row, view, api);
     if (held) return held;
     if (row?.review?.prelaunch) return {action: 'review', stage: 'prelaunch', reviewers: reviewersFor(row.review.prelaunch), quorum: 1};
     return 'dispatch';
@@ -61,7 +62,7 @@ export const defaultStrategy = {
 export const noReviewStrategy = {
   onSubmitted(task, view, api) {
     const row = api.submittedRow(task);
-    const held = dependsOnIntent(row, view);
+    const held = dependsOnIntent(row, view, api);
     if (held) return held;
     return 'dispatch'; // a configured review.prelaunch is ignored: never gate the launch
   },
@@ -76,7 +77,7 @@ export function quorumStrategy(n) {
   return {
     onSubmitted(task, view, api) {
       const row = api.submittedRow(task);
-      const held = dependsOnIntent(row, view);
+      const held = dependsOnIntent(row, view, api);
       if (held) return held;
       if (row?.review?.prelaunch) return {action: 'review', stage: 'prelaunch', reviewers: reviewersFor(row.review.prelaunch), quorum: n};
       return 'dispatch';

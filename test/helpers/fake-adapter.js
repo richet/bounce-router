@@ -40,8 +40,8 @@ export function fakeAdapter(script) {
       }
       const never = !Array.isArray(outcome) && outcome?.never === true;
       const events = Array.isArray(outcome) ? outcome : outcome?.events ?? [];
-      const cancelResult = (!Array.isArray(outcome) && outcome?.cancel) ?? {verified: true};
-      return {events, never, cancelResult, ended: false, waiters: []};
+      const cancelResult = (Array.isArray(outcome) ? null : outcome?.cancel) ?? {verified: true};
+      return {events, never, cancelResult, ended: false, waiters: [], report: args.profile?.report};
     },
     async resume(args) {
       calls.resume++;
@@ -54,8 +54,8 @@ export function fakeAdapter(script) {
       }
       const never = !Array.isArray(outcome) && outcome?.never === true;
       const events = Array.isArray(outcome) ? outcome : outcome?.events ?? [];
-      const cancelResult = (!Array.isArray(outcome) && outcome?.cancel) ?? {verified: true};
-      return {events, never, cancelResult, ended: false, waiters: []};
+      const cancelResult = (Array.isArray(outcome) ? null : outcome?.cancel) ?? {verified: true};
+      return {events, never, cancelResult, ended: false, waiters: [], report: args.profile?.report};
     },
     async *events(handle) {
       calls.events++;
@@ -65,6 +65,13 @@ export function fakeAdapter(script) {
       }
       for (const event of handle.events) {
         if (event.kind === '__throw') throw new Error(event.message);
+        if (event.kind === 'result' && event.status === 'completed' && handle.report?.BOUNCE_REPORT_BUS) {
+          const fs = await import('node:fs');
+          const {connectBus} = await import('../../src/bus.js');
+          const client = await connectBus({path: handle.report.BOUNCE_REPORT_BUS, token: fs.readFileSync(handle.report.BOUNCE_REPORT_TOKEN_FILE, 'utf8').trim()});
+          try { await client.report({op: 'final', outcome: 'completed', phase: 'done', text: event.text ?? 'done', next: 'none', summary: event.text ?? 'done', evidence: [], remaining: 'none'}); }
+          finally { await client.close(); }
+        }
         yield event;
       }
     },

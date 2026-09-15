@@ -6,7 +6,14 @@ import {limitPattern} from '../providers.js';
 
 // Shared by every live adapter: a vendor process must never block on an undrained pipe, never
 // throw out of band, never see the bus, and always be cancellable within a bound.
-export const vendorEnv = (env = process.env) => Object.fromEntries(Object.entries(env).filter(([k]) => !k.startsWith('BOUNCE_BUS') && k !== 'BOUNCE_REMOTE_SESSION'));
+// Provider children inherit a scrubbed environment. The daemon may supply only this fixed,
+// explicit capability set for an orchestrator/report endpoint; arbitrary profile env is never
+// forwarded.
+const VENDOR_CAPS = new Set(['BOUNCE_BUS', 'BOUNCE_BUS_TOKEN_FILE', 'BOUNCE_ROLE', 'BOUNCE_ORCHESTRATOR_PROFILE', 'BOUNCE_REPORT_BUS', 'BOUNCE_REPORT_TOKEN_FILE']);
+export const vendorEnv = (env = process.env, capabilities = {}) => ({
+  ...Object.fromEntries(Object.entries(env).filter(([k]) => !k.startsWith('BOUNCE_BUS') && k !== 'BOUNCE_REMOTE_SESSION' && !VENDOR_CAPS.has(k))),
+  ...Object.fromEntries(Object.entries(capabilities).filter(([k, value]) => VENDOR_CAPS.has(k) && typeof value === 'string')),
+});
 
 // Yields {kind:'line', text} per stdout line (the adapter normalizes), {kind:'diagnostic', text} per
 // stderr line, then exactly one terminal event: {kind:'exit', code, signal, limited} or {kind:'error', code, text}.

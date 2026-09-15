@@ -183,7 +183,9 @@ test('E5 the orchestrator grant cannot escalate: budget.reserved, task.completed
   const cwd = tmpRoot('bounce-e5-cwd-');
   const daemon = await (async () => {
     writeE2EConfig(root, {operation: 'orchestrator', orchestrator: 'main', profiles: {main: {adapter: 'codex'}, build: {adapter: 'codex'}}});
-    return startOrchestratorDaemon(root, cwd);
+    // The probes below need the daemon and its grants alive: hold the orchestrator's turn open
+    // after its task ends (the wait no longer runs out the clock on a failed task — P15).
+    return startOrchestratorDaemon(root, cwd, {FAKE_ORCH_HOLD_MS: '20000'});
   })();
   t.after(async () => {
     try { await run(['stop', daemon.id], bounceEnv(root)); } catch {}

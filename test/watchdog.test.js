@@ -60,7 +60,7 @@ test('W1 silent hang: escalate once, correct with a delivered message, then canc
   const delivered = await waitFor(() => session.events.find(e => e.kind === 'task.delivered' && e.task === row.task));
   assert.equal(delivered.tier, 'live');
   assert.equal(adapter.calls.deliver, 1);
-  assert.equal(adapter.deliveries[0].event.text, 'bounce watchdog: silent for 125 s — publish a task.milestone with evidence, or task.blocked with the blocker');
+  assert.equal(adapter.deliveries[0].event.text, 'bounce watchdog: silent for 125 s — use bounce report --report <json> with op:milestone and evidence, or op:blocked with the blocker; include phase, text and next');
 
   for (let t2 = 130000; t2 <= 244000; t2 += 10000) { now = t2; await scheduler.tick(); }
   assert.equal(session.events.filter(e => e.kind === 'policy.escalated' && e.task === row.task).length, 1);
@@ -75,7 +75,7 @@ test('W1 silent hang: escalate once, correct with a delivered message, then canc
   assert.equal(adapter.calls.cancel, 1);
 });
 
-test('W2 noisy loop: activity keeps silent from ever firing, stalled fires at the stall threshold, same ladder continues', async t => {
+test('W2 observed activity requests missing milestones but never cancels solely for missing reports', async t => {
   const {session} = setup(t);
   let now = 0;
   const clock = () => now;
@@ -119,8 +119,9 @@ test('W2 noisy loop: activity keeps silent from ever firing, stalled fires at th
   now = 725000;
   session.publish({kind: 'task.activity', task: row.task, text: 'still going', from: `worker:${row.task}`, context: row.context, time: new Date(now).toISOString()});
   await scheduler.tick();
-  assert.equal(session.events.some(e => e.kind === 'task.cancelled' && e.task === row.task), true);
-  assert.equal(adapter.calls.cancel, 1);
+  assert.equal(session.events.some(e => e.kind === 'task.cancelled' && e.task === row.task), false);
+  assert.equal(adapter.calls.cancel, 0);
+  await scheduler.cancel(row.task);
 });
 
 test('W3 declared long test: a declared expect suppresses silent until it elapses, then the normal silence window applies', async t => {

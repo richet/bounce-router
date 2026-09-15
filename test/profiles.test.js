@@ -1,8 +1,19 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {validateOrchestration, profileFor} from '../src/profiles.js';
+import {validateOrchestration, profileFor, starterProfiles} from '../src/profiles.js';
 import {defaults} from '../src/core.js';
 import {defaultStrategy} from '../src/strategy.js';
+
+test('new orchestration profiles validate with a distinct cross-provider worker fallback', () => {
+  const settings = {order: ['claude'], mode: 'plan', operation: 'orchestrator', orchestrator: 'main', models: {}};
+  settings.profiles = starterProfiles(settings);
+  const view = validateOrchestration(settings);
+  assert.deepEqual(view.profiles.build.fallback, ['build_claude']);
+  assert.equal(view.profiles.build.adapter, 'codex');
+  assert.equal(view.profiles.build_claude.adapter, 'claude');
+  assert.equal(view.profiles.build_claude.role, 'builder');
+  assert.equal(view.profiles.main.role, 'orchestrator');
+});
 
 test('P1 legacy config is untouched and classic', () => {
   const input = {order: ['claude'], mode: 'yolo'};
@@ -54,7 +65,7 @@ test('P4 error messages, one case each', () => {
   assert.throws(() => validateOrchestration({...base, orchestrator: 'nope'}), {message: 'orchestrator must name a profile'});
   assert.throws(() => validateOrchestration({...base, profiles: {}}), {message: 'profiles must be a nonempty object'});
   assert.throws(() => validateOrchestration({...base, profiles: {main: {adapter: 'gpt5'}}}),
-    {message: 'profile main: adapter must be one of claude, codex, muse'});
+    {message: 'profile main: adapter must be one of claude, codex, muse, local'});
   assert.throws(() => validateOrchestration({...base, profiles: {main: {adapter: 'claude', mode: 'sideways'}}}),
     {message: 'profile main: mode must be yolo or plan'});
   assert.throws(() => validateOrchestration({...base, profiles: {main: {adapter: 'claude', policy: 'delete'}}}),

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {peers, tasks, budgets, cooldowns, watchdog} from '../src/reducers.js';
+import {peers, tasks, budgets, cooldowns, watchdog, sessionName} from '../src/reducers.js';
 
 // F4/A7: the reducer's own row fields hold absolute timestamps (a moment), not durations —
 // named lastActivityAt/lastProgressAt so nothing reads them as elapsed ms by mistake. The
@@ -196,4 +196,13 @@ test('a self-referencing or cyclic parent/replaces chain never recurses forever'
   // Each member of a mutual cycle resolves to itself: the chain stops at the first revisited id.
   assert.deepEqual(Object.keys(view.roots).sort(), ['a', 'b', 'c', 'd']);
   assert.deepEqual(view.orphans.tasks, []);
+});
+
+test('sessionName: the last rename wins, else the first prompt line with the orchestrator brief stripped, cut to 48 chars', () => {
+  assert.equal(sessionName([]), null);
+  assert.equal(sessionName([{kind: 'user', text: 'You are the orchestrator peer of session abc; see ORDERS.md.\ncontinue with the handoff'}]), 'continue with the handoff');
+  assert.equal(sessionName([{kind: 'user', text: '  fix   the\nparser '}]), 'fix the');
+  assert.equal(sessionName([{kind: 'user', text: 'a'.repeat(60)}]), `${'a'.repeat(47)}…`);
+  assert.equal(sessionName([{kind: 'user', text: 'first'}, {kind: 'session.renamed', name: ' billing v2 '}, {kind: 'session.renamed', name: '   '}]), 'billing v2');
+  assert.equal(sessionName([{kind: 'user', text: 'You are the orchestrator peer of session abc; see x.'}]), null);
 });

@@ -135,10 +135,11 @@ test('L4 cancellation: cancel aborts a never-ending generation and events end', 
   const handle = await adapter.launch({peer: {}, profile: {backend: 'fake', model: 'x', script}, orders: 'x', cwd, dir: dirFor(cwd)});
   // wait for the first delta to land before cancelling, so we know the loop is truly mid-stream
   const iterator = adapter.events(handle);
-  const first = await iterator.next();
+  let first = await iterator.next();
+  while (!first.done && !(first.value.kind === 'activity' && first.value.text === 'first')) first = await iterator.next();
   assert.equal(first.value.kind, 'activity');
   const cancelled = await adapter.cancel(handle);
-  assert.deepEqual(cancelled, {verified: true});
+  assert.deepEqual(cancelled, {verified: false});
   released();
   const next = await iterator.next();
   assert.equal(next.done, true);
@@ -204,7 +205,7 @@ test('deliver at the tool boundary reaches the model live', async () => {
   await atBoundary;
   const tier = await adapter.deliver(handle, {text: 'inject me'});
   assert.equal(tier, 'live');
-  assert.equal(handle.messages.some(m => m.role === 'user' && m.content === 'inject me'), true);
+  assert.equal(handle.deliveries.includes('inject me'), true);
   released();
   for await (const event of iterator) { if (event.kind === 'result') break; }
 });
@@ -218,7 +219,7 @@ test('cancel on an already-finished handle still resolves {verified:true}', asyn
   assert.deepEqual(await adapter.cancel(handle), {verified: true});
 });
 
-test('concurrency 1: a second launch on the same adapter instance queues and runs after the first completes', async () => {
+test('parallel handles: admission belongs to the scheduler, so a second handle starts independently', async () => {
   const cwd = setup();
   let released, reached;
   const gate = new Promise(resolve => { released = resolve; });
@@ -229,32 +230,44 @@ test('concurrency 1: a second launch on the same adapter instance queues and run
   const handleA = await adapter.launch({peer: {}, profile: {backend: 'fake', model: 'x', script: scriptA}, orders: 'x', cwd, dir: dirFor(cwd)});
   const handleB = await adapter.launch({peer: {}, profile: {backend: 'fake', model: 'x', script: scriptB}, orders: 'x', cwd, dir: dirFor(cwd)});
   const bIterator = adapter.events(handleB);
-  let bResolved = false;
-  const bNext = bIterator.next().then(v => { bResolved = true; return v; });
-  await aRunning; // A is parked mid-turn on its gate: B cannot have started (concurrency 1)
-  await new Promise(resolve => setImmediate(resolve)); // give B every chance to wrongly resolve
-  assert.equal(bResolved, false, 'B must not produce any event while A is still running');
+  const bNext = bIterator.next();
+  await aRunning;
+  let bFirst = await bNext;
+  while (!bFirst.done && bFirst.value.kind !== 'result') bFirst = await bIterator.next();
+  assert.equal(bFirst.value.kind, 'result');
+  assert.equal(bFirst.value.text, 'b-done');
   released();
   const aEvents = await drain(adapter, handleA);
   assert.equal(aEvents.at(-1).text, 'a-done');
-  const bFirst = await bNext;
-  assert.equal(bFirst.value.kind, 'result');
-  assert.equal(bFirst.value.text, 'b-done');
+});
+
+test('a slow consumer still receives a terminal result after an activity flood', async () => {
+  const cwd = setup();
+  const script = [[...Array.from({length: 1_100}, (_, i) => ({kind: 'delta', text: String(i)})), {kind: 'done', text: 'done'}]];
+  const adapter = createLocalLive({backends: {fake: createFakeBackend()}});
+  const handle = await adapter.launch({peer: {}, profile: {backend: 'fake', model: 'x', script}, orders: 'x', cwd, dir: dirFor(cwd)});
+  const events = await drain(adapter, handle);
+  assert.equal(events.some(event => event.kind === 'result' && event.text === 'done'), true);
 });
 
 test('capabilities reports the contract shape', () => {
   const adapter = createLocalLive({backends: {fake: createFakeBackend()}});
-  assert.deepEqual(adapter.capabilities(), {live: true, resume: true, modelPin: true, policies: ['yolo'], executionPolicies: ['read-only'], quota: 'stream'});
+  assert.deepEqual(adapter.capabilities(), {live: true, resume: true, modelPin: true, policies: ['yolo'], executionPolicies: ['read-only', 'plan', 'write'], quota: 'stream'});
 });
 
 test('resume resolves to a bare handle and completes like launch', async () => {
   const cwd = setup();
-  const script = [[{kind: 'done', text: 'resumed-done'}]];
+  const script = [[{kind: 'done', text: 'first-done'}], [{kind: 'done', text: 'resumed-done'}]];
   const adapter = createLocalLive({backends: {fake: createFakeBackend()}});
-  const handle = await adapter.resume({native: {sessionId: 'none'}, message: 'continue', cwd, dir: dirFor(cwd), profile: {backend: 'fake', model: 'x', script}});
+  const dir = dirFor(cwd);
+  const profile = {backend: 'fake', model: 'x', script};
+  const original = await adapter.launch({cwd, dir, profile, orders: 'first question'});
+  await drain(adapter, original);
+  const handle = await adapter.resume({native: {sessionId: path.join(dir, 'local-live-history.json')}, message: 'continue', cwd, dir, profile});
   const events = await drain(adapter, handle);
   assert.equal(events.at(-1).status, 'completed');
   assert.equal(events.at(-1).text, 'resumed-done');
+  assert.equal(handle.messages[0].content, 'first question');
 });
 
 // B2 shape tests (CONTRACT.md §B2): "if a real backend's wire shape is uncertain, implement to
@@ -295,6 +308,98 @@ test('lmstudio backend: health() reflects the /v1/models probe result', async ()
   assert.equal(await ok.health(), true);
   const down = createLmStudioBackend({fetchImpl: async () => { throw new Error('ECONNREFUSED'); }});
   assert.equal(await down.health(), false);
+});
+
+test('lmstudio backend keeps the abort signal alive after response headers while streaming', async () => {
+  let captured;
+  let controller;
+  const body = new ReadableStream({start(value) { controller = value; }});
+  const backend = createLmStudioBackend({fetchImpl: async (_url, options) => {
+    captured = options.signal;
+    return {ok: true, status: 200, body};
+  }});
+  const outer = new AbortController();
+  const pending = (async () => { for await (const _ of backend.generate({model: 'x', messages: [], tools: [], signal: outer.signal})) {} })();
+  await new Promise(resolve => setImmediate(resolve));
+  outer.abort();
+  assert.equal(captured.aborted, true);
+  await assert.rejects(pending);
+});
+
+test('lmstudio backend: preserves every fragmented CRLF tool call and rejects malformed arguments', async () => {
+  const frames = [
+    `data: ${JSON.stringify({choices: [{delta: {tool_calls: [{index: 1, id: 'b', function: {name: 'search', arguments: '{"query":"b'}}]}}]})}\r\n\r\n`,
+    `data: ${JSON.stringify({choices: [{delta: {tool_calls: [{index: 0, id: 'a', function: {name: 'read_file', arguments: '{"path":"a"}'}}]}}]})}\r\n\r\n`,
+    `data: ${JSON.stringify({choices: [{delta: {tool_calls: [{index: 1, function: {arguments: '"}'}}]}, finish_reason: 'tool_calls'}]})}\r\n\r\n`,
+  ];
+  const backend = createLmStudioBackend({fetchImpl: async () => ({ok: true, status: 200, body: bodyFromChunks(frames)})});
+  const events = []; for await (const event of backend.generate({model: 'x', messages: [], tools: []})) events.push(event);
+  assert.deepEqual(events.filter(event => event.kind === 'tool_call').map(event => [event.id, event.arguments]), [['a', {path: 'a'}], ['b', {query: 'b'}]]);
+  const bad = createLmStudioBackend({fetchImpl: async () => ({ok: true, status: 200, body: bodyFromChunks([`data: ${JSON.stringify({choices: [{delta: {tool_calls: [{index: 0, id: 'bad', function: {name: 'search', arguments: '{'}}]}, finish_reason: 'tool_calls'}]})}\n\n`])})});
+  await assert.rejects(async () => { for await (const _ of bad.generate({model: 'x', messages: [], tools: []})) {} }, /malformed arguments/);
+});
+
+test('lmstudio backend: premature EOF and redirects fail rather than continuing', async () => {
+  const eof = createLmStudioBackend({fetchImpl: async () => ({ok: true, status: 200, body: bodyFromChunks(['data: {"choices":[{"delta":{"content":"partial"}}]}'])})});
+  await assert.rejects(async () => { for await (const _ of eof.generate({model: 'x', messages: [], tools: []})) {} }, /premature EOF/);
+  let options;
+  const redirect = createLmStudioBackend({fetchImpl: async (_url, request) => { options = request; return {ok: false, status: 302}; }});
+  assert.equal(await redirect.health(), false);
+  assert.equal(options.redirect, 'manual');
+});
+
+test('local runtime seam executes multiple calls in order and holds final reporting until finish', async () => {
+  const cwd = setup(), calls = [], reports = [];
+  const script = [[
+    {kind: 'tool_call', id: 'one', name: 'read_file', arguments: {path: 'a'}},
+    {kind: 'tool_call', id: 'two', name: 'bounce_report', arguments: {op: 'final', outcome: 'completed', phase: 'done', text: 'done', next: 'none', summary: 'ok'}},
+  ], [{kind: 'done', text: 'complete'}]];
+  const runtimeFactory = () => ({prepare: async () => ({execute: async call => { calls.push(call.name); return 'read'; }, finish: async () => { calls.push('finish'); return {verified: true}; }, cancel: async () => ({verified: true})})});
+  const adapter = createLocalLive({backends: {fake: createFakeBackend()}, runtimeFactory, report: async value => { reports.push(value); }});
+  // The fake backend intentionally selects the injected runtime boundary by a non-fake name.
+  adapter; // retain a concrete composed adapter construction for the production seam below.
+  const backend = {health: async () => true, generate: createFakeBackend().generate};
+  const composed = createLocalLive({backends: {test: backend}, runtimeFactory, report: async value => { reports.push(value); }});
+  const handle = await composed.launch({peer: {}, task: 't', attempt: 2, context: 'c', profile: {backend: 'test', model: 'x', script}, orders: 'x', cwd, dir: dirFor(cwd)});
+  const events = await drain(composed, handle);
+  assert.equal(events.at(-1).status, 'completed');
+  assert.deepEqual(calls, ['read_file', 'finish']);
+  assert.deepEqual(reports, [{task: 't', attempt: 2, context: 'c', report: {op: 'final', outcome: 'completed', phase: 'done', text: 'done', next: 'none', summary: 'ok', evidence: ['Supervisor published: no changed paths']}}]);
+  assert.deepEqual(handle.observedTools.map(call => call.id), ['one', 'two']);
+});
+
+test('launch report callback and write policy expose granted tools; calls share one assistant message', async () => {
+  const cwd = setup(), seen = [], reports = [];
+  let turn = 0;
+  const backend = {health: async () => true, async *generate({tools}) { seen.push(tools.map(tool => tool.name)); if (turn++ === 0) { yield {kind: 'tool_call', id: 'w', name: 'write_file', arguments: {path: 'a', content: 'x'}}; yield {kind: 'tool_call', id: 'r', name: 'bounce_report', arguments: {op: 'final', outcome: 'completed', phase: 'done', text: 'done', next: 'none', summary: 'ok'}}; } yield {kind: 'done', text: 'ok'}; }};
+  const runtimeFactory = () => ({prepare: async () => ({execute: async () => 'written', finish: async () => ({verified: true}), cancel: async () => ({verified: true})})});
+  const adapter = createLocalLive({backends: {test: backend}, runtimeFactory});
+  const handle = await adapter.launch({peer: {}, task: 't', attempt: 1, context: 'c', report: async value => reports.push(value), profile: {backend: 'test', model: 'm', policy: 'write', mode: 'yolo'}, orders: 'x', cwd, dir: dirFor(cwd)});
+  await drain(adapter, handle);
+  assert.equal(seen[0].includes('write_file'), true);
+  assert.equal(seen[0].includes('patch_file'), true);
+  assert.equal(seen[0].includes('run_command'), true);
+  assert.equal(seen[0].includes('bounce_report'), true);
+  assert.equal(handle.messages.filter(message => message.role === 'assistant').length, 1);
+  assert.equal(handle.messages.filter(message => message.role === 'assistant')[0].tool_calls.length, 2);
+  assert.equal(reports.length, 1);
+});
+
+test('reported work requests one bounded final-report repair before publishing', async () => {
+  const cwd = setup(), publishes = [], reports = [];
+  let turn = 0;
+  const backend = {health: async () => true, async *generate() {
+    if (turn++ === 1) yield {kind: 'tool_call', id: 'final', name: 'bounce_report', arguments: {op: 'final', outcome: 'completed', phase: 'done', text: 'done', next: 'none', summary: 'ok'}};
+    yield {kind: 'done', text: 'done'};
+  }};
+  const runtimeFactory = () => ({prepare: async () => ({execute: async () => 'ok', finish: async ({publish}) => { publishes.push(publish); return {verified: true}; }, cancel: async () => ({verified: true})})});
+  const adapter = createLocalLive({backends: {test: backend}, runtimeFactory});
+  const handle = await adapter.launch({peer: {}, report: async value => reports.push(value), profile: {backend: 'test', model: 'm'}, orders: 'x', cwd, dir: dirFor(cwd)});
+  const events = await drain(adapter, handle);
+  assert.equal(events.at(-1).status, 'completed');
+  assert.deepEqual(publishes, [true]);
+  assert.equal(reports.length, 1);
+  assert.equal(handle.messages.some(message => message.role === 'user' && /final report/.test(message.content)), true);
 });
 
 test('ollama backend: parses streamed newline-delimited JSON deltas, a tool_call, and usage from the documented shape', async () => {

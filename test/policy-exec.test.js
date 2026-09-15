@@ -137,7 +137,7 @@ test('E6 live-adapter capabilities: executionPolicies deepEqual the declared lad
   assert.deepEqual(createClaudeLive().capabilities().executionPolicies, ['read-only', 'plan', 'yolo']);
   assert.deepEqual(createCodexLive().capabilities().executionPolicies, ['read-only', 'plan', 'yolo']);
   assert.deepEqual(createMuseLive().capabilities().executionPolicies, ['read-only', 'plan', 'yolo']);
-  assert.deepEqual(createLocalLive().capabilities().executionPolicies, ['read-only']);
+  assert.deepEqual(createLocalLive().capabilities().executionPolicies, ['read-only', 'plan', 'write']);
 });
 
 // E7: real seam — local through the real scheduler with an effective-yolo profile is

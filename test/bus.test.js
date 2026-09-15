@@ -77,7 +77,7 @@ const rawConnect = async (bus, t) => {
 test('legacy: importing src/bus.js does not change Session exports or defaults()', () => {
   const before = ['order', 'mode', 'models', 'cooldownMinutes', 'contextChars', 'executables', 'skills'];
   assert.deepEqual(Object.keys(defaults()).sort(), before.sort());
-  assert.deepEqual(Object.keys(core).sort(), ['LIVE_KINDS', 'Router', 'Session', 'config', 'dataRoot', 'defaults', 'gitSnapshot', 'handoff', 'saveJSON'].sort());
+  assert.deepEqual(Object.keys(core).sort(), ['LIVE_KINDS', 'Router', 'Session', 'config', 'dataRoot', 'defaults', 'gitSnapshot', 'handoff', 'pidAlive', 'saveJSON'].sort());
 });
 
 test('P1 round trip: publish as the granted peer lands in the journal', async t => {
@@ -680,4 +680,37 @@ test('reapStaleSockets skips its own keep path and a missing/foreign directory',
   const reaped = await reapStaleSockets({tmpRoot, uid, keep: mine});
   assert.deepEqual(reaped, [], 'the keep path is never reaped even if it looks dead');
   assert.equal(fs.existsSync(mine), true);
+});
+
+test('P14 a task.submitted published without a task id gets one from the bus: the reply and the journal carry a uuid', async t => {
+  const {session, bus} = await setup(t);
+  const orchestrator = await connect(bus, 'orchestrator', {tasks: [], canSubmit: true});
+  t.after(() => orchestrator.close());
+  const row = await orchestrator.publish({kind: 'task.submitted', parent: null, profile: 'p', orders: 'do it'});
+  assert.match(row.task, /^[0-9a-f-]{36}$/);
+  const journaled = session.events.find(e => e.kind === 'task.submitted');
+  assert.equal(journaled.task, row.task);
+});
+
+test('P15 a wait for task.completed resolves on the task\'s failure instead of running out the clock, both for an existing row and a future one', async t => {
+  const {session, bus} = await setup(t);
+  const orchestrator = await connect(bus, 'orchestrator', {tasks: [], canSubmit: true});
+  t.after(() => orchestrator.close());
+  // Already failed before the wait: answered immediately with the failure.
+  session.append({kind: 'task.submitted', task: 'gone', parent: null, profile: 'p', orders: 'x'});
+  session.append({kind: 'task.failed', task: 'gone', reason: 'error', text: 'Invalid request'});
+  const started = Date.now();
+  const row = await orchestrator.wait({match: {kind: 'task.completed', task: 'gone'}, timeout: 5000});
+  assert.equal(row.kind, 'task.failed');
+  assert.equal(row.text, 'Invalid request');
+  assert.ok(Date.now() - started < 2000, 'did not wait for the timeout');
+  // Fails while waiting: answered with the cancellation row.
+  session.append({kind: 'task.submitted', task: 'live', parent: null, profile: 'p', orders: 'x'});
+  const pending = orchestrator.wait({match: {kind: 'task.completed', task: 'live'}, timeout: 5000});
+  setTimeout(() => session.append({kind: 'task.cancelled', task: 'live'}), 50);
+  assert.equal((await pending).kind, 'task.cancelled');
+  // A wait that names no task keeps exact matching: a task.completed for another task never satisfies it.
+  const other = orchestrator.wait({match: {kind: 'task.milestone', text: 'm'}, timeout: 300});
+  session.append({kind: 'task.completed', task: 'live', summary: 's'});
+  assert.equal(await other, null);
 });

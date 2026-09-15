@@ -9,12 +9,17 @@ import {createHash} from 'node:crypto';
 import {installUpdate} from './update.js';
 import {spawn} from 'node:child_process';
 import {parseArgs} from 'node:util';
-import {Session, config, dataRoot} from './core.js';
+import {Session, config, dataRoot, pidAlive} from './core.js';
+import {resolveSessionRef} from './sessions.js';
+export {pidAlive};
 import {createBus, connectBus} from './bus.js';
 import {validateOrchestration} from './profiles.js';
+import {createLocalActivation} from './local-activation.js';
 import {providers} from './providers.js';
 import {createScheduler} from './scheduler.js';
 import {hostSession} from './remote.js';
+import {createMainService} from './main-service.js';
+import {createViewServer, connectView, requestViewControl} from './view-transport.js';
 
 const CHILD_KILL_GRACE_MS = 1500; // same grace as runProcess's cancel and live-common's verifiedCancel
 
@@ -52,11 +57,6 @@ export async function validate(root = projectRoot, emit = () => {}) {
 
 // ---- shared helpers -------------------------------------------------------
 
-export function pidAlive(pid) {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return true; }
-  catch { return false; }
-}
 
 function daemonJsonPath(dir) { return path.join(dir, 'daemon.json'); }
 
@@ -105,13 +105,21 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator}) {
   fs.writeFileSync(file, [
     `# Orchestrator orders — session ${session.id}`, '',
     'You coordinate; workers implement. Delegate every implementation task to a worker profile below.',
-    'Do not edit the repository yourself and do not read bounce\'s own source to learn the bridge — everything you need is here.', '',
+    'Do not edit the repository yourself and do not read bounce\'s own source to learn the bridge — everything you need is here.',
+    'Workers run ONLY through this bridge: never your own subagent/Agent/Task tools (they are switched off for you), and never',
+    'do the work yourself when a dispatch fails — a task.failed row names the reason; report it to the user and stop.', '',
     `Skill: ${path.join(root, 'skills', 'agent-orchestrator', 'SKILL.md')}`, '',
     'Bridge (already in your environment):',
     `    BOUNCE_BUS=${bus.path}`,
     `    BOUNCE_BUS_TOKEN_FILE=${grant.file}`, '',
     'Worker profiles you can submit to (name → adapter/model):',
     ...Object.entries(profiles).filter(([name]) => name !== orchestrator).map(([name, p]) => `    ${name} → ${[p.adapter, p.model].filter(Boolean).join('/')}${p.role ? ` (${p.role})` : ''}`),
+    ...Object.entries(profiles).filter(([, profile]) => profile.adapter === 'local').map(([name, profile]) =>
+      `    ${name}: LM Studio endpoint=${profile.endpoint}, model=${profile.model || 'auto'}, policy=${profile.policy}; reads=${JSON.stringify(profile.readPaths)}, writes=${JSON.stringify(profile.writePaths)}, commands=${JSON.stringify(profile.commands)}, localOnly=${profile.localOnly}. Commands use isolated Docker-compatible containers; no host shell fallback.`),
+    'Local discovery checks eligibility at dispatch. A downloaded model is not necessarily loaded or tool-capable.',
+    'When the user requests local/LM Studio workers, use a local profile from this roster. If none is available, report that and request /local setup or /local activate; never substitute a cloud worker.',
+    'Capacity waits, progress and failures are journaled. Do not infer a worker crash from silence alone; inspect its latest task state.',
+    'Require observed tests and a final report from local builders; their private changes publish only after verified container termination.',
     '',
     'Submit work with `bounce publish --event <json>` and wait for it with `bounce wait --match <json>`.',
     'Example — submit one task, then wait for it to end:',
@@ -119,10 +127,18 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator}) {
     `    bounce wait --match '{"kind":"task.completed","task":"<task id from the publish reply>"}' --timeout 3600`,
     'Fields: parent (null for a root task), profile (a name above), orders (the brief, required), deadline (ms, optional),',
     'depends_on (task ids, optional), review ({"prelaunch": <profile>, "completion": <profile>}, optional, review-role profiles only).',
-    'The publish reply carries the task id. A refusal arrives as a task.failed row naming the reason — read it before retrying.',
+    'The publish reply carries the task id. `wait` on a task outcome follows replacements and waits for completion review when configured. Read the',
+    'returned row\'s `kind`: task.completed or task.accepted is done; task.failed (with `reason` and `text`), task.cancelled, task.deadline or',
+    'task.rejected mean stop and report that reason to the user. A refusal is such a task.failed row — read it before retrying.',
     'Terminal rows: task.completed, task.failed, task.cancelled, task.rejected. Steer a running worker with',
     `    bounce publish --event '{"kind":"message","to":"worker:<task id>","text":"..."}'`, '',
+    'Progress is a durable contract, not a heartbeat. Publish task.milestone with phase, text, next, and evidence',
+    'after initial inspection, every phase change, and before completion. Phases: inspect, plan, implement, test,',
+    'verify, review, document, done. `text` says what changed, `next` says what happens next, and `evidence` names',
+    'the concrete file, command, test result, or artifact. Publish task.blocked immediately when progress stops.', '',
     'You may publish only: task.submitted, task.milestone, task.blocked, task.input_required, task.usage, task.activity, message.',
+    'A Codex worker calls its scoped `bounce_report` tool; other workers use `bounce report --report <json>`. Reports require op, phase, text and next;',
+    'a final report additionally requires outcome (completed|failed|blocked|input_required) and summary. Do not use publish for a final report.',
     'Everything else is refused — `user`, `control.*`, and every task lifecycle row the scheduler owns.',
   ].join('\n') + '\n', {mode: 0o600});
   return file;
@@ -149,7 +165,8 @@ async function legacySupervise(args, {spawnChild, updateInstall}) {
       let request, update;
       const child = spawnChild(process.execPath,[cliPath,...args],{
         stdio:['inherit','inherit','inherit','ipc'],
-        env:{...process.env,BOUNCE_SUPERVISED:'1',BOUNCE_RESTART:resume ? JSON.stringify(resume) : ''},
+        env:{...Object.fromEntries(Object.entries(process.env).filter(([key]) => !ORCHESTRATOR_ENV.includes(key))),
+          BOUNCE_SUPERVISED:'1', BOUNCE_REMOTE_SESSION:'', BOUNCE_PERSISTENT_VIEW:'', BOUNCE_VIEW_DAEMON:'', BOUNCE_DETACHED:'', BOUNCE_RESTART:resume ? JSON.stringify(resume) : ''},
       });
       const terminate = () => child.kill('SIGTERM');
       const interrupt = () => {}; // Foreground process group delivers Ctrl+C to the child too.
@@ -183,7 +200,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // instead of cancelling the tree the moment its own `run` child exits. A test can
   // set the same env var around a direct, in-process supervise() call to get the same
   // drain semantics without actually forking a background process.
-  const detachedDaemon = process.env.BOUNCE_DETACHED === '1';
+  const detachedDaemon = process.env.BOUNCE_DETACHED === '1' || process.env.BOUNCE_VIEW_DAEMON === '1';
   const root = dataRoot();
   const settings = config(root);
   // The live adapters are orchestrator mode's workers; a test may replace any of them by name.
@@ -195,7 +212,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   const orchestration = validateOrchestration(settings, [...new Set([...Object.keys(adapters), ...Object.keys(providers)])]);
   const orchestrating = orchestration.operation === 'orchestrator';
   const cwd = fs.realpathSync(values.cwd || process.cwd());
-  const session = new Session(cwd, {root, id: values.resume});
+  const session = new Session(cwd, {root, id: values.resume ? resolveSessionRef(root, values.resume) : undefined});
   session.lock();
 
   const profiles = profileOverride ?? (orchestrating ? orchestration.profiles : buildProfiles(settings));
@@ -203,8 +220,17 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // Phase 8: the strategy seam, same shape as `adapters`/`profiles` above — a test (or, later, a
   // config-driven caller) may inject a strategy object directly; absent, the declarative
   // `strategy:` setting resolved by validateOrchestration (default: defaultStrategy) applies.
-  const scheduler = createScheduler({session, adapters, profiles, sessionMode: settings.mode, strict: orchestration.strict, strategy: strategyOverride ?? orchestration.strategy});
-  const bus = await createBus({session, dir: session.dir, validate: scheduler.validate});
+  let bus;
+  const reportTokens = new Map();
+  const scheduler = createScheduler({session, adapters, profiles, localSettings: settings.local, sessionMode: settings.mode, strict: orchestration.strict,
+    requireFinalReport: orchestrating, reportGrant: ({task, attempt, context}) => {
+      if (!orchestrating || !bus) return null;
+      const peer = `report:${task}:${attempt}`;
+      const grant = bus.grant({peer, tasks: [task], context, report: {task, attempt}});
+      reportTokens.set(peer, true);
+      return {BOUNCE_REPORT_BUS: bus.path, BOUNCE_REPORT_TOKEN_FILE: grant.file};
+    }, strategy: strategyOverride ?? orchestration.strategy});
+  bus = await createBus({session, dir: session.dir, validate: scheduler.validate, report: scheduler.report});
   const userGrant = bus.grant({peer: 'user', canSubmit: true, tasks: [], context: session.id});
   // daemon.json is written AFTER the SIGTERM/SIGINT handlers are installed (below), never here:
   // it is the daemon's discovery record, so the moment it exists a `stop`/SIGTERM can arrive, and
@@ -218,6 +244,13 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   const orchestratorGrant = orchestrating ? bus.grant({peer: 'orchestrator', canSubmit: true, tasks: [], context: session.id}) : null;
   if (orchestrating) writeOrders({session, root, bus, grant: orchestratorGrant, profiles: orchestration.profiles, orchestrator: orchestration.orchestrator});
   if (orchestrating) session.append({kind: 'operation', operation: 'orchestrator', orchestrator: orchestration.orchestrator, shape: orchestration.shape, text: `Operation: orchestrator on ${orchestration.orchestrator} (${orchestration.shape})`});
+  const main = orchestrating && positionals[0] !== 'run' ? createMainService({session, adapters, profile: orchestratorProfile, settings,
+    orchestratorEnv: {BOUNCE_BUS: bus.path, BOUNCE_BUS_TOKEN_FILE: orchestratorGrant.file, BOUNCE_ROLE: 'orchestrator', BOUNCE_ORCHESTRATOR_PROFILE: JSON.stringify(orchestratorProfile)},
+    brief: `Read and follow ${path.join(session.dir, 'orchestrator', 'ORDERS.md')}.`}) : null;
+  const closeLocalActivation = createLocalActivation({session, scheduler, profiles, settings,
+    readSettings: () => config(root),
+    refresh: () => writeOrders({session, root, bus, grant: orchestratorGrant, profiles, orchestrator: orchestration.orchestrator})});
+  if (values.resume) scheduler.reconcile().catch(error => session.append({kind: 'status', text: `Recovery failed: ${error.message}`}));
 
   // Worker grants are the dispatch policy expressed on the bus: a task that starts gets a grant
   // scoped to itself alone, and any terminal row revokes it. The orchestrator's own grant is
@@ -228,9 +261,17 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
     if (row.kind === 'task.submitted' && row.from === 'orchestrator') bus.extendGrant('orchestrator', [row.task]);
     else if (row.kind === 'task.started') {
       const peer = `worker:${row.task}`;
-      workerTokens.set(peer, bus.grant({peer, tasks: [row.task], context: row.context}).file);
-    } else if (TERMINAL_KINDS.has(row.kind) && workerTokens.delete(`worker:${row.task}`)) {
-      void bus.revoke(`worker:${row.task}`);
+      workerTokens.set(peer, bus.grant({peer, tasks: [row.task], context: row.context,
+        report: {task: row.task, attempt: row.attempt}}).file);
+    } else if (row.kind === 'task.attempt.ended') {
+      const peer = `report:${row.task}:${row.attempt}`;
+      if (reportTokens.delete(peer)) void bus.revoke(peer);
+      if (workerTokens.delete(`worker:${row.task}`)) void bus.revoke(`worker:${row.task}`);
+    } else if (TERMINAL_KINDS.has(row.kind)) {
+      if (workerTokens.delete(`worker:${row.task}`)) void bus.revoke(`worker:${row.task}`);
+      for (const peer of [...reportTokens.keys()]) if (peer.startsWith(`report:${row.task}:`)) {
+        reportTokens.delete(peer); void bus.revoke(peer);
+      }
     }
   });
 
@@ -253,6 +294,8 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
 
   let finished = false;
   let finishPromise = null;
+  let viewServer = null;
+  let wakeViewDaemon;
   // Single-flight AND single-completion. Two teardown paths can fire together: the SIGTERM
   // handler's finish(143), and the run loop's finish() once a cancel makes the task tree
   // terminal and waitForDrain() resolves. The old `if (finished) return` guarded double-
@@ -268,17 +311,24 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
       process.exitCode = code;
       stopUnsubscribe();
       grantsUnsubscribe();
+      closeLocalActivation();
       scheduler.close();
+      const mainStopped = await main?.close().catch(() => ({verified: false}));
+      if (mainStopped?.verified === false) unverifiedOnStop = [...unverifiedOnStop, 'orchestrator'];
+      await viewServer?.close();
       process.off('SIGTERM', onSigterm); process.off('SIGINT', onSigterm);
       // Every grant this daemon minted goes away with it: the worker and orchestrator grants
       // explicitly here, the user grant with bus.close(), which unlinks every remaining token file.
       for (const peer of workerTokens.keys()) await bus.revoke(peer).catch(() => {});
       workerTokens.clear();
+      for (const peer of reportTokens.keys()) await bus.revoke(peer).catch(() => {});
+      reportTokens.clear();
       if (orchestratorGrant) await bus.revoke('orchestrator').catch(() => {});
       await bus.close().catch(() => {});
       session.unlock();
       if (unverifiedOnStop.length) writeDaemonJson(session.dir, {pid: process.pid, bus: bus.path, started: new Date().toISOString(), userToken: userGrant.file, unverified: unverifiedOnStop});
       else removeDaemonJson(session.dir);
+      wakeViewDaemon?.();
     })();
     return finishPromise;
   };
@@ -319,8 +369,25 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   };
   process.on('SIGTERM', onSigterm);
   process.on('SIGINT', onSigterm);
+  if (main && process.env.BOUNCE_VIEW_DAEMON === '1') {
+    viewServer = await createViewServer({session, main, token: fs.readFileSync(userGrant.file, 'utf8').trim(), onControl: async message => {
+      if (message.action === 'cancel' && message.task) await scheduler.cancel(message.task);
+      else if (message.action === 'stop') await scheduler.stop();
+      else if (message.action === 'quit') {
+        const {unverified} = await scheduler.stop();
+        const mainStopped = await main.cancel();
+        if (unverified.length || mainStopped?.verified !== true) return {verified: false, reason: 'termination_unverified'};
+        return {verified: true, afterAck: () => finish(0)};
+      }
+    }});
+  }
   // Now discoverable: a signal from here on is caught by onSigterm and torn down cleanly.
-  writeDaemonJson(session.dir, {pid: process.pid, bus: bus.path, started: new Date().toISOString(), userToken: userGrant.file});
+  writeDaemonJson(session.dir, {pid: process.pid, bus: bus.path, started: new Date().toISOString(), userToken: userGrant.file,
+    ...(viewServer ? {view: viewServer.path, protocol: 1, profile: orchestratorProfile} : {})});
+  if (viewServer) {
+    await new Promise(resolve => { if (finished) resolve(); else wakeViewDaemon = resolve; });
+    return;
+  }
 
   // Detached daemon only: waits for every root task to go terminal (or for `finish`
   // to already have run, via control.stop/SIGTERM) before the daemon is allowed to
@@ -349,15 +416,19 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
       BOUNCE_ROLE: 'orchestrator', BOUNCE_ORCHESTRATOR_PROFILE: JSON.stringify(orchestratorProfile),
     });
     const outcome = await new Promise(resolvePromise => {
-      let request, update;
+      let request, update, switchTo;
       const child = spawnChild(process.execPath, [cliPath, ...childArgs], {
         stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
         env: childEnv,
       });
       currentChild = child;
-      const host = hostSession({session, child});
+      const host = hostSession({session, child, main});
       child.on('message', message => {
         if (message?.type === 'restart') { request = message.state; update = message.update === true; }
+        // /resume and /new in orchestrator mode: this daemon is bound to one session (its bus,
+        // grants and journal), so switching means finishing here and letting supervise() start
+        // a daemon for the other session. The TUI refuses the switch while workers still run.
+        else if (message?.type === 'switch') { switchTo = typeof message.id === 'string' && message.id ? message.id : 'new'; }
         // Phase 9.3 steering: the interactive orchestrator child (the TUI) asks the daemon to
         // cancel one task or the whole tree over its own IPC channel — the scheduler owns cancel,
         // and the resulting task.cancelled rows flow back to the TUI's AGENTS pane.
@@ -370,10 +441,14 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
       child.once('close', (code, signal) => {
         currentChild = null;
         host.detach();
-        resolvePromise({code: code ?? (signal ? 130 : 1), request, update});
+        resolvePromise({code: code ?? (signal ? 130 : 1), request, update, switchTo});
       });
     });
     if (finished) break;
+    if (outcome.code === 76 && outcome.switchTo) {
+      await finish(0);
+      return {switchTo: outcome.switchTo};
+    }
     if (outcome.code !== 75 || !outcome.request) {
       if (detachedDaemon) {
         await waitForDrain();
@@ -403,7 +478,7 @@ async function detachRun(args, {spawnChild}) {
   const cwd = fs.realpathSync(values.cwd || process.cwd());
   // Minting (or reopening) the session here, in the foreground, is what lets us print
   // the id immediately; the detached daemon reopens the same session by id.
-  const session = new Session(cwd, {root, id: values.resume});
+  const session = new Session(cwd, {root, id: values.resume ? resolveSessionRef(root, values.resume) : undefined});
   const id = session.id;
   const childArgs = args.filter(a => a !== '--detach').filter(a => a !== '--resume' && a !== id);
   if (!childArgs.includes('--json')) childArgs.push('--json');
@@ -416,14 +491,91 @@ async function detachRun(args, {spawnChild}) {
   process.exitCode = 0;
 }
 
+// attach/stop accept a name or id prefix; an unknown reference keeps its raw form so the
+// commands' own "not running" path answers, as before.
+function resolveOrRaw(ref) {
+  if (!ref) return ref;
+  try { return resolveSessionRef(dataRoot(), ref); } catch { return ref; }
+}
+
+async function interactiveView(args, {existing, restart} = {}) {
+  const {values} = parseArgs({args, allowPositionals: true, strict: false, options: {cwd: {type: 'string'}, resume: {type: 'string'}}});
+  const root = dataRoot();
+  const session = existing ? {id: existing.id, dir: path.join(root, 'sessions', existing.id)}
+    : new Session(fs.realpathSync(values.cwd || process.cwd()), {root, id: values.resume ? resolveSessionRef(root, values.resume) : undefined});
+  let info = existing?.info ?? readDaemonJson(session.dir);
+  if (!info || !pidAlive(info.pid)) {
+    const daemonArgs = args.filter((value, index) => value !== '--resume' && args[index - 1] !== '--resume' && !value.startsWith('--resume='));
+    const daemon = spawn(process.execPath, [cliPath, ...daemonArgs, '--resume', session.id], {
+      detached: true, stdio: 'ignore', env: {...process.env, BOUNCE_VIEW_DAEMON: '1', BOUNCE_DETACHED: '1', BOUNCE_SUPERVISED: '', BOUNCE_REMOTE_SESSION: ''},
+    });
+    daemon.unref();
+    let spawnError;
+    daemon.once('error', error => { spawnError = error; });
+    const deadline = Date.now() + 10000;
+    while (Date.now() < deadline && !spawnError) {
+      info = readDaemonJson(session.dir);
+      if (info?.view && pidAlive(info.pid)) break;
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    if (spawnError || !info?.view || !pidAlive(info.pid)) throw spawnError ?? new Error(`Daemon did not become ready for ${session.id}; inspect its session journal`);
+  }
+  if (!info.view || info.protocol !== 1) throw new Error('Running daemon uses an older view protocol; use bounce attach ID --json or stop it explicitly before restarting');
+  const channel = await connectView({path: info.view, token: fs.readFileSync(info.userToken, 'utf8').trim()});
+  const child = spawn(process.execPath, [cliPath, ...args], {
+    stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
+    env: {...process.env, BOUNCE_SUPERVISED: '1', BOUNCE_REMOTE_SESSION: '1', BOUNCE_PERSISTENT_VIEW: '1', BOUNCE_VIEW_DAEMON: '',
+      BOUNCE_ROLE: 'orchestrator', BOUNCE_ORCHESTRATOR_PROFILE: JSON.stringify(info.profile), BOUNCE_RESTART: restart ? JSON.stringify(restart) : ''},
+  });
+  let requestedQuit = false, requestedRestart = null, switchTo = null, quitRequest;
+  channel.on('message', message => { if (child.connected) child.send(message, () => {}); });
+  child.on('message', message => {
+    if (message?.type === 'control' && message.action === 'quit') {
+      requestedQuit = true;
+      quitRequest = requestViewControl(channel, 'quit').catch(error => ({verified: false, reason: error.message}));
+      return;
+    }
+    if (message?.type === 'restart') { requestedRestart = message; return; }
+    if (message?.type === 'switch') { switchTo = message.id; return; }
+    try { channel.send(message); } catch {}
+  });
+  channel.on('disconnect', () => {
+    if (child.connected) child.send({type: 'main.event', event: {kind: 'main.disconnected', state: 'unavailable', text: 'Daemon disconnected; session journal is saved'}}, () => {});
+  });
+  // Detaching a view never cancels its provider. Explicit /quit is sent before the view exits.
+  const code = await new Promise(resolve => { child.once('error', () => resolve(1)); child.once('close', value => resolve(value ?? 1)); });
+  if ((code === 75 && requestedRestart) || (code === 76 && switchTo) || requestedQuit) {
+    const stopped = await (quitRequest ?? requestViewControl(channel, 'quit'));
+    if (stopped?.verified !== true) {
+      channel.close();
+      throw new Error(`Session ${session.id} remains running: ${stopped?.reason ?? 'termination unverified'}. Reattach with bounce attach ${session.id}`);
+    }
+    const deadline = Date.now() + 10000;
+    while (readDaemonJson(session.dir) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
+    if (readDaemonJson(session.dir)) { channel.close(); throw new Error('Stopped daemon has not released its session; restart refused'); }
+  }
+  channel.close();
+  if (code === 75 && requestedRestart) {
+    return interactiveView(args, {existing: {id: session.id}, restart: requestedRestart.state});
+  }
+  if (code === 76 && switchTo) {
+    const next = args.filter((value, index) => value !== '--resume' && args[index - 1] !== '--resume' && !value.startsWith('--resume='));
+    if (switchTo !== 'new') next.push('--resume', switchTo);
+    return interactiveView(next);
+  }
+  process.exitCode = code === 80 ? 0 : code;
+  if (!requestedQuit) console.log(`Session ${session.id} continues. Reattach: bounce attach ${session.id}`);
+}
+
 async function attachCommand(args) {
   const {values, positionals} = parseArgs({args: args.slice(1), allowPositionals: true, options: {json: {type: 'boolean'}}});
-  const id = positionals[0];
+  const id = resolveOrRaw(positionals[0]);
   if (!id) { console.error('bounce: attach requires a session id'); process.exitCode = 2; return; }
   const root = dataRoot();
   const dir = path.join(root, 'sessions', id);
   const info = readDaemonJson(dir);
   if (!info || !pidAlive(info.pid)) { console.log(`session ${id} is not running`); process.exitCode = 1; return; }
+  if (!values.json && process.stdin.isTTY && info.view) return interactiveView(['--resume', id], {existing: {id, info}});
   let client;
   try { client = await connectBus({path: info.bus, token: fs.readFileSync(info.userToken, 'utf8').trim()}); }
   catch (error) { console.log(`session ${id} is not running`); process.exitCode = 1; return; }
@@ -452,7 +604,7 @@ async function attachCommand(args) {
 }
 
 async function stopCommand(args) {
-  const [id] = args.slice(1);
+  const id = resolveOrRaw(args[1]);
   if (!id) { console.error('bounce: stop requires a session id'); process.exitCode = 2; return; }
   const root = dataRoot();
   const dir = path.join(root, 'sessions', id);
@@ -507,8 +659,33 @@ export async function supervise(args = process.argv.slice(2), {spawnChild = spaw
   // loop, byte-identical. We read only the raw `operation` field (not full validateOrchestration,
   // which would reject a `local` profile under the default adapter list) and let daemonSupervise
   // do the real validation and surface any error.
+  // Only the interactive TUI itself (no subcommand, or `dev`) gets the apparatus. Every other
+  // invocation — sessions, models, quota, skills, rename, task, --help, --version, the bridge
+  // commands — is a plain command: routing those through daemonSupervise created a session, a
+  // bus and an orchestrator grant per invocation (96 empty sessions were found this way).
+  const {positionals, values: info} = parseArgs({args, allowPositionals: true, strict: false, options: {
+    cwd: {type: 'string'}, resume: {type: 'string'}, provider: {type: 'string'}, model: {type: 'string'}, mode: {type: 'string'},
+    image: {type: 'string', multiple: true}, scope: {type: 'string'}, help: {type: 'boolean', short: 'h'}, version: {type: 'boolean', short: 'v'},
+  }});
+  const interactive = !info.help && !info.version && (positionals.length === 0 || (positionals.length === 1 && positionals[0] === 'dev'));
   let operation = 'classic';
-  try { operation = config(dataRoot()).operation ?? 'classic'; } catch { /* a broken config surfaces in the classic TUI below */ }
-  if (operation === 'orchestrator') return daemonSupervise(args, {spawnChild, updateInstall, adapters, profiles, strategy, onReady});
+  if (interactive) { try { operation = config(dataRoot()).operation ?? 'classic'; } catch { /* a broken config surfaces in the classic TUI below */ } }
+  if (operation === 'orchestrator') {
+    if (process.env.BOUNCE_VIEW_DAEMON !== '1' && spawnChild === spawn && process.stdin.isTTY) return interactiveView(args);
+    // A session switch (/resume, /new) ends one daemon and starts the next for the chosen
+    // session — same args, only `--resume` replaced ('new' drops it).
+    let current = args;
+    for (;;) {
+      const result = await daemonSupervise(current, {spawnChild, updateInstall, adapters, profiles, strategy, onReady});
+      if (!result?.switchTo) return result;
+      const stripped = [];
+      for (let i = 0; i < current.length; i++) {
+        if (current[i] === '--resume') { i++; continue; }
+        if (current[i].startsWith('--resume=')) continue;
+        stripped.push(current[i]);
+      }
+      current = result.switchTo === 'new' ? stripped : [...stripped, '--resume', result.switchTo];
+    }
+  }
   return legacySupervise(args, {spawnChild, updateInstall});
 }

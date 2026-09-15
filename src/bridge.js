@@ -21,8 +21,12 @@ function parseJsonArg(value, label) {
 
 export async function bridgeCommand(argv, env = process.env) {
   const [command, ...rest] = argv;
-  const busPath = env.BOUNCE_BUS, tokenFile = env.BOUNCE_BUS_TOKEN_FILE;
-  if (!busPath || !tokenFile) return {stdout: 'bounce: BOUNCE_BUS and BOUNCE_BUS_TOKEN_FILE must be set\n', exitCode: 2};
+  // Reporting is deliberately a separate, attempt-scoped credential. A worker cannot turn a
+  // report capability into the general publish/wait capability even by invoking this CLI.
+  const reporting = command === 'report';
+  const busPath = reporting ? env.BOUNCE_REPORT_BUS : env.BOUNCE_BUS;
+  const tokenFile = reporting ? env.BOUNCE_REPORT_TOKEN_FILE : env.BOUNCE_BUS_TOKEN_FILE;
+  if (!busPath || !tokenFile) return {stdout: `bounce: ${reporting ? 'BOUNCE_REPORT_BUS and BOUNCE_REPORT_TOKEN_FILE' : 'BOUNCE_BUS and BOUNCE_BUS_TOKEN_FILE'} must be set\n`, exitCode: 2};
 
   let token;
   try { token = fs.readFileSync(tokenFile, 'utf8').trim(); }
@@ -31,16 +35,19 @@ export async function bridgeCommand(argv, env = process.env) {
   let values;
   try {
     ({values} = parseArgs({args: rest, allowPositionals: false, options: {
-      event: {type: 'string'}, match: {type: 'string'}, timeout: {type: 'string'},
+      event: {type: 'string'}, report: {type: 'string'}, match: {type: 'string'}, timeout: {type: 'string'},
       'after-seq': {type: 'string'}, json: {type: 'boolean'},
     }}));
   } catch (error) { return {stdout: `bounce: ${error.message}\n`, exitCode: 2}; }
 
-  let event, match, timeout, afterSeq = 0;
+  let event, report, match, timeout, afterSeq = 0;
   try {
     if (command === 'publish') {
       if (!values.event) throw new Error('publish requires --event');
       event = parseJsonArg(values.event, 'event');
+    } else if (command === 'report') {
+      if (!values.report) throw new Error('report requires --report');
+      report = parseJsonArg(values.report, 'report');
     } else if (command === 'wait') {
       if (!values.match) throw new Error('wait requires --match');
       match = parseJsonArg(values.match, 'match');
@@ -60,6 +67,10 @@ export async function bridgeCommand(argv, env = process.env) {
   try {
     if (command === 'publish') {
       const row = await client.publish(event);
+      return {stdout: formatRow(row, values.json) + '\n', exitCode: 0};
+    }
+    if (command === 'report') {
+      const row = await client.report(report);
       return {stdout: formatRow(row, values.json) + '\n', exitCode: 0};
     }
     const row = await client.wait({match, timeout, afterSeq});

@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
+import {createInterface} from 'node:readline';
 import {spawn as realSpawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {createClaudeLive, hookCommand, shellQuote} from '../../src/adapters/claude-live.js';
@@ -75,7 +76,34 @@ test('L2 deliver live: the message and its auth line reach the running turn over
   assert.equal(await waitFor(() => fs.existsSync(path.join(dir, 'messaging.json'))), true);
   assert.equal(await adapter.deliver(handle, {text: 'ping'}), 'live');
   assert.equal(await waitFor(() => fs.existsSync(received) && lines(received).length === 2), true);
-  assert.deepEqual(lines(received), ['{"type":"auth","token":"tok-l2"}', '{"text":"ping"}']);
+  assert.deepEqual(lines(received), ['{"type":"auth","token":"tok-l2"}', '{"type":"user","message":{"role":"user","content":"ping"}}']);
+  assert.equal(fs.existsSync(path.join(dir, 'pending.jsonl')), false);
+});
+
+test("L2b deliver live: only Claude's authenticated user-envelope acknowledgement counts as an active-turn delivery", async t => {
+  const dir = tmp(t), sock = path.join(dir, 's'), received = [];
+  const server = net.createServer(socket => {
+    let authenticated = false;
+    createInterface({input: socket}).on('line', line => {
+      const frame = JSON.parse(line);
+      received.push(frame);
+      if (frame.type === 'auth' && frame.token === 'protocol-test-token') authenticated = true;
+    });
+    socket.on('end', () => {
+      const message = received[1];
+      if (authenticated && message?.type === 'user' && message.message?.role === 'user' && message.message?.content === 'ping') socket.end();
+    });
+  });
+  await new Promise(resolve => server.listen(sock, resolve));
+  t.after(() => server.close());
+  fs.writeFileSync(path.join(dir, 'messaging.json'), JSON.stringify({socket: `uds:${sock}`, token: 'protocol-test-token'}));
+  const adapter = createClaudeLive({writeWait: 30});
+  const handle = {dir, sessionId: 'sess', live: {exited: () => false}};
+  assert.equal(await adapter.deliver(handle, {text: 'ping'}), 'live');
+  assert.deepEqual(received, [
+    {type: 'auth', token: 'protocol-test-token'},
+    {type: 'user', message: {role: 'user', content: 'ping'}},
+  ]);
   assert.equal(fs.existsSync(path.join(dir, 'pending.jsonl')), false);
 });
 
@@ -209,4 +237,12 @@ test('L10 events: 1.1 MB of stderr still completes, and a missing executable end
   const gone = await adapter.launch({peer: {}, profile: {mode: 'yolo', executables: {claude: path.join(dir, 'no-such-claude')}},
     orders: 'x', cwd: dir, dir});
   assert.deepEqual((await drain(adapter, gone)).map(e => ({kind: e.kind, code: e.code})), [{kind: 'error', code: 'missing'}]);
+});
+
+test('L11 a clean live-source EOF without a normalizer result fails the adapter protocol', async () => {
+  const adapter = createClaudeLive({});
+  const handle = {live: {events: (async function* () {})()}};
+  assert.deepEqual(await drain(adapter, handle), [{
+    kind: 'result', status: 'failed', text: 'protocol error: claude stream ended without result',
+  }]);
 });

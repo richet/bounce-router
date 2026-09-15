@@ -9,6 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {supervise} from '../src/reload.js';
+import {Session} from '../src/core.js';
 
 const fakeCli = fileURLToPath(new URL('./helpers/fake-cli.js', import.meta.url));
 const fakeOrchestratorCli = fileURLToPath(new URL('./helpers/fake-orchestrator-cli.js', import.meta.url));
@@ -128,4 +129,73 @@ test('P9.3 steering: a control.cancel of one task id cancels just that task', as
   }));
   const cancelled = sessionRef.events.find(e => e.kind === 'task.cancelled');
   assert.equal(cancelled?.task, taskId, 'the named task was cancelled');
+});
+
+test('P9.7 --resume by name reconciles the resumed log (orphaned running task) before the TUI child starts', async t => {
+  const root = tmpRoot('bounce-resume-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  writeOrchestratorConfig(root, {profiles: {main: {adapter: 'codex'}, build: {adapter: 'codex'}}});
+  const cwd = process.cwd();
+  const stale = new Session(cwd, {root});
+  stale.append({kind: 'user', text: 'old work'});
+  stale.append({kind: 'session.renamed', name: 'old work'});
+  stale.append({kind: 'task.submitted', task: 'gone', parent: null, profile: 'build', orders: 'x', deadline: null, context: stale.id});
+  stale.append({kind: 'task.started', task: 'gone', attempt: 1});
+  const {EventEmitter} = await import('node:events');
+  let sessionRef;
+  const spawnChild = () => {
+    const child = new EventEmitter();
+    child.kill = () => {}; child.send = () => {};
+    setTimeout(() => child.emit('close', 0, null), 100);
+    return child;
+  };
+  await withEnv({BOUNCE_HOME: root}, () => supervise(['--resume', 'old work'], {spawnChild, adapters: {codex: completingAdapter()}, onReady: async ({session}) => { sessionRef = session; }}));
+  assert.equal(sessionRef.id, stale.id, 'the name resolved to the stale session');
+  const orphan = sessionRef.events.find(e => e.kind === 'task.blocked' && e.task === 'gone');
+  assert.equal(orphan?.reason, 'orphaned');
+  assert.equal(orphan?.text, 'termination unverified after daemon restart; inspect the previous worker process before resubmitting');
+});
+
+test('P9.8 a switch message from the TUI child ends this daemon and supervise() starts one for the chosen session', async t => {
+  const root = tmpRoot('bounce-switch-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  writeOrchestratorConfig(root, {profiles: {main: {adapter: 'codex'}, build: {adapter: 'codex'}}});
+  const {EventEmitter} = await import('node:events');
+  const seen = [];
+  let spawns = 0;
+  const spawnChild = () => {
+    const child = new EventEmitter();
+    child.kill = () => {}; child.send = () => {};
+    const n = ++spawns;
+    if (n === 1) { setTimeout(() => child.emit('message', {type: 'switch', id: 'new'}), 40); setTimeout(() => child.emit('close', 76, null), 80); }
+    else setTimeout(() => child.emit('close', 0, null), 40);
+    return child;
+  };
+  await withEnv({BOUNCE_HOME: root}, () => supervise([], {spawnChild, adapters: {codex: completingAdapter()}, onReady: async ({session}) => { seen.push(session.id); }}));
+  assert.equal(spawns, 2);
+  assert.equal(seen.length, 2);
+  assert.notEqual(seen[0], seen[1], 'the second daemon runs a new session');
+  assert.deepEqual(fs.readdirSync(path.join(root, 'sessions')).sort(), [...seen].sort());
+  for (const id of seen) assert.equal(fs.existsSync(path.join(root, 'sessions', id, 'daemon.json')), false, 'both daemons finished cleanly');
+});
+
+test('P9.9 plain commands under an orchestrator config never build the apparatus: no session, socket or grant is created', async t => {
+  const root = tmpRoot('bounce-plain-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  writeOrchestratorConfig(root, {profiles: {main: {adapter: 'codex'}, build: {adapter: 'codex'}}});
+  const {EventEmitter} = await import('node:events');
+  let daemonChildren = 0, legacyChildren = 0;
+  const spawnChild = (exe, args, opts) => {
+    if (opts?.env?.BOUNCE_REMOTE_SESSION === '1') daemonChildren++; else legacyChildren++;
+    const child = new EventEmitter();
+    child.kill = () => {}; child.send = () => {};
+    setTimeout(() => child.emit('close', 0, null), 20);
+    return child;
+  };
+  for (const args of [['sessions'], ['sessions', '--json'], ['--help'], ['-v'], ['rename', 'x', 'y'], ['models'], ['skills', 'list'], ['--cwd', root, 'quota']]) {
+    await withEnv({BOUNCE_HOME: root, BOUNCE_REMOTE_SESSION: '1'}, () => supervise(args, {spawnChild, adapters: {codex: completingAdapter()}}));
+  }
+  assert.equal(daemonChildren, 0, 'no plain command reached daemonSupervise');
+  assert.equal(legacyChildren, 8);
+  assert.equal(fs.existsSync(path.join(root, 'sessions')), false, 'no session directory was created');
 });

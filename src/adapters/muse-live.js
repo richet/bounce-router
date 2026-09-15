@@ -39,7 +39,7 @@ export function createMuseLive({spawn = nodeSpawn, kill = process.kill} = {}) {
   const start = ({promptFile, profile = {}, cwd, dir, native}) => new Promise((resolve, reject) => {
     const executable = resolveExecutable('muse', profile.executables?.muse);
     const args = invocation('muse', {model: profile.model, mode: profile.mode}, promptFile);
-    const live = spawnLive({executable, args, cwd, env: vendorEnv(), stdin: muse.stdin(), spawn});
+    const live = spawnLive({executable, args, cwd, env: vendorEnv(process.env, {...profile.orchestratorEnv, ...profile.report}), stdin: muse.stdin(), spawn});
     // A spawn failure is the one outcome the caller cannot act on through the stream:
     // the scheduler maps `.code === 'missing'` to task.failed{reason:'missing'}.
     live.child.once('error', error => {

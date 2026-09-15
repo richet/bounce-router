@@ -1,40 +1,59 @@
 #!/usr/bin/env node
 import {login} from './login.js';
 import {resolveExecutable} from './executable.js';
-import {PassThrough} from 'node:stream';
-import {completions, typedCommand, frameDiff, createMouseInput, mouseTracking, createPasteInput, createKeyInput, inputLayout, windowAround, modelRows, checklistRows, suspendTerminal, resumeTerminal} from './terminal.js';
+import {createMainClient} from './main-client.js';
+import {createInkTerminal} from './tui/ink-terminal.js';
+import {workspaceColumns} from './tui/Workspace.js';
+import {backspace, clampCursor, deleteForward, deleteWordBackward, deleteWordForward, insertText, moveCursor, moveLineEnd, moveLineStart, moveVertical, moveWord} from './tui/editor.js';
+import {inputDisposition} from './commands.js';
+import {completions, typedCommand, inputLayout, windowAround, modelRows, checklistRows} from './terminal.js';
 import {modelCatalog, modelEntries, catalogNotes} from './models.js';
+import {discoverLocalModels} from './local-models.js';
+import {localModelEntries, selectWorkerModel} from './local-picker.js';
+import {previewLocalProfile} from './local-setup.js';
+import {runLocalSetup} from './local-wizard.js';
+import {createLocalSetupView} from './local-setup-view.js';
+import {activateLocalProfiles} from './local-activation.js';
+import {createInterface} from 'node:readline';
+import {inspectLocalToolchain, prepareLocalToolchain} from './local-toolchain.js';
 import stringWidth from 'string-width';
-import {clean, createFormatter, createTranscriptRenderer, createWorkSummary, workReview, activeModel, taskTree, foldedThread, workerThread, agentsBoard, boardLayout, parseCommand, continueMain} from './format.js';
-import {validateOrchestration} from './profiles.js';
-import {loadQuota, recordQuota, refreshQuota, quotaSnapshot, quotaShort, quotaPanel, quotaReport, quotaUnavailable} from './quota.js';
+import {clean, createFormatter, createWorkSummary, workReview, withAsides, continueMain} from './format.js';
+import {validateOrchestration, starterProfiles} from './profiles.js';
+import {loadQuota, recordQuota, refreshQuota, quotaSnapshot, quotaShort, quotaPanel, quotaReport, quotaUnavailable, usageOrder} from './quota.js';
 import {skillsCommand, syncSkills, inspectSkills, skillsChanged, importCandidates, importSelected, importSummary, syncSummary, skillAreas} from './skills.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import {spawn} from 'node:child_process';
-import {emitKeypressEvents} from 'node:readline';
+
 import {parseArgs} from 'node:util';
 import {Session, Router, config, saveJSON, dataRoot} from './core.js';
 import * as reducers from './reducers.js';
 import {providers, runProcess} from './providers.js';
 import {projectRoot, fingerprint, validate, supervise, pidAlive} from './reload.js';
+import {listSessions, resolveSessionRef, sessionsTable, sessionAge} from './sessions.js';
 import {createRemoteSession} from './remote.js';
 import {version, checkUpdate, globalInstall, installUpdate} from './update.js';
-import {BOUNCE_LOGO} from './logo.js';
 
 const help = `bounce — one terminal, your coding agents
 
   bounce [--cwd PATH] [--resume ID] [--provider NAME] [--model ID]
   bounce run "prompt" [--image PATH ...] [--cwd PATH] [--json] [--mode yolo|plan] [--detach]
-  bounce attach ID [--json]     Stream a running session's daemon as text
+  bounce attach ID [--json]     Reopen its interactive view; --json streams the journal
   bounce stop ID                Cancel a running session's task tree and exit its daemon
   bounce publish --event JSON|@FILE [--json]     One-process bridge: publish an event
+  bounce report --report JSON|@FILE [--json]    Worker: report progress or final outcome
   bounce wait --match JSON --timeout SECONDS [--after-seq N] [--json]     Bridge: wait for one
   bounce login claude|codex|muse
   bounce models [--json]
+  bounce local models [--json]     Discover local models without loading them
+  bounce local setup              Guided model recommendation and worker configuration
+  bounce local profile NAME JSON [--save]  Preview/add a local worker; writes require explicit scope
+  bounce local check [IMAGE]       Diagnose Docker/image/project setup (no build)
+  bounce local prepare [IMAGE] [--allow-network]  Explicitly cache Linux npm dependencies
   bounce quota [--json]
   bounce skills [list|sync|new NAME|add PATH|remove NAME|import [NAME] [--list]|clear|reset] [--scope user|project]
-  bounce sessions               Marks sessions with a live daemon: ● live PID
+  bounce sessions [--json]      List sessions: name, age, mode, id, workspace (● = live)
+  bounce rename SESSION NAME    Name a session (SESSION = name, id or id prefix; --resume takes the same)
   bounce task compare SESSION A B   Built-in A/B: compare two tasks (tokens, wall, rounds) from the log
   bounce doctor
   bounce update [--check]  Check for or install the latest npm release
@@ -45,18 +64,26 @@ TUI commands:
   /model                Pick from every model your signed-in agents report
   /model ID             Set selected agent's model; "default" resets
   /model refresh        Re-ask each agent for its catalog, then pick
+  /model worker PROFILE [auto|endpoint/model|refresh] [--save]  Select a local worker, not the main agent
+  /model worker PROFILE prefer|exclude REF,REF [--save]  Edit local model preferences
+  /local setup [loaded]  Guided local worker setup here; loaded limits choices to loaded models
+  /local cancel          Cancel setup without interrupting agents
+  /details [on|off]      Expand or fold tool output and worker dispatch details
+  /local activate [NAME] Activate saved local workers in this session without restarting
   /order claude,codex,muse  Save the fallback order
   /mode yolo|plan       YOLO default; plan uses restrictive provider flags
   /operation [NAME]     Switch/pick classic|orchestrator — no arg opens a menu, Ctrl+O toggles
   /stop [TASK]          Orchestrator: cancel one task, or every running task with no arg
   /msg TASK TEXT        Orchestrator: send a message to a running worker
-  /zoom                 Orchestrator: every agent's live activity in the central area; toggle, Esc closes
-  /zoom TASK            Orchestrator: one worker full-screen; typing messages it; /zoom or Esc returns
-  /attach [TASK]        Orchestrator: show one worker's folded thread in the transcript; no arg returns
-  /tasks                Toggle the task tree in the sidebar
+  /agents [TASK]        Interactive split panes for the orchestrator and every worker; optionally focus one
+  /tasks                Show task states and retained outcomes
   /login NAME           Open the vendor's native login flow
   /new                  Start a new session in this workspace
+  /rename NAME          Name this session
+  /resume [SESSION]     Resume another session here; no arg opens a picker
+  /sessions             List this workspace's sessions
   /note TEXT            Save a durable handoff note
+  /btw TEXT             Steer the focused agent live; when idle, save an aside for its next turn
   /skills               List bounce skills and where each agent has them
   /skills sync          Install them into every agent's skills directory
   /skills new NAME      Scaffold a SKILL.md under ~/.bounce/skills
@@ -71,11 +98,12 @@ TUI commands:
   /update [check]       Install the latest npm release, or only check
   /restart              Test and reload updated code, keeping this session
   /help                 Show commands
-  /quit                 Exit (Esc cancels an active turn)
+  /detach               Close this view; orchestrator and workers keep running
+  /quit                 Stop this session and exit (Esc cancels an active turn)
 
 Drop PNG/JPEG/GIF/WebP files into your prompt, then press Enter to send.
 
-Keys: / command picker · Tab complete (or next agent) · F2 pause for copying
+Keys: / command picker · Tab complete (or next agent pane) · F2 pause for copying
       Enter send · Shift+Enter newline (Alt+Enter and Ctrl+J too)
       PgUp/PgDn scroll · F3 toggle mouse scrolling · ↑/↓ prompt history
       Ctrl+C cancel turn / exit when idle · Ctrl+U clear input
@@ -87,45 +115,12 @@ YOLO disables provider approvals/sandboxing. Native CLI credentials stay with ve
 Model names are passed through to each CLI. Quota comes from the agents themselves:
 Codex answers on demand, Claude reports its windows while a turn runs, Muse reports none.
 `;
-// CONTRACT.md #5 bullet 3: `bounce sessions` rows gain `spend: {tokens, measured, tasks}` from
-// reducers.spend over the session log — null for a session with no task rows (classic rows).
-// reducers.spend is builder-1's (src/reducers.js); guarded so this module still loads and the
-// command still runs before it lands — a session with task rows then just reads spend: null.
-function sessionSpend(events) {
-  if (!events.some(e => e.kind === 'task.submitted')) return null;
-  const view = reducers.spend?.(events);
-  if (!view) return null;
-  const roots = Object.values(view.roots ?? {});
-  const tokens = roots.reduce((sum, r) => sum + (r.tokens || 0), 0);
-  const measured = roots.length > 0 && roots.every(r => r.measured);
-  const tasks = Object.keys(view.tasks ?? {}).length;
-  return {tokens, measured, tasks};
-}
-function listSessions(root) {
-  const dir = path.join(root, 'sessions');
-  if (!fs.existsSync(dir)) return [];
-  return fs.readdirSync(dir).flatMap(id => {
-    try {
-      const s = new Session(process.cwd(), {root, id});
-      let daemon = null;
-      try { daemon = JSON.parse(fs.readFileSync(path.join(dir, id, 'daemon.json'), 'utf8')); } catch {}
-      const live = !!(daemon && pidAlive(daemon.pid));
-      // Which operation mode a session ran under is a fold over its own log, so it survives
-      // the daemon that wrote it (daemon.json is removed on a clean exit).
-      const operation = s.events.findLast(e => e.kind === 'operation');
-      return [{id, cwd: s.cwd, updated: s.events.at(-1)?.time, live, pid: live ? daemon.pid : undefined,
-        operation: operation?.operation ?? 'classic', orchestrator: operation?.orchestrator ?? null,
-        prompt: s.events.find(e => e.kind === 'user')?.text?.slice(0, 80) ?? '(empty)',
-        spend: sessionSpend(s.events)}];
-    }
-    catch { return []; }
-  }).sort((a,b) => b.updated.localeCompare(a.updated));
-}
 async function main() {
   const {values, positionals} = parseArgs({allowPositionals: true, options: {
     image: {type: 'string', multiple: true}, cwd: {type: 'string'}, resume: {type: 'string'}, provider: {type: 'string'}, model: {type: 'string'},
     mode: {type: 'string'}, json: {type: 'boolean'}, help: {type: 'boolean', short: 'h'}, version: {type: 'boolean', short: 'v'},
     check: {type: 'boolean'}, scope: {type: 'string'}, force: {type: 'boolean'}, list: {type: 'boolean'}, all: {type: 'boolean'},
+    save: {type: 'boolean'}, 'allow-network': {type: 'boolean'},
   }});
   if (values.help) return console.log(help);
   if (values.version) return console.log(`bounce ${version}`);
@@ -139,6 +134,54 @@ async function main() {
   }
   if (values.mode && !restarted) { if (!['yolo', 'plan'].includes(values.mode)) throw new Error('Mode must be yolo or plan'); settings.mode = values.mode; }
   if (values.model && !restarted) settings.models[settings.order[0]] = values.model;
+  if (positionals[0] === 'local') {
+    if (positionals[1] === 'setup') {
+      if (values.json || values.save) throw new Error('Guided setup uses interactive confirmation; use local profile NAME JSON --save for manual automation');
+      const file = path.join(root, 'config.json');
+      const current = () => fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
+      const baseline = current();
+      const lines = createInterface({input: process.stdin, output: process.stdout, terminal: Boolean(process.stdin.isTTY && process.stdout.isTTY)});
+      const iterator = lines[Symbol.asyncIterator]();
+      try {
+        await runLocalSetup({settings, cwd,
+          ask: async question => {process.stdout.write(question); const answer = await iterator.next(); return answer.done ? null : answer.value;},
+          write: text => console.log(text),
+          save: next => {
+            if (current() !== baseline) throw new Error('Configuration changed during setup; nothing saved. Rerun setup to preserve those changes.');
+            validateOrchestration(next);
+            saveJSON(file, next);
+          }});
+      } finally { lines.close(); }
+      return;
+    }
+    if (positionals[1] === 'check' || positionals[1] === 'prepare') {
+      const options = {cwd, image: positionals[2] ?? 'node:22-alpine'};
+      const result = positionals[1] === 'check' ? await inspectLocalToolchain(options)
+        : await prepareLocalToolchain({...options, allowNetwork: values['allow-network'] === true, onActivity: event => {if (!values.json) console.error(event.text);}});
+      console.log(JSON.stringify(result, null, 2));
+      if (!values.json && result.profileImageID) console.log(`Use container.image=${result.profileImageID} in your local worker profile. No configuration was changed. npm lifecycle scripts were disabled.`);
+      return;
+    }
+    if (positionals[1] === 'models') {
+      const catalogs = await discoverLocalModels(settings.local, {maxAge: 0});
+      if (values.json) return console.log(JSON.stringify(catalogs, null, 2));
+      for (const catalog of catalogs) {
+        console.log(`${catalog.endpoint}: ${catalog.error ?? `${catalog.models.length} models`}${catalog.stale ? ' (stale)' : ''}`);
+        for (const model of catalog.models) console.log(`  ${model.ref} · ${model.ready === true ? 'loaded' : model.ready === false ? 'downloaded' : 'unknown readiness'} · tools: ${model.tools ?? 'unknown'} (${model.capabilitySource})`);
+      }
+      return;
+    }
+    if (positionals[1] === 'profile') {
+      const preview = previewLocalProfile({settings, name: positionals[2], options: JSON.parse(positionals[3] ?? '{}')});
+      console.log(JSON.stringify(preview.profile, null, 2));
+      if (values.save) {
+        saveJSON(path.join(root, 'config.json'), preview.settings);
+        console.log('Saved. Available in a newly started session; running sessions were not changed.');
+      } else console.log('Preview only. Add --save to persist. Docker images are not downloaded automatically.');
+      return;
+    }
+    throw new Error('Use bounce local setup, bounce local models or bounce local profile NAME JSON [--save]');
+  }
   if (positionals[0] === 'update') {
     if (values.check) {
       const release = await checkUpdate({root, force: true});
@@ -147,9 +190,23 @@ async function main() {
     return console.log(await installUpdate({root}));
   }
   if (positionals[0] === 'login') return login(positionals[1], settings, cwd);
-  if (positionals[0] === 'sessions') return console.log(JSON.stringify(listSessions(root), null, 2));
+  if (positionals[0] === 'sessions') {
+    const rows = listSessions(root);
+    return console.log(values.json ? JSON.stringify(rows, null, 2) : sessionsTable(rows).join('\n'));
+  }
+  if (positionals[0] === 'rename') {
+    const [, ref, ...words] = positionals;
+    const name = words.join(' ').trim();
+    if (!ref || !name) throw new Error('Use: bounce rename SESSION NAME');
+    const id = resolveSessionRef(root, ref);
+    if (listSessions(root).find(r => r.id === id)?.live) throw new Error('That session is running · use /rename inside it');
+    const target = new Session(process.cwd(), {root, id});
+    target.append({kind: 'session.renamed', name});
+    return console.log(`Renamed ${id.slice(0, 8)} to "${name}"`);
+  }
   if (positionals[0] === 'models') {
-    const catalogs = await modelCatalog(settings, {maxAge: 0});
+    const [cloud, local] = await Promise.all([modelCatalog(settings, {maxAge: 0}), discoverLocalModels(settings.local, {maxAge: 0})]);
+    const catalogs = [...cloud, ...local];
     if (values.json) return console.log(JSON.stringify(catalogs, null, 2));
     for (const catalog of catalogs) {
       console.log(`${catalog.provider}${catalog.account ? ` (${catalog.account})` : ''}: ${catalog.error ?? `${catalog.models.length} models`}`);
@@ -159,8 +216,9 @@ async function main() {
   }
   if (positionals[0] === 'quota') {
     const store = await refreshQuota(settings, {root, cwd});
+    const quotaOrder = usageOrder(settings.order, settings.operation === 'orchestrator' ? settings.profiles : {});
     if (values.json) return console.log(JSON.stringify(store, null, 2));
-    return console.log(quotaReport(store, settings.order));
+    return console.log(quotaReport(store, quotaOrder));
   }
   if (positionals[0] === 'skills') {
     const options = {root, scope: values.scope || settings.skills.scope, cwd, base: process.cwd()};
@@ -231,12 +289,18 @@ async function main() {
   }
   let session = process.env.BOUNCE_REMOTE_SESSION === '1'
     ? await createRemoteSession(process)
-    : new Session(cwd, {root, id: restarted?.id ?? values.resume});
+    : new Session(cwd, {root, id: restarted?.id ?? (values.resume ? resolveSessionRef(root, values.resume) : undefined)});
   session.lock();
   // The orchestrator's CLI is a peer, not a plain vendor process: keepBus is the single
   // documented exception to runProcess's env strip (src/providers.js).
-  const routerOptions = orchestrating ? {runner: options => runProcess({...options, keepBus: true})} : {};
-  let router = new Router(session, settings, routerOptions);
+  // The orchestrator delegates ONLY through the bridge: a vendor's own subagent tools would run
+  // workers bounce cannot see (observed: told to go on without codex, claude spawned its own
+  // Agent and the AGENTS pane stayed empty). Claude Code exposes --disallowedTools for exactly
+  // this; other vendors' subagent features have no such switch here yet, so ORDERS.md forbids them.
+  const noOwnSubagents = provider => provider === 'claude' ? ['--disallowedTools', 'Agent,Task'] : [];
+  const routerOptions = orchestrating ? {runner: options => runProcess({...options, keepBus: true}), extraArgs: noOwnSubagents} : {};
+  const remoteMain = orchestrating && positionals[0] !== 'run' && typeof session.runMain === 'function';
+  let router = remoteMain ? createMainClient(session, settings) : new Router(session, settings, routerOptions);
   const orchestratorBrief = orchestrating
     ? `You are the orchestrator peer of session ${session.id}; the bounce bridge is available via BOUNCE_BUS/BOUNCE_BUS_TOKEN_FILE; see ${path.join(session.dir, 'orchestrator', 'ORDERS.md')}.\n`
     : '';
@@ -265,21 +329,45 @@ async function main() {
     try { await session.flush?.(); } catch {}
     process.exit(process.exitCode ?? 0);
   }
-  let input = '', busy = false, suspended = false, scroll = 0, historyIndex = -1;
-  const pending = [];
-  // Phase 6 §A2: /tasks toggles the task-tree pane; /attach focuses one worker's live activity.
-  // Both are TUI-local — plain variables, never journaled (see CONTRACT.md A2/U6).
-  let showTasks = false, attachedTask = null, zoomTask = null, boardOpen = false;
-  // Live worker activity is never journaled (task.activity is a LIVE_KIND), so the pane that
-  // shows one worker keeps the last rows per task in memory; workerThread merges them by time.
-  const liveActivity = new Map();
-  const LIVE_ACTIVITY_MAX = 400;
-  function recordActivity(event) {
-    if (event?.kind !== 'task.activity' || !event.task || !event.text) return;
-    const rows = liveActivity.get(event.task) ?? [];
-    rows.push({time: event.time ?? new Date().toISOString(), text: event.text});
-    if (rows.length > LIVE_ACTIVITY_MAX) rows.splice(0, rows.length - LIVE_ACTIVITY_MAX);
-    liveActivity.set(event.task, rows);
+  let attachedTurn = remoteMain && ['running', 'starting', 'blocked'].includes(session.main?.state);
+  let input = '', inputCursor = 0, verticalColumn = null, busy = attachedTurn, suspended = false, scroll = 0, historyIndex = -1;
+  const pendingTurns = [];
+  const asides = [];
+  async function noteAside(text) {
+    if (!text) throw new Error('Use /btw <text>');
+    const task = agentsOpen ? selectedWorker() : null;
+    if (task) {
+      if (reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) throw new Error('This worker has finished');
+      session.append({kind: 'message', to: `worker:${task}`, text});
+      notice = `Delivery requested for worker ${task.slice(0, 8)}`;
+      return;
+    }
+    if (busy && remoteMain) {
+      notice = 'Sending to the active turn…'; render();
+      const result = await router.deliver(text);
+      notice = result.state === 'acknowledged' || result.tier === 'live'
+        ? 'Live delivery acknowledged by the provider'
+        : `Delivery ${result.state ?? result.tier ?? 'failed'}${result.reason ? ': ' + result.reason : ''}`;
+      return;
+    }
+    if (busy) throw new Error('Live steering requires an orchestrator session');
+    asides.push(text);
+    session.append({kind: 'aside', text});
+    notice = `Saved aside for the next orchestrator prompt · ${asides.length} pending`;
+  }
+  // The agent workspace is TUI-local: one focusable pane for the orchestrator and one per worker.
+  // Its selection is never journaled and never changes task/model lifecycle state.
+  let agentsOpen = false, selectedAgentPane = 'orchestrator';
+  let details = false;
+  const paneInputs = new Map();
+  let terminal;
+  function changePane(id) {
+    paneInputs.set(selectedAgentPane, {input, inputCursor, scroll});
+    selectedAgentPane = id;
+    const draft = paneInputs.get(id);
+    input = draft?.input ?? '';
+    inputCursor = clampCursor(input, draft?.inputCursor ?? input.length);
+    scroll = draft?.scroll ?? 0;
   }
   // The orchestration profile table this session was configured with, if any — read once here
   // so /continue can validate a profile name without touching the bus. A malformed config never
@@ -287,36 +375,83 @@ async function main() {
   let orchestration;
   try { orchestration = validateOrchestration(settings); }
   catch { orchestration = {operation: 'classic', orchestrator: null, profiles: {}, shape: 'none', strict: false}; }
+  // The usage panel covers every vendor the session can spend on: in orchestrator mode the
+  // workers' vendors too, not just the orchestrator's own (settings.order is narrowed to it).
+  const quotaOrder = () => usageOrder(settings.order, orchestration.operation === 'orchestrator' ? orchestration.profiles : {});
   let activityTimer, activityStarted = 0, progress = '';
   const activity = () => `${['◐', '◓', '◑', '◒'][Math.floor((Date.now() - activityStarted) / 150) % 4]} Working · ${Math.floor((Date.now() - activityStarted) / 1000)}s`;
   let loadedFingerprint = fingerprint();
-  let completionIndex = 0, menuDismissed = false, copyPaused = false, previousFrame = [], previousCursor = '';
+  let completionIndex = 0, menuDismissed = false, copyPaused = false;
   let mouseScroll = false;
   let picker = null;
+  let localSetup = null;
   const suggestions = () => menuDismissed ? [] : completions(input);
-  const acceptCompletion = () => {const options = suggestions(); if (options.length) {input = '/' + options[completionIndex % options.length][0] + ' '; completionIndex = 0; menuDismissed = false; return true;} return false;};
+  const acceptCompletion = () => {const options = suggestions(); if (options.length) {input = '/' + options[completionIndex % options.length][0] + ' '; inputCursor = input.length; completionIndex = 0; menuDismissed = false; return true;} return false;};
   let notice = [restarted?.updateNotice, skillNotice, 'Ready. Select text / open links with your terminal. F2 pause · F3 mouse scroll · /help'].filter(Boolean).join(' ');
   const history = session.events.filter(e => e.kind === 'user').map(e => e.text);
   const selected = () => session.active || settings.order[0];
-  const save = () => saveJSON(path.join(root, 'config.json'), settings);
-  const {style, clip, wrap, event: formatEvent} = createFormatter();
-  const transcriptRows = createTranscriptRenderer(formatEvent);
-  // Orchestrator sessions render a folded, compact thread (delegation + milestones, tool noise and
-  // child-worker transcript collapsed) instead of the raw firehose; classic keeps transcriptRows.
-  // Built only in orchestrator mode: a classic run must not pay the extra formatter's startup cost
-  // (a second Chalk/Marked/highlight setup), which under heavy parallel load slowed classic child
-  // startup enough to race the subprocess tests (O1/D1b).
-  // Rows of the orchestrator's own turn carry from:'main'; label them with its profile name so a
-  // line reads `main · claude · Tool …`, not just the vendor.
-  const roleOf = row => row.from === 'main' ? orchestration.orchestrator : null;
-  const foldedTranscript = orchestration.operation === 'orchestrator' ? createTranscriptRenderer(createFormatter({compact: true, role: roleOf}).event) : null;
-  // /zoom shows one worker in full detail with the classic formatter; its own renderer instance so
-  // the main transcript's incremental cache is not invalidated by switching views.
-  const zoomTranscript = orchestration.operation === 'orchestrator' ? createTranscriptRenderer(createFormatter({role: roleOf}).event) : null;
+  const workerOverrides = new Map();
+  const currentWorkerSettings = () => ({...settings, profiles: {...settings.profiles, ...Object.fromEntries(workerOverrides)}});
+  const setupDefaults = {};
+  const savedSettings = () => ({...settings, ...setupDefaults});
+  const save = () => saveJSON(path.join(root, 'config.json'), savedSettings());
+  function cancelLocalSetup() {
+    if (!localSetup) return;
+    const view = localSetup; localSetup = null; view.cancel();
+    input = ''; inputCursor = 0;
+    notice = 'Local setup cancelled · agents unchanged; an already approved image build may still finish';
+    render();
+  }
+  function openLocalSetup(loadedOnly) {
+    if (localSetup) throw new Error('Local setup is already open · answer below, Esc or /local cancel');
+    picker = null;
+    const file = path.join(root, 'config.json');
+    const current = () => fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
+    const baseline = current();
+    const initial = config(root);
+    const view = createLocalSetupView({settings: initial, cwd: session.cwd, loadedOnly, liveActivation: true,
+      onChange: render,
+      save: async next => {
+        if (current() !== baseline) throw new Error('Configuration changed during setup; nothing saved. Rerun /local setup.');
+        validateOrchestration(next);
+        saveJSON(file, next);
+        // Preserve these saved fields in later TUI saves without changing the live daemon team.
+        for (const key of ['profiles', 'local']) {
+          if (Object.hasOwn(next, key)) settings[key] = structuredClone(next[key]);
+        }
+        for (const key of ['operation', 'orchestrator', 'mode']) {
+          if (Object.hasOwn(next, key)) setupDefaults[key] = next[key];
+        }
+        const names = Object.keys(next.profiles).filter(name => next.profiles[name].adapter === 'local' && !Object.hasOwn(initial.profiles ?? {}, name));
+        if (names.length) await activateLocalProfiles(session, names);
+      }});
+    view.loadedOnly = loadedOnly;
+    localSetup = view;
+    void view.done.then(() => {
+      if (localSetup !== view) return;
+      localSetup = null; input = ''; inputCursor = 0;
+      notice = view.state.error ? `Local setup: ${view.state.error}` : view.state.result?.saved
+        ? 'Local setup saved · workers active in this session; existing agents unchanged'
+        : 'Local setup finished · no configuration saved';
+      session.append({kind: 'status', text: notice});
+      render();
+    });
+    render();
+  }
+  const {style} = createFormatter();
   const workSummary = createWorkSummary();
   // Picking a model also picks the agent that reported it.
   const applyModel = entry => {
-    session.active = entry.provider;
+    if (entry.profileName) {
+      if (entry.disabled) {notice = entry.description; return;}
+      const next = selectWorkerModel({settings: currentWorkerSettings(), profileName: entry.profileName, ref: entry.id});
+      if (entry.save) {settings.profiles[entry.profileName] = next.profiles[entry.profileName]; workerOverrides.delete(entry.profileName); save();}
+      else workerOverrides.set(entry.profileName, next.profiles[entry.profileName]);
+      session.append({kind: 'control.local_model', from: 'user', profile: entry.profileName, model: entry.id});
+      notice = `Worker ${entry.profileName}: ${entry.id} · ${entry.save ? 'saved' : 'this session only'}; active attempts unchanged`;
+      return;
+    }
+    router.select(entry.provider);
     settings.order = [entry.provider, ...settings.order.filter(p => p !== entry.provider)];
     settings.models[entry.provider] = entry.id;
     save();
@@ -332,12 +467,12 @@ async function main() {
     const previous = {operation: settings.operation, profiles: settings.profiles, orchestrator: settings.orchestrator};
     settings.operation = arg;
     if (arg === 'orchestrator' && !(settings.profiles && typeof settings.profiles === 'object' && Object.keys(settings.profiles).length)) {
-      const build = settings.order[1] ?? settings.order[0];
-      settings.profiles = {main: {adapter: settings.order[0]}, build: {adapter: build}};
+      settings.profiles = starterProfiles(settings);
       settings.orchestrator = 'main';
     }
     try { orchestration = validateOrchestration(settings); }
     catch (error) { Object.assign(settings, previous); notice = `Cannot switch to ${arg}: ${error.message}`; return; }
+    delete setupDefaults.operation; delete setupDefaults.orchestrator;
     save();
     session.append({kind: 'status', text: arg === 'orchestrator'
       ? `Operation: orchestrator · ${orchestration.orchestrator} · ${Object.entries(orchestration.profiles).map(([n, pr]) => `${n}(${pr.adapter})`).join(', ')} — saved; applies to the next \`bounce run\`.`
@@ -355,6 +490,32 @@ async function main() {
     if (!entries.length) throw new Error(notes.join(' · ') || 'No agent reported any models');
     picker = {entries, notes, index: Math.max(0, entries.findIndex(e => e.provider === selected() && e.current))};
     notice = 'Select a model. Esc cancels.';
+  }
+  async function openWorkerModelPicker(profileName, selection, persist = false) {
+    if (!profileName) throw new Error('Use /model worker PROFILE [auto|endpoint/model|refresh]');
+    const preference = /^(prefer|exclude)(?:\s+(.*))?$/.exec(selection ?? '');
+    if (preference) {
+      const next = structuredClone(currentWorkerSettings());
+      if (next.profiles?.[profileName]?.adapter !== 'local' || next.orchestrator === profileName) throw new Error('Choose a configured local worker profile');
+      const field = preference[1], refs = !preference[2] || preference[2] === 'clear' ? [] : preference[2].split(',').map(ref => ref.trim());
+      next.profiles[profileName][field] = refs;
+      validateOrchestration(next);
+      if (persist) {settings.profiles[profileName] = next.profiles[profileName]; workerOverrides.delete(profileName); save();}
+      else workerOverrides.set(profileName, next.profiles[profileName]);
+      session.append({kind: 'control.local_preferences', from: 'user', profile: profileName, field, refs});
+      notice = `Worker ${profileName} ${field}: ${refs.join(', ') || 'cleared'} · ${persist ? 'saved' : 'this session only'}; active attempts unchanged`;
+      return;
+    }
+    if (selection && selection !== 'refresh') {
+      applyModel({profileName, id: selection, save: persist});
+      return;
+    }
+    notice = `Discovering models for worker ${profileName}…`; render();
+    const catalogs = await discoverLocalModels(settings.local, {maxAge: selection === 'refresh' ? 0 : 30000});
+    const entries = localModelEntries({catalogs, settings: currentWorkerSettings(), profileName}).map(entry => ({...entry, save: persist}));
+    picker = {kind: 'worker-model', entries, index: Math.max(0, entries.findIndex(entry => entry.current)),
+      notes: catalogs.filter(catalog => catalog.error).map(catalog => `${catalog.endpoint}: ${catalog.error}`)};
+    notice = `Worker ${profileName} only · Enter ${persist ? 'saves pin' : 'pins for this session'} · Automatic follows preferences · Esc cancels`;
   }
   // Import is a choice, not a command: adopting an agent's whole skill set unasked is what
   // filled the store with skills the user never wanted. Offer the list and adopt the ticks.
@@ -389,45 +550,32 @@ async function main() {
     session.append({kind: 'skills', text: [importSummary(report), syncSummary(synced)].filter(Boolean).join('\n')});
     notice = `Imported ${selection.length} skill${selection.length === 1 ? '' : 's'}.`;
   }
-  // The zoom banner: who this worker is and how to leave. Thin map over one taskTree() row.
-  function zoomHeader(task, line) {
-    const row = taskTree(session.events).find(r => r.task === task);
-    const elapsed = row?.startedAt ? `${Math.floor((Date.now() - Date.parse(row.startedAt)) / 1000)}s` : null;
-    const who = row ? [row.profile, [row.adapter, row.model].filter(Boolean).join('/') || null, row.state, elapsed, row.lastMilestone, row.blocker].filter(Boolean).join(' · ') : task;
-    return [
-      style.title(clean(`ZOOM · ${task.slice(0, 8)} · ${who}`)),
-      style.muted('Type to message this worker · /zoom or Esc returns · /stop ' + task.slice(0, 8) + ' cancels it'),
-      style.muted(line),
-    ];
-  }
-  // The agents board (/zoom with no task): every worker in the central area, one header line
-  // each plus its last live activity lines, height shared by boardLayout. Thin map over
-  // agentsBoard(); nothing here derives state.
-  function boardRows(width, height) {
-    const board = agentsBoard(session.events, liveActivity);
-    if (!board.length) return [style.muted('No agents running yet · type to give the orchestrator a task · /zoom or Esc returns')];
-    const {shown, lines, more} = boardLayout(board.map(a => a.lines.length), height);
-    const out = [];
-    for (let i = 0; i < shown; i++) {
-      const a = board[i];
-      const elapsed = a.startedAt ? `${Math.floor((Date.now() - Date.parse(a.startedAt)) / 1000)}s` : null;
-      const am = [a.adapter, a.model].filter(Boolean).join('/');
-      const bits = [am || null, a.state, elapsed, a.lastMilestone, a.blocker, a.outcome, a.tier ? `tier ${a.tier}` : null].filter(Boolean).join(' · ');
-      out.push(clip(style.title(clean(`${'  '.repeat(a.depth)}${a.task === attachedTask ? '➤ ' : ''}${a.profile} (${a.task.slice(0, 8)})`)) + '  ' + style.status(clean(bits)), width));
-      for (const text of a.lines.slice(a.lines.length - lines[i])) out.push(clip('  ' + style.muted(clean(text)), width));
-    }
-    if (more) out.push(style.muted(`+ ${more} more agent${more === 1 ? '' : 's'} · /zoom <task> to open one`));
-    return out;
-  }
+  const paneIds = () => terminal?.paneIds() ?? ['orchestrator'];
+  const selectedWorker = () => terminal?.snapshot().panes.find(pane => pane.id === selectedAgentPane)?.task ?? null;
+  const inputTarget = () => {
+    const task = selectedWorker();
+    if (!task) return 'main';
+    const pane = terminal?.snapshot().panes.find(row => row.task === task);
+    return `${pane?.profile ?? 'worker'} ${task.slice(0, 8)}`;
+  };
   function render() {
-    if (suspended || copyPaused) return;
-    const totalWidth = Math.max(4, (process.stdout.columns || 80) - 2);
-    const sidebarWidth = !zoomTask && totalWidth >= 100 && (process.stdout.rows || 24) >= 22 ? 30 : 0;
-    const width = totalWidth - (sidebarWidth ? sidebarWidth + 3 : 0);
+    if (suspended || !terminal) return;
+    if (agentsOpen && !paneIds().includes(selectedAgentPane)) {
+      const previous = selectedAgentPane;
+      const unsent = input;
+      changePane('orchestrator');
+      paneInputs.delete(previous);
+      if (unsent) {
+        notice = `Worker finished · unsent draft saved in transcript (${previous.slice(7, 15)})`;
+        session.append({kind: 'note', text: `Unsent draft for ${previous}:\n${unsent}`});
+      }
+    }
+    const {content: width} = workspaceColumns(process.stdout.columns || 80);
     const terminalRows = process.stdout.rows || 24;
-    // Sidebar branding leaves the conversation pane free of header rows.
-    const headerRows = sidebarWidth ? 0 : 5;
-    const draft = inputLayout(input, width - 2, Math.max(1, Math.min(Math.floor(terminalRows / 3), terminalRows - headerRows - 5)));
+    const headerRows = 1;
+    const target = localSetup ? 'setup › ' : agentsOpen ? `${inputTarget()} › ` : '';
+    const promptWidth = Math.max(1, width - 2 - stringWidth(target));
+    const draft = inputLayout(input, promptWidth, Math.max(1, Math.min(Math.floor(terminalRows / 3), terminalRows - headerRows - 5)));
     const options = suggestions();
     const menuBudget = Math.max(0, terminalRows - headerRows - 5 - draft.rows.length);
     const plain = s => s;
@@ -439,6 +587,11 @@ async function main() {
       for (let i = start; i < end; i++) menu.push([rows[i], i === picker.index ? style.selected : picker.chosen.has(i) ? style.result : plain]);
       for (const note of picker.notes) menu.push([note, style.diagnostic]);
       menu.push(['↑/↓ move · Space tick · a all · n none · Enter import · Esc cancel', style.muted]);
+    } else if (picker?.kind === 'session') {
+      const {start, end} = windowAround(picker.entries.length, picker.index, Math.max(1, menuBudget - 2));
+      menu.push([`Resume a session in this workspace · ${picker.entries.length} found`, style.title]);
+      for (let i = start; i < end; i++) menu.push([`${i === picker.index ? '\u203a' : ' '} ${picker.entries[i].label}`, i === picker.index ? style.selected : plain]);
+      menu.push(['\u2191/\u2193 choose \u00b7 Enter resume \u00b7 Esc cancel', style.muted]);
     } else if (picker?.kind === 'operation') {
       menu.push(['Operation mode', style.title]);
       picker.entries.forEach((name, i) => menu.push([`${i === picker.index ? '\u203a' : ' '} ${name}${name === orchestration.operation ? '  (current)' : ''}`, i === picker.index ? style.selected : plain]));
@@ -455,124 +608,77 @@ async function main() {
       const start = Math.max(0, completionIndex - 3);
       for (let i = start; i < Math.min(options.length, start + 5); i++) menu.push([`${i === completionIndex ? '›' : ' '} /${options[i][0]}  ${options[i][1]}`, i === completionIndex ? style.selected : style.muted]);
       menu.push(['↑/↓ choose · Tab completes · Enter runs · Esc dismiss', style.muted]);
+    } else if (localSetup) {
+      const state = localSetup.state;
+      const question = inputLayout(state.question || 'Working… slash commands remain available', width, 3).rows;
+      const history = state.lines.flatMap(line => inputLayout(line, width, 100).rows);
+      const available = Math.max(0, Math.min(10, menuBudget - question.length - 2));
+      menu.push([`Local setup · ${localSetup.loadedOnly ? 'currently loaded models' : 'auto-discovery'}`, style.title]);
+      localSetup.scroll = Math.min(localSetup.scroll ?? 0, Math.max(0, history.length - available));
+      const end = history.length - localSetup.scroll;
+      for (const line of available ? history.slice(Math.max(0, end - available), end) : []) menu.push([line, style.muted]);
+      for (const line of question) menu.push([line, style.result]);
+      menu.push(['Enter answers · PgUp/Dn review · slash commands work · Esc cancels setup only', style.muted]);
     }
     menu.length = Math.min(menu.length, menuBudget);
-    const bodyHeight = Math.max(1, terminalRows - headerRows - 4 - draft.rows.length - menu.length);
-    // Orchestrator views: zoom = one worker, full detail, full width; attach = one worker folded
-    // in place of the main thread; otherwise the folded main thread. Classic is unchanged.
-    const rows = orchestration.operation !== 'orchestrator' ? transcriptRows(session.events, width)
-      : zoomTask ? zoomTranscript(workerThread(session.events, zoomTask, liveActivity.get(zoomTask) ?? []), width)
-      : boardOpen ? boardRows(width, bodyHeight)
-      : attachedTask ? foldedTranscript(workerThread(session.events, attachedTask, liveActivity.get(attachedTask) ?? []), width)
-      : foldedTranscript(foldedThread(session.events, session.context), width);
-    scroll = Math.min(scroll, Math.max(0, rows.length - bodyHeight));
-    const end = rows.length - scroll;
-    const body = rows.slice(Math.max(0, end - bodyHeight), end);
-    while (body.length < bodyHeight) body.push('');
-    const line = '─'.repeat(width);
-    const header = zoomTask ? zoomHeader(zoomTask, line) : sidebarWidth ? [] : [
-      style.title(BOUNCE_LOGO),
-      style.status(clean(`${selected()} · Model: ${activeModel(session.events, selected(), settings.models[selected()])} · ${settings.mode.toUpperCase()}${settings.mode === 'yolo' ? ' (approvals + sandbox bypassed)' : ''} · ${busy ? `RUNNING${pending.length ? ` · ${pending.length} QUEUED` : ''}` : 'READY'}`)),
-      style.muted(clean(`${session.cwd} · session ${session.id.slice(0, 8)}`)),
-      style.muted(clean(settings.order.map(p => `${p}${router.cooldowns[p] > Date.now() ? ' [cooldown]' : ''}${quotaShort(quotas[p]) ? ` (${quotaShort(quotas[p])})` : ''}`).join(' → '))),
-      style.muted(line),
-    ];
-    const nextFrame = [
-      ...header.map(s => clip(s, width)),
-      ...body, ...menu.map(([text, paint]) => clip(paint(clean(text)), width)),
-      style.muted(line),
-      ...draft.rows.map((row, i) => style.prompt(i === 0 ? '❯ ' : '  ') + row),
-      style.muted(line), clip(style.status(clean(busy && activityTimer ? [activity(), progress, notice].filter(Boolean).join(' · ') : notice)), width),
-    ];
-    if (sidebarWidth) {
-      const singleLine = value => clean(value).replace(/\s+/g, ' ').trim();
-      const top = [
-        style.title(BOUNCE_LOGO),
-        style.status(singleLine(`${selected()} · ${settings.mode.toUpperCase()}`)),
-        singleLine(`Model: ${activeModel(session.events, selected(), settings.models[selected()])}`),
-        style.status(`Operation: ${orchestration.operation}${orchestration.orchestrator ? ` · ${orchestration.orchestrator}` : ''}`),
-        style.status(busy ? `RUNNING${pending.length ? ` · ${pending.length} QUEUED` : ''}` : 'READY'),
-        ...(settings.mode === 'yolo' ? [style.muted('Approvals + sandbox bypassed')] : []),
-        style.muted(singleLine(session.cwd)),
-        style.muted(`Session ${session.id.slice(0, 8)}`),
-        style.muted('─'.repeat(sidebarWidth)),
-      ];
-      // The provider headings say what the block is, so it needs no title of its own.
-      // Usage takes the rows left after the recap keeps its rule, its title and three entries;
-      // the panel itself gives up its bars, then its per-window lines, when that is too few.
-      const usage = quotaPanel(quotas, settings.order, {width: sidebarWidth, now: Date.now(),
-        rows: Math.max(2, nextFrame.length - top.length - 5), cooldowns: router.cooldowns,
-        paint: {title: style.title, text: plain, muted: style.muted, ok: style.result,
-          warn: style.status, high: style.error, tick: style.note}});
-      const tasksPane = orchestration.operation === 'orchestrator' || showTasks;
-      const side = [...top, ...usage, style.muted('─'.repeat(sidebarWidth)), style.title(tasksPane ? 'AGENTS' : 'WORK DONE')];
-      const available = Math.max(0, nextFrame.length - side.length);
-      // §A2: /tasks toggles this pane in place of WORK DONE. Thin map: each taskTree() row
-      // becomes exactly one formatted line; no state-deriving logic lives here.
-      if (tasksPane) {
-        const rows = taskTree(session.events);
-        if (!rows.length && available) side.push(style.muted(orchestration.operation === 'orchestrator' ? 'No agents running yet' : 'No tasks yet'));
-        for (const row of rows.slice(0, available)) {
-          const elapsed = row.startedAt ? `${Math.floor((Date.now() - Date.parse(row.startedAt)) / 1000)}s` : null;
-          const am = [row.adapter, row.model].filter(Boolean).join('/');
-          const bits = [am || null, row.state, elapsed, row.lastMilestone, row.deadline != null ? `deadline ${row.deadline}` : null,
-            row.remainingStarts != null ? `${row.remainingStarts} starts left` : null,
-            row.remainingRounds != null ? `${row.remainingRounds} rounds left` : null,
-            row.blocker, row.outcome, row.tier ? `tier ${row.tier}` : null].filter(Boolean).join(' · ');
-          const marker = row.task === attachedTask ? '➤ ' : '  ';
-          side.push(clip(marker + singleLine(`${'  '.repeat(row.depth)}${row.profile} (${row.task.slice(0, 8)}) ${bits}`), sidebarWidth - 1));
-        }
-      } else {
-        const work = workSummary(session.events);
-        if (!work.length && available) side.push(style.muted('No completed turns yet'));
-        else if (available) {
-          let remaining = available, shown = 0;
-          for (const item of [...work].reverse()) {
-            // Reserve a row for the count of older entries that will not fit.
-            const budget = remaining - (shown + 1 < work.length ? 1 : 0);
-            if (budget <= 0) break;
-            const lines = wrap(singleLine(item), sidebarWidth - 2);
-            const count = Math.min(3, budget, lines.length);
-            for (let i = 0; i < count; i++) {
-              const text = i === count - 1 && count < lines.length
-                ? clip(lines[i], sidebarWidth - 3) + '…' : lines[i];
-              side.push((i === 0 ? '• ' : '  ') + text);
-            }
-            remaining -= count;
-            shown++;
-          }
-          if (shown < work.length) side.push(style.muted(`+ ${work.length - shown} earlier`));
-        }
-      }
-      for (let i = 0; i < nextFrame.length; i++) {
-        const left = clip(nextFrame[i], width);
-        nextFrame[i] = left + ' '.repeat(Math.max(0, width - stringWidth(left)))
-          + style.muted(' │ ') + (stringWidth(side[i] || '') > sidebarWidth
-            ? clip(side[i], sidebarWidth - 1) + '…' : side[i] || '');
-      }
-    }
-    const update = frameDiff(previousFrame, nextFrame);
-    const cursor = `\x1b[${header.length + body.length + menu.length + 2 + draft.cursorRow};${3 + draft.cursorColumn}H\x1b[1 q\x1b[?25h`;
-    if (update || cursor !== previousCursor) process.stdout.write((update ? '\x1b[?25l' + update : '') + cursor);
-    previousCursor = cursor;
-    previousFrame = nextFrame;
+    terminal.update({
+      agentsOpen, details, selectedId: selectedAgentPane, input, inputCursor: clampCursor(input, inputCursor), inputTarget: localSetup ? 'setup' : inputTarget(), scroll, busy, progress,
+      paneScrolls: {...Object.fromEntries([...paneInputs].map(([id, value]) => [id, value.scroll])), [selectedAgentPane]: scroll},
+      main: {...session.main, text: progress || notice, operation: orchestration.operation},
+      notice: localSetup?.state.question || notice, paused: copyPaused, mouseScroll,
+      menu: menu.map(([text, paint]) => paint(clean(text))),
+      metadata: {
+        provider: selected(), model: settings.models[selected()] || '', mode: settings.mode,
+        cwd: session.cwd, sessionId: session.id, operation: orchestration.operation,
+        orchestrator: orchestration.orchestrator ?? 'main', pendingTurns: pendingTurns.length,
+        quotaLines: quotaPanel(quotas, quotaOrder(), {
+          width: 28, now: Date.now(), rows: 12, cooldowns: router.cooldowns,
+          paint: {title: style.title, text: plain, muted: style.muted, ok: style.result,
+            warn: style.status, high: style.error, tick: style.note},
+        }),
+      },
+    });
   }
   let renderTimer;
   function scheduleRender(event) {
+    if (attachedTurn && ['main.terminal', 'main.blocked'].includes(event?.kind)) {
+      attachedTurn = false;
+      busy = false;
+      notice = event.text || `Turn ${event.status ?? 'blocked'}.`;
+    }
     if (event?.kind === 'progress') progress = clean(event.text);
-    recordActivity(event);
+    terminal?.ingest(event);
+    if (event?.kind === 'task.delivered') notice = `Worker ${event.task.slice(0, 8)} · delivery ${event.tier}`;
     // Vendor streams repeat quota many times per turn; only a changed reading redraws.
     if (event?.kind === 'raw' && !recordQuota(quotas, root, quotaSnapshot(event.provider, event.raw))) return;
     if (renderTimer) return;
     renderTimer = setTimeout(() => {renderTimer = null; render();}, 40);
   }
-  const enter = () => { suspended = false; previousFrame = []; previousCursor = ''; resumeTerminal(process.stdin, process.stdout, {mouse: mouseScroll && !copyPaused}); render(); };
-  const leave = () => { suspended = true; suspendTerminal(process.stdin, process.stdout); };
+  const enter = () => { suspended = false; terminal?.resume(); render(); };
+  const leave = () => { suspended = true; terminal?.suspend(); };
+  // /resume and /new: hand the terminal to another session. Under the daemon this is a switch
+  // message (the daemon is bound to one session and supervise() starts the next); classic
+  // restarts the child into the chosen id through the existing restart channel.
+  async function switchSession(id) {
+    if (!process.send) throw new Error('Resuming needs the bounce supervisor');
+    if (process.env.BOUNCE_REMOTE_SESSION === '1') {
+      const open = Object.values(reducers.tasks(session.events)).filter(t => !reducers.TERMINAL.has(t.state));
+      if (open.length) throw new Error(`${open.length} worker${open.length === 1 ? ' is' : 's are'} still running · /stop first`);
+      await new Promise((resolve, reject) => process.send({type: 'switch', id: id ?? 'new'}, error => error ? reject(error) : resolve()));
+      leave(); session.unlock();
+      try { await session.flush?.(); } catch {}
+      process.exit(76);
+    }
+    const state = {id: id ?? undefined, settings: savedSettings(), provider: selected(), dev};
+    await new Promise((resolve, reject) => process.send({type: 'restart', state}, error => error ? reject(error) : resolve()));
+    leave(); session.unlock();
+    process.exit(75);
+  }
   async function restart() {
     notice = 'Validating updated code…'; render();
     await validate(projectRoot, text => session.append({kind: 'status', text}));
     session.append({kind: 'status', text: 'Validation passed. Restarting into updated code.'});
-    const state = {id: session.id, settings, provider: selected(), dev};
+    const state = {id: session.id, settings: savedSettings(), provider: selected(), dev};
     await new Promise((resolve, reject) => process.send({type: 'restart', state}, error => error ? reject(error) : resolve()));
     leave(); session.unlock();
     try { await session.flush?.(); } catch {}
@@ -585,21 +691,57 @@ async function main() {
       return;
     }
     await globalInstall();
-    const state = {id: session.id, settings, provider: selected(), dev};
+    const state = {id: session.id, settings: savedSettings(), provider: selected(), dev};
     await new Promise((resolve, reject) => process.send({type: 'restart', state, update: true}, error => error ? reject(error) : resolve()));
     leave(); session.unlock();
     try { await session.flush?.(); } catch {}
     process.exit(75);
   }
-  const quit = () => { leave(); session.unlock(); void (async () => { try { await session.flush?.(); } catch {} process.exit(0); })(); };
-  async function submit(text) {
-    activityStarted = Date.now(); progress = '';
-    activityTimer = setInterval(render, 150);
+  const quit = (detach = false) => { leave(); session.unlock(); void (async () => {
+    try { await session.flush?.(); } catch {}
+    if (!detach && process.env.BOUNCE_PERSISTENT_VIEW === '1') {
+      await new Promise(resolve => process.send({type: 'control', action: 'quit'}, resolve));
+    }
+    process.exit(detach ? 80 : 0);
+  })(); };
+  async function submit(text, {parsedCommand, ownsTurn = true} = {}) {
+    if (ownsTurn) {
+      activityStarted = Date.now(); progress = '';
+      activityTimer = setInterval(render, 150);
+    }
     try {
-      const parsedCommand = parseCommand(text);
       if (parsedCommand) {
         const {command, parts, arg} = parsedCommand;
+        if (command === 'details') {
+          if (!['', 'on', 'off'].includes(arg)) throw new Error('Use /details [on|off]');
+          details = arg ? arg === 'on' : !details;
+          scroll = 0;
+          notice = details ? 'Details expanded · /details to fold · PgUp/PgDn scroll' : 'Details folded · /details to expand';
+          render();
+          return;
+        }
+        if (command === 'local') {
+          if (arg === 'cancel') {cancelLocalSetup(); return;}
+          if (arg === 'activate' || arg.startsWith('activate ')) {
+            const saved = config(root);
+            const requested = arg.slice('activate'.length).trim();
+            const names = requested ? [requested] : Object.keys(saved.profiles ?? {}).filter(name => saved.profiles[name].adapter === 'local');
+            if (!names.length) throw new Error('No saved local workers; use /local setup');
+            const result = await activateLocalProfiles(session, names);
+            settings.profiles = structuredClone(saved.profiles);
+            notice = result.text;
+            render();
+            return;
+          }
+          if (!['', 'setup', 'setup loaded', 'setup --loaded', 'loaded'].includes(arg)) throw new Error('Use /local setup [loaded], /local activate [NAME], or /local cancel');
+          openLocalSetup(arg.includes('loaded')); return;
+        }
+        if (localSetup && ['new', 'resume', 'restart', 'update', 'login', 'quit', 'detach'].includes(command)) cancelLocalSetup();
         if (command === 'quit') return quit();
+        if (command === 'detach') {
+          if (process.env.BOUNCE_PERSISTENT_VIEW !== '1') throw new Error('Detach requires a persistent orchestrator session');
+          return quit(true);
+        }
         if (command === 'update') {
           if (arg && arg !== 'check') throw new Error('Use /update or /update check');
           return await update(arg === 'check');
@@ -614,12 +756,13 @@ async function main() {
         }
         if (command === 'provider') {
           if (!providers[arg]) throw new Error('Choose claude, codex, or muse');
-          session.active = arg; settings.order = [arg, ...settings.order.filter(p => p !== arg)]; save();
+          router.select(arg); settings.order = [arg, ...settings.order.filter(p => p !== arg)]; save();
         } else if (command === 'model') {
+          if (parts[0] === 'worker') {await openWorkerModelPicker(parts[1], parts.slice(2).filter(part => part !== '--save').join(' '), parts.includes('--save')); return;}
           if (!arg || arg === 'refresh') { await openModelPicker(arg === 'refresh'); return; }
           settings.models[selected()] = arg === 'default' ? '' : arg; save();
         } else if (command === 'mode') {
-          if (!['yolo','plan'].includes(arg)) throw new Error('Use /mode yolo or /mode plan'); settings.mode = arg; save();
+          if (!['yolo','plan'].includes(arg)) throw new Error('Use /mode yolo or /mode plan'); settings.mode = arg; delete setupDefaults.mode; save();
         } else if (command === 'operation') {
           if (!arg) { openOperationPicker(); return; }
           applyOperation(arg);
@@ -638,10 +781,10 @@ async function main() {
         } else if (command === 'order') {
           const order = arg.split(',').map(p => p.trim());
           if (!order.length || order.some(p => !providers[p]) || new Set(order).size !== order.length) throw new Error('Use unique provider names separated by commas');
-          settings.order = order; session.active = order[0]; save();
+          settings.order = order; router.select(order[0]); save();
         } else if (command === 'quota') {
           await refreshQuota(settings, {root, store: quotas, cwd: session.cwd});
-          session.append({kind: 'quota', text: quotaReport(quotas, settings.order)});
+          session.append({kind: 'quota', text: quotaReport(quotas, quotaOrder())});
         } else if (command === 'retry') {
           router.cooldowns = {}; for (const p of Object.keys(providers)) session.append({kind: 'cooldown', provider: p, until: 0, text: 'Local cooldown cleared'});
         } else if (command === 'skills') {
@@ -652,7 +795,10 @@ async function main() {
         } else if (command === 'note') {
           if (!arg) throw new Error('Use /note TEXT'); session.append({kind: 'note', text: arg});
         } else if (command === 'new') {
+          if (process.env.BOUNCE_REMOTE_SESSION === '1') { await switchSession(null); return; }
+          if (Object.keys(setupDefaults).length) {await switchSession(null); return;}
           const next = new Session(session.cwd, {root}); next.lock(); session.unlock(); session = next;
+          terminal.reset(session.events);
           router = new Router(session, settings, routerOptions); session.onEvent = scheduleRender; scroll = 0;
         } else if (command === 'login') {
           // Validate before the screen flips, so a typo never drops the user out of the TUI.
@@ -667,26 +813,53 @@ async function main() {
           // The vendor's output is on the main screen bounce just left, so say what happened.
           session.append({kind: 'status', text: outcome});
           notice = outcome;
+          // A sign-in changes what the vendor will report: re-ask now, or the usage panel keeps
+          // the pre-login "unavailable" reading until the next turn happens to refresh it.
+          void refreshQuota(settings, {root, store: quotas, cwd: session.cwd}).then(render, () => {});
           return;
         } else if (command === 'tasks') {
-          showTasks = !showTasks;
-        } else if (command === 'zoom') {
-          if (orchestration.operation !== 'orchestrator') throw new Error('/zoom is only available in orchestrator mode');
+          const rows = Object.values(reducers.tasks(session.events));
+          session.append({kind: 'status', text: rows.length ? rows.map(task => `${task.profile} ${task.id.slice(0, 8)} · ${task.state}${task.blocker || task.error || task.summary ? ` · ${task.blocker || task.error || task.summary}` : ''}`).join('\n') : 'No tasks in this session'});
+          notice = 'Task states saved in transcript · PgUp/PgDn scroll';
+        } else if (command === 'rename') {
+          const name = arg.trim();
+          if (!name) throw new Error('Use /rename <name>');
+          session.append({kind: 'session.renamed', name});
+          notice = `Session renamed to "${name}"`;
+        } else if (command === 'sessions') {
+          const rows = listSessions(root).filter(r => r.cwd === session.cwd).slice(0, 20);
+          session.append({kind: 'status', text: rows.length ? sessionsTable(rows).join('\n') : 'No sessions in this workspace'});
+        } else if (command === 'resume') {
+          if (arg.trim()) { await switchSession(resolveSessionRef(root, arg.trim())); return; }
+          const rows = listSessions(root).filter(r => r.cwd === session.cwd && r.id !== session.id).slice(0, 30);
+          if (!rows.length) throw new Error('No other sessions in this workspace');
+          picker = {kind: 'session', index: 0, notes: [], entries: rows.map(r => ({id: r.id, label: `${r.name ?? r.id.slice(0, 8)} · ${sessionAge(r.updated)} ago · ${r.operation}${r.live ? ' · live' : ''} · ${r.id.slice(0, 8)}`}))};
+          notice = 'Pick a session to resume. Esc cancels.';
+          return;
+        } else if (command === 'btw') {
+          await noteAside(arg.trim());
+          return;
+        } else if (command === 'agents' || command === 'zoom' || command === 'attach') {
+          if (orchestration.operation !== 'orchestrator') throw new Error('/agents is only available in orchestrator mode');
           if (!arg) {
-            if (zoomTask) { zoomTask = null; boardOpen = true; notice = 'Agents board · every worker in the centre · /zoom or Esc returns'; }
-            else { boardOpen = !boardOpen; notice = boardOpen ? 'Agents board · every worker in the centre · /zoom or Esc returns' : 'Board closed'; }
+            agentsOpen = !agentsOpen;
+            changePane('orchestrator');
+            notice = agentsOpen ? 'Agent workspace · Tab changes pane · typing targets the selected pane · Esc closes' : 'Agent workspace closed';
             scroll = 0; return;
           }
           const known = reducers.tasks(session.events);
-          const task = known[arg] ? arg : Object.keys(known).find(id => id.startsWith(arg));
+          if (['main', 'orchestrator'].includes(arg)) {
+            agentsOpen = true; changePane('orchestrator');
+            notice = 'Focused orchestrator pane'; return;
+          }
+          const matches = Object.keys(known).filter(id => id.startsWith(arg));
+          if (matches.length > 1 && !known[arg]) throw new Error('Task prefix is ambiguous');
+          const task = known[arg] ? arg : matches[0];
           if (!task) { session.append({kind: 'status', text: 'no such task'}); return; }
-          zoomTask = task; scroll = 0;
-          notice = `Zoomed into ${task.slice(0, 8)} · type to message it · /zoom or Esc returns`;
+          if (reducers.TERMINAL.has(known[task].state)) throw new Error('This task has finished · its outcome is in the transcript');
+          agentsOpen = true; changePane(terminal.snapshot().panes.find(pane => pane.task === task)?.id ?? `worker:${task}`);
+          notice = `Focused ${task.slice(0, 8)} · typing messages this worker · Tab changes pane`;
           return;
-        } else if (command === 'attach') {
-          if (!arg) { attachedTask = null; }
-          else if (!reducers.tasks(session.events)[arg]) { session.append({kind: 'status', text: 'no such task'}); return; }
-          else { attachedTask = arg; }
         } else if (command === 'continue') {
           // §A2/U5: this is the ONLY place a main turn can be started on an orchestration
           // profile, and it is reached only from here — the keyboard's Enter handler calling
@@ -697,99 +870,71 @@ async function main() {
           if (!decision.ok) { session.append({kind: 'status', text: decision.error}); return; }
           const profile = orchestration.profiles[decision.profile];
           settings.order = [profile.adapter, ...settings.order.filter(p => p !== profile.adapter)];
-          settings.models[profile.adapter] = profile.model; session.active = profile.adapter; save();
+          settings.models[profile.adapter] = profile.model; router.select(profile.adapter); save();
           scroll = 0;
           notice = 'Running · Esc or Ctrl+C cancels the agent process group';
           render();
-          const result = await router.run(orchestratorBrief + 'Continue.');
+          const result = await router.run((remoteMain ? '' : orchestratorBrief) + withAsides('Continue.', asides.splice(0)));
           notice = `Turn ${result}. Session saved.`;
           void refreshQuota(settings, {root, store: quotas, cwd: session.cwd}).then(render, () => {});
           return;
         } else throw new Error('Unknown command. Type /help');
         notice = 'Updated.';
-      } else if (zoomTask) {
-        // Zoomed in: plain text is a message to that worker, never a main turn.
+      } else if (agentsOpen && selectedWorker()) {
+        // A selected worker pane is an explicit message target, never a main model turn.
+        const task = selectedWorker();
         history.push(text); historyIndex = -1; scroll = 0;
-        if (reducers.TERMINAL.has(reducers.tasks(session.events)[zoomTask]?.state)) throw new Error('This worker has finished · /zoom returns to the orchestrator');
-        session.append({kind: 'message', to: `worker:${zoomTask}`, text});
-        notice = `Message queued for worker ${zoomTask.slice(0, 8)}`;
+        if (reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) throw new Error('This worker has finished · Tab selects the orchestrator');
+        session.append({kind: 'message', to: `worker:${task}`, text});
+        notice = `Message queued for worker ${task.slice(0, 8)}`;
       } else {
         history.push(text); historyIndex = -1; scroll = 0;
         notice = 'Running · Esc or Ctrl+C cancels the agent process group';
-        render(); const result = await router.run(orchestratorBrief + text); notice = `Turn ${result}. Session saved.`;
+        render(); const result = await router.run((remoteMain ? '' : orchestratorBrief) + withAsides(text, asides.splice(0))); notice = `Turn ${result}. Session saved.`;
         void refreshQuota(settings, {root, store: quotas, cwd: session.cwd}).then(render, () => {});
         if (dev && result === 'completed' && fingerprint() !== loadedFingerprint) await restart();
       }
-    } catch (e) {notice = e.message; if (!input) input = text;}
+    } catch (e) {notice = e.message; if (!input) { input = text; inputCursor = input.length; }}
     finally {
+      if (!ownsTurn) { render(); return; }
       clearInterval(activityTimer); activityTimer = null; progress = '';
-      const next = pending.shift();
+      const next = pendingTurns.shift();
       if (next) {
-        notice = pending.length ? `Starting queued message · ${pending.length} still queued` : 'Starting queued message';
+        notice = pendingTurns.length ? `Starting queued turn · ${pendingTurns.length} still queued` : 'Starting queued turn';
         render();
-        void submit(next);
+        const decision = inputDisposition(next, {busy: false});
+        void submit(next, {parsedCommand: decision.kind === 'turn' ? decision : null});
       } else {
         busy = false;
         render();
       }
     }
   }
-  const keyboard = new PassThrough();
-  // Node's keypress parser holds a lone ESC until another byte follows, so deliver it directly.
-  const toKeyboard = text => text === '\x1b' ? handleKey('\x1b', {name: 'escape'}) : keyboard.write(text);
-  // Asking the terminal to report Shift+Enter also re-encodes Ctrl+C, Escape and friends,
-  // so decoded modifier keys are dispatched straight to handleKey; a modified Enter becomes
-  // the event the prompt already treats as "newline, do not submit".
-  const keyInput = createKeyInput(toKeyboard, () => handleKey('\r', {name: 'return', meta: true}), handleKey);
-  const mouseInput = createMouseInput(keyInput, amount => {
-    if (suspended || copyPaused || !mouseScroll) return;
-    scroll = Math.max(0, scroll + amount); render();
-  });
-  const pasteInput = createPasteInput(text => mouseInput(text), text => {
-    if (suspended || copyPaused || picker) return;
-    input += clean(text);
-    completionIndex = 0; menuDismissed = false; render();
-  });
-  let mouseTimer;
-  process.stdin.setEncoding('utf8');
-  process.stdin.on('data', chunk => {
-    if (suspended) return;
-    clearTimeout(mouseTimer);
-    pasteInput(chunk);
-    mouseTimer = setTimeout(() => {pasteInput.flush(); mouseInput.flush(); keyInput.flush();}, 50);
-  });
   function handleKey(str, key = {}) {
     if (suspended) return;
     if (key.name === 'f2') {
       copyPaused = !copyPaused;
-      process.stdout.write(mouseTracking(mouseScroll && !copyPaused));
-      if (copyPaused) {
-        process.stdout.write('\x1b[?25l');
-        previousCursor = '';
-        const row = Math.max(1, previousFrame.length);
-        process.stdout.write(`\x1b[${row};1H\x1b[2KPaused — select/copy or open links with your terminal; F2 resumes.`);
-        previousFrame[row - 1] = '';
-      } else render();
+      render();
       return;
     }
     if (copyPaused && !(key.ctrl && key.name === 'c')) return;
+    if (localSetup && !picker && (key.name === 'escape' || (key.ctrl && key.name === 'c'))) {cancelLocalSetup(); return;}
     if (key.name === 'f3') {
       mouseScroll = !mouseScroll;
-      process.stdout.write(mouseTracking(mouseScroll));
+
       notice = mouseScroll
         ? 'Mouse scrolling on · F3 restores text selection and link clicks · F2 pauses for copying'
         : 'Mouse scrolling off · Select text / open links with your terminal · PgUp/PgDn scroll';
       render(); return;
     }
-    if (key.ctrl && key.name === 'c') { if (busy) {router.cancel(); notice = 'Cancelling…'; render();} else quit(); return; }
+    if (key.ctrl && key.name === 'c') { if (busy) {void Promise.resolve(router.cancel()).catch(error => { notice = error.message; render(); }); notice = 'Cancelling…'; render();} else quit(); return; }
     if (key.ctrl && key.name === 'o') { applyOperation(orchestration.operation === 'classic' ? 'orchestrator' : 'classic'); render(); return; }
-    if (key.name === 'escape' && busy) {router.cancel(); return;}
-    if (key.name === 'pageup') {scroll += 8; render(); return;}
-    if (key.name === 'pagedown') {scroll = Math.max(0, scroll - 8); render(); return;}
+    if (key.name === 'pageup') {if (localSetup) localSetup.scroll = (localSetup.scroll ?? 0) + 8; else scroll += 8; render(); return;}
+    if (key.name === 'pagedown') {if (localSetup) localSetup.scroll = Math.max(0, (localSetup.scroll ?? 0) - 8); else scroll = Math.max(0, scroll - 8); render(); return;}
     if (picker) {
       const move = key.name === 'up' ? -1 : key.name === 'down' ? 1 : 0;
       if (move) picker.index = (picker.index + move + picker.entries.length) % picker.entries.length;
-      else if (key.name === 'escape') {const kind = picker.kind; picker = null; notice = kind === 'import' ? 'Import cancelled. Nothing changed.' : kind === 'operation' ? 'Operation unchanged.' : 'Model unchanged.';}
+      else if (key.name === 'escape') {const kind = picker.kind; picker = null; notice = kind === 'import' ? 'Import cancelled. Nothing changed.' : kind === 'operation' ? 'Operation unchanged.' : kind === 'session' ? 'Session unchanged.' : 'Model unchanged.';}
       else if (picker.kind === 'import') {
         if (str === ' ' || key.name === 'space') {picker.chosen.has(picker.index) ? picker.chosen.delete(picker.index) : picker.chosen.add(picker.index);}
         else if (str === 'a') for (let i = 0; i < picker.entries.length; i++) picker.chosen.add(i);
@@ -797,46 +942,93 @@ async function main() {
         else if (key.name === 'return') applyImport();
       }
       else if (str && !key.ctrl && !key.meta && /^[1-9]$/.test(str) && Number(str) <= picker.entries.length) picker.index = Number(str) - 1;
-      else if (key.name === 'return') {const entry = picker.entries[picker.index]; const kind = picker.kind; picker = null; if (kind === 'operation') applyOperation(entry); else applyModel(entry);}
+      else if (key.name === 'return') {const entry = picker.entries[picker.index]; const kind = picker.kind; picker = null; if (kind === 'operation') applyOperation(entry); else if (kind === 'session') switchSession(entry.id).catch(e => { notice = e.message; render(); }); else applyModel(entry);}
       render(); return;
     }
+    if (key.name === 'escape' && agentsOpen && !input) {agentsOpen = false; changePane('orchestrator'); notice = 'Agent workspace closed'; render(); return;}
+    if (key.name === 'escape' && busy) {void Promise.resolve(router.cancel()).catch(error => { notice = error.message; render(); }); return;}
     // Enter alone submits; Shift+Enter — or any other modifier, or Ctrl+J — drops down a line.
-    if (key.name === 'enter' || (key.name === 'return' && (key.meta || key.ctrl || key.shift))) {input += '\n'; menuDismissed = true; render(); return;}
+    if (key.name === 'enter' || (key.name === 'return' && (key.meta || key.ctrl || key.shift))) {({input, cursor: inputCursor} = insertText(input, inputCursor, '\n')); menuDismissed = true; render(); return;}
     const options = suggestions();
     if (options.length && ['up', 'down'].includes(key.name)) {completionIndex = (completionIndex + (key.name === 'up' ? -1 : 1) + options.length) % options.length; render(); return;}
     if (options.length && key.name === 'tab') {acceptCompletion(); render(); return;}
+    if (localSetup && key.name === 'tab') {render(); return;}
+    if (agentsOpen && key.name === 'tab') {
+      const ids = paneIds();
+      const current = Math.max(0, ids.indexOf(selectedAgentPane));
+      changePane(ids[(current + (key.shift ? -1 : 1) + ids.length) % ids.length]);
+      notice = selectedWorker() ? `Input targets worker ${selectedWorker().slice(0, 8)}` : 'Input targets the orchestrator';
+      render(); return;
+    }
+    if (input.includes('\n') && ['up', 'down'].includes(key.name)) {
+      ({cursor: inputCursor, column: verticalColumn} = moveVertical(input, inputCursor, key.name, verticalColumn));
+      render(); return;
+    }
     // Enter only completes a half-typed command; a complete one falls through and is run.
     if (options.length && key.name === 'return' && !typedCommand(input)) {acceptCompletion(); render(); return;}
-    if (key.name === 'escape') {menuDismissed = true; if (!input && (zoomTask || boardOpen)) {zoomTask = null; boardOpen = false; notice = 'Board closed'; scroll = 0;} render(); return;}
+    if (key.name === 'escape') {menuDismissed = true; render(); return;}
     const beforeInput = input;
+    verticalColumn = null;
     if (key.name === 'return') {
-      const text = input.trim(); input = '';
+      if (localSetup && !input.trim().startsWith('/')) {
+        if (localSetup.answer(input.trim())) {input = ''; inputCursor = 0;}
+        else notice = 'Setup is working · keep editing, use a slash command, or Esc to cancel setup';
+        render(); return;
+      }
+      const text = input.trim(); input = ''; inputCursor = 0;
       if (text) {
-        if (busy) {
-          pending.push(text); historyIndex = -1;
-          notice = `Queued · ${pending.length} message${pending.length === 1 ? '' : 's'} waiting`;
-        } else { busy = true; void submit(text); }
+        const decision = inputDisposition(text, {busy});
+        if (agentsOpen && selectedWorker() && decision.kind === 'prompt') {
+          void submit(text, {ownsTurn: false});
+        } else if (decision.kind === 'lifecycle' && busy) {
+          notice = `/${decision.command} cannot change the session while a turn is active · cancel it first`;
+        } else if (decision.action === 'run-command') {
+          void submit(text, {parsedCommand: decision, ownsTurn: false});
+        } else if (decision.action === 'queue-turn') {
+          if (attachedTurn) { notice = 'Existing turn is active · use /btw to steer it, or wait before starting a new prompt'; render(); return; }
+          pendingTurns.push(text); historyIndex = -1;
+          notice = `Queued · ${pendingTurns.length} turn${pendingTurns.length === 1 ? '' : 's'} waiting`;
+        } else {
+          busy = true;
+          void submit(text, {parsedCommand: decision.kind === 'turn' ? decision : null});
+        }
       }
     }
-    else if (key.name === 'backspace') input = [...input].slice(0,-1).join('');
-    else if (key.ctrl && key.name === 'u') input = '';
-    else if (key.name === 'tab') {const i = settings.order.indexOf(selected()); session.active = settings.order[(i + 1) % settings.order.length];}
-    else if (key.name === 'up') {historyIndex = Math.min(history.length - 1, historyIndex + 1); input = history[history.length - 1 - historyIndex] || '';}
-    else if (key.name === 'down') {historyIndex = Math.max(-1, historyIndex - 1); input = historyIndex < 0 ? '' : history[history.length - 1 - historyIndex];}
-    else if (str && !key.ctrl && !key.meta && !['left','right','home','end','delete','escape'].includes(key.name)) input += clean(str).replace(/\n/g, ' ');
+    else if (key.name === 'left') inputCursor = (key.ctrl || key.meta) ? moveWord(input, inputCursor, 'left') : moveCursor(input, inputCursor, 'left');
+    else if (key.name === 'right') inputCursor = (key.ctrl || key.meta) ? moveWord(input, inputCursor, 'right') : moveCursor(input, inputCursor, 'right');
+    else if (key.name === 'home' || (key.ctrl && key.name === 'a')) inputCursor = moveLineStart(input, inputCursor);
+    else if (key.name === 'end' || (key.ctrl && key.name === 'e')) inputCursor = moveLineEnd(input, inputCursor);
+    else if (key.name === 'backspace') ({input, cursor: inputCursor} = (key.ctrl || key.meta) ? deleteWordBackward(input, inputCursor) : backspace(input, inputCursor));
+    else if (key.name === 'delete') ({input, cursor: inputCursor} = (key.ctrl || key.meta) ? deleteWordForward(input, inputCursor) : deleteForward(input, inputCursor));
+    else if (key.ctrl && key.name === 'u') { input = ''; inputCursor = 0; }
+    else if (key.name === 'tab') {const i = settings.order.indexOf(selected()); router.select(settings.order[(i + 1) % settings.order.length]);}
+    else if (key.name === 'up' && !input.includes('\n')) {if (!localSetup) {historyIndex = Math.min(history.length - 1, historyIndex + 1); input = history[history.length - 1 - historyIndex] || ''; inputCursor = input.length;}}
+    else if (key.name === 'down' && !input.includes('\n')) {if (!localSetup) {historyIndex = Math.max(-1, historyIndex - 1); input = historyIndex < 0 ? '' : history[history.length - 1 - historyIndex]; inputCursor = input.length;}}
+    else if (str && !key.ctrl && !key.meta && !['left','right','home','end','delete','escape'].includes(key.name)) ({input, cursor: inputCursor} = insertText(input, inputCursor, clean(str).replace(/\n/g, ' ')));
     if (input !== beforeInput) {completionIndex = 0; menuDismissed = false;}
     render();
   }
-  emitKeypressEvents(keyboard);
-  keyboard.on('keypress', handleKey);
+  terminal = createInkTerminal({
+    history: () => session.events,
+    stdin: process.stdin, stdout: process.stdout, onKeypress: handleKey,
+    onPaste: text => {
+      if (suspended || copyPaused || picker) return;
+      ({input, cursor: inputCursor} = insertText(input, inputCursor, clean(text))); completionIndex = 0; menuDismissed = false; render();
+    },
+    onScroll: amount => { if (!copyPaused) { scroll = Math.max(0, scroll + amount); render(); } },
+    onResize: render,
+  });
+  for (const event of session.events) terminal.ingest(event);
+  await terminal.mount({});
+
   session.onEvent = scheduleRender;
   // Orchestrator sessions tick once a second so the AGENTS pane's elapsed times advance between
   // events; unref'd so it never keeps the process alive, and render() is a no-op while suspended.
   if (orchestration.operation === 'orchestrator') { const t = setInterval(() => render(), 1000); t.unref?.(); }
   void refreshQuota(settings, {root, store: quotas, cwd: session.cwd}).then(render, () => {});
-  process.stdout.on('resize', render);
+
   process.on('SIGTERM', () => { if (busy) {router.cancel(); const timer = setInterval(() => {if (!busy) {clearInterval(timer); quit();}}, 100);} else quit(); });
-  process.on('exit', () => { if (!suspended) leave(); });
+  process.on('exit', () => { terminal?.unmount(); });
   enter();
   if (!dev && process.env.BOUNCE_NO_UPDATE_CHECK !== '1') {
     void globalInstall().then(() => checkUpdate({root})).then(release => {
@@ -856,6 +1048,6 @@ async function runBridge() {
   process.exitCode = exitCode;
 }
 const [bridgeCmd] = process.argv.slice(2);
-(bridgeCmd === 'publish' || bridgeCmd === 'wait' ? runBridge()
+(['publish', 'wait', 'report'].includes(bridgeCmd) ? runBridge()
   : process.env.BOUNCE_SUPERVISED === '1' && typeof process.send === 'function' ? main() : supervise()
 ).catch(error => {console.error(`bounce: ${error.message}`); process.exitCode = 1;});

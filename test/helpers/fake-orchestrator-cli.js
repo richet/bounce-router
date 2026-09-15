@@ -47,8 +47,12 @@ async function main() {
     foreign: await attempt(client, {kind: 'task.milestone', task: 'foreign-task-id', text: 'not mine'}),
   }));
 
+  // A wait on a task outcome answers on ANY terminal row (P15); read the kind, as a real
+  // orchestrator must. FAKE_ORCH_HOLD_MS keeps the turn open afterwards for probes that need the
+  // daemon (and its grants) alive while they publish.
   const completed = await client.wait({match: {kind: 'task.completed', task}, timeout: 20000});
-  say(completed ? 'child completed' : 'child never completed');
+  say(!completed ? 'child never completed' : completed.kind === 'task.completed' ? 'child completed' : `child ended: ${completed.kind}${completed.reason ? ` (${completed.reason})` : ''}`);
+  if (process.env.FAKE_ORCH_HOLD_MS) await new Promise(resolve => setTimeout(resolve, Number(process.env.FAKE_ORCH_HOLD_MS)));
   try { await client.close(); } catch {}
   finish();
 }

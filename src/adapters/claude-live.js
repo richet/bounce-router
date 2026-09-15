@@ -39,18 +39,18 @@ export function createClaudeLive({connect = nodeConnect, fs = nodeFs, kill = pro
     const {model, mode, images = []} = profile;
     const executable = resolveExecutable('claude', profile.executables?.claude);
     const args = [...claude.invocation({model, mode, images}), ...extraArgs, '--settings', settingsFor(dir)];
-    const live = spawnLive({executable, args, cwd, env: vendorEnv(), stdin: claude.stdin(stdin), ...(spawn ? {spawn} : {})});
+    const live = spawnLive({executable, args: [...args, ...(profile.orchestratorEnv ? ['--disallowedTools', 'Agent,Task'] : [])], cwd, env: vendorEnv(process.env, {...profile.orchestratorEnv, ...profile.report}), stdin: claude.stdin(stdin), ...(spawn ? {spawn} : {})});
     return {live, child: live.child, pid: live.child.pid, args, dir, cwd, sessionId: null};
   };
 
   return {
-    async launch({peer, profile, orders, cwd, dir}) {
-      return start({profile, stdin: orders, cwd, dir});
+    async launch({peer, profile, orders, cwd, dir, userImages = []}) {
+      return start({profile: {...profile, images: userImages}, stdin: orders, cwd, dir});
     },
 
-    async resume({peer, profile, native, message, cwd, dir}) {
+    async resume({peer, profile, native, message, cwd, dir, userImages = []}) {
       const texts = takePending(pendingPath(dir));
-      return start({profile, extraArgs: ['--resume', native.sessionId], stdin: [...texts, message].join('\n'), cwd, dir});
+      return start({profile: {...profile, images: userImages}, extraArgs: ['--resume', native.sessionId], stdin: [...texts, message].join('\n'), cwd, dir});
     },
 
     // Never throws: every terminal condition of the process becomes an event and ends the stream.
@@ -60,7 +60,7 @@ export function createClaudeLive({connect = nodeConnect, fs = nodeFs, kill = pro
         if (event.kind === 'diagnostic') { yield event; continue; }
         if (event.kind === 'error') { yield {kind: 'error', code: event.code, text: event.text}; return; }
         if (event.kind === 'exit') {
-          if (!sawResult) yield {kind: 'result', status: event.limited ? 'limited' : event.code === 0 ? 'completed' : 'failed'};
+          if (!sawResult) yield {kind: 'result', status: 'failed', text: 'protocol error: claude exited without result'};
           return;
         }
         let raw;
@@ -81,6 +81,7 @@ export function createClaudeLive({connect = nodeConnect, fs = nodeFs, kill = pro
           yield normalized;
         }
       }
+      if (!sawResult) yield {kind: 'result', status: 'failed', text: 'protocol error: claude stream ended without result'};
     },
 
     async deliver(handle, {text}) {
@@ -109,7 +110,7 @@ export function createClaudeLive({connect = nodeConnect, fs = nodeFs, kill = pro
           socket.on('close', () => finish(wrote)); // only a turn that took the message and closed counts as live
           socket.on('connect', () => {
             socket.write(JSON.stringify({type: 'auth', token: messaging.token}) + '\n');
-            socket.write(JSON.stringify({text}) + '\n');
+            socket.end(JSON.stringify({type: 'user', message: {role: 'user', content: text}}) + '\n');
             wrote = true;
           });
         } catch { finish(false); }

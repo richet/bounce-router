@@ -83,7 +83,7 @@ for (const [name, {make, executable, env}] of Object.entries(adapters)) {
 const usageEnv = {
   claude: {FAKE_SESSION: 'sess-conf-usage', FAKE_USAGE: JSON.stringify({
     input_tokens: 11, cache_read_input_tokens: 3, cache_creation_input_tokens: 2, output_tokens: 7})},
-  codex: {FAKE_USAGE: JSON.stringify({input_tokens: 11, cached_input_tokens: 3, output_tokens: 7})},
+  codex: {FAKE_USAGE: JSON.stringify({inputTokens: 11, cachedInputTokens: 3, outputTokens: 7, reasoningOutputTokens: 0, totalTokens: 21})},
   muse: {},
 };
 const expectedUsage = {
@@ -157,8 +157,12 @@ test('local: deliver contract — non-string text is coerced, oversize text is q
 test('local: resume resolves to the bare handle, and its events end with a result', async () => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'conformance-local-resume-'));
   const adapter = createLocalLive({backends: {fake: createFakeBackend()}});
-  const script = [[{kind: 'done', text: 'resumed'}]];
-  const handle = await adapter.resume({peer: {}, profile: {backend: 'fake', model: '', script}, native: {sessionId: 'none'}, message: 'continue', cwd, dir: path.join(cwd, 'd')});
+  const script = [[{kind: 'done', text: 'first'}], [{kind: 'done', text: 'resumed'}]];
+  const dir = path.join(cwd, 'd'), profile = {backend: 'fake', model: '', script};
+  const first = await adapter.launch({peer: {}, profile, orders: 'first question', cwd, dir});
+  for await (const event of adapter.events(first)) { if (event.kind === 'result') break; }
+  await adapter.cancel(first);
+  const handle = await adapter.resume({peer: {}, profile, native: {sessionId: path.join(dir, 'local-live-history.json')}, message: 'continue', cwd, dir});
   assert.equal(typeof handle, 'object', 'resume resolves to the handle, not {handle}');
   const events = [];
   for await (const event of adapter.events(handle)) { events.push(event); if (event.kind === 'result') break; }

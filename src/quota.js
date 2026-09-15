@@ -101,6 +101,14 @@ export function recordQuota(store, root, snapshot) {
   if (root) saveJSON(quotaFile(root), store);
   return true;
 }
+// Which vendors the usage panel shows: the fallback order, plus — in orchestrator mode — every
+// adapter a profile runs on (the workers' vendors are where the quota actually goes), in that
+// order, deduped, only vendors that report quota. Pure.
+export function usageOrder(order = [], profiles = {}, known = [...new Set([...streamsQuota, ...Object.keys(quotaQueries)])]) {
+  const adapters = Object.values(profiles ?? {}).map(p => p?.adapter).filter(Boolean);
+  return [...new Set([...order, ...adapters])].filter(p => known.includes(p));
+}
+
 export async function refreshQuota(settings, {root, store = loadQuota(root), ...options} = {}) {
   const results = await Promise.all(Object.keys(quotaQueries)
     .map(provider => readQuota(provider, resolveExecutable(provider, settings.executables?.[provider]), options)));

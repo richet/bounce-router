@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {EventEmitter} from 'node:events';
 import {PassThrough} from 'node:stream';
-import {quotaSnapshot, readQuota, loadQuota, recordQuota, quotaShort, quotaReport, quotaPanel, windowLabel, windowTitle, resetText} from '../src/quota.js';
+import {quotaSnapshot, readQuota, loadQuota, recordQuota, quotaShort, quotaReport, quotaPanel, windowLabel, windowTitle, resetText, usageOrder} from '../src/quota.js';
 
 const fake = script => (executable, args) => {
   const child = new EventEmitter();
@@ -165,4 +165,12 @@ test('window titles and reset text read the way a plan states them', () => {
   assert.match(resetText({resetsAt: now + 90 * 60000}, now), /^resets \d{1,2}:\d{2}(am|pm)$/);
   assert.equal(resetText({resetsAt: null}, now), '');
   assert.equal(resetText({resetsAt: now - 1}, now), '');
+});
+
+test('usageOrder: the fallback order first, then every profile adapter, deduped, quota-reporting vendors only', () => {
+  const profiles = {main: {adapter: 'claude'}, build: {adapter: 'codex'}, critic: {adapter: 'claude'}, local: {adapter: 'local'}};
+  assert.deepEqual(usageOrder(['claude'], profiles, ['claude', 'codex', 'muse']), ['claude', 'codex']);
+  assert.deepEqual(usageOrder(['codex', 'claude'], {}, ['claude', 'codex', 'muse']), ['codex', 'claude']);
+  assert.deepEqual(usageOrder(['muse'], profiles, ['claude', 'codex', 'muse']), ['muse', 'claude', 'codex']);
+  assert.deepEqual(usageOrder([], {}, ['claude']), []);
 });

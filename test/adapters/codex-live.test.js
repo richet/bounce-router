@@ -8,6 +8,7 @@ import {PassThrough} from 'node:stream';
 import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {createCodexLive} from '../../src/adapters/codex-live.js';
+import {version} from '../../src/update.js';
 
 // The fake stands in for `codex` itself: the adapter spawns it as the executable and talks the
 // app-server protocol to it. No test ever spawns a real vendor CLI.
@@ -74,6 +75,7 @@ function harness(t, {delay = 0} = {}) {
 function scriptedServer() {
   const stdout = new PassThrough(), stderr = new PassThrough(), emitter = new EventEmitter();
   const written = [];
+  const spawned = [];
   const child = {
     pid: 4242,
     stdin: {write: chunk => {written.push(chunk); return true;}, end() {}, on() {}, destroyed: false},
@@ -84,7 +86,7 @@ function scriptedServer() {
     kill() {},
   };
   const lines = () => written.join('').split('\n').filter(Boolean).map(line => JSON.parse(line));
-  return {child, lines, spawn: () => child,
+  return {child, lines, spawned, spawn: (...args) => { spawned.push(args); return child; },
     send: message => stdout.write(typeof message === 'string' ? message + '\n' : JSON.stringify(message) + '\n'),
     close: (code, signal = null) => emitter.emit('close', code, signal),
     fail: error => emitter.emit('error', error),
@@ -92,19 +94,33 @@ function scriptedServer() {
 }
 const goneKill = () => { throw Object.assign(new Error('no such process'), {code: 'ESRCH'}); };
 
-async function scriptedLaunch({model} = {}) {
+async function scriptedLaunch({model, profile = {}, connectBus} = {}) {
   const server = scriptedServer();
-  const adapter = createCodexLive({spawn: server.spawn, kill: goneKill});
-  const launching = adapter.launch({peer: 'worker:s', profile: {executables: {codex: 'codex'}, model},
+  const adapter = createCodexLive({spawn: server.spawn, kill: goneKill, ...(connectBus ? {connectBus} : {})});
+  const launching = adapter.launch({peer: 'worker:s', profile: {...profile, executables: {codex: 'codex'}, ...(model ? {model} : {})},
     orders: 'go', cwd: '/tmp', dir: '/tmp'});
   await server.expect(1);
   server.send({id: 1, result: {}});
   await server.expect(3); // initialized (a notification) and thread/start
-  server.send({id: 2, result: {threadId: 't-9'}});
+  server.send({id: 2, result: {thread: {id: 't-9'}}});
   await server.expect(4);
-  server.send({id: 3, result: {turnId: 'u-1'}});
+  server.send({id: 3, result: {turn: {id: 'u-1'}}});
   const handle = await launching;
   return {adapter, handle, server};
+}
+
+async function scriptedResume({profile = {}, connectBus} = {}) {
+  const server = scriptedServer();
+  const adapter = createCodexLive({spawn: server.spawn, kill: goneKill, ...(connectBus ? {connectBus} : {})});
+  const resuming = adapter.resume({peer: 'worker:s', profile: {...profile, executables: {codex: 'codex'}},
+    native: {sessionId: 't-old'}, message: 'again', cwd: '/tmp', dir: '/tmp'});
+  await server.expect(1);
+  server.send({id: 1, result: {}});
+  await server.expect(3);
+  server.send({id: 2, result: {thread: {id: 't-current'}}});
+  await server.expect(4);
+  server.send({id: 3, result: {turn: {id: 'u-current'}}});
+  return {adapter, handle: await resuming, server};
 }
 
 test('X1 launch drives the handshake; a turn that ends with nothing queued is the result and the server exits', async t => {
@@ -114,7 +130,7 @@ test('X1 launch drives the handshake; a turn that ends with nothing queued is th
 
   assert.deepEqual(h.received().map(message => message.method),
     ['initialize', 'initialized', 'thread/start', 'turn/start']);
-  assert.deepEqual(h.received()[0], {id: 1, method: 'initialize', params: {}});
+  assert.deepEqual(h.received()[0], {id: 1, method: 'initialize', params: {clientInfo: {name: 'bounce', version}}});
   assert.deepEqual(h.received().map(message => message.id), [1, undefined, 2, 3]);
   const turn = h.methods('turn/start')[0];
   assert.deepEqual(turn.params.input, [{type: 'text', text: 'do the thing'}]);
@@ -129,7 +145,7 @@ test('X1 launch drives the handshake; a turn that ends with nothing queued is th
   assert.equal(rows[2].kind, 'usage');
   // CONTRACT.md #5: mapped to {input, cache_read, cache_write, output} before yielding — the
   // fake's default usage carries no cached_input_tokens, so cache_read stays absent.
-  assert.deepEqual(rows[2].usage, {input: 1, output: 1});
+  assert.deepEqual(rows[2].usage, {input: 1, cache_read: 0, output: 1});
   assert.deepEqual(rows[3], {kind: 'result', status: 'completed', text: 'echo: do the thing'});
   await waitFor(() => handle.exited, 'the server exits on EOF after the result');
   assert.deepEqual((await take(h.adapter.events(handle), 1)), []); // one result, never a second on exit
@@ -157,6 +173,43 @@ test('X2 a delivery queued mid-turn makes the first turn a milestone and the sec
   assert.equal(h.methods('thread/start').length, 1);
 });
 
+test('X2a App Server v2 uses policy-bearing thread and turn requests, and steering is bound by expectedTurnId', async t => {
+  const h = harness(t, {delay: 120});
+  const handle = await h.launch({orders: 'first', profile: {mode: 'plan'}});
+  await take(h.adapter.events(handle), 1);
+
+  assert.deepEqual(h.methods('thread/start')[0].params, {
+    approvalPolicy: 'on-request',
+    sandbox: 'read-only',
+  });
+  assert.deepEqual(h.methods('turn/start')[0].params, {
+    threadId: 't-1',
+    input: [{type: 'text', text: 'first'}],
+    approvalPolicy: 'on-request',
+    sandboxPolicy: {type: 'readOnly'},
+  });
+  assert.equal(await h.adapter.deliver(handle, {text: 'steer', expectedTurnId: 'u-1'}), 'live');
+  assert.deepEqual(h.methods('turn/steer')[0].params, {
+    threadId: 't-1',
+    expectedTurnId: 'u-1',
+    input: [{type: 'text', text: 'steer'}],
+  });
+  assert.equal(h.adapter.capabilities().live, true);
+});
+
+test('X2b read-only policy wins over yolo mode in App Server thread and turn settings', async t => {
+  const h = harness(t);
+  const handle = await h.launch({orders: 'inspect only', profile: {mode: 'yolo', policy: 'read-only'}});
+  await take(h.adapter.events(handle), 1);
+  assert.deepEqual(h.methods('thread/start')[0].params, {
+    approvalPolicy: 'on-request', sandbox: 'read-only',
+  });
+  assert.deepEqual(h.methods('turn/start')[0].params, {
+    threadId: 't-1', input: [{type: 'text', text: 'inspect only'}],
+    approvalPolicy: 'on-request', sandboxPolicy: {type: 'readOnly'},
+  });
+});
+
 test('X3 a mid-turn deliver waits: the second turn/start follows the first turn/completed', async t => {
   const h = harness(t, {delay: 120});
   const handle = await h.launch({orders: 'first'});
@@ -176,6 +229,16 @@ test('X3 a mid-turn deliver waits: the second turn/start follows the first turn/
   assert.deepEqual(handle.queue, []);
 });
 
+test('X3a stale steering fails at its original turn and is never queued onto a successor', async t => {
+  const h = harness(t, {delay: 120});
+  const handle = await h.launch({orders: 'first'});
+  await take(h.adapter.events(handle), 1);
+  assert.equal(await h.adapter.deliver(handle, {text: 'stale', expectedTurnId: 'u-old'}), 'failed');
+  assert.deepEqual(handle.queue, []);
+  await waitFor(() => handle.resulted, 'the original turn to finish');
+  assert.equal(h.methods('turn/start').length, 1);
+});
+
 test('X4 resume re-attaches to the thread and starts a turn on it', async t => {
   const h = harness(t);
   const handle = await h.resume({native: {sessionId: 't-42'}, message: 'again'});
@@ -183,8 +246,13 @@ test('X4 resume re-attaches to the thread and starts a turn on it', async t => {
 
   assert.deepEqual(h.received().map(message => message.method),
     ['initialize', 'initialized', 'thread/resume', 'turn/start']);
-  assert.deepEqual(h.methods('thread/resume')[0].params, {threadId: 't-42'});
-  assert.deepEqual(h.methods('turn/start')[0].params, {threadId: 't-42', input: [{type: 'text', text: 'again'}]});
+  assert.deepEqual(h.methods('thread/resume')[0].params, {
+    threadId: 't-42', approvalPolicy: 'never', sandbox: 'danger-full-access',
+  });
+  assert.deepEqual(h.methods('turn/start')[0].params, {
+    threadId: 't-42', input: [{type: 'text', text: 'again'}],
+    approvalPolicy: 'never', sandboxPolicy: {type: 'dangerFullAccess'},
+  });
   assert.equal(handle.threadId, 't-42');
   assert.deepEqual(rows[0], {kind: 'native', provider: 'codex', sessionId: 't-42'});
   assert.deepEqual(rows[3], {kind: 'result', status: 'completed', text: 'echo: again'});
@@ -200,7 +268,7 @@ test('X5 cancel mid-turn interrupts, kills the group, and the turn reports nothi
 
   const rest = drain(stream); // the iterable must end, so this must resolve
   assert.deepEqual(await h.adapter.cancel(handle), {verified: true});
-  assert.deepEqual(h.methods('turn/interrupt')[0].params, {threadId: 't-1'});
+  assert.deepEqual(h.methods('turn/interrupt')[0].params, {threadId: 't-1', turnId: 'u-1'});
   assert.equal(handle.exited, true);
 
   assert.deepEqual(await rest, []); // no result, no usage, no milestone for an interrupted turn
@@ -235,20 +303,23 @@ test('X6 the reader ignores malformed, null, oversized and unmatched lines', asy
   server.send('[1,2,3]');
   server.send({id: 99, result: {threadId: 'forged'}}); // no request ever carried id 99
   server.send(JSON.stringify({method: 'item/completed',
-    params: {item: {type: 'agent_message', text: 'x'.repeat(1_048_756)}}})); // over 1 MiB
-  server.send({method: 'thread/started', params: {thread_id: 't-9'}}); // the vendor's own native row
-  server.send({method: 'item/completed', params: {item: {type: 'agent_message', text: 'survivor'}}});
-  server.send({method: 'turn/completed', params: {turnId: 'u-1', usage: {input_tokens: 2, output_tokens: 3}}});
+    params: {item: {type: 'agentMessage', text: 'x'.repeat(1_048_756)}}})); // over 1 MiB
+  server.send({method: 'item/completed', params: {threadId: 't-9', turnId: 'u-1', completedAtMs: 1,
+    item: {id: 'i-1', type: 'agentMessage', text: 'survivor'}}});
+  server.send({method: 'thread/tokenUsage/updated', params: {threadId: 't-9', turnId: 'u-1', tokenUsage: {
+    last: {inputTokens: 2, cachedInputTokens: 0, outputTokens: 3, reasoningOutputTokens: 0, totalTokens: 5},
+    total: {inputTokens: 2, cachedInputTokens: 0, outputTokens: 3, reasoningOutputTokens: 0, totalTokens: 5},
+  }}});
+  server.send({method: 'turn/completed', params: {threadId: 't-9', turn: {id: 'u-1', items: [], status: 'completed'}}});
 
-  const rows = await take(stream, 5);
+  const rows = await take(stream, 4);
   assert.deepEqual(rows[0], {kind: 'native', provider: 'codex', sessionId: 't-9'});
-  assert.deepEqual(rows[1], {kind: 'native', provider: 'codex', sessionId: 't-9'}); // never `peer.native`
-  assert.deepEqual(rows[2], {kind: 'assistant', text: 'survivor'});
-  assert.equal(rows[3].kind, 'usage');
-  assert.deepEqual(rows[4], {kind: 'result', status: 'completed', text: 'survivor'});
+  assert.deepEqual(rows[1], {kind: 'assistant', text: 'survivor'});
+  assert.equal(rows[2].kind, 'usage');
+  assert.deepEqual(rows[3], {kind: 'result', status: 'completed', text: 'survivor'});
   assert.equal(handle.threadId, 't-9'); // the forged id resolved nothing
   assert.deepEqual(adapter.capabilities(),
-    {live: false, resume: true, modelPin: true, policies: ['yolo', 'plan'], executionPolicies: ['read-only', 'plan', 'yolo'], quota: 'query'});
+    {live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'], executionPolicies: ['read-only', 'plan', 'yolo'], quota: 'query'});
 });
 
 test('the vendor process sees no bus keys, is detached, and gets the task cwd', async t => {
@@ -273,15 +344,100 @@ test('the vendor process sees no bus keys, is detached, and gets the task cwd', 
   assert.equal(handle.cwd, h.root);
 });
 
-test('the result row is the process exit, and its status is that exit', async () => {
-  for (const [code, stderr, status] of [[0, '', 'completed'], [1, '', 'failed'], [1, 'rate limit exceeded', 'limited']]) {
+test('a scoped report grant is a parent-side experimental dynamic tool, never child socket authority', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-codex-report-'));
+  const tokenFile = path.join(root, 'report-token');
+  fs.writeFileSync(tokenFile, 'test-token', {mode: 0o600});
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const reported = [], connections = [];
+  const connectBus = async connection => {
+    connections.push(connection);
+    return {tasks: ['s'], report: async report => { reported.push(report); }, close: async () => {}};
+  };
+  const report = {op: 'final', outcome: 'completed', phase: 'done', text: 'finished', next: 'none', summary: 'done'};
+  const {handle, server} = await scriptedLaunch({profile: {mode: 'plan', report: {
+    BOUNCE_REPORT_BUS: '/private/tmp/not-in-child.sock', BOUNCE_REPORT_TOKEN_FILE: tokenFile, task: 's',
+  }}, connectBus});
+
+  assert.deepEqual(server.spawned[0][1], ['app-server']);
+  assert.deepEqual(server.lines()[0].params.capabilities, {experimentalApi: true});
+  assert.equal(server.spawned[0][2].env.BOUNCE_REPORT_BUS, undefined);
+  assert.equal(server.spawned[0][2].env.BOUNCE_REPORT_TOKEN_FILE, undefined);
+  assert.deepEqual(server.lines().find(line => line.method === 'thread/start').params.dynamicTools, [{
+    type: 'function', name: 'bounce_report', description: 'Publish a progress or final report for this assigned worker attempt.',
+    inputSchema: {type: 'object', properties: {
+      op: {enum: ['milestone', 'blocked', 'input_required', 'final']},
+      outcome: {enum: ['completed', 'failed', 'blocked', 'input_required']},
+      phase: {type: 'string'}, text: {type: 'string'}, next: {type: 'string'}, summary: {type: 'string'},
+      evidence: {type: 'array', items: {type: 'string'}}, remaining: {type: 'string'},
+    }, required: ['op', 'phase', 'text', 'next']},
+  }]);
+
+  server.send({id: 40, method: 'item/tool/call', params: {
+    threadId: handle.threadId, turnId: handle.turnId, callId: 'report-1', tool: 'bounce_report', arguments: report,
+  }});
+  await server.expect(5);
+  assert.deepEqual(server.lines().at(-1), {id: 40, result: {success: true, contentItems: [{type: 'inputText', text: 'report accepted'}]}});
+  assert.deepEqual(connections, [{path: '/private/tmp/not-in-child.sock', token: 'test-token'}]);
+  assert.deepEqual(reported, [report]);
+
+  // A stale turn, another tool, and a replay are all rejected before the bus is contacted.
+  server.send({id: 41, method: 'item/tool/call', params: {threadId: handle.threadId, turnId: 'u-stale',
+    callId: 'stale', tool: 'bounce_report', arguments: report}});
+  server.send({id: 42, method: 'item/tool/call', params: {threadId: handle.threadId, turnId: handle.turnId,
+    callId: 'wrong-tool', tool: 'not_bounce_report', arguments: report}});
+  server.send({id: 43, method: 'item/tool/call', params: {threadId: handle.threadId, turnId: handle.turnId,
+    callId: 'report-1', tool: 'bounce_report', arguments: report}});
+  await server.expect(8);
+  assert.deepEqual(server.lines().slice(-3).map(line => line.result), [
+    {success: false, contentItems: [{type: 'inputText', text: 'report rejected'}]},
+    {success: false, contentItems: [{type: 'inputText', text: 'report rejected'}]},
+    {success: false, contentItems: [{type: 'inputText', text: 'report rejected'}]},
+  ]);
+  assert.equal(connections.length, 1);
+});
+
+test('resume re-declares the report tool, binds it to the current turn, and rejects an old task grant', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-codex-report-resume-'));
+  const tokenFile = path.join(root, 'report-token');
+  fs.writeFileSync(tokenFile, 'test-token', {mode: 0o600});
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  let connected = 0;
+  const {handle, server} = await scriptedResume({profile: {report: {
+    BOUNCE_REPORT_BUS: '/private/tmp/not-in-child.sock', BOUNCE_REPORT_TOKEN_FILE: tokenFile, task: 's',
+  }}, connectBus: async () => {
+    connected++;
+    return {tasks: ['previous-task'], report: async () => assert.fail('old grant must not report'), close: async () => {}};
+  }});
+  assert.deepEqual(server.spawned[0][1], ['app-server']);
+  assert.deepEqual(server.lines()[0].params.capabilities, {experimentalApi: true});
+  const resumed = server.lines().find(line => line.method === 'thread/resume');
+  assert.equal(resumed.params.threadId, 't-old');
+  assert.equal(resumed.params.dynamicTools[0].name, 'bounce_report');
+  assert.equal(handle.threadId, 't-current');
+  assert.equal(handle.turnId, 'u-current');
+  server.send({id: 50, method: 'item/tool/call', params: {threadId: 't-old', turnId: 'u-current',
+    callId: 'old-turn', tool: 'bounce_report', arguments: {op: 'milestone', phase: 'p', text: 't', next: 'n'}}});
+  server.send({id: 51, method: 'item/tool/call', params: {threadId: 't-current', turnId: 'u-current',
+    callId: 'old-grant', tool: 'bounce_report', arguments: {op: 'milestone', phase: 'p', text: 't', next: 'n'}}});
+  await server.expect(6);
+  assert.deepEqual(server.lines().slice(-2).map(line => line.result), [
+    {success: false, contentItems: [{type: 'inputText', text: 'report rejected'}]},
+    {success: false, contentItems: [{type: 'inputText', text: 'report rejected'}]},
+  ]);
+  assert.equal(connected, 1); // only the current turn reaches the bus, where its old token is refused
+});
+
+test('a clean process EOF without turn/completed fails the adapter protocol', async () => {
+  for (const [code, stderr] of [[0, ''], [1, ''], [1, 'rate limit exceeded']]) {
     const {adapter, handle, server} = await scriptedLaunch();
     const rows = drain(adapter.events(handle));
     if (stderr) server.child.stderr.write(stderr + '\n');
     await new Promise(resolve => setTimeout(resolve, 20)); // let readline hand the line to spawnLive
     server.close(code);
-    assert.deepEqual((await rows).filter(row => row.kind === 'result'), [{kind: 'result', status}],
-      `exit ${code} with stderr ${JSON.stringify(stderr)}`);
+    assert.deepEqual((await rows).filter(row => row.kind === 'result'), [{
+      kind: 'result', status: 'failed', text: 'protocol error: codex app-server exited without turn/completed',
+    }], `exit ${code} with stderr ${JSON.stringify(stderr)}`);
     assert.equal(handle.exited, true);
   }
 });
@@ -293,6 +449,22 @@ test('a cancelled worker reports no result when its process ends', async () => {
   server.close(0);         // the exit those signals cause: cancel() already journals the outcome
   assert.deepEqual(await rows, [{kind: 'native', provider: 'codex', sessionId: 't-9'}]);
   assert.equal(handle.exited, true);
+});
+
+test('a failed or interrupted terminal status wins over assistant preamble', async () => {
+  for (const [status, expected] of [['failed', 'failed'], ['interrupted', 'interrupted'], ['completed', 'completed']]) {
+    const {adapter, handle, server} = await scriptedLaunch();
+    server.send({method: 'item/completed', params: {threadId: 't-9', turnId: 'u-1', completedAtMs: 1,
+      item: {id: 'i-1', type: 'agentMessage', text: 'opening text'}}});
+    server.send({method: 'turn/completed', params: {threadId: 't-9', turn: {
+      id: 'u-1', items: [], status, ...(status === 'failed' ? {error: {message: `${status} detail`}} : {}),
+    }}});
+    await waitFor(() => handle.resulted, 'terminal result');
+    const rows = drain(adapter.events(handle));
+    server.close(0);
+    assert.deepEqual((await rows).filter(row => row.kind === 'result'),
+      [{kind: 'result', status: expected, text: status === 'completed' ? 'opening text' : status === 'failed' ? `${status} detail` : status}]);
+  }
 });
 
 test('a process error ends the stream with its own code', async () => {
@@ -337,4 +509,36 @@ test('a handshake that never answers rejects launch and leaves no process behind
   server.fail(Object.assign(new Error('spawn codex ENOENT'), {code: 'ENOENT'}));
   await assert.rejects(launching, /codex app-server closed/);
   assert.equal(killed >= 1, true); // verifiedCancel probed the pid rather than leaving it running
+});
+
+test('a request deadline rejects an unanswered App Server request and cancels its process', async () => {
+  const server = scriptedServer();
+  let killed = 0;
+  const adapter = createCodexLive({spawn: () => server.child, kill: (...args) => { killed++; return goneKill(); }, requestTimeoutMs: 20});
+  const launching = adapter.launch({peer: 'worker:x', profile: {executables: {codex: 'codex'}},
+    orders: 'go', cwd: '/tmp', dir: '/tmp'});
+  await server.expect(1);
+  const outcome = await Promise.race([
+    launching.then(() => 'resolved', () => 'rejected'),
+    new Promise(resolve => setTimeout(() => resolve('timed out'), 100)),
+  ]);
+  assert.equal(outcome, 'rejected');
+  assert.equal(killed >= 1, true);
+});
+
+test('a thread response without an id rejects at the adapter boundary and leaves no process behind', async () => {
+  const server = scriptedServer();
+  let killed = 0;
+  const adapter = createCodexLive({spawn: () => server.child, kill: (...args) => { killed++; return goneKill(); }});
+  const launching = adapter.launch({peer: 'worker:x', profile: {executables: {codex: 'codex'}},
+    orders: 'go', cwd: '/tmp', dir: '/tmp'});
+  const rejected = assert.rejects(launching, /codex thread response did not include a thread id/);
+  await server.expect(1);
+  server.send({id: 1, result: {}});
+  await server.expect(3);
+  server.send({id: 2, result: {thread: {id: null}}});
+
+  await rejected;
+  assert.equal(server.lines().length, 3); // invalid state is never forwarded into turn/start
+  assert.equal(killed >= 1, true);
 });

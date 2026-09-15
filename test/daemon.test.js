@@ -6,7 +6,7 @@ import path from 'node:path';
 import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {supervise, installControlAuthority, pidAlive} from '../src/reload.js';
-import {socketPathFor} from '../src/bus.js';
+import {socketPathFor, connectBus} from '../src/bus.js';
 
 const cliPath = fileURLToPath(new URL('../src/cli.js', import.meta.url));
 const fakeCli = fileURLToPath(new URL('./helpers/fake-cli.js', import.meta.url));
@@ -441,9 +441,15 @@ function writeOrchestratorConfig(root, {orchestrator = 'main', profiles, order =
   }));
 }
 
+async function finalWorkerReport(profile) {
+  const client = await connectBus({path: profile.report.BOUNCE_REPORT_BUS, token: fs.readFileSync(profile.report.BOUNCE_REPORT_TOKEN_FILE, 'utf8').trim()});
+  try { await client.report({op: 'final', outcome: 'completed', phase: 'done', text: 'child done', next: 'none', summary: 'child done', evidence: [], remaining: 'none'}); }
+  finally { await client.close(); }
+}
+
 const completingAdapter = () => ({
-  async launch() { return {}; },
-  async *events() { yield {kind: 'result', status: 'completed', text: 'child done'}; },
+  async launch({profile}) { return {profile}; },
+  async *events({profile}) { await finalWorkerReport(profile); yield {kind: 'result', status: 'completed', text: 'child done'}; },
   async cancel() { return {verified: true}; },
 });
 
@@ -528,6 +534,8 @@ test('O2 orchestrator single-provider: the orchestrator submits over the bridge,
   assert.equal(orders.includes('BOUNCE_BUS_TOKEN_FILE='), true);
   // The stated capability is the bus's own allowlist (src/bus.js PEER_KINDS), verbatim.
   assert.equal(orders.includes('You may publish only: task.submitted, task.milestone, task.blocked, task.input_required, task.usage, task.activity, message.'), true);
+  assert.equal(orders.includes('phase, text, next, and evidence'), true, 'workers receive the durable progress checkpoint contract');
+  assert.equal(orders.includes('initial inspection, every phase change, and before completion'), true, 'checkpoint cadence is explicit');
 });
 
 test('O3 the orchestrator grant cannot publish a user row (even with `from` omitted) nor control.stop', async t => {
@@ -562,7 +570,7 @@ test('O4 multi-provider: orchestrator on codex delegates to a muse profile; sess
   assert.equal(session.events.find(e => e.kind === 'peer.joined' && e.name === `worker:${submitted.task}`).adapter, 'muse');
   assert.equal(session.events.some(e => e.kind === 'assistant' && e.text === 'child completed'), true);
 
-  const {code, stdout} = await run(['sessions'], bounceEnv(root));
+  const {code, stdout} = await run(['sessions', '--json'], bounceEnv(root));
   assert.equal(code, 0);
   const listed = JSON.parse(stdout).find(s => s.id === session.id);
   assert.equal(listed.operation, 'orchestrator');
@@ -598,8 +606,8 @@ async function withRunningWorker(root, body) {
   let release;
   const gate = new Promise(resolve => { release = resolve; });
   const gated = {
-    async launch() { return {}; },
-    async *events() { await gate; yield {kind: 'result', status: 'completed', text: 'child done'}; },
+    async launch({profile}) { return {profile}; },
+    async *events({profile}) { await gate; await finalWorkerReport(profile); yield {kind: 'result', status: 'completed', text: 'child done'}; },
     async cancel() { return {verified: true}; },
   };
   let session;

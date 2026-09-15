@@ -5,6 +5,7 @@
 // a back-compat DEFAULT for `policy` on these historically-read-only labels — the read-only/
 // write ratchet itself keys on `policy`, never on the label (CONTRACT.md §4).
 import {defaultStrategy, noReviewStrategy, quorumStrategy} from './strategy.js';
+import {normalizeLocalProfile} from './local-profiles.js';
 
 const READ_ONLY_ROLES = new Set(['critic', 'verifier', 'analyst']);
 
@@ -26,15 +27,25 @@ function resolveStrategy(spec) {
 // request; no current bounce profile produces it.
 export const POLICY_RANK = {'read-only': 0, plan: 1, write: 2, yolo: 3};
 
+// Used only when the user enables orchestration without an existing profile table.
+export function starterProfiles(settings) {
+  return {
+    main: {adapter: settings.order[0]},
+    build: {adapter: 'codex', model: settings.models?.codex || 'gpt-5.6-terra', fallback: ['build_claude']},
+    build_claude: {adapter: 'claude', model: settings.models?.claude || 'sonnet'},
+  };
+}
+
 // A profile's effective policy (pure): read-only is absolute; otherwise mode narrows write/unset
 // down to plan or yolo.
 export function effectivePolicy(profile) {
   if (profile.policy === 'read-only') return 'read-only';
   if (profile.mode === 'plan') return 'plan';
+  if (profile.adapter === 'local' && profile.policy === 'write') return 'write';
   return 'yolo';
 }
 
-export function validateOrchestration(settings, adapterNames = ['claude', 'codex', 'muse']) {
+export function validateOrchestration(settings, adapterNames = ['claude', 'codex', 'muse', 'local']) {
   const strategy = resolveStrategy(settings.strategy);
   if (settings.operation === undefined || settings.operation === 'classic') {
     return {operation: 'classic', orchestrator: null, profiles: {}, shape: 'none', strict: false, strategy};
@@ -59,7 +70,7 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
     let role = raw.role ?? 'builder';
     if (typeof role !== 'string' || !role) throw new Error(`profile ${name}: role must be a non-empty string`);
     if (name === settings.orchestrator) role = 'orchestrator';
-    const policy = raw.policy ?? (READ_ONLY_ROLES.has(role) ? 'read-only' : 'write');
+    const policy = raw.policy ?? (raw.adapter === 'local' || READ_ONLY_ROLES.has(role) ? 'read-only' : 'write');
     if (!['write', 'read-only'].includes(policy)) throw new Error(`profile ${name}: policy must be write or read-only`);
     const fallback = raw.fallback ?? [];
     if (!Array.isArray(fallback) || fallback.some(f => !names.includes(f))) throw new Error(`profile ${name}: fallback must list known profiles`);
@@ -67,6 +78,15 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
     if (mode === 'yolo' && settings.mode === 'plan') throw new Error(`profile ${name}: mode exceeds session mode`);
     if (READ_ONLY_ROLES.has(role) && policy === 'write') throw new Error(`profile ${name}: ${role} must be read-only`);
     profiles[name] = {adapter: raw.adapter, model: typeof raw.model === 'string' ? raw.model : '', mode, policy, fallback: [...fallback], role, executables: {...(settings.executables ?? {})}};
+    if (raw.adapter === 'local') {
+      Object.assign(profiles[name], normalizeLocalProfile({raw, policy, role, settings}));
+    }
+  }
+
+  for (const [name, profile] of Object.entries(profiles)) {
+    if (profile.adapter === 'local' && profile.localOnly && profile.fallback.some(target => profiles[target].adapter !== 'local')) {
+      throw new Error(`profile ${name}: localOnly forbids cross-provider fallback`);
+    }
   }
 
   const orchestratorAdapter = profiles[settings.orchestrator].adapter;
