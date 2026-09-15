@@ -200,7 +200,8 @@ test('U9: selected worker-pane input appends a worker message and never reaches 
   assert.notEqual(workerText, -1, 'expected the selected worker-pane plain-text branch');
   const workerTextBlock = cliSource.slice(workerText, cliSource.indexOf('} else {', workerText));
   assert.equal(/router\.run\(/.test(workerTextBlock), false);
-  assert.match(workerTextBlock, /session\.append\(\{kind: 'message', to: `worker:\$\{task\}`, text\}\)/);
+  // A /NAME an agent owns is expanded for a worker too; anything else goes as typed.
+  assert.match(workerTextBlock, /session\.append\(\{kind: 'message', to: `worker:\$\{task\}`, text: expandVendorCommand\(text, vendorOptions\(\)\)\?\.prompt \?\? text\}\)/);
 });
 
 // U10: agentsBoard — every agent with its last live activity lines (first line of each) and,
@@ -376,7 +377,7 @@ test('U19: paneGrid uses readable divider-aware layouts and reports overflow', (
 // U20: command dispatch is classified before the busy gate. Commands own no main-turn state;
 // only prompts and /continue may enter the turn queue while a provider is working.
 test('U20: busy TUI input runs commands immediately and queues only turns', () => {
-  assert.match(cliSource, /inputDisposition\(text, \{busy\}\)/);
+  assert.match(cliSource, /inputDisposition\(text, \{busy, vendorCommand\}\)/);
   assert.match(cliSource, /decision\.action === 'run-command'/);
   assert.match(cliSource, /decision\.action === 'queue-turn'/);
   assert.match(cliSource, /pendingTurns\.push\(text\)/);

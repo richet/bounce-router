@@ -144,6 +144,7 @@ Headless usage: `bounce run "Explain this screenshot" --image "/path/Screen shot
 - `/btw TEXT` steers the focused agent while it works — the message is delivered into the running turn (or to the selected worker when the AGENTS pane is open). When nothing is running it is saved as an aside for the next turn.
 - `/sessions`, `/rename NAME`, `/resume [SESSION]` and `/detach` manage sessions; see [Sessions](#sessions). `/agents`, `/tasks`, `/stop` and `/msg` are orchestrator commands; see [Orchestrator mode](#orchestrator-mode).
 - `/login [provider]`, `/new`, `/note TEXT`, `/retry`, `/help`, `/quit`.
+- Any other `/NAME` is looked up among the commands your agents keep — a repository's `.claude/commands/NAME.md`, Codex prompts, skills — and sent as the turn. See [Your agents' commands](#your-agents-commands).
 - Escape or Ctrl+C cancels the running process group; Ctrl+C while idle exits.
 - Mouse capture is on by default so the wheel/trackpad scrolls the transcript (three lines per tick). A terminal reports either the whole mouse or none of it, so while capture is on, hold Option (Shift in most terminals other than iTerm2) to drag-select or click links; F3 turns capture off to restore plain drag-select and link clicks, and F2 pauses updates and releases capture for copying. A plain click while capture is on prints a one-line reminder of these options. Use your terminal’s copy shortcut (usually Cmd+C or Ctrl+Shift+C); Ctrl+C cancels a turn or exits bounce. PgUp/PgDn scroll the transcript. Up/down recalls prompts; Ctrl+U clears input.
 - The prompt shows a blinking block cursor and grows as text wraps, up to one third of the terminal height. Longer drafts keep their last lines visible; pasted newlines are preserved. F2 hides the cursor while copying, and exit restores the terminal's default cursor style.
@@ -241,6 +242,8 @@ bounce skills clear                 # withdraw every copy bounce installed
 bounce skills reset --force         # also empty bounce's own store
 ```
 
+`import` surveys everything an agent reads — its home area (`~/.claude/skills`, `$CODEX_HOME/skills`, `~/.agents/skills`) and the current workspace's own `.claude/skills`, `.codex/skills` and `.agents/skills` — whichever scope bounce is set to install into; a workspace find is listed as `(claude · project)`. Where the same skill sits in both, the workspace copy is offered, since that is the one the vendor lets shadow the other.
+
 The same words work as `/skills …` in the TUI, with one difference: `/skills import` opens a checklist rather than adopting everything, because an agent's whole skill set is rarely what you meant to take. ↑/↓ moves, Space ticks one, `a` ticks all, `n` clears, Enter imports the ticks and Esc changes nothing. `/skills import --all` skips the checklist. Every write happens through the same sync, so `add`, `remove` and `import` leave the agents up to date without a separate step.
 
 `clear` withdraws the copies bounce installed but keeps its store; `reset` empties the store as well, so an import you did not want can be undone in one step. Because deleting the store cannot be undone, `reset` first lists what would go and only acts on `--force`. Neither touches a skill the agent shipped or you installed natively.
@@ -260,6 +263,20 @@ Each installed copy carries a `.bounce-skill.json` marker naming the skill and h
 `skills.scope` (or `--scope` for one command) chooses between the agents' home directories and the workspace. Project scope writes into the repository you are working in — commit or ignore those directories deliberately. In a workspace Muse also reads `.claude/skills` and `.codex/skills`, so it sees the same skill three times and keeps the highest-priority copy with a note; nothing fails. `bounce skills clear --scope project` withdraws them again.
 
 Skills are the only capability bounce carries across providers. Instructions in the handoff packet — the transcript and `/note` — reach every agent as text; `CLAUDE.md`, `AGENTS.md` and each vendor's own configuration remain that vendor's business.
+
+## Your agents' commands
+
+A repository often carries slash commands of its own — `.claude/commands/triage.md` gives Claude Code a `/triage`. Typed into bounce, such a line would normally go nowhere: bounce wraps every request in a handoff packet, so the vendor never sees a bare `/triage` at the start of its input, and only bounce's own commands are on the `/` menu. So bounce expands them itself. A `/NAME` that is not one of bounce's commands is looked up, in this order, in the workspace's `.claude/commands`, then `~/.claude/commands` (`CLAUDE_CONFIG_DIR`), then Codex prompts (`$CODEX_HOME/prompts`), then skills — bounce's own store first, then each agent's workspace and home skill directories — and the first match becomes the turn. The same lookup works headless: `bounce run "/triage REC-1234"`.
+
+```sh
+/triage REC-1234          # .claude/commands/triage.md with $ARGUMENTS filled in
+/seed-account Acme Jane   # $1, $2 … take the words; $ARGUMENTS the whole tail
+/deploy                   # a skill by name, with a pointer to its files
+```
+
+Expansion follows Claude Code's rules: the frontmatter is dropped (`allowed-tools`, `model` and the like are vendor configuration, not instructions), `$ARGUMENTS` is the whole argument tail and `$1`…`$9` its words, and arguments a template never mentions are appended so nothing is lost. Inline `!\`command\`` is left as written for the agent to run rather than executed by bounce, and `@file` mentions pass through. Because the expansion happens in bounce, the command works whichever agent answers the turn — a Claude command runs on Codex after fallback — but anything inside it that names a Claude-only feature (a subagent from `.claude/agents`, a nested `/command`) still only means something to Claude.
+
+The transcript shows the line you typed with a note of how much it expanded to; `/details` unfolds the full text. The journal keeps the expansion, so a fallback agent and later turns read the instructions rather than a slash line they cannot resolve. These commands join the `/` picker after bounce's own, `/help` lists the ones this workspace offers, and a name that clashes with a bounce command (`/review`, `/skills`) is bounce's. Nothing is copied or synced: a repository's commands stay that repository's, which is also the answer when a skill should exist in one repo only — keep it in that repo's `.claude/skills` rather than in bounce's store, and it is still reachable as `/NAME` there.
 
 ## Routing and context
 

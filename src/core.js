@@ -141,7 +141,10 @@ export class Router {
   // that turn's fallback may finish without overwriting the provider chosen for the next turn.
   select(provider) { this.selectionVersion++; this.session.active = provider; }
   cancel() { this.controller?.abort(); }
-  async run(prompt, files = []) {
+  // `typed` is the slash line a prompt was expanded from (vendor-commands.js); the journal
+  // keeps the expansion as the request — that is what a fallback agent and later turns must
+  // read — and the typed line only for the transcript.
+  async run(prompt, files = [], {typed} = {}) {
     if (this.controller) throw new Error('A turn is already running');
     this.controller = new AbortController();
     const {signal} = this.controller;
@@ -153,7 +156,7 @@ export class Router {
     const selectionVersion = this.selectionVersion;
     try {
       const images = saveImages([...new Set([...imagePaths(prompt, s.cwd), ...files.map(file => path.resolve(s.cwd, file))])], s);
-      s.append({kind: 'user', text: prompt, ...(images.length ? {images} : {})});
+      s.append({kind: 'user', text: prompt, ...(typed ? {typed} : {}), ...(images.length ? {images} : {})});
       s.append({kind: 'checkpoint', ...gitSnapshot(s.cwd)});
       const first = s.active && cfg.order.includes(s.active) ? s.active : cfg.order[0];
       const order = [first, ...cfg.order.filter(p => p !== first)];

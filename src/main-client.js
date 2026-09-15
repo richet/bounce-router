@@ -6,7 +6,7 @@ export function createMainClient(session, settings) {
   return {
     cooldowns: {},
     select(provider) { session.active = provider; },
-    async run(text, files = []) {
+    async run(text, files = [], {typed} = {}) {
       if (activeRequest) throw new Error('A main turn is already active');
       const id = randomUUID();
       activeRequest = id;
@@ -24,7 +24,7 @@ export function createMainClient(session, settings) {
         }
       });
       try {
-        const ack = await session.runMain({id, text, files, provider, model: settings.models[provider] || '', mode: settings.mode});
+        const ack = await session.runMain({id, text, files, provider, model: settings.models[provider] || '', mode: settings.mode, ...(typed ? {typed} : {})});
         if (ack.accepted === false) throw new Error(ack.reason || 'Main turn refused');
         return await terminal;
       } finally {

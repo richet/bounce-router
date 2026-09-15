@@ -16,8 +16,11 @@ export function classifyInput(text) {
   return {kind: kind ?? 'immediate', command, parts, arg: parts.join(' '), ...(kind ? {} : {unknown: true})};
 }
 
-export function inputDisposition(text, {busy}) {
-  const input = classifyInput(text);
+// `vendorCommand(name)` says whether an agent owns a /name bounce does not: such a line is a
+// turn to expand (see vendor-commands.js), not a typo. bounce's own commands are matched first.
+export function inputDisposition(text, {busy, vendorCommand = () => false}) {
+  let input = classifyInput(text);
+  if (input.unknown && vendorCommand(input.command)) input = {kind: 'prompt', text, vendor: input.command};
   const action = input.kind === 'prompt' || input.kind === 'turn'
     ? busy ? 'queue-turn' : 'run-turn'
     : 'run-command';

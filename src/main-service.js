@@ -92,6 +92,7 @@ export function createMainService({session, adapters, profile, settings, orchest
       if (typeof params?.text !== 'string' || !params.text.trim()) return {accepted: false, reason: 'empty_prompt'};
       if (params.files !== undefined && (!Array.isArray(params.files) || params.files.some(file => typeof file !== 'string'))) return {accepted: false, reason: 'invalid_attachments'};
       if (params.mode !== undefined && !['yolo', 'plan'].includes(params.mode)) return {accepted: false, reason: 'invalid_mode'};
+      if (params.typed !== undefined && (typeof params.typed !== 'string' || !params.typed.startsWith('/'))) return {accepted: false, reason: 'invalid_typed'};
       const provider = params.provider ?? profile.adapter;
       if (!adapters[provider]) return {accepted: false, reason: 'unknown_provider'};
       let images;
@@ -102,7 +103,7 @@ export function createMainService({session, adapters, profile, settings, orchest
         handle: null, turnId: null, cancelled: false, finished: false};
       current = run;
       session.active = provider;
-      session.append({kind: 'user', text: params.text, ...(images.length ? {images} : {})});
+      session.append({kind: 'user', text: params.text, ...(params.typed ? {typed: params.typed} : {}), ...(images.length ? {images} : {})});
       emit({kind: 'main.starting', provider, requestId: run.id, state: 'starting'});
       run.done = Promise.resolve().then(() => execute(run, {...params}));
       return {accepted: true, requestId: run.id, state: 'started'};

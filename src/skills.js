@@ -203,25 +203,38 @@ export function newSkill(root, name, description = 'Describe when an agent shoul
 // without being retyped. Copies bounce itself installed are skipped: they are already here.
 // Surveying is separate from adopting so the TUI can offer the list before anything is
 // written, and so the same list drives both the picker and the headless run.
-export function importCandidates({root, scope = 'user', cwd, env, home, providers = Object.keys(skillAreas)} = {}) {
+//
+// The survey covers every area the vendor reads, not just the one bounce installs into:
+// `scope` says where sync writes, but a skill kept in the workspace's own .claude/skills is
+// as much "what the agent already has" as one under ~/.claude, and surveying only the
+// install scope left project skills invisible to import. The project area comes first
+// within a provider because that is the copy the vendor itself lets shadow the user one.
+export function importCandidates({root, cwd, env, home, providers = Object.keys(skillAreas)} = {}) {
   const found = [];
   for (const provider of providers) {
-    const dir = skillDir(provider, {scope, cwd, env, home});
-    if (!fs.existsSync(dir)) { found.push({provider, action: 'absent', detail: `${dir} does not exist`}); continue; }
-    for (const entry of fs.readdirSync(dir, {withFileTypes: true}).sort((a, b) => a.name.localeCompare(b.name))) {
-      if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
-      const source = path.join(dir, entry.name);
-      if (marker(source)) continue;
-      const skill = readSkill(source);
-      if (skill.error) { found.push({provider, skill: entry.name, action: 'invalid', detail: skill.error}); continue; }
-      // The same skill often sits in two agents' directories; offer the first one only.
-      if (found.some(row => row.skill === skill.name && row.action !== 'invalid')) continue;
-      found.push({provider, skill: skill.name, dir: source, description: skill.description,
-        action: fs.existsSync(path.join(skillStore(root), skill.name)) ? 'exists' : 'new'});
+    const areas = [...(cwd ? [['project', skillDir(provider, {scope: 'project', cwd, env, home})]] : []), ['user', skillDir(provider, {scope: 'user', env, home})]];
+    const present = areas.filter(([, dir]) => fs.existsSync(dir));
+    if (!present.length) { found.push({provider, action: 'absent', detail: `${areas.map(([, dir]) => dir).join(' and ')} ${areas.length === 1 ? 'does' : 'do'} not exist`}); continue; }
+    for (const [scope, dir] of present) {
+      for (const entry of fs.readdirSync(dir, {withFileTypes: true}).sort((a, b) => a.name.localeCompare(b.name))) {
+        if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+        const source = path.join(dir, entry.name);
+        if (marker(source)) continue;
+        const skill = readSkill(source);
+        if (skill.error) { found.push({provider, scope, skill: entry.name, action: 'invalid', detail: skill.error}); continue; }
+        // The same skill often sits in two agents' directories, or in a workspace and the
+        // home area alike; offer the first one only.
+        if (found.some(row => row.skill === skill.name && row.action !== 'invalid')) continue;
+        found.push({provider, scope, skill: skill.name, dir: source, description: skill.description,
+          action: fs.existsSync(path.join(skillStore(root), skill.name)) ? 'exists' : 'new'});
+      }
     }
   }
   return found;
 }
+// Where a candidate was found, for listings: the user area is the plain provider name, a
+// workspace copy says so.
+export const importOrigin = row => row.scope === 'project' ? `${row.provider} · project` : row.provider;
 // Adopts exactly the candidates handed back, so a selection made in the picker is what runs.
 export function importSelected(root, candidates, {home, force = false} = {}) {
   return candidates.map(candidate => {
@@ -249,8 +262,8 @@ export function importListing(found) {
   if (!offered.length) return ['Nothing to import.',
     ...found.filter(row => row.detail).map(row => `  ${row.provider}: ${row.detail}`)].join('\n');
   return [`${offered.length} skill${offered.length === 1 ? '' : 's'} available to import:`,
-    ...offered.map(row => `  ${row.action === 'exists' ? '=' : '+'} ${row.skill} (${row.provider}) — ${String(row.description).slice(0, 90)}`),
-    ...found.filter(row => row.action === 'invalid').map(row => `  ! ${row.skill} (${row.provider}): ${row.detail}`),
+    ...offered.map(row => `  ${row.action === 'exists' ? '=' : '+'} ${row.skill} (${importOrigin(row)}) — ${String(row.description).slice(0, 90)}`),
+    ...found.filter(row => row.action === 'invalid').map(row => `  ! ${row.skill} (${importOrigin(row)}): ${row.detail}`),
     '"+" is new to bounce; "=" is already in the store and needs --force to replace.'].join('\n');
 }
 export const importSummary = report => summarize(report, ['adopted', 'exists', 'skipped']);

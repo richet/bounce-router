@@ -137,6 +137,7 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
       if (e.state === 'failed' || e.state === 'timed_out') return [head, ...preview, clip(`   ${style.muted('⎿')}  ${style.muted(`next: ${failureHint(e.reason, e.text)}`)}`, width)];
       return [head, ...preview];
     }
+    if (compact && e.kind === 'user' && e.typed) return [clip(style.user('You'), width), ...wrap(clean(e.typed), width), clip(`   ${style.muted('⎿')}  ${style.muted(`expanded to ${withoutBrief(e.text).length.toLocaleString()} chars · /details shows it`)}`, width), ''];
     if (compact && e.kind === 'user') return [clip(style.user('You'), width), ...wrap(clean(withoutBrief(e.text)), width), ''];
     const names = {user: 'You', assistant: 'Response', delta: 'Response', result: 'Result',
       status: 'Activity', route: 'Agent selected', tool: 'Tool output', error: 'Error',

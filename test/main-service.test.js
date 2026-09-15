@@ -125,3 +125,14 @@ test('switching back to a native provider includes the intervening provider hand
   assert.equal(calls[2].native.sessionId, 'codex-thread');
   assert.match(calls[2].message, /claude UNIQUE_RESULT/);
 });
+
+test('daemon main records the slash line a request was expanded from and rejects a malformed one', async t => {
+  const f = fixture(t);
+  assert.equal(f.main.run({id: 'bad', text: 'work', typed: 'triage'}).reason, 'invalid_typed');
+  assert.equal(f.main.run({id: 'bad', text: 'work', typed: 7}).reason, 'invalid_typed');
+  assert.equal((await f.main.run({id: 'request-1', text: 'Command: /triage — file\n\nTriage REC-1', typed: '/triage REC-1'})).accepted, true);
+  const user = f.session.events.find(e => e.kind === 'user');
+  assert.equal(user.typed, '/triage REC-1');
+  assert.match(user.text, /Triage REC-1/);
+  f.pending.shift()?.({kind: 'result', status: 'completed', text: 'Done'});
+});

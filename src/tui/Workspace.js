@@ -9,7 +9,7 @@ export function workspaceColumns(columns = 80) {
 
 function line(event) {
   const label = event.kind === 'user' ? 'You' : event.from ?? event.provider ?? 'Bounce';
-  const text = clean(event.text ?? event.summary ?? event.kind).replace(/\n+/g, ' ');
+  const text = clean(event.typed ?? event.text ?? event.summary ?? event.kind).replace(/\n+/g, ' ');
   return `${label} · ${text}`;
 }
 

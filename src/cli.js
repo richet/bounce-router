@@ -6,7 +6,7 @@ import {createInkTerminal} from './tui/ink-terminal.js';
 import {workspaceColumns} from './tui/Workspace.js';
 import {backspace, clampCursor, deleteForward, deleteWordBackward, deleteWordForward, insertText, moveCursor, moveLineEnd, moveLineStart, moveVertical, moveWord} from './tui/editor.js';
 import {inputDisposition} from './commands.js';
-import {completions, typedCommand, inputLayout, windowAround, modelRows, checklistRows} from './terminal.js';
+import {commands as ownCommands, completions, typedCommand, inputLayout, windowAround, modelRows, checklistRows} from './terminal.js';
 import {modelCatalog, modelEntries, catalogNotes} from './models.js';
 import {discoverLocalModels} from './local-models.js';
 import {localModelEntries, selectWorkerModel} from './local-picker.js';
@@ -20,7 +20,8 @@ import stringWidth from 'string-width';
 import {clean, createFormatter, createWorkSummary, workReview, withAsides, continueMain} from './format.js';
 import {validateOrchestration, starterProfiles} from './profiles.js';
 import {loadQuota, recordQuota, refreshQuota, quotaSnapshot, quotaShort, quotaPanel, quotaReport, quotaUnavailable, usageOrder} from './quota.js';
-import {skillsCommand, syncSkills, inspectSkills, skillsChanged, importCandidates, importSelected, importSummary, syncSummary, skillAreas} from './skills.js';
+import {skillsCommand, syncSkills, inspectSkills, skillsChanged, importCandidates, importSelected, importSummary, importOrigin, syncSummary, skillAreas} from './skills.js';
+import {expandVendorCommand, findVendorCommand, vendorCommandRows} from './vendor-commands.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import {spawn} from 'node:child_process';
@@ -317,7 +318,9 @@ async function main() {
     };
     const cancel = () => router.cancel();
     process.on('SIGINT', cancel); process.on('SIGTERM', cancel);
-    try { const result = await router.run(orchestratorBrief + positionals.slice(1).join(' '), values.image || []); process.exitCode = result === 'completed' ? 0 : result === 'cancelled' ? 130 : 1; }
+    const typed = positionals.slice(1).join(' ');
+    const expanded = typed.startsWith('/') ? expandVendorCommand(typed, {root, cwd: session.cwd}) : null;
+    try { const result = await router.run(orchestratorBrief + (expanded?.prompt ?? typed), values.image || [], expanded ? {typed} : {}); process.exitCode = result === 'completed' ? 0 : result === 'cancelled' ? 130 : 1; }
     finally { session.unlock(); process.off('SIGINT', cancel); process.off('SIGTERM', cancel); }
     // `run` is always this process's whole job, and under the supervisor's daemon
     // apparatus this session is a RemoteSession that keeps the IPC channel actively
@@ -387,10 +390,20 @@ async function main() {
   let mouseScroll = true;
   let picker = null;
   let localSetup = null;
-  const suggestions = () => menuDismissed ? [] : completions(input);
+  // The agents' own commands for this workspace join the picker after bounce's; a name bounce
+  // already uses (Muse ships a review skill) is bounce's. The directories are small but the
+  // picker redraws per keystroke, so the survey is kept briefly.
+  const vendorOptions = () => ({root, cwd: session.cwd});
+  let vendorCache = {at: 0, rows: []};
+  const vendorRows = () => {
+    if (Date.now() - vendorCache.at > 3000) vendorCache = {at: Date.now(), rows: vendorCommandRows(vendorOptions()).filter(([name]) => !ownCommands.some(([own]) => own === name))};
+    return vendorCache.rows;
+  };
+  const vendorCommand = name => !!findVendorCommand(name, vendorOptions());
+  const suggestions = () => menuDismissed ? [] : completions(input, vendorRows);
   const acceptCompletion = () => {const options = suggestions(); if (options.length) {input = '/' + options[completionIndex % options.length][0] + ' '; inputCursor = input.length; completionIndex = 0; menuDismissed = false; return true;} return false;};
   let notice = [restarted?.updateNotice, skillNotice, 'Ready. Mouse wheel scrolls the transcript · Option-drag selects text (F3 turns the wheel off) · F2 pause for copying · /help'].filter(Boolean).join(' ');
-  const history = session.events.filter(e => e.kind === 'user').map(e => e.text);
+  const history = session.events.filter(e => e.kind === 'user').map(e => e.typed ?? e.text);
   const selected = () => session.active || settings.order[0];
   const workerOverrides = new Map();
   const currentWorkerSettings = () => ({...settings, profiles: {...settings.profiles, ...Object.fromEntries(workerOverrides)}});
@@ -533,8 +546,8 @@ async function main() {
       // Nothing is ticked to begin with: "select all" is one key away, and an empty
       // selection makes Enter a safe no-op rather than a repeat of the accidental import.
       chosen: new Set(),
-      notes: found.filter(row => row.action === 'invalid').map(row => `${row.skill} (${row.provider}): ${row.detail}`),
-      entryLabel: entry => `${entry.skill} (${entry.provider})${entry.action === 'exists' ? ' — already in bounce, replaces it' : ''}`,
+      notes: found.filter(row => row.action === 'invalid').map(row => `${row.skill} (${importOrigin(row)}): ${row.detail}`),
+      entryLabel: entry => `${entry.skill} (${importOrigin(entry)})${entry.action === 'exists' ? ' — already in bounce, replaces it' : ''}`,
       options,
     };
     for (const entry of entries) entry.label = picker.entryLabel(entry);
@@ -749,7 +762,11 @@ async function main() {
           return await update(arg === 'check');
         }
         if (command === 'restart') return await restart();
-        if (command === 'help') {session.append({kind: 'status', text: help}); return;}
+        if (command === 'help') {
+          const rows = vendorRows().map(([name, description, hint]) => `  /${name}${hint ? ' ' + hint : ''}`.padEnd(24) + description);
+          session.append({kind: 'status', text: help + (rows.length ? `\nCommands your agents keep here (expanded by bounce, so they work whichever agent answers):\n${rows.join('\n')}` : '')});
+          return;
+        }
         if (command === 'review') {
           session.append({kind: 'review', text: workReview(workSummary(session.events))});
           scroll = 0;
@@ -887,12 +904,13 @@ async function main() {
         const task = selectedWorker();
         history.push(text); historyIndex = -1; scroll = 0;
         if (reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) throw new Error('This worker has finished · Tab selects the orchestrator');
-        session.append({kind: 'message', to: `worker:${task}`, text});
+        session.append({kind: 'message', to: `worker:${task}`, text: expandVendorCommand(text, vendorOptions())?.prompt ?? text});
         notice = `Message queued for worker ${task.slice(0, 8)}`;
       } else {
         history.push(text); historyIndex = -1; scroll = 0;
-        notice = 'Running · Esc or Ctrl+C cancels the agent process group';
-        render(); const result = await router.run((remoteMain ? '' : orchestratorBrief) + withAsides(text, asides.splice(0))); notice = `Turn ${result}. Session saved.`;
+        const expanded = text.startsWith('/') ? expandVendorCommand(text, vendorOptions()) : null;
+        notice = expanded ? `Running /${expanded.name} (${expanded.origin}) · Esc or Ctrl+C cancels the agent process group` : 'Running · Esc or Ctrl+C cancels the agent process group';
+        render(); const result = await router.run((remoteMain ? '' : orchestratorBrief) + withAsides(expanded?.prompt ?? text, asides.splice(0)), [], expanded ? {typed: text} : {}); notice = `Turn ${result}. Session saved.`;
         void refreshQuota(settings, {root, store: quotas, cwd: session.cwd}).then(render, () => {});
         if (dev && result === 'completed' && fingerprint() !== loadedFingerprint) await restart();
       }
@@ -904,7 +922,7 @@ async function main() {
       if (next) {
         notice = pendingTurns.length ? `Starting queued turn · ${pendingTurns.length} still queued` : 'Starting queued turn';
         render();
-        const decision = inputDisposition(next, {busy: false});
+        const decision = inputDisposition(next, {busy: false, vendorCommand});
         void submit(next, {parsedCommand: decision.kind === 'turn' ? decision : null});
       } else {
         busy = false;
@@ -971,7 +989,7 @@ async function main() {
       render(); return;
     }
     // Enter only completes a half-typed command; a complete one falls through and is run.
-    if (options.length && key.name === 'return' && !typedCommand(input)) {acceptCompletion(); render(); return;}
+    if (options.length && key.name === 'return' && !typedCommand(input, vendorRows)) {acceptCompletion(); render(); return;}
     if (key.name === 'escape') {menuDismissed = true; render(); return;}
     const beforeInput = input;
     verticalColumn = null;
@@ -983,7 +1001,7 @@ async function main() {
       }
       const text = input.trim(); input = ''; inputCursor = 0;
       if (text) {
-        const decision = inputDisposition(text, {busy});
+        const decision = inputDisposition(text, {busy, vendorCommand});
         if (agentsOpen && selectedWorker() && decision.kind === 'prompt') {
           void submit(text, {ownsTurn: false});
         } else if (decision.kind === 'lifecycle' && busy) {
