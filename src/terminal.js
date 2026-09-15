@@ -2,13 +2,16 @@ import stringWidth from 'string-width';
 import wrapAnsi from 'wrap-ansi';
 
 export const commands = [
-  ['provider', 'Select default agent'], ['model', 'Select model'], ['order', 'Set fallback order'],
+  ['provider', 'Select default agent'], ['model', 'Select model'], ['local', 'Set up local workers · /local setup [loaded]'], ['order', 'Set fallback order'],
   ['mode', 'Set yolo or plan mode'], ['login', 'Sign in to an agent'], ['new', 'Start new session'],
-  ['note', 'Save handoff note'], ['skills', 'Manage and install skills'],
+  ['note', 'Save handoff note'], ['btw', 'Aside for the next turn'], ['rename', 'Name this session'], ['resume', 'Resume a session'], ['sessions', 'List sessions here'], ['skills', 'Manage and install skills'],
   ['review', 'Show full session work items'], ['quota', 'Show reported quota'], ['retry', 'Clear quota cooldowns'],
   ['update', 'Install latest npm release'],
+  ['details', 'Expand or fold transcript details'],
   ['restart', 'Validate and reload'],
-  ['help', 'Show help'], ['quit', 'Exit bounce'],
+  ['operation', 'Switch classic/orchestrator'], ['stop', 'Cancel a task or all'], ['msg', 'Message a worker'],
+  ['agents', 'Interactive orchestrator and worker panes'], ['tasks', 'Toggle task tree'], ['continue', 'Start an orchestrator turn'],
+  ['help', 'Show help'], ['detach', 'Close view; keep agents running'], ['quit', 'Stop session and exit'],
 ];
 export function completions(input) {
   if (!/^\/\S*$/.test(input)) return [];

@@ -8,16 +8,18 @@
   },
   "scripts": {
     "start": "node src/cli.js",
-    "test": "node --test",
-    "check": "node --check src/cli.js && node --check src/core.js && node --check src/login.js && node --check src/providers.js && node --check src/reload.js && node --check src/terminal.js && node --check src/executable.js && node --check src/format.js && node --check src/images.js && node --check src/logo.js && node --check src/models.js && node --check src/query.js && node --check src/quota.js && node --check src/skills.js && node --check src/update.js"
+    "test": "node --test \"test/**/*.test.js\"",
+    "baseline": "node scripts/baseline.mjs",
+    "check": "node --check src/cli.js && node --check src/commands.js && node --check src/core.js && node --check src/login.js && node --check src/providers.js && node --check src/reload.js && node --check src/terminal.js && node --check src/executable.js && node --check src/format.js && node --check src/images.js && node --check src/logo.js && node --check src/models.js && node --check src/query.js && node --check src/quota.js && node --check src/skills.js && node --check src/update.js && node --check src/adapters/index.js && node --check src/adapters/claude.js && node --check src/adapters/codex.js && node --check src/adapters/muse.js && node --check src/reducers.js && node --check src/bus.js && node --check src/scheduler.js && node --check src/strategy.js && node --check src/sessions.js && node --check src/remote.js && node --check src/bridge.js && node --check src/profiles.js && node --check src/checkpoint.js && node --check src/adapters/muse-live.js && node --check src/adapters/claude-live.js && node --check src/adapters/codex-live.js && node --check src/adapters/live-common.js && node --check src/adapters/local-live.js && node --check src/adapters/backends/lmstudio.js && node --check src/adapters/backends/ollama.js && node --check src/adapters/backends/fake.js && node --check src/main-service.js && node --check src/main-client.js && node --check src/view-transport.js && node --check src/reporting.js && node --check src/tui/projection.js && node --check src/tui/Workspace.js && node --check src/tui/ink-terminal.js && node --check src/tui/editor.js && node --check src/tui/prompt-layout.js && node --check src/local-admission.js && node --check src/local-models.js && node --check src/local-picker.js && node --check src/local-profiles.js && node --check src/local-runtime.js && node --check src/local-setup.js && node --check src/local-toolchain.js && node --check src/local-recommend.js && node --check src/local-wizard.js && node --check src/local-setup-view.js"
   },
   "engines": {
     "node": ">=22"
   },
   "license": "MIT",
+  "private": true,
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/richet/bounce-router.git"
+    "url": "git+https://github.com/Arecius/bounce-router.git"
   },
   "files": [
     "src/"
@@ -28,8 +30,10 @@
   "dependencies": {
     "chalk": "^5.6.2",
     "cli-highlight": "^2.1.11",
+    "ink": "7.1.1",
     "marked": "^15.0.12",
     "marked-terminal": "^7.3.0",
+    "react": "19.2.4",
     "slice-ansi": "^7.1.2",
     "string-width": "^7.2.0",
     "strip-ansi": "^7.2.0",

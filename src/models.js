@@ -1,53 +1,11 @@
 import {queryLines} from './query.js';
 import {resolveExecutable} from './executable.js';
 import {providers} from './providers.js';
+import {adapters} from './adapters/index.js';
 
 // Every catalog comes from the vendor CLI's own protocol. Nothing here hard-codes
 // a model name, so a CLI update changes the picker without changing bounce.
-export const catalogQueries = {
-  claude: {
-    args: ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
-      '--no-session-persistence', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}'],
-    requests: [{type: 'control_request', request_id: 'bounce-models', request: {subtype: 'initialize'}}],
-    read(raw, out) {
-      if (raw.type !== 'control_response' || raw.response?.request_id !== 'bounce-models') return false;
-      const result = raw.response.response ?? {};
-      out.account = result.account?.email ?? null;
-      out.models = (result.models ?? []).map(m => ({id: m.value, label: m.displayName || m.value, description: m.description || m.resolvedModel || ''}));
-      return true;
-    },
-  },
-  codex: {
-    args: ['app-server'],
-    requests: [
-      {id: 1, method: 'initialize', params: {clientInfo: {name: 'bounce', version: '0.1.0'}}},
-      {method: 'initialized'},
-      {id: 2, method: 'account/read', params: {}},
-      {id: 3, method: 'model/list', params: {}},
-    ],
-    read(raw, out) {
-      if (raw.id === 2) out.account = raw.result?.account?.email ?? null;
-      if (raw.id === 3) out.models = (raw.result?.data ?? []).filter(m => !m.hidden)
-        .map(m => ({id: m.id ?? m.model, label: m.displayName || m.id || m.model, description: m.description || ''}));
-      return out.models !== undefined && out.account !== undefined;
-    },
-  },
-  muse: {
-    args: ['serve'],
-    requests: [
-      {jsonrpc: '2.0', id: 1, method: 'initialize', params: {clientInfo: {name: 'bounce', version: '0.1.0'}}},
-      {jsonrpc: '2.0', method: 'initialized'},
-      {jsonrpc: '2.0', id: 2, method: 'model/list', params: {}},
-    ],
-    read(raw, out) {
-      if (raw.id !== 2) return false;
-      const result = raw.result ?? {};
-      out.account = result.profileId ? `${result.providerId}/${result.profileId}` : result.providerId ?? null;
-      out.models = (result.models ?? []).map(m => ({id: m.modelId, label: m.displayLabel || m.modelId, description: m.description || ''}));
-      return true;
-    },
-  },
-};
+export const catalogQueries = Object.fromEntries(Object.entries(adapters).map(([name, a]) => [name, a.catalog]));
 
 // A failed or empty catalog is reported, never thrown: one signed-out agent must
 // not hide the models of the others.

@@ -1,18 +1,26 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {completions, typedCommand, frameDiff} from '../src/terminal.js';
+import {commandCatalog} from '../src/commands.js';
 import {resolveExecutable} from '../src/executable.js';
 test('slash shows all commands; prefixes narrow and arguments dismiss',()=>{
- assert.equal(completions('/').length,15);
+ assert.equal(completions('/').length,28);
+ assert.deepEqual(completions('/re').map(x=>x[0]),['rename','resume','review','retry','restart']);
+ assert.deepEqual(completions('/b').map(x=>x[0]),['btw']);
+ assert.deepEqual(completions('/ag').map(x=>x[0]),['agents']);
+ assert.deepEqual(completions('/co').map(x=>x[0]),['continue']);
+ assert.deepEqual(completions('/st').map(x=>x[0]),['stop']);
  assert.deepEqual(completions('/sk').map(x=>x[0]),['skills']);
  assert.deepEqual(completions('/mo').map(x=>x[0]),['model','mode']);
  assert.deepEqual(completions('/q').map(x=>x[0]),['quota','quit']);
  assert.deepEqual(completions('/up').map(x=>x[0]),['update']);
  assert.equal(typedCommand('/update'), 'update');
  assert.equal(typedCommand('/review'), 'review');
+ assert.equal(typedCommand('/agents'), 'agents');
  assert.deepEqual(completions('/rev').map(x=>x[0]), ['review']);
  assert.deepEqual(completions('/restart').map(x=>x[0]),['restart']);
  for (const input of ['hello','/model ','/unknown']) assert.deepEqual(completions(input),[]);
+ assert.deepEqual(completions('/').map(([name]) => name).sort(), Object.values(commandCatalog).flat().sort());
 });
 test('idle frames produce no writes and typing leaves transcript untouched',()=>{
  const before=['title','transcript','❯ /'];
