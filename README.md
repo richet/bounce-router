@@ -1,5 +1,12 @@
 # bounce-router
 
+[![npm version](https://img.shields.io/npm/v/bouncerouter?logo=npm&color=cb3837)](https://www.npmjs.com/package/bouncerouter)
+[![npm downloads](https://img.shields.io/npm/dm/bouncerouter?logo=npm)](https://www.npmjs.com/package/bouncerouter)
+[![Node.js 22+](https://img.shields.io/node/v/bouncerouter?logo=node.js&color=339933)](https://nodejs.org/)
+[![License: MIT](https://img.shields.io/github/license/richet/bounce-router?color=blue)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/richet/bounce-router?style=flat&logo=github)](https://github.com/richet/bounce-router/stargazers)
+[![Last commit](https://img.shields.io/github/last-commit/richet/bounce-router?logo=github)](https://github.com/richet/bounce-router/commits/main)
+
 bounce-router is one TUI for your installed Claude Code, Codex, and Muse coding agents, run with the `bounce` command. Uses native CLI login and headless processes; bounce owns the conversation and carries context between providers. When one provider's subscription usage is exhausted, it automatically fails over to the next signed-in provider.
 
 ### Auto usage fail over while maintaining context
@@ -114,7 +121,7 @@ Headless usage: `bounce run "Explain this screenshot" --image "/path/Screen shot
 - Type `/` to open the command picker; type a prefix to filter. Up/down selects and Tab completes. Enter completes a half-typed command and runs one you typed out in full, so `/skills` lists your skills on the first press. Esc dismisses the picker.
 - Tab switches agent when the picker is closed.
 - Enter sends; Shift+Enter inserts a newline. A terminal sends a bare `\r` for Shift+Enter — indistinguishable from Enter — until an application asks it not to, so bounce turns on the kitty keyboard protocol and xterm's modifyOtherKeys while the TUI is up, and turns them off again whenever it hands the terminal back. That covers iTerm2 3.5+, Ghostty, kitty, WezTerm and xterm with no configuration. In a terminal that supports neither (Apple Terminal, older iTerm2), map the key yourself — in iTerm2, Settings → Profiles → Keys → Key Mappings → `+`, press ⇧↩, choose *Send Escape Sequence* and enter `[13;2u` — or use Alt+Enter or Ctrl+J, which insert a newline everywhere with no configuration. Ctrl+Enter and Cmd+Enter work too. Modified Enter is accepted in every encoding terminals use for it: CSI u (`\x1b[13;2u` is Shift+Enter), xterm's modifyOtherKeys (`\x1b[27;2;13~`), and Alt's ESC prefix. Requesting those reports also re-encodes other modified keys — Ctrl+C arrives as `\x1b[99;5u` — so the same decoder turns each one back into the key event the prompt expects.
-- F2 freezes display updates for selecting/copying text while an agent runs; F2 resumes. Events continue to be saved while paused. Unchanged frames produce no terminal writes, and ordinary updates redraw only changed rows.
+- F2 freezes display updates for selecting/copying text while an agent runs; F2 resumes. Pausing also redraws the frame full width with the work sidebar hidden, because terminals select whole lines: a drag across the transcript would otherwise copy the sidebar text sitting on those same lines. Events continue to be saved while paused. Unchanged frames produce no terminal writes, and ordinary updates redraw only changed rows.
 - `/provider claude` selects and saves the default.
 - `/model` lists every model each signed-in agent reports and lets you pick one: up/down or 1-9 to choose, Enter to use it, Esc to cancel. A pick saves the model and makes that agent the default. `/model refresh` re-asks the agents; catalogs are cached for five minutes.
 - `/model MODEL_ID` saves the selected provider's model without opening the picker; `/model default` uses its native default.
@@ -126,7 +133,7 @@ Headless usage: `bounce run "Explain this screenshot" --image "/path/Screen shot
 - `/skills` lists bounce's skills and where each agent has them; `/skills sync`, `/skills new NAME`, `/skills add PATH`, `/skills remove NAME`, `/skills import [provider]`, `/skills clear` and `/skills reset` manage them. See [Skills](#skills).
 - `/login [provider]`, `/new`, `/note TEXT`, `/retry`, `/help`, `/quit`.
 - Escape or Ctrl+C cancels the running process group; Ctrl+C while idle exits.
-- Mouse capture is off by default so you can drag to select text and open visible URLs using your terminal’s usual link gesture (often Cmd+click on macOS or Ctrl+click elsewhere). Use your terminal’s copy shortcut (usually Cmd+C or Ctrl+Shift+C); Ctrl+C cancels a turn or exits bounce. PgUp/PgDn scroll the transcript. F3 toggles mouse wheel/trackpad scrolling (three lines per tick); toggle it off again to select text or open links. F2 freezes updates and releases mouse capture while you copy; F2 resumes the previous mode. Up/down recalls prompts; Ctrl+U clears input.
+- Mouse capture is on by default so the wheel/trackpad scrolls the transcript (three lines per tick). A terminal reports either the whole mouse or none of it, so while capture is on, hold Option (Shift in most terminals other than iTerm2) to drag-select or click links; F3 turns capture off to restore plain drag-select and link clicks, and F2 pauses updates, releases capture and hides the sidebar for copying. Use your terminal’s copy shortcut (usually Cmd+C or Ctrl+Shift+C); Ctrl+C cancels a turn or exits bounce. PgUp/PgDn scroll the transcript. Up/down recalls prompts; Ctrl+U clears input.
 - The prompt shows a blinking block cursor and grows as text wraps, up to one third of the terminal height. Longer drafts keep their last lines visible; pasted newlines are preserved. F2 hides the cursor while copying, and exit restores the terminal's default cursor style.
 
 YOLO intentionally lets agents run commands and change files with your user permissions. Launch in the workspace you intend to let the agents modify.
