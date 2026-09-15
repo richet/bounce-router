@@ -26,6 +26,25 @@ test('conversation shows one answer and one worker outcome, with expandable mech
   assert.equal(events[6].text, answer, 'journal content stays intact');
 });
 
+test('a result that repeats the answer, or only says the turn completed, is not shown twice', () => {
+  const rows = conversationEvents([
+    events[5], {id: 'r1', kind: 'result', success: true, text: answer},
+    {kind: 'user', text: 'Again'}, {id: 'a2', kind: 'assistant', provider: 'codex', text: 'Sure.'}, {id: 'r2', kind: 'result', success: true, text: 'Turn completed'},
+    {id: 'r3', kind: 'result', success: false, text: 'protocol error: claude exited without result'},
+  ]);
+  assert.deepEqual(rows.map(row => row.kind), ['assistant', 'user', 'assistant', 'result']);
+  assert.equal(conversationEvents([events[5], {id: 'r1', kind: 'result', success: true, text: answer}], {details: true}).length, 2);
+});
+
+test('streamed deltas read as one answer block and the result that repeats them is dropped', () => {
+  const rows = conversationEvents([
+    {id: 'd1', kind: 'delta', provider: 'muse', text: 'Hi'}, {id: 'd2', kind: 'delta', provider: 'muse', text: ' — picked'}, {id: 'd3', kind: 'delta', provider: 'muse', text: ' up'},
+    {id: 'r', kind: 'result', success: true, text: 'Hi — picked up'},
+  ]);
+  assert.deepEqual(rows.map(row => [row.kind, row.id, row.text]), [['delta', 'd1+3', 'Hi — picked up']]);
+  assert.equal(conversationEvents([{id: 'd1', kind: 'delta', provider: 'muse', text: 'Hi'}, {id: 'd2', kind: 'delta', provider: 'muse', text: '!'}], {details: true}).length, 2);
+});
+
 test('a terminal-only answer is retained and rendered as Markdown', () => {
   const rows = conversationEvents([events[6]]);
   const text = rows.flatMap(row => createFormatter({color: false}).event(row, 80)).join('\n');

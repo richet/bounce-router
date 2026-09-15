@@ -181,19 +181,45 @@ test('work review preserves all item text and orders oldest first without mutati
   assert.equal(workReview([]), 'No completed turns yet.');
 });
 
-test('compact formatter: a tool call is a ⏺ line, a tool result a ⎿ line, a delegation row a glyph line with a next step on failure', () => {
+test('compact formatter: a tool call is a ● Name(purpose) line, a tool result a ⎿ preview block, a delegation row a glyph line with a next step on failure', () => {
   const {event} = createFormatter({color: false, compact: true});
   const call = event({kind: 'tool', provider: 'claude', text: 'Bash: {"command":"npm test","description":"Run the suite"}'}, 200);
-  assert.deepEqual(call, ['⏺ Bash  Run the suite']);
-  const result = event({kind: 'tool', provider: 'claude', text: '# pass 12\n# fail 0\nok'}, 200);
-  assert.deepEqual(result, ['   ⎿  # pass 12 (+2 lines)']);
-  assert.deepEqual(event({kind: 'tool', provider: 'claude', text: '<persisted-output>\nOutput too large'}, 200), ['   ⎿  output saved to a file (+1 lines)']);
+  assert.deepEqual(call, ['● Bash(Run the suite)']);
+  assert.deepEqual(event({kind: 'tool', provider: 'claude', text: 'Bash: {"command":"npm test","description":"Run the whole suite again"}'}, 20), ['● Bash(Run the who…)']);
+  // The first lines show under ⎿ at the content column, the rest fold to "… +N lines"; a blank
+  // row closes the block. Inner indentation is kept; an overlong line is clipped, not wrapped.
+  const result = event({kind: 'tool', provider: 'claude', text: '\n  # pass 12\n  indented\n# fail 0\nok\nmore\n'}, 200);
+  assert.deepEqual(result, ['  ⎿    # pass 12', '       indented', '     # fail 0', '     … +2 lines', '']);
+  assert.deepEqual(event({kind: 'tool', provider: 'claude', text: 'x'.repeat(40)}, 30), ['  ⎿  ' + 'x'.repeat(24) + '…', '']);
+  assert.deepEqual(event({kind: 'tool', provider: 'claude', text: '<persisted-output>\nOutput too large'}, 200), ['  ⎿  output saved to a file', '']);
   assert.deepEqual(event({kind: 'task.fold', task: 't1', state: 'running', reason: null, text: 'build · running · writing tests'}, 200), ['● build · running · writing tests']);
   assert.deepEqual(event({kind: 'task.fold', task: 't1', state: 'failed', reason: 'error', text: 'build · failed · error: Invalid request: invalid type: null, expected a string'}, 200), [
     '✗ build · failed · error: Invalid request: invalid type: null, expected a string',
-    '   ⎿  next: the vendor CLI speaks a different protocol version than bounce expects · update bounce (or the vendor), then resubmit',
+    '  ⎿  next: the vendor CLI speaks a different protocol version than bounce expects · update bounce (or the vendor), then resubmit',
   ]);
-  assert.deepEqual(event({kind: 'user', text: 'You are the orchestrator peer of session s; see x.\ncontinue with the handoff'}, 200), ['You', 'continue with the handoff', '']);
+  assert.deepEqual(event({kind: 'user', text: 'You are the orchestrator peer of session s; see x.\ncontinue with the handoff'}, 200), ['> continue with the handoff', '']);
+  // Answers hang two columns under their ●, lists keep their marker column when they wrap, and
+  // bookkeeping rows sit at the content column.
+  const answer = event({kind: 'assistant', provider: 'claude', text: 'Done.\n\n- first item that is long enough to wrap past the width\n- second\n\n1. numbered item that is also long enough to wrap past the width\n2. next'}, 40);
+  assert.deepEqual(answer, [
+    '● Done.', '',
+    '  - first item that is long enough to', '    wrap past the width',
+    '  - second', '',
+    '  1. numbered item that is also long', '     enough to wrap past the width',
+    '  2. next', '',
+  ]);
+  assert.deepEqual(event({kind: 'status', provider: 'claude', text: 'Finished · completed'}, 80), ['  claude · Activity  Finished · completed']);
+});
+
+test('Markdown lists use Claude Code markers, nest by the marker width and wrap under their text; code has no header', () => {
+  const out = plain.markdown('- item one\n  - nested item\n    - deeper\n- item two\n\n3. third\n4. fourth\n   - sub\n\n```js\nfunction x() {\n  return 1;\n}\n```', 80);
+  assert.deepEqual(out, [
+    '- item one', '  - nested item', '    - deeper', '- item two', '',
+    '3. third', '4. fourth', '   - sub', '',
+    '  function x() {', '    return 1;', '  }',
+  ]);
+  // A long code line continues under its own indentation.
+  assert.deepEqual(plain.markdown('```\n    ' + 'word '.repeat(8).trim() + '\n```', 30), ['      word word word word word', '      word word word']);
 });
 
 test('classic formatter (no compact) still renders a tool row as a full block', () => {

@@ -23,7 +23,7 @@ test('central transcript preserves highlighting and folds tools without dumping 
   try {
     await terminal.mount({events: [
       {id: '1', kind: 'tool', provider: 'claude', text: 'Bash: {"description":"Run focused tests","command":"npm test"}'},
-      {id: '2', kind: 'tool', provider: 'claude', text: 'Tests passed\nRAW_LINE_TWO\nRAW_LINE_THREE'},
+      {id: '2', kind: 'tool', provider: 'claude', text: 'Tests passed\nRAW_LINE_TWO\nRAW_LINE_THREE\nRAW_LINE_FOUR\nRAW_LINE_FIVE'},
       {id: '3', kind: 'task.observed', task: 'worker', text: 'WORKER_RAW_DUMP'},
       {id: '4', kind: 'assistant', provider: 'claude', text: '**Verified** the test results.'},
     ]});
@@ -31,10 +31,11 @@ test('central transcript preserves highlighting and folds tools without dumping 
     terminal.unmount();
   }
   const plain = stripAnsi(output);
-  assert.match(plain, /Bash  Run focused tests/);
-  assert.match(plain, /Tests passed.*\(\+2 lines\)/);
-  assert.doesNotMatch(plain, /RAW_LINE_TWO|RAW_LINE_THREE|WORKER_RAW_DUMP/);
-  assert.match(output, /\x1b\[35m/);
+  // Claude Code's shape: "● Bash(what for)", a ⎿ block previewing the first lines, "… +N lines".
+  assert.match(plain, /● Bash\(Run focused tests\)/);
+  assert.match(plain, /⎿  Tests passed[\s\S]*RAW_LINE_THREE[\s\S]*… \+2 lines/);
+  assert.doesNotMatch(plain, /RAW_LINE_FOUR|RAW_LINE_FIVE|WORKER_RAW_DUMP/);
+  assert.match(output, /\x1b\[32m●/);
   assert.match(output, /\x1b\[1mVerified/);
 });
 
@@ -49,6 +50,21 @@ test('prompt stays visible even with multiline draft and an overflowing command 
   assert.match(output, /line one/);
   assert.match(output, /Working/);
   assert.ok(output.split('\n').length <= 12);
+});
+
+test('blank transcript rows keep their height so blocks and sections stay separated', () => {
+  const Workspace = createWorkspace(React, Ink);
+  const rows = ['● Done.', '', '  What changed', '', '  - item', '', '> next prompt'];
+  const render = (extra = {}) => stripAnsi(Ink.renderToString(React.createElement(Workspace, {
+    model: {panes: [{id: 'main', kind: 'orchestrator', task: 'main', profile: 'main', state: 'running', activity: []}], transcript: []},
+    transcriptRows: rows, view: {columns: 60, rows: 16, ...extra},
+  }), {columns: 60})).split('\n');
+  // Ink drops an empty <Text> entirely; the conversation and the orchestrator pane both keep the row.
+  assert.deepEqual(render().slice(1, 8).map(row => row.trim()), ['● Done.', '', 'What changed', '', '- item', '', '> next prompt']);
+  const pane = render({agentsOpen: true, selectedId: 'main'});
+  const start = pane.findIndex(row => row.includes('● Done.'));
+  assert.ok(start > 0);
+  assert.deepEqual(pane.slice(start, start + 7).map(row => row.replace(/[│ ]/g, '')), ['●Done.', '', 'Whatchanged', '', '-item', '', '>nextprompt']);
 });
 
 test('prompt viewport follows the caret instead of always showing the end of a long draft', () => {
@@ -68,7 +84,7 @@ test('worker panes show tool descriptions instead of serialized tool arguments',
       activity: ['Bash: {"description":"Run focused tests","command":"npm test"}']}], transcript: []},
     transcriptRows: [], view: {columns: 58, rows: 20, agentsOpen: true, selectedId: 'worker:abc'},
   }), {columns: 58}));
-  assert.match(output, /Bash  Run focused tests/);
+  assert.match(output, /Bash\(Run focused tests\)/);
   assert.doesNotMatch(output, /"description"|"command"/);
 });
 
@@ -93,7 +109,7 @@ test('details expand tool output and folding restores the compact view without s
   };
   try {
     await terminal.mount({events: [
-      {id: 'tool', kind: 'tool', text: 'First line\nHIDDEN_DETAIL'},
+      {id: 'tool', kind: 'tool', text: 'First line\nsecond\nthird\nfourth\nHIDDEN_DETAIL'},
       {id: 'response', kind: 'assistant', text: '## Answer\n\n**Readable** result.'},
       {id: 'terminal', kind: 'main.terminal', status: 'completed', text: '## Answer\n\n**Readable** result.'},
     ]});

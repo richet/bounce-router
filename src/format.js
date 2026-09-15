@@ -7,6 +7,9 @@ import sliceAnsi from 'slice-ansi';
 import stripAnsi from 'strip-ansi';
 import {tasks, budgets, TERMINAL} from './reducers.js';
 
+// How many lines of a tool result the compact transcript shows before "… +N lines".
+const RESULT_PREVIEW = 3;
+
 // Only renderer-owned terminal escapes may reach the display.
 export const clean = text => stripAnsi(String(text ?? ''))
   .replace(/\r\n?/g, '\n')
@@ -52,8 +55,22 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
       const visible = compact ? lines.slice(0, 4) : lines;
       const code = codeColors(visible.join('\n'), language);
       const folded = lines.length - visible.length;
-      const more = folded ? '\n' + c.gray(`  ▸ ${folded} more lines · /details to expand`) : '';
-      return c.gray(`  ┌─ ${lang || 'code'}`) + '\n' + code.split('\n').map(line => '  ' + line).join('\n') + more + '\n\n';
+      const more = folded ? '\n' + c.gray(`  … +${folded} lines · /details to expand`) : '';
+      return code.split('\n').map(line => '  ' + line).join('\n') + more + '\n\n';
+    },
+    // Lists the way Claude Code shows them: `- ` and `1. ` markers at the content column, an
+    // item's further lines (and nested lists) hanging under its text. marked-terminal's own list
+    // renderer indents by a tab and uses `*`.
+    list(token) {
+      const rows = [];
+      token.items.forEach((item, index) => {
+        const marker = token.ordered ? `${(token.start || 1) + index}. ` : '- ';
+        const check = item.task ? (item.checked ? '[x] ' : '[ ] ') : '';
+        // A tight list has no blank rows inside an item; paragraph renderers add them anyway.
+        const lines = this.parser.parse(item.tokens).replace(/\n+$/, '').split('\n').filter(line => token.loose || line !== '');
+        rows.push(marker + check + lines[0], ...lines.slice(1).map(line => line ? ' '.repeat(marker.length) + line : ''));
+      });
+      return rows.join('\n') + '\n\n';
     },
     ...(compact ? {
       // Compact tables do not use marked-terminal's colon-delimited table transport.
@@ -62,7 +79,7 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
         const labels = header.map(cell => this.parser.parseInline(cell.tokens));
         const preview = rows.slice(0, 3).map(row => row.map((cell, index) =>
           `${c.gray(labels[index] + ':')} ${this.parser.parseInline(cell.tokens)}`).join(' · '));
-        const more = rows.length > 3 ? `\n${c.gray(`  ▸ ${rows.length - 3} more rows · /details to expand`)}` : '';
+        const more = rows.length > 3 ? `\n${c.gray(`  … +${rows.length - 3} rows · /details to expand`)}` : '';
         return preview.join('\n') + more + '\n\n';
       },
     } : {}),
@@ -74,10 +91,19 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
   }});
   const wrap = (text, width) => wrapAnsi(color ? text : stripAnsi(text), Math.max(1, width), {hard: true, trim: false}).split('\n');
   const clip = (text, width) => sliceAnsi(color ? text : stripAnsi(text), 0, Math.max(0, width));
+  // A line that wraps continues under its own text — past its indentation and any list marker —
+  // the way Claude Code lays out lists and indented code, rather than snapping back to column 0.
+  const hang = (line, width) => {
+    const lead = /^\s*(?:(?:[-*•] |\d+[.)] )\s*)?/.exec(stripAnsi(line))[0];
+    if (!lead || !line.startsWith(lead) || lead.length > width / 2) return wrap(line, width).map(row => row.trimEnd());
+    const rest = line.slice(lead.length);
+    return wrap(rest, width - lead.length).map((row, index) => (index ? ' '.repeat(lead.length) + row.replace(/^ /, '') : lead + row).trimEnd());
+  };
+  const hangAll = (text, width) => text.split('\n').flatMap(line => hang(line, width));
   function markdown(text, width) {
     const source = clean(text);
-    try { return wrap(parser.parse(source).trimEnd(), width); }
-    catch { return wrap(source, width); } // Partial/unknown Markdown must never hide a response.
+    try { return hangAll(parser.parse(source).trimEnd(), width); }
+    catch { return hangAll(source, width); } // Partial/unknown Markdown must never hide a response.
   }
   // Claude sends tool calls as `Name: {json}`. Escaped newlines and quotes are unreadable,
   // so display the fields as lines. The journal keeps the original text for handoffs.
@@ -94,6 +120,8 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     }
     return lines.length > 40 ? [...lines.slice(0, 40), `… ${lines.length - 40} more lines`] : lines;
   };
+  // A transcript block: its glyph on the first row, every other row two columns in under it.
+  const block = (glyph, rows) => rows.map((row, index) => index ? (row ? '  ' + row : '') : `${glyph} ${row}`);
   // Short bookkeeping events read as one line; only real content earns a block of its own.
   const inline = ['status', 'progress', 'route', 'cooldown', 'attempt', 'turn', 'diagnostic', 'note', 'aside'];
   const who = e => [role?.(e) ?? null, e.provider || 'Bounce'].filter(Boolean).join(' · ');
@@ -113,39 +141,47 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     // output are noise — fold each tool row to one summary line, and render foldedThread's delegation
     // rows as one line each. Classic transcript never sets compact, so it is unchanged.
     if (compact && e.kind === 'tool') {
-      // A tool CALL (`Name: {json}`) is one ⏺ line naming the tool and what it was for; a tool
-      // RESULT is one ⎿ line with its first line and how much more there was — the shape Claude
-      // Code and Codex use, so the eye can skip mechanics and land on responses and outcomes.
-      const t = clean(e.text).trim();
-      const m = /^([A-Za-z_][\w.-]*): (\{[\s\S]*\})$/.exec(t);
+      // A tool CALL (`Name: {json}`) is one "● Name(what for)" line; a tool RESULT is a ⎿ block
+      // with its first few lines and "… +N lines" for the rest — the shape Claude Code uses, so
+      // the eye can skip mechanics and land on responses and outcomes.
+      // Leading blank lines go; a first line's own indentation stays, it is part of the output.
+      const t = clean(e.text).replace(/^\n+/, '').trimEnd();
+      const m = /^([A-Za-z_][\w.-]*): (\{[\s\S]*\})$/.exec(t.trim());
       if (m) {
         let summary = '';
         try { const o = JSON.parse(m[2]); summary = String(o.description || o.path || o.file_path || (typeof o.command === 'string' ? o.command.split('\n')[0] : '') || o.pattern || o.query || ''); } catch {}
-        return [clip(`${style.tool('⏺')} ${style.tool(m[1])}${summary ? `  ${summary}` : ''}`, width)];
+        const head = `${style.result('●')} ${c.bold(m[1])}`;
+        if (!summary) return [head];
+        const room = width - stripAnsi(head).length - 3;
+        return [`${head}(${summary.length > room ? summary.slice(0, Math.max(0, room)) + '…' : summary})`];
       }
-      const lines = t.split('\n');
-      const first = /^<persisted-output>/.test(lines[0]) ? 'output saved to a file' : lines[0];
-      const more = lines.length > 1 ? style.muted(` (+${lines.length - 1} lines)`) : '';
-      return [clip(`   ${style.muted('⎿')}  ${style.muted(first)}${more}`, width)];
+      const lines = /^<persisted-output>/.test(t) ? ['output saved to a file'] : t.split('\n');
+      const preview = lines.slice(0, RESULT_PREVIEW).map(line => {
+        const room = width - 5;
+        return stripAnsi(line).length > room ? clip(line, room - 1) + '…' : line;
+      });
+      const more = lines.length > preview.length ? [style.muted(`… +${lines.length - preview.length} lines`)] : [];
+      return [...[...preview, ...more].map((line, index) => (index ? '     ' : `  ${style.muted('⎿')}  `) + style.muted(line)), ''];
     }
     if (compact && e.kind === 'task.fold') {
       const paint = ['failed', 'timed_out', 'cancelled', 'rejected'].includes(e.state) ? style.error
         : ['completed', 'accepted'].includes(e.state) ? style.result
         : ['blocked', 'input_required'].includes(e.state) ? style.status : style.title;
       const head = clip(`${paint(stateGlyph(e.state))} ${paint(clean(e.text))}`, width);
-      const preview = e.preview ? [clip(`   ${style.muted(clean(e.preview))}`, width)] : [];
-      if (e.state === 'failed' || e.state === 'timed_out') return [head, ...preview, clip(`   ${style.muted('⎿')}  ${style.muted(`next: ${failureHint(e.reason, e.text)}`)}`, width)];
+      const preview = e.preview ? [clip(`  ${style.muted(clean(e.preview))}`, width)] : [];
+      if (e.state === 'failed' || e.state === 'timed_out') return [head, ...preview, clip(`  ${style.muted('⎿')}  ${style.muted(`next: ${failureHint(e.reason, e.text)}`)}`, width)];
       return [head, ...preview];
     }
-    if (compact && e.kind === 'user' && e.typed) return [clip(style.user('You'), width), ...wrap(clean(e.typed), width), clip(`   ${style.muted('⎿')}  ${style.muted(`expanded to ${withoutBrief(e.text).length.toLocaleString()} chars · /details shows it`)}`, width), ''];
-    if (compact && e.kind === 'user') return [clip(style.user('You'), width), ...wrap(clean(withoutBrief(e.text)), width), ''];
+    if (compact && e.kind === 'user' && e.typed) return [...block(style.user('>'), wrap(clean(e.typed), width - 2)), clip(`  ${style.muted('⎿')}  ${style.muted(`expanded to ${withoutBrief(e.text).length.toLocaleString()} chars · /details shows it`)}`, width), ''];
+    if (compact && e.kind === 'user') return [...block(style.user('>'), wrap(clean(withoutBrief(e.text)), width - 2)), ''];
+    if (compact && ['assistant', 'delta', 'result'].includes(e.kind)) return [...block('●', markdown(e.text, width - 2)), ''];
     const names = {user: 'You', assistant: 'Response', delta: 'Response', result: 'Result',
       status: 'Activity', route: 'Agent selected', tool: 'Tool output', error: 'Error',
       diagnostic: 'Diagnostics', note: 'Saved note', cooldown: 'Retry delay', attempt: 'Agent finished',
       turn: 'Turn finished', quota: 'Reported quota', skills: 'Skills', review: 'Work Done review', aside: 'By the way'};
     const label = e.kind === 'user' ? 'You' : e.kind === 'aside' ? 'You · By the way' : `${who(e)} · ${names[e.kind] || e.kind}`;
     const paint = style[e.kind] || style.muted;
-    if (inline.includes(e.kind)) return wrap(`${paint(clean(label))}  ${clean(e.text)}`, width);
+    if (inline.includes(e.kind)) return compact ? hang(`  ${paint(clean(label))}  ${clean(e.text)}`, width) : wrap(`${paint(clean(label))}  ${clean(e.text)}`, width);
     const source = e.kind === 'tool' ? (toolLines(clean(e.text)) ?? [clean(e.text)]).join('\n') : clean(e.text);
     const content = ['assistant', 'delta', 'result'].includes(e.kind)
       ? markdown(e.text, width) : wrap(e.kind === 'tool' ? codeColors(source) : source, width);

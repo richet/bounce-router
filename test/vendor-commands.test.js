@@ -112,8 +112,8 @@ test('the journal keeps the expansion as the request and the typed line for the 
   assert.equal('typed' in session.events.findLast(e => e.kind === 'user'), false);
 
   const compact = createFormatter({color: false, compact: true}).event(user, 80);
-  assert.deepEqual(compact.slice(0, 2), ['You', '/triage REC-7']);
-  assert.match(compact[2], /expanded to \d+ chars · \/details shows it/);
+  assert.equal(compact[0], '> /triage REC-7');
+  assert.match(compact[1], /^  ⎿  expanded to \d+ chars · \/details shows it/);
   assert.equal(compact.join('\n').includes('end-to-end'), false);
   assert.match(createFormatter({color: false}).event(user, 80).join('\n'), /end-to-end/);
 });

@@ -1,5 +1,6 @@
 const describe = value => typeof value === 'string' ? value : JSON.stringify(value ?? '');
 // Tool results arrive as content blocks; show their text rather than a JSON dump.
+const foregroundTasks = new Set();
 const contentText = value => Array.isArray(value)
   ? value.map(part => part?.type === 'text' ? part.text : part?.type === 'image' ? '[image]' : describe(part)).join('\n')
   : describe(value);
@@ -37,8 +38,14 @@ export default {
     if (raw.type === 'system') {
       if (raw.subtype === 'thinking_tokens') add('progress', `Thinking · ~${raw.estimated_tokens ?? 0} tokens`);
       else if (raw.subtype === 'init') add('progress', `Ready · ${(raw.tools ?? []).length} tools`);
-      else if (raw.subtype === 'task_started') add('status', `Task started · ${describe(raw.description ?? raw.task_id ?? '')}`);
-      else if (raw.subtype === 'task_notification') add('status', `Task ${describe(raw.status ?? 'update')} · ${describe(raw.summary ?? raw.task_id ?? '')}`);
+      else if (raw.subtype === 'task_started') {
+        const foreground = raw.task_type === 'local_bash' && !raw.is_backgrounded && typeof raw.task_id === 'string';
+        if (foreground) foregroundTasks.add(raw.task_id);
+        add(foreground ? 'progress' : 'status', `Task started · ${describe(raw.description ?? raw.task_id ?? '')}`);
+      } else if (raw.subtype === 'task_notification') {
+        const foreground = foregroundTasks.delete(raw.task_id);
+        add(foreground ? 'progress' : 'status', `Task ${describe(raw.status ?? 'update')} · ${describe(raw.summary ?? raw.task_id ?? '')}`);
+      }
       else add('status', raw.subtype ?? 'system');
     }
     if (raw.type === 'tool_progress') add('progress', `${describe(raw.tool_name ?? 'Tool')} · ${raw.elapsed_time_seconds ?? 0}s`);

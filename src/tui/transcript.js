@@ -26,6 +26,18 @@ export function conversationEvents(events, {details = false} = {}) {
       lastAnswer = event.text?.trim();
       lastProvider = event.provider;
     }
+    // Muse streams an answer as many small deltas, each its own journal row. They read as one
+    // block; the row's id changes as it grows so a cached rendering of it is not reused.
+    if (event.kind === 'delta' && !details) {
+      const previous = rows.at(-1);
+      if (previous?.kind === 'delta' && previous.provider === event.provider) {
+        previous.text += event.text ?? '';
+        previous.id = `${previous.first}+${++previous.merged}`;
+      } else rows.push({...event, first: event.id, merged: 1});
+      lastAnswer = rows.at(-1).text.trim();
+      lastProvider = event.provider;
+      continue;
+    }
     if (event.kind === 'main.terminal') {
       if (event.status === 'completed') {
         const text = event.text?.trim();
@@ -43,6 +55,10 @@ export function conversationEvents(events, {details = false} = {}) {
       continue;
     }
     if (HIDDEN.has(event.kind)) continue;
+    if (event.kind === 'result' && event.success !== false) {
+      const text = event.text?.trim();
+      if (!text || text === lastAnswer || text === 'Turn completed') continue;
+    }
     if (event.kind?.startsWith('task.') && event.kind !== 'task.fold') {
       if (!event.task || (!WORKER_STATES[event.kind] && !WORKER_PROGRESS.has(event.kind))) continue;
       const previous = workers.get(event.task);

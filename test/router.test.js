@@ -139,6 +139,16 @@ test('token counters and command starts become live progress, not transcript', (
   assert.deepEqual(normalize('claude',{type:'system',subtype:'task_notification',status:'completed',summary:'Probe models'}),
     [{kind:'status',text:'Task completed · Probe models'}]);
   assert.deepEqual(normalize('claude',{type:'system',subtype:'compact_boundary'}),[{kind:'status',text:'compact_boundary'}]);
+  // A foreground Bash call is a "task" to Claude too; its start and end are live progress, not
+  // transcript rows next to the tool row that already shows it. Backgrounded tasks keep theirs.
+  assert.deepEqual(normalize('claude',{type:'system',subtype:'task_started',task_id:'fg1',task_type:'local_bash',is_backgrounded:false,description:'Run tests'}),
+    [{kind:'progress',text:'Task started · Run tests'}]);
+  assert.deepEqual(normalize('claude',{type:'system',subtype:'task_notification',task_id:'fg1',status:'completed',summary:'Run tests'}),
+    [{kind:'progress',text:'Task completed · Run tests'}]);
+  assert.deepEqual(normalize('claude',{type:'system',subtype:'task_started',task_id:'bg1',task_type:'local_bash',is_backgrounded:true,description:'Watch logs'}),
+    [{kind:'status',text:'Task started · Watch logs'}]);
+  assert.deepEqual(normalize('claude',{type:'system',subtype:'task_notification',task_id:'bg1',status:'completed',summary:'Watch logs'}),
+    [{kind:'status',text:'Task completed · Watch logs'}]);
   // Tool results arrive as content blocks; their text is kept, not a JSON dump.
   assert.equal(normalize('claude',{type:'user',message:{content:[{type:'tool_result',content:[{type:'text',text:'passed'}]}]}})[0].text,'passed');
 });

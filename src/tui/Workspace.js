@@ -81,7 +81,7 @@ export function createWorkspace(React, Ink) {
     const rows = [...details, ...activityRows];
     return React.createElement(Box, {position: 'absolute', left: x, top: y, borderStyle: 'round', borderColor: selected ? 'cyan' : 'gray', width, height, paddingX: 1, flexDirection: 'column', overflow: 'hidden'},
       React.createElement(Text, {bold: true, color: selected ? 'cyan' : undefined}, `${selected ? '●' : '○'} ${title}`),
-      ...rows.map((text, index) => React.createElement(Text, {key: `${index}:${text}`, wrap: 'truncate-end'}, text)));
+      ...rows.map((text, index) => React.createElement(Text, {key: `${index}:${text}`, wrap: 'truncate-end'}, text || ' ')));
   }
   function Workspace({model, transcriptRows, view}) {
     const {total, content: columns, sidebar} = workspaceColumns(view.columns);
@@ -129,7 +129,9 @@ export function createWorkspace(React, Ink) {
           scroll: view.paneScrolls?.[pane.id] ?? (pane.id === view.selectedId ? view.scroll : 0),
           now: view.now ?? Date.now(),
         })))
-        : React.createElement(Box, {height: bodyHeight, flexDirection: 'column', overflow: 'hidden'}, ...rows.map((text, index) => React.createElement(Text, {key: `${index}:${text}`, wrap: 'truncate-end'}, text))),
+        // An empty Text is zero rows high in Ink, which would swallow the blank row between
+        // blocks, paragraphs and headings; a single space keeps the row.
+        : React.createElement(Box, {height: bodyHeight, flexDirection: 'column', overflow: 'hidden'}, ...rows.map((text, index) => React.createElement(Text, {key: `${index}:${text}`, wrap: 'truncate-end'}, text || ' '))),
       view.agentsOpen && remaining ? React.createElement(Text, {color: 'gray'}, `+ ${remaining} more agents · Tab cycles`) : null,
       ...menu.map((item, index) => React.createElement(Box, {key: `menu:${index}`, height: 1, flexShrink: 0}, React.createElement(Text, {wrap: 'truncate-end', color: item.selected ? 'cyan' : item.muted ? 'gray' : undefined}, item.text.replace(/\n/g, ' ')))),
       React.createElement(Box, {height: draft.length + 2, flexShrink: 0, flexDirection: 'column'},
