@@ -48,7 +48,7 @@ export function recommendLocalModels({catalogs, settings = {}, intent = 'researc
   });
   const notes = [
     'Model names are identifiers, never quality rankings. General coding quality is unknown.',
-    'Loaded does not prove spare RAM/GPU capacity; memory footprint is unavailable. Start with one local worker at a time.',
+    'Bounce defaults to three local workers per endpoint. Loaded does not prove spare RAM/GPU capacity; lower maxConcurrent if your hardware needs it.',
     'Preferences take precedence. Otherwise passed synthetic tests, then your chosen priority are used; equal evidence uses a stable identifier tie-break, not a quality claim.',
     ...catalogs.filter(catalog => catalog.error).map(catalog => `${catalog.endpoint}: ${catalog.error}`),
   ];

@@ -35,7 +35,9 @@ test('scheduler local admission queues visibly, cancels without launch, and bind
     async *events(handle) {await handle.pending;},
     async cancel(handle) {handle.end(); return {verified: true};},
   };
-  const localAdmission = createLocalAdmission({discover: async () => [{provider: 'local', backend: 'lmstudio', endpoint: 'lmstudio', models: [
+  const localAdmission = createLocalAdmission({local: {endpoints: {lmstudio: {
+    backend: 'lmstudio', url: 'http://127.0.0.1:1234', maxConcurrent: 1,
+  }}}, discover: async () => [{provider: 'local', backend: 'lmstudio', endpoint: 'lmstudio', models: [
     {id: 'model', ref: 'lmstudio/model', type: 'llm', tools: true, ready: true, instances: [{id: 'loaded', context: 8192}]},
   ]}]});
   const profiles = {worker: {adapter: 'local', backend: 'lmstudio', endpoint: 'lmstudio', model: 'auto', mode: 'yolo', policy: 'read-only', fallback: []}};

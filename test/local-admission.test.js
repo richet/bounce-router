@@ -10,6 +10,23 @@ const catalog = [{provider: 'local', backend: 'lmstudio', endpoint: 'lmstudio', 
 const profile = {adapter: 'local', backend: 'lmstudio', endpoint: 'lmstudio', model: 'auto',
   localOptions: {maxOutputTokens: 1024}};
 
+test('defaults admit three workers and queue the fourth until a slot is released', async () => {
+  let discoveries = 0;
+  const manager = createLocalAdmission({discover: async () => {discoveries++; return catalog;}});
+  const first = await manager.acquire({profile});
+  const second = await manager.acquire({profile});
+  const third = await manager.acquire({profile});
+  assert.equal(discoveries, 3);
+  let status;
+  const waiting = manager.acquire({profile, onStatus: text => {status = text;}});
+  assert.equal(discoveries, 3);
+  assert.equal(status, 'Waiting for LM Studio capacity · lmstudio');
+  first.release({verified: true});
+  const fourth = await waiting;
+  assert.equal(discoveries, 4);
+  for (const lease of [second, third, fourth]) lease.release({verified: true});
+});
+
 test('live configuration preserves outstanding leases, queued work, and quarantine', async () => {
   let discoveries = 0;
   const manager = createLocalAdmission({local, discover: async () => {discoveries++; return catalog;}});

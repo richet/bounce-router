@@ -1,7 +1,7 @@
 import {createHash} from 'node:crypto';
 
 const cache = new Map();
-const DEFAULT_ENDPOINT = {backend: 'lmstudio', url: 'http://127.0.0.1:1234', loadPolicy: 'loaded-only', maxConcurrent: 1};
+const DEFAULT_ENDPOINT = {backend: 'lmstudio', url: 'http://127.0.0.1:1234', loadPolicy: 'loaded-only', maxConcurrent: 3};
 const endpointIdPattern = /^[A-Za-z0-9_-]+$/;
 const maxBodyBytes = 1024 * 1024;
 
@@ -23,7 +23,7 @@ function endpointConfig(id, input) {
   if (input.trusted !== undefined && typeof input.trusted !== 'boolean') throw error(`Endpoint ${id} trusted must be boolean`);
   if (input.loadPolicy !== undefined && !['loaded-only', 'on-demand'].includes(input.loadPolicy)) throw error(`Endpoint ${id} has an invalid loadPolicy`);
   if (input.maxConcurrent !== undefined && (!Number.isInteger(input.maxConcurrent) || input.maxConcurrent < 1)) throw error(`Endpoint ${id} maxConcurrent must be a positive integer`);
-  const normalized = {backend: 'lmstudio', url: parsed.href.replace(/\/$/, ''), loadPolicy: input.loadPolicy ?? 'loaded-only', maxConcurrent: input.maxConcurrent ?? 1};
+  const normalized = {backend: 'lmstudio', url: parsed.href.replace(/\/$/, ''), loadPolicy: input.loadPolicy ?? 'loaded-only', maxConcurrent: input.maxConcurrent ?? DEFAULT_ENDPOINT.maxConcurrent};
   if (input.apiKeyEnv) normalized.apiKeyEnv = input.apiKeyEnv;
   if (input.trusted) normalized.trusted = true;
   return normalized;

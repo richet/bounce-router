@@ -11,10 +11,13 @@ const local = endpoints => ({endpoints});
 test('normalizes the loopback catalog defaults and rejects unsafe endpoint configuration', () => {
   assert.deepEqual(normalizeLocalSettings(), {
     enabled: true,
-    endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234', loadPolicy: 'loaded-only', maxConcurrent: 1}},
+    endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234', loadPolicy: 'loaded-only', maxConcurrent: 3}},
     preferences: {}, exclude: [], overrides: {},
   });
   assert.deepEqual(normalizeLocalSettings({endpoints: {}}).endpoints, {});
+  const endpoint = {backend: 'lmstudio', url: 'http://127.0.0.1:1234'};
+  assert.equal(normalizeLocalSettings({endpoints: {office: endpoint}}).endpoints.office.maxConcurrent, 3);
+  assert.equal(normalizeLocalSettings({endpoints: {office: {...endpoint, maxConcurrent: 1}}}).endpoints.office.maxConcurrent, 1);
   assert.throws(() => normalizeLocalSettings({endpoints: {bad: {backend: 'lmstudio', url: 'https://key@example.test'}}}), {code: 'INVALID_LOCAL_SETTINGS'});
   assert.throws(() => normalizeLocalSettings({endpoints: {bad: {backend: 'lmstudio', url: 'http://host/?x=1'}}}), {code: 'INVALID_LOCAL_SETTINGS'});
   assert.throws(() => normalizeLocalSettings({endpoints: {'not ok': {backend: 'lmstudio', url: 'http://localhost'}}}), {code: 'INVALID_LOCAL_SETTINGS'});
