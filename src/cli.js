@@ -647,8 +647,9 @@ async function main() {
         provider: selected(), model: settings.models[selected()] || '', mode: settings.mode,
         cwd: session.cwd, sessionId: session.id, operation: orchestration.operation,
         orchestrator: orchestration.orchestrator ?? 'main', pendingTurns: pendingTurns.length,
+        // The sidebar spends 11 rows on the header block, the AGENTS list and the two gaps, plus one per worker.
         quotaLines: quotaPanel(quotas, quotaOrder(), {
-          width: 28, now: Date.now(), rows: 12, cooldowns: router.cooldowns,
+          width: 28, now: Date.now(), rows: Math.max(4, terminalRows - 11 - (terminal?.snapshot().panes.length ?? 0)), cooldowns: router.cooldowns,
           paint: {title: style.title, text: plain, muted: style.muted, ok: style.result,
             warn: style.status, high: style.error, tick: style.note},
         }),

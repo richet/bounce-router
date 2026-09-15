@@ -38,6 +38,16 @@ test('the sidebar is on by default and /sidebar off gives its columns back to th
   }
 });
 
+test('the sidebar separates its header, each quota group and the agents list with blank rows', () => {
+  const quotaLines = ['CLAUDE', '5-hour limit 38%', '', 'CODEX · Plus', '5-hour limit 0%'];
+  const rail = frame(120, false, {metadata: {...metadata, quotaLines}}).split('\n').map(line => line.replace(/^.*│ ?/, '').trim());
+  const at = text => rail.findIndex(line => line.startsWith(text));
+  assert.deepEqual([rail[at('Session') + 1], rail[at('CLAUDE') + 2], rail[at('CODEX') + 2]], ['', '', '']);
+  assert.equal(rail[at('Session') + 2], 'CLAUDE');
+  assert.equal(rail[at('CLAUDE') + 3], 'CODEX · Plus');
+  assert.equal(rail[at('CODEX') + 3], 'AGENTS · 2');
+});
+
 test('config keeps the sidebar on unless told otherwise, and rejects a non-boolean', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-sidebar-config-'));
   try {

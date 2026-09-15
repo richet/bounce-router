@@ -126,10 +126,13 @@ test('the sidebar panel draws each window as a bar with its reset time and pace 
     // Half the week has run against 15% spent, so the tick sits well ahead of the fill.
     'Weekly limit         4d 0h 15%',
     '■'.repeat(5) + '□'.repeat(8) + '│' + '□'.repeat(16),
+    // Each provider is its own group, separated by a blank row.
+    '',
     'CODEX · Plus',
     // A full window keeps its reset time by dropping the word that no longer fits.
     '5-hour limit       1:00pm 100%',
     '■'.repeat(24) + '│' + '■'.repeat(5),
+    '',
     'MUSE',
     'muse does not report quota',
   ]);
@@ -154,6 +157,11 @@ test('the panel gives up bars, then lines, as the sidebar runs out of rows', () 
   assert.deepEqual(rows(2), ['CODEX · Plus', '5h 100% · 7d 34%']);
   // Below even the compact form, the panel is cut rather than allowed to push the recap out.
   assert.deepEqual(rows(1), ['CODEX · Plus']);
+  // The gap between providers costs a row while there is room; the compact form drops it.
+  const two = budget => quotaPanel({...store, claude: store.codex}, ['claude', 'codex'], {width: 30, now, rows: budget});
+  assert.equal(two(Infinity).length, 11);
+  assert.deepEqual(two(7).map(row => row === '' ? 'gap' : row.split(' ')[0]), ['CLAUDE', '5-hour', 'Weekly', 'gap', 'CODEX', '5-hour', 'Weekly']);
+  assert.deepEqual(two(6).map(row => row === '' ? 'gap' : row.split(' ')[0]), ['CLAUDE', '5h', 'CODEX', '5h']);
 });
 
 test('window titles and reset text read the way a plan states them', () => {

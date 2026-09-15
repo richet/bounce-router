@@ -203,12 +203,14 @@ export function quotaPanel(store, order, {width = 30, now = Date.now(), rows = I
     const head = panelRow(windowTitle(w.label), resetForms(w, now), `${w.percent}%`, width, p);
     return detail === 'bars' ? [head, quotaBar(w, width, now, p)] : [head];
   };
-  const build = detail => order.flatMap(provider => {
+  const build = detail => order.flatMap((provider, index) => {
     const entry = store[provider];
     const windows = entry?.windows ?? [];
-    if (!windows.length) return [head(provider), p.muted(entry?.error ?? quotaUnavailable(provider))];
+    // Providers read as separate groups while there is room; the compact form stays dense.
+    const gap = index && detail !== 'compact' ? [''] : [];
+    if (!windows.length) return [...gap, head(provider), p.muted(entry?.error ?? quotaUnavailable(provider))];
     if (detail === 'compact') return [head(provider), p.muted(quotaShort(entry, now))];
-    return [head(provider), ...windows.flatMap(w => line(w, detail))];
+    return [...gap, head(provider), ...windows.flatMap(w => line(w, detail))];
   });
   let built = [];
   for (const detail of ['bars', 'lines', 'compact']) {

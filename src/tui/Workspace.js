@@ -61,7 +61,7 @@ export function createWorkspace(React, Ink) {
       borderColor: 'gray', paddingLeft: 1, flexDirection: 'column', overflow: 'hidden',
     }, ...lines.slice(0, height).map((row, index) => React.createElement(Text, {
       key: index, color: row.color, bold: row.bold, wrap: 'truncate-end',
-    }, row.text)));
+    }, row.text || ' ')));
   }
   function Pane({pane, selected, x, y, width, height, scroll = 0, now = Date.now()}) {
     const title = pane.kind === 'orchestrator' ? 'orchestrator' : `${pane.profile} · ${pane.task.slice(0, 8)}${pane.model ? ` · ${pane.model}` : ''}`;
