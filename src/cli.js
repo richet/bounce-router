@@ -103,7 +103,7 @@ TUI commands:
 
 Drop PNG/JPEG/GIF/WebP files into your prompt, then press Enter to send.
 
-Keys: / command picker · Tab complete (or next agent) · F2 pause + hide sidebar to copy
+Keys: / command picker · Tab complete (or next agent) · F2 pause for copying
       Enter send · Shift+Enter newline (Alt+Enter and Ctrl+J too)
       PgUp/PgDn or mouse wheel scroll · F3 mouse scroll off (drag-select) · ↑/↓ prompt history
       Ctrl+C cancel turn / exit when idle · Ctrl+U clear input
@@ -381,17 +381,15 @@ async function main() {
   let activityTimer, activityStarted = 0, progress = '';
   const activity = () => `${['◐', '◓', '◑', '◒'][Math.floor((Date.now() - activityStarted) / 150) % 4]} Working · ${Math.floor((Date.now() - activityStarted) / 1000)}s`;
   let loadedFingerprint = fingerprint();
-  // copyFrame draws one sidebar-free, full-width frame: a terminal selects whole lines, so
-  // dragging across the transcript with the sidebar up drags the sidebar's text along with it.
-  let completionIndex = 0, menuDismissed = false, copyPaused = false, copyFrame = false, previousFrame = [], previousCursor = '';
+  let completionIndex = 0, menuDismissed = false, copyPaused = false;
   // On by default: the wheel scrolls the transcript, which is what a scroll gesture means here.
   // F3 hands the mouse back to the terminal for drag-selection and link clicks.
   let mouseScroll = true;
   let picker = null;
   let localSetup = null;
   const suggestions = () => menuDismissed ? [] : completions(input);
-  const acceptCompletion = () => {const options = suggestions(); if (options.length) {input = '/' + options[completionIndex % options.length][0] + ' '; completionIndex = 0; menuDismissed = false; return true;} return false;};
-  let notice = [restarted?.updateNotice, skillNotice, 'Ready. Mouse wheel scrolls the transcript · Option-drag selects text (F3 turns the wheel off) · F2 pause + hide sidebar · /help'].filter(Boolean).join(' ');
+  const acceptCompletion = () => {const options = suggestions(); if (options.length) {input = '/' + options[completionIndex % options.length][0] + ' '; inputCursor = input.length; completionIndex = 0; menuDismissed = false; return true;} return false;};
+  let notice = [restarted?.updateNotice, skillNotice, 'Ready. Mouse wheel scrolls the transcript · Option-drag selects text (F3 turns the wheel off) · F2 pause for copying · /help'].filter(Boolean).join(' ');
   const history = session.events.filter(e => e.kind === 'user').map(e => e.text);
   const selected = () => session.active || settings.order[0];
   const workerOverrides = new Map();
@@ -554,13 +552,27 @@ async function main() {
     session.append({kind: 'skills', text: [importSummary(report), syncSummary(synced)].filter(Boolean).join('\n')});
     notice = `Imported ${selection.length} skill${selection.length === 1 ? '' : 's'}.`;
   }
-  // Called with no arguments everywhere (including as a resize and promise handler), so the
-  // copy frame is asked for through copyFrame rather than a parameter a stray value could set.
+  const paneIds = () => terminal?.paneIds() ?? ['orchestrator'];
+  const selectedWorker = () => terminal?.snapshot().panes.find(pane => pane.id === selectedAgentPane)?.task ?? null;
+  const inputTarget = () => {
+    const task = selectedWorker();
+    if (!task) return 'main';
+    const pane = terminal?.snapshot().panes.find(row => row.task === task);
+    return `${pane?.profile ?? 'worker'} ${task.slice(0, 8)}`;
+  };
   function render() {
-    if (suspended || (copyPaused && !copyFrame)) return;
-    const totalWidth = Math.max(4, (process.stdout.columns || 80) - 2);
-    const sidebarWidth = !copyFrame && totalWidth >= 100 && (process.stdout.rows || 24) >= 22 ? 30 : 0;
-    const width = totalWidth - (sidebarWidth ? sidebarWidth + 3 : 0);
+    if (suspended || !terminal) return;
+    if (agentsOpen && !paneIds().includes(selectedAgentPane)) {
+      const previous = selectedAgentPane;
+      const unsent = input;
+      changePane('orchestrator');
+      paneInputs.delete(previous);
+      if (unsent) {
+        notice = `Worker finished · unsent draft saved in transcript (${previous.slice(7, 15)})`;
+        session.append({kind: 'note', text: `Unsent draft for ${previous}:\n${unsent}`});
+      }
+    }
+    const {content: width} = workspaceColumns(process.stdout.columns || 80);
     const terminalRows = process.stdout.rows || 24;
     const headerRows = 1;
     const target = localSetup ? 'setup › ' : agentsOpen ? `${inputTarget()} › ` : '';
@@ -900,54 +912,15 @@ async function main() {
       }
     }
   }
-  const keyboard = new PassThrough();
-  // Node's keypress parser holds a lone ESC until another byte follows, so deliver it directly.
-  const toKeyboard = text => text === '\x1b' ? handleKey('\x1b', {name: 'escape'}) : keyboard.write(text);
-  // Asking the terminal to report Shift+Enter also re-encodes Ctrl+C, Escape and friends,
-  // so decoded modifier keys are dispatched straight to handleKey; a modified Enter becomes
-  // the event the prompt already treats as "newline, do not submit".
-  const keyInput = createKeyInput(toKeyboard, () => handleKey('\r', {name: 'return', meta: true}), handleKey);
   // A terminal reports either the whole mouse or none of it: wheel scrolling and native
   // click-drag selection cannot both be live. Rather than let a click do nothing, answer it
   // with the three ways to select text.
-  const selectionHint = 'Drag-select needs the mouse back · hold Option (Shift in most terminals) to select now · F3 turns wheel scrolling off · F2 pauses and hides the sidebar so copied lines carry the transcript alone';
-  const mouseInput = createMouseInput(keyInput, amount => {
-    if (suspended || copyPaused || !mouseScroll) return;
-    scroll = Math.max(0, scroll + amount); render();
-  }, () => {
-    if (suspended || copyPaused || !mouseScroll || notice === selectionHint) return;
-    notice = selectionHint; render();
-  });
-  const pasteInput = createPasteInput(text => mouseInput(text), text => {
-    if (suspended || copyPaused || picker) return;
-    input += clean(text);
-    completionIndex = 0; menuDismissed = false; render();
-  });
-  let mouseTimer;
-  process.stdin.setEncoding('utf8');
-  process.stdin.on('data', chunk => {
-    if (suspended) return;
-    clearTimeout(mouseTimer);
-    pasteInput(chunk);
-    mouseTimer = setTimeout(() => {pasteInput.flush(); mouseInput.flush(); keyInput.flush();}, 50);
-  });
+  const selectionHint = 'Drag-select needs the mouse back · hold Option (Shift in most terminals) to select now · F3 turns wheel scrolling off · F2 pauses so copied lines carry the transcript alone';
   function handleKey(str, key = {}) {
     if (suspended) return;
     if (key.name === 'f2') {
       copyPaused = !copyPaused;
-      process.stdout.write(mouseTracking(mouseScroll && !copyPaused));
-      if (copyPaused) {
-        // Redraw full width with the sidebar gone before freezing, so a dragged line copies
-        // the transcript alone. The transcript re-wraps to the wider pane, which is the text
-        // being copied anyway.
-        copyFrame = true;
-        try { render(); } finally { copyFrame = false; }
-        process.stdout.write('\x1b[?25l');
-        previousCursor = '';
-        const row = Math.max(1, previousFrame.length);
-        process.stdout.write(`\x1b[${row};1H\x1b[2KPaused — sidebar hidden, select/copy or open links with your terminal; F2 resumes.`);
-        previousFrame[row - 1] = '';
-      } else render();
+      render();
       return;
     }
     if (copyPaused && !(key.ctrl && key.name === 'c')) return;
@@ -1049,10 +1022,11 @@ async function main() {
       ({input, cursor: inputCursor} = insertText(input, inputCursor, clean(text))); completionIndex = 0; menuDismissed = false; render();
     },
     onScroll: amount => { if (!copyPaused) { scroll = Math.max(0, scroll + amount); render(); } },
+    onPress: () => { if (suspended || copyPaused || !mouseScroll || notice === selectionHint) return; notice = selectionHint; render(); },
     onResize: render,
   });
   for (const event of session.events) terminal.ingest(event);
-  await terminal.mount({});
+  await terminal.mount({mouseScroll});
 
   session.onEvent = scheduleRender;
   // Orchestrator sessions tick once a second so the AGENTS pane's elapsed times advance between

@@ -3,7 +3,7 @@
 // Reads --prompt-file from its own argv and echoes that file's content back as a
 // run.output.delta, so a test can prove exactly what prompt the adapter wrote.
 // Prints run.model.configured, (optional probes), the echo delta, then
-// run.terminal.completed, and exits 0.
+// run.terminal.completed, and exits 0 once its output has drained.
 //
 // FAKE_MUSE_HANG=1: print run.model.configured, then stay alive forever (cancel tests).
 // FAKE_MUSE_TRAP=1: as HANG, but also swallow SIGTERM, so only SIGKILL ends it.
@@ -32,8 +32,11 @@ if (process.env.FAKE_MUSE_HANG === '1' || process.env.FAKE_MUSE_TRAP === '1') {
   process.exit(1);
 } else {
   const mb = Number(process.env.FAKE_MUSE_STDERR_MB ?? 0);
-  // Blocking writes on purpose: this is the pipe pressure the adapter must drain.
-  for (let i = 0; i < mb * 16; i++) writeSync(2, 'x'.repeat(65536) + '\n');
+  // Through the stream, never writeSync(2): once console.log has initialised stdio, macOS
+  // pipes are non-blocking and a 64 KB writeSync throws EAGAIN when the pipe is full. The
+  // stream queues instead, and the natural exit below holds the process open until the
+  // reader has drained it — so an adapter that never drains stderr still hangs here.
+  for (let i = 0; i < mb * 16; i++) process.stderr.write('x'.repeat(65536) + '\n');
   if (process.env.FAKE_MUSE_PROBE_ENV === '1') line('run.output.delta', {text: JSON.stringify({
     bus: process.env.BOUNCE_BUS ?? 'none',
     token: process.env.BOUNCE_BUS_TOKEN_FILE ?? 'none',
@@ -42,5 +45,5 @@ if (process.env.FAKE_MUSE_HANG === '1' || process.env.FAKE_MUSE_TRAP === '1') {
   })});
   line('run.output.delta', {text: readFileSync(flag('--prompt-file'), 'utf8')});
   line('run.terminal.completed', {terminal: 'completed', text: 'done', run_id: 'r-fake-1'});
-  process.exit(0);
+  process.exitCode = 0; // no process.exit(): let the event loop flush stdout and stderr first
 }

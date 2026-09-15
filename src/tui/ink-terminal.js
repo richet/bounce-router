@@ -10,7 +10,7 @@ const EMPTY_VIEW = {agentsOpen: false, selectedId: 'orchestrator', input: '', sc
 
 // CLI owns commands, drafts and focus policy. This adapter owns terminal mode, parses input once,
 // and turns the incremental event log projection into an Ink frame.
-export function createInkTerminal({stdin = process.stdin, stdout = process.stdout, onKeypress = () => {}, onPaste = () => {}, onResize = () => {}, onScroll = () => {}, onFrame = () => {}, history, projectionOptions} = {}) {
+export function createInkTerminal({stdin = process.stdin, stdout = process.stdout, onKeypress = () => {}, onPaste = () => {}, onResize = () => {}, onScroll = () => {}, onPress = () => {}, onFrame = () => {}, history, projectionOptions} = {}) {
   const projection = createWorkspaceProjection(projectionOptions);
   let view = {...EMPTY_VIEW};
   let app = null;
@@ -43,7 +43,7 @@ export function createInkTerminal({stdin = process.stdin, stdout = process.stdou
     () => onKeypress('\r', {name: 'return', meta: true}),
     onKeypress,
   );
-  const mouseInput = createMouseInput(keyInput, onScroll);
+  const mouseInput = createMouseInput(keyInput, onScroll, onPress);
   const pasteInput = createPasteInput(mouseInput, onPaste);
 
   function visibleTranscriptRows(events, width, rowLimit) {

@@ -6,6 +6,9 @@ import path from 'node:path';
 import {execFileSync} from 'node:child_process';
 import {version, newer, checkUpdate, globalInstall, installUpdate} from '../src/update.js';
 
+// A release the registry could plausibly return: always one major above whatever package.json
+// says, so a version bump never turns "an update is available" into "up to date".
+const next = `${Number(version.split('.')[0]) + 1}.0.0`;
 function temp(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-update-'));
   t.after(() => fs.rmSync(root, {recursive: true, force: true}));
@@ -21,7 +24,7 @@ test('release comparison is numeric and rejects invalid or prerelease versions',
 });
 test('checks cache for 24 hours, force refresh, and tolerate unwritable cache', async t => {
   const root = temp(t); let calls = 0;
-  const run = async () => {calls++; return '"0.1.10"';};
+  const run = async () => {calls++; return JSON.stringify(next);};
   assert.equal((await checkUpdate({root, run, now: 100})).available, true);
   await checkUpdate({root, run, now: 200}); assert.equal(calls, 1);
   await checkUpdate({root, run, now: 200, force: true}); assert.equal(calls, 2);
@@ -42,11 +45,11 @@ test('global detection rejects local installations and linked checkouts', async 
 });
 test('install pins checked version and detected prefix; failures propagate without sudo', async () => {
   const calls = [], detect = async () => '/custom/prefix';
-  const run = async (args) => {calls.push(args); return '"0.1.10"';};
-  assert.match(await installUpdate({run, detect}), /0.1.10/);
-  assert.deepEqual(calls[1], ['install', '--global', '--prefix', '/custom/prefix', 'bouncerouter@0.1.10']);
+  const run = async (args) => {calls.push(args); return JSON.stringify(next);};
+  assert.equal(await installUpdate({run, detect}), `Updated bounce to ${next}.`);
+  assert.deepEqual(calls[1], ['install', '--global', '--prefix', '/custom/prefix', `bouncerouter@${next}`]);
   let installs = 0;
   await installUpdate({detect, run: async args => {if (args[0] === 'install') installs++; return JSON.stringify(version);}});
   assert.equal(installs, 0);
-  await assert.rejects(installUpdate({detect, run: async args => {if (args[0] === 'install') throw new Error('EACCES'); return '"0.1.10"';}}), /EACCES/);
+  await assert.rejects(installUpdate({detect, run: async args => {if (args[0] === 'install') throw new Error('EACCES'); return JSON.stringify(next);}}), /EACCES/);
 });

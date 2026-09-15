@@ -46,8 +46,10 @@ test('muse-live launch: args are invocation() verbatim, orders.txt holds the ord
   const {calls, spawn} = recordingSpawn();
   const adapter = createMuseLive({spawn});
   const orders = 'Ship the muse adapter.\nSecond line.';
+  // executables.muse pins the name: without it resolveExecutable would hand the spawn a real
+  // muse binary's full path on any machine that has one installed.
   const handle = await adapter.launch({
-    peer: {name: 'w1'}, profile: {model: 'm1', mode: 'plan'}, orders, cwd: root, dir,
+    peer: {name: 'w1'}, profile: {model: 'm1', mode: 'plan', executables: {muse: 'muse'}}, orders, cwd: root, dir,
   });
 
   assert.equal(calls.length, 1);

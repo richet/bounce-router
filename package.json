@@ -1,6 +1,6 @@
 {
   "name": "bouncerouter",
-  "version": "0.1.7",
+  "version": "0.2.0",
   "description": "One terminal. Your local coding agent subscriptions.",
   "type": "module",
   "bin": {
@@ -16,10 +16,9 @@
     "node": ">=22"
   },
   "license": "MIT",
-  "private": true,
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Arecius/bounce-router.git"
+    "url": "git+https://github.com/richet/bounce-router.git"
   },
   "files": [
     "src/"
