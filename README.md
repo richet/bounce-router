@@ -266,6 +266,8 @@ Each installed copy carries a `.bounce-skill.json` marker naming the skill and h
 
 Skills are the only capability bounce carries across providers. Instructions in the handoff packet — the transcript and `/note` — reach every agent as text; `CLAUDE.md`, `AGENTS.md` and each vendor's own configuration remain that vendor's business.
 
+bounce ships its own `agent-orchestrator` skill and seeds it into the store the first time an orchestrator session starts, so the brief resolves even on a machine that has never run `bounce skills import`. If you already have a skill named `agent-orchestrator`, or you edit the seeded copy, seeding never overwrites it.
+
 ## Your agents' commands
 
 A repository often carries slash commands of its own — `.claude/commands/triage.md` gives Claude Code a `/triage`. Typed into bounce, such a line would normally go nowhere: bounce wraps every request in a handoff packet, so the vendor never sees a bare `/triage` at the start of its input, and only bounce's own commands are on the `/` menu. So bounce expands them itself. A `/NAME` that is not one of bounce's commands is looked up, in this order, in the workspace's `.claude/commands`, then `~/.claude/commands` (`CLAUDE_CONFIG_DIR`), then Codex prompts (`$CODEX_HOME/prompts`), then skills — bounce's own store first, then each agent's workspace and home skill directories — and the first match becomes the turn. The same lookup works headless: `bounce run "/triage REC-1234"`.

@@ -2,6 +2,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {createHash, randomUUID} from 'node:crypto';
+import {fileURLToPath} from 'node:url';
+
+// bounce's own skills/, resolved relative to this file so an installed package finds its
+// bundled copy regardless of the caller's cwd.
+export const bundledStore = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'skills');
 
 // Skills are a vendor feature: every CLI scans its own directory and none of them knows
 // about bounce. A routed turn can land on any agent, so a skill installed for one of them
@@ -98,11 +103,38 @@ function replace(target, build) {
     fs.renameSync(staging, target);
   } finally { fs.rmSync(staging, {recursive: true, force: true}); }
 }
-function install(skill, target) {
+function install(skill, target, {bundled = false} = {}) {
   replace(target, dir => {
     copyInto(skill.dir, dir);
-    fs.writeFileSync(path.join(dir, MARKER), JSON.stringify({skill: skill.name, hash: skill.hash, source: skill.dir, installed: new Date().toISOString()}, null, 2) + '\n', {mode: 0o600});
+    fs.writeFileSync(path.join(dir, MARKER), JSON.stringify({skill: skill.name, hash: skill.hash, source: skill.dir, installed: new Date().toISOString(), ...(bundled ? {bundled: true} : {})}, null, 2) + '\n', {mode: 0o600});
   });
+}
+
+// Ships bounce's own skills into the store on first orchestrator start, so the ORDERS.md
+// pointer resolves even where `skills import` has never run. Only a copy carrying bounce's
+// bundled marker is ever touched again: a user's own skill of the same name, or one they
+// edited after it was seeded, is left exactly as they made it.
+export function seedSkills({root, bundled = bundledStore} = {}) {
+  const report = [];
+  if (!fs.existsSync(bundled)) return report;
+  const store = skillStore(root);
+  for (const entry of fs.readdirSync(bundled, {withFileTypes: true})) {
+    if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+    const source = readSkill(path.join(bundled, entry.name));
+    if (source.error) { report.push({skill: source.name, action: 'invalid', detail: source.error}); continue; }
+    const target = path.join(store, source.name);
+    if (!fs.existsSync(target)) { install(source, target, {bundled: true}); report.push({skill: source.name, action: 'installed'}); continue; }
+    const installed = marker(target);
+    if (!installed?.bundled) { report.push({skill: source.name, action: 'unmanaged'}); continue; }
+    // The user's own edit is read from the target drifting off what was recorded, and is
+    // answered first: a seeded copy they have since changed is theirs, whether or not the
+    // bundled skill has also moved on.
+    if (skillHash(target) !== installed.hash) { report.push({skill: source.name, action: 'modified'}); continue; }
+    if (installed.hash === source.hash) { report.push({skill: source.name, action: 'current'}); continue; }
+    install(source, target, {bundled: true});
+    report.push({skill: source.name, action: 'updated'});
+  }
+  return report;
 }
 
 export function syncSkills({root, scope = 'user', cwd, env, home, providers = Object.keys(skillAreas)} = {}) {
