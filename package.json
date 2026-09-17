@@ -21,7 +21,8 @@
     "url": "git+https://github.com/richet/bounce-router.git"
   },
   "files": [
-    "src/"
+    "src/",
+    "skills/"
   ],
   "publishConfig": {
     "access": "public"
