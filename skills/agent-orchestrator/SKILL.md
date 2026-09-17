@@ -13,7 +13,7 @@ You own the plan, the judgment calls, integration, and talking to the user. Dele
 - `references/claude-code.md` — a plain Claude Code session.
 - `references/codex.md` — a plain Codex session.
 
-They name the workers that exist there and how to constrain them. Never design a workflow around a worker this session cannot reach.
+They name the workers that exist there, how to constrain them, and any one-time setup those workers need. Never design a workflow around a worker this session cannot reach.
 
 ## Decide whether to delegate
 
