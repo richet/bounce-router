@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {skillMetadata, skillDir, skillStore, listSkills, syncSkills, inspectSkills, addSkill, newSkill, importSkills, importCandidates, importSelected, clearSkills, resetSkills, skillsCommand, skillsChanged} from '../src/skills.js';
+import {skillMetadata, skillDir, skillStore, skillHash, listSkills, syncSkills, inspectSkills, addSkill, newSkill, importSkills, importCandidates, importSelected, clearSkills, resetSkills, skillsCommand, skillsChanged, seedSkills, seededFile, seedSummary} from '../src/skills.js';
 import {config, defaults} from '../src/core.js';
 
 const write = (dir, name, description, extra = {}) => {
@@ -144,7 +144,7 @@ test('the command surface scaffolds, syncs, lists and clears without touching ve
   assert.match(skillsCommand(['remove', 'deploy'], options).text, /Removed .*skills\/deploy/);
   assert.equal(fs.existsSync(path.join(home, '.codex/skills/deploy')), false);
   assert.throws(() => skillsCommand(['remove', 'deploy'], options), /No bounce skill named deploy/);
-  assert.throws(() => skillsCommand(['explode'], options), /list, sync, new, add, remove, import, clear or reset/);
+  assert.throws(() => skillsCommand(['explode'], options), /list, sync, seed, new, add, remove, import, clear or reset/);
 });
 
 test('skill settings default on and reject an unusable scope', t => {
@@ -280,4 +280,126 @@ test('reset empties bounce only after confirmation and leaves the agents their o
   assert.match(skillsCommand(['reset'], options).text, /no skills to delete/);
   assert.deepEqual(resetSkills(options), []);
   assert.throws(() => skillsCommand(['explode'], options), /import, clear or reset/);
+});
+
+test('seeding ships the bundled agent-orchestrator skill and leaves the user\'s own alone', t => {
+  const {root, home, options} = setup(t);
+
+  const first = seedSkills({root});
+  assert.deepEqual(first, [{skill: 'agent-orchestrator', action: 'installed'}]);
+  const target = path.join(skillStore(root), 'agent-orchestrator');
+  assert.equal(fs.existsSync(path.join(target, 'SKILL.md')), true);
+  assert.equal(fs.existsSync(path.join(target, 'references/bounce.md')), true);
+  assert.equal(skillMetadata(fs.readFileSync(path.join(target, 'SKILL.md'), 'utf8')).name, 'agent-orchestrator');
+
+  // Unchanged bundled source writes nothing on a second pass.
+  const hashBefore = skillHash(target);
+  const mtimeBefore = fs.statSync(path.join(target, 'SKILL.md')).mtimeMs;
+  assert.deepEqual(seedSkills({root}), [{skill: 'agent-orchestrator', action: 'current'}]);
+  assert.equal(skillHash(target), hashBefore);
+  assert.equal(fs.statSync(path.join(target, 'SKILL.md')).mtimeMs, mtimeBefore);
+
+  // A pre-existing store skill of the same name, with no bounce marker, is the user's own.
+  fs.rmSync(target, {recursive: true, force: true});
+  write(target, 'agent-orchestrator', 'Hand-written by the user');
+  const bytesBefore = fs.readFileSync(path.join(target, 'SKILL.md'), 'utf8');
+  assert.deepEqual(seedSkills({root}), [{skill: 'agent-orchestrator', action: 'unmanaged'}]);
+  assert.equal(fs.readFileSync(path.join(target, 'SKILL.md'), 'utf8'), bytesBefore);
+
+  // A seeded copy the user then edits is reported modified, and the edit is never clobbered.
+  fs.rmSync(target, {recursive: true, force: true});
+  seedSkills({root, force: true});
+  fs.appendFileSync(path.join(target, 'SKILL.md'), '\nA user note.\n');
+  assert.deepEqual(seedSkills({root}), [{skill: 'agent-orchestrator', action: 'modified'}]);
+  assert.match(fs.readFileSync(path.join(target, 'SKILL.md'), 'utf8'), /A user note\./);
+
+  // The seeded copy is a first-class store skill: sync reaches it like any other.
+  const synced = syncSkills(options);
+  assert.equal(synced.some(r => r.skill === 'agent-orchestrator' && r.action === 'installed'), true);
+  assert.equal(fs.existsSync(path.join(home, '.claude/skills/agent-orchestrator/SKILL.md')), true);
+});
+
+test('seeding upgrades an untouched seeded copy but yields to the user once they have edited it', t => {
+  const {base, root} = setup(t);
+  const bundled = path.join(base, 'bundled');
+  const source = path.join(bundled, 'demo-skill');
+  write(source, 'demo-skill', 'A bundled skill', {'references/notes.md': 'one\n'});
+  const target = path.join(skillStore(root), 'demo-skill');
+
+  assert.deepEqual(seedSkills({root, bundled}), [{skill: 'demo-skill', action: 'installed'}]);
+  assert.equal(fs.readFileSync(path.join(target, 'references/notes.md'), 'utf8'), 'one\n');
+
+  // bounce ships a new version and the seeded copy is untouched: it is replaced.
+  fs.writeFileSync(path.join(source, 'references/notes.md'), 'two\n');
+  assert.deepEqual(seedSkills({root, bundled}), [{skill: 'demo-skill', action: 'updated'}]);
+  assert.equal(fs.readFileSync(path.join(target, 'references/notes.md'), 'utf8'), 'two\n');
+  assert.deepEqual(seedSkills({root, bundled}), [{skill: 'demo-skill', action: 'current'}]);
+
+  // The same upgrade against a copy the user has edited leaves their version in place.
+  fs.appendFileSync(path.join(target, 'references/notes.md'), 'and mine\n');
+  fs.writeFileSync(path.join(source, 'references/notes.md'), 'three\n');
+  assert.deepEqual(seedSkills({root, bundled}), [{skill: 'demo-skill', action: 'modified'}]);
+  assert.equal(fs.readFileSync(path.join(target, 'references/notes.md'), 'utf8'), 'two\nand mine\n');
+});
+
+test('a bundled skill the user deletes stays deleted until they ask for it back', t => {
+  const {base, root, options} = setup(t);
+  const bundled = path.join(base, 'bundled');
+  write(path.join(bundled, 'demo-skill'), 'demo-skill', 'A bundled skill');
+  const target = path.join(skillStore(root), 'demo-skill');
+
+  assert.deepEqual(seedSkills({root, bundled}), [{skill: 'demo-skill', action: 'installed'}]);
+  assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(seededFile(root), 'utf8'))), ['demo-skill']);
+
+  // Removed on purpose: seeding does not quietly undo it, and says why.
+  fs.rmSync(target, {recursive: true, force: true});
+  const withdrawn = seedSkills({root, bundled});
+  assert.deepEqual(withdrawn, [{skill: 'demo-skill', action: 'withdrawn'}]);
+  assert.equal(fs.existsSync(target), false);
+  assert.match(seedSummary(withdrawn), /demo-skill: not reinstalled: removed after bounce seeded it/);
+
+  // A reset deletes the store, and the record outlives it, so the confirmed deletion holds.
+  seedSkills({root, bundled, force: true});
+  resetSkills({...options, root});
+  assert.equal(fs.existsSync(skillStore(root)), false);
+  assert.deepEqual(seedSkills({root, bundled}), [{skill: 'demo-skill', action: 'withdrawn'}]);
+  assert.equal(fs.existsSync(target), false);
+
+  // And the documented way back puts it in the store and syncs it out to the agents.
+  const seeded = skillsCommand(['seed', '--force'], {...options, root, bundled});
+  assert.equal(fs.readFileSync(path.join(target, 'SKILL.md'), 'utf8').includes('name: demo-skill'), true);
+  assert.match(seeded.text, /demo-skill: installed/);
+  assert.equal(seeded.report.some(row => row.provider === 'claude' && row.skill === 'demo-skill' && row.action === 'installed'), true);
+});
+
+test('a seeded copy whose marker is lost is adopted back, and a different skill of the same name is not', t => {
+  const {base, root} = setup(t);
+  const bundled = path.join(base, 'bundled');
+  const source = path.join(bundled, 'demo-skill');
+  write(source, 'demo-skill', 'A bundled skill', {'references/notes.md': 'one\n'});
+  const target = path.join(skillStore(root), 'demo-skill');
+  seedSkills({root, bundled});
+
+  // The bytes are still exactly what bounce shipped, so an unreadable marker is bounce's
+  // problem to repair rather than grounds for calling the copy the user's forever.
+  fs.writeFileSync(path.join(target, '.bounce-skill.json'), '{ not json');
+  assert.deepEqual(seedSkills({root, bundled}), [{skill: 'demo-skill', action: 'adopted'}]);
+  assert.deepEqual(seedSkills({root, bundled}), [{skill: 'demo-skill', action: 'current'}]);
+
+  // Repaired, so the next bundled version lands as usual.
+  fs.writeFileSync(path.join(source, 'references/notes.md'), 'two\n');
+  assert.deepEqual(seedSkills({root, bundled}), [{skill: 'demo-skill', action: 'updated'}]);
+  assert.equal(fs.readFileSync(path.join(target, 'references/notes.md'), 'utf8'), 'two\n');
+
+  // A copy that differs is the user's whatever its marker says, and is never written over.
+  fs.rmSync(path.join(target, '.bounce-skill.json'));
+  fs.writeFileSync(path.join(target, 'references/notes.md'), 'mine\n');
+  assert.deepEqual(seedSkills({root, bundled}), [{skill: 'demo-skill', action: 'unmanaged'}]);
+  assert.equal(fs.readFileSync(path.join(target, 'references/notes.md'), 'utf8'), 'mine\n');
+});
+
+test('seeding is a no-op for an absent bundled directory or an empty bundled skills store', t => {
+  const {root} = setup(t);
+  assert.deepEqual(seedSkills({root, bundled: path.join(root, 'no-such-dir')}), []);
+  assert.deepEqual(seedSkills({root, bundled: fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-empty-'))}), []);
 });

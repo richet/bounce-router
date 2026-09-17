@@ -2,6 +2,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {createHash, randomUUID} from 'node:crypto';
+import {fileURLToPath} from 'node:url';
+
+// bounce's own skills/, resolved relative to this file so an installed package finds its
+// bundled copy regardless of the caller's cwd.
+export const bundledStore = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'skills');
 
 // Skills are a vendor feature: every CLI scans its own directory and none of them knows
 // about bounce. A routed turn can land on any agent, so a skill installed for one of them
@@ -98,12 +103,90 @@ function replace(target, build) {
     fs.renameSync(staging, target);
   } finally { fs.rmSync(staging, {recursive: true, force: true}); }
 }
-function install(skill, target) {
+function install(skill, target, {bundled = false} = {}) {
   replace(target, dir => {
     copyInto(skill.dir, dir);
-    fs.writeFileSync(path.join(dir, MARKER), JSON.stringify({skill: skill.name, hash: skill.hash, source: skill.dir, installed: new Date().toISOString()}, null, 2) + '\n', {mode: 0o600});
+    fs.writeFileSync(path.join(dir, MARKER), JSON.stringify({skill: skill.name, hash: skill.hash, source: skill.dir, installed: new Date().toISOString(), ...(bundled ? {bundled: true} : {})}, null, 2) + '\n', {mode: 0o600});
   });
 }
+
+// Which bundled skills this machine has already been given. Seeding is a first-run courtesy,
+// not a standing policy, and the store cannot remember that on its own: `skills reset` deletes
+// the store outright, and `skills remove` deletes the directory the decision is about. So the
+// record lives beside the store, and an absent skill that appears here is one the user threw
+// away — `skills seed --force` is the way back.
+export const seededFile = root => path.join(root, 'seeded-skills.json');
+function seededSkills(root) {
+  try { const value = JSON.parse(fs.readFileSync(seededFile(root), 'utf8')); return value && typeof value === 'object' ? value : {}; }
+  catch { return {}; }
+}
+function recordSeeded(root, name) {
+  const record = {...seededSkills(root), [name]: new Date().toISOString()};
+  const file = seededFile(root);
+  fs.mkdirSync(root, {recursive: true, mode: 0o700});
+  const staging = `${file}.${randomUUID()}.tmp`;
+  fs.writeFileSync(staging, JSON.stringify(record, null, 2) + '\n', {mode: 0o600});
+  fs.renameSync(staging, file);
+}
+
+// Ships bounce's own skills into the store on first orchestrator start, so the ORDERS.md
+// pointer resolves even where `skills import` has never run. Only a copy carrying bounce's
+// bundled marker is ever touched again: a user's own skill of the same name, or one they
+// edited after it was seeded, is left exactly as they made it.
+export function seedSkills({root, bundled = bundledStore, force = false} = {}) {
+  const report = [];
+  if (!fs.existsSync(bundled)) return report;
+  const store = skillStore(root);
+  const history = seededSkills(root);
+  for (const entry of fs.readdirSync(bundled, {withFileTypes: true})) {
+    if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+    const source = readSkill(path.join(bundled, entry.name));
+    if (source.error) { report.push({skill: source.name, action: 'invalid', detail: source.error}); continue; }
+    const target = path.join(store, source.name);
+    if (!fs.existsSync(target)) {
+      if (history[source.name] && !force) { report.push({skill: source.name, action: 'withdrawn'}); continue; }
+      install(source, target, {bundled: true});
+      recordSeeded(root, source.name);
+      report.push({skill: source.name, action: 'installed'});
+      continue;
+    }
+    const installed = marker(target);
+    // A marker that is missing, unreadable or older than the bundled flag is not evidence the
+    // copy is the user's. Bytes identical to what bounce ships are bounce's own whatever the
+    // marker says, so the marker is rewritten rather than the skill being written off as
+    // unmanaged for good; anything that differs is theirs and is left untouched.
+    if (!installed?.bundled) {
+      if (skillHash(target) !== source.hash) { report.push({skill: source.name, action: 'unmanaged'}); continue; }
+      install(source, target, {bundled: true});
+      recordSeeded(root, source.name);
+      report.push({skill: source.name, action: 'adopted'});
+      continue;
+    }
+    // The user's own edit is read from the target drifting off what was recorded, and is
+    // answered first: a seeded copy they have since changed is theirs, whether or not the
+    // bundled skill has also moved on.
+    if (skillHash(target) !== installed.hash) { report.push({skill: source.name, action: 'modified'}); continue; }
+    if (installed.hash === source.hash) { report.push({skill: source.name, action: 'current'}); continue; }
+    install(source, target, {bundled: true});
+    report.push({skill: source.name, action: 'updated'});
+  }
+  return report;
+}
+// Says what seeding did in the user's terms, and — for the three outcomes that leave the
+// ORDERS.md pointer dangling or stale — why, and what to do about it.
+const SEED_DETAIL = {
+  installed: 'installed',
+  adopted: 'adopted the copy already in the store',
+  updated: 'updated to the bundled version',
+  current: 'already current',
+  modified: 'left alone: edited since bounce installed it',
+  unmanaged: 'left alone: not the copy bounce installed',
+  withdrawn: 'not reinstalled: removed after bounce seeded it — "skills seed --force" brings it back',
+  failed: 'could not be seeded',
+};
+export const seedSummary = report => report.length
+  ? report.map(row => `${row.skill}: ${SEED_DETAIL[row.action] ?? row.action}${row.detail ? ` — ${row.detail}` : ''}`).join('\n')
+  : 'bounce ships no bundled skills.';
 
 export function syncSkills({root, scope = 'user', cwd, env, home, providers = Object.keys(skillAreas)} = {}) {
   const skills = listSkills(root);
@@ -297,6 +380,7 @@ export function skillsCommand(words, options) {
     const report = resetSkills(options);
     return {text: summarize(report, ['removed', 'deleted']) || 'Nothing to reset.', report};
   }
+  if (action === 'seed') { const report = seedSkills({root, bundled: options.bundled, force}); return sync(seedSummary(report)); }
   if (action === 'new') return {text: `Created ${newSkill(root, args[0], args.slice(1).join(' ') || undefined)}\nEdit its SKILL.md, then run skills sync.`};
   if (action === 'add') {
     if (!args.length) throw new Error('Use skills add PATH');
@@ -316,5 +400,5 @@ export function skillsCommand(words, options) {
     const report = importSkills({...options, providers, force});
     return sync(importSummary(report));
   }
-  throw new Error('Use skills list, sync, new, add, remove, import, clear or reset');
+  throw new Error('Use skills list, sync, seed, new, add, remove, import, clear or reset');
 }

@@ -10,6 +10,8 @@ import {installUpdate} from './update.js';
 import {spawn} from 'node:child_process';
 import {parseArgs} from 'node:util';
 import {Session, config, dataRoot, pidAlive} from './core.js';
+import {seedSkills, seedSummary} from './skills.js';
+const SEED_NOTABLE = ['invalid', 'unmanaged', 'modified', 'withdrawn', 'failed'];
 import {resolveSessionRef} from './sessions.js';
 export {pidAlive};
 import {createBus, connectBus} from './bus.js';
@@ -126,7 +128,9 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator}) {
     `    bounce publish --event '{"kind":"task.submitted","parent":null,"profile":"${Object.keys(profiles).find(n => n !== orchestrator) ?? 'build'}","orders":"<goal, owned paths, acceptance, how to verify>","deadline":3600000}'`,
     `    bounce wait --match '{"kind":"task.completed","task":"<task id from the publish reply>"}' --timeout 3600`,
     'Fields: parent (null for a root task), profile (a name above), orders (the brief, required), deadline (ms, optional),',
-    'depends_on (task ids, optional), review ({"prelaunch": <profile>, "completion": <profile>}, optional, review-role profiles only).',
+    'depends_on (task ids, optional), review ({"prelaunch": <profile>, "completion": <profile>}, optional, review-role profiles only),',
+    'steps (the verification steps, as text) — required when the completion reviewer is a verifier profile, refused with reason `steps` without it.',
+    'A verifier is handed steps alone as its orders, so they must stand on their own. A strict session requires both review stages as well.',
     'The publish reply carries the task id. `wait` on a task outcome follows replacements and waits for completion review when configured. Read the',
     'returned row\'s `kind`: task.completed or task.accepted is done; task.failed (with `reason` and `text`), task.cancelled, task.deadline or',
     'task.rejected mean stop and report that reason to the user. A refusal is such a task.failed row — read it before retrying.',
@@ -136,10 +140,11 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator}) {
     'after initial inspection, every phase change, and before completion. Phases: inspect, plan, implement, test,',
     'verify, review, document, done. `text` says what changed, `next` says what happens next, and `evidence` names',
     'the concrete file, command, test result, or artifact. Publish task.blocked immediately when progress stops.', '',
-    'You may publish only: task.submitted, task.milestone, task.blocked, task.input_required, task.usage, task.activity, message.',
-    'A Codex worker calls its scoped `bounce_report` tool; other workers use `bounce report --report <json>`. Reports require op, phase, text and next;',
+    'You may publish only: task.submitted, task.accepted, task.milestone, task.blocked, task.input_required, task.usage, task.activity, message.',
+    'A Codex worker calls its scoped `bounce_report` tool; other workers use `bounce report --report <json>`. Reports require op (milestone, blocked,',
+    'input_required or final), phase, text and next;',
     'a final report additionally requires outcome (completed|failed|blocked|input_required) and summary. Do not use publish for a final report.',
-    'Everything else is refused — `user`, `control.*`, and every task lifecycle row the scheduler owns.',
+    'Everything else is refused — `user`, `control.*`, and every other task lifecycle row the scheduler owns.',
   ].join('\n') + '\n', {mode: 0o600});
   return file;
 }
@@ -242,6 +247,16 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // to run on, and a standing brief on disk; classic mode reaches none of this.
   const orchestratorProfile = orchestrating ? orchestration.profiles[orchestration.orchestrator] : null;
   const orchestratorGrant = orchestrating ? bus.grant({peer: 'orchestrator', canSubmit: true, tasks: [], context: session.id}) : null;
+  // A read-only home or similar must not take the session down: the ORDERS.md pointer would
+  // simply dangle, same as before this skill existed. Silence is the wrong answer for the
+  // outcomes that leave the pointer dangling or the skill stale, though — those are said out
+  // loud, because the orchestrator is about to be told to read a file that may not be there.
+  if (orchestrating) {
+    let notable = [];
+    try { notable = seedSkills({root}).filter(row => SEED_NOTABLE.includes(row.action)); }
+    catch (error) { notable = [{skill: 'bundled skills', action: 'failed', detail: error.message}]; }
+    if (notable.length) session.append({kind: 'status', text: seedSummary(notable)});
+  }
   if (orchestrating) writeOrders({session, root, bus, grant: orchestratorGrant, profiles: orchestration.profiles, orchestrator: orchestration.orchestrator});
   if (orchestrating) session.append({kind: 'operation', operation: 'orchestrator', orchestrator: orchestration.orchestrator, shape: orchestration.shape, text: `Operation: orchestrator on ${orchestration.orchestrator} (${orchestration.shape})`});
   const main = orchestrating && positionals[0] !== 'run' ? createMainService({session, adapters, profile: orchestratorProfile, settings,

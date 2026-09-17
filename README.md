@@ -142,7 +142,7 @@ Headless usage: `bounce run "Explain this screenshot" --image "/path/Screen shot
 - `/mode yolo` (default) bypasses native approvals and sandboxing.
 - `/mode plan` requests Claude plan mode, Codex read-only sandbox, or Muse disabled write/shell. It is not an interactive approval bridge, and provider-native tools/configuration determine exact restrictions.
 - `/quota` refreshes and prints the usage each agent reports. On terminals at least 100 columns wide, a right sidebar topped by the BOUNCE wordmark shows the provider, mode, model, operation mode and state, queued prompts, workspace, session id, each agent's short quota reading, and an AGENTS list of the main agent and every worker with its state. It is on by default; `/sidebar` toggles it (`/sidebar on|off` sets it) and the choice is saved in `config.json` as `sidebar`. Narrower terminals keep the header. Use `/review` to print the full text of every completed turn's result in chronological order.
-- `/skills` lists bounce's skills and where each agent has them; `/skills sync`, `/skills new NAME`, `/skills add PATH`, `/skills remove NAME`, `/skills import [provider]`, `/skills clear` and `/skills reset` manage them. See [Skills](#skills).
+- `/skills` lists bounce's skills and where each agent has them; `/skills sync`, `/skills new NAME`, `/skills add PATH`, `/skills remove NAME`, `/skills import [provider]`, `/skills clear`, `/skills reset` and `/skills seed --force` manage them. See [Skills](#skills).
 - `/btw TEXT` steers the focused agent while it works — the message is delivered into the running turn (or to the selected worker when the AGENTS pane is open). When nothing is running it is saved as an aside for the next turn.
 - `/sessions`, `/rename NAME`, `/resume [SESSION]` and `/detach` manage sessions; see [Sessions](#sessions). `/agents`, `/tasks`, `/stop` and `/msg` are orchestrator commands; see [Orchestrator mode](#orchestrator-mode).
 - `/login [provider]`, `/new`, `/note TEXT`, `/retry`, `/help`, `/quit`.
@@ -242,6 +242,7 @@ bounce skills sync                  # install into every agent
 bounce skills remove deploy-web     # delete from bounce and from every agent
 bounce skills clear                 # withdraw every copy bounce installed
 bounce skills reset --force         # also empty bounce's own store
+bounce skills seed --force          # put the skills bounce ships back, deleted or not
 ```
 
 `import` surveys everything an agent reads — its home area (`~/.claude/skills`, `$CODEX_HOME/skills`, `~/.agents/skills`) and the current workspace's own `.claude/skills`, `.codex/skills` and `.agents/skills` — whichever scope bounce is set to install into; a workspace find is listed as `(claude · project)`. Where the same skill sits in both, the workspace copy is offered, since that is the one the vendor lets shadow the other.
@@ -265,6 +266,8 @@ Each installed copy carries a `.bounce-skill.json` marker naming the skill and h
 `skills.scope` (or `--scope` for one command) chooses between the agents' home directories and the workspace. Project scope writes into the repository you are working in — commit or ignore those directories deliberately. In a workspace Muse also reads `.claude/skills` and `.codex/skills`, so it sees the same skill three times and keeps the highest-priority copy with a note; nothing fails. `bounce skills clear --scope project` withdraws them again.
 
 Skills are the only capability bounce carries across providers. Instructions in the handoff packet — the transcript and `/note` — reach every agent as text; `CLAUDE.md`, `AGENTS.md` and each vendor's own configuration remain that vendor's business.
+
+bounce ships its own `agent-orchestrator` skill and seeds it into the store the first time an orchestrator session starts, so the brief resolves even on a machine that has never run `bounce skills import`. If you already have a skill named `agent-orchestrator`, or you edit the seeded copy, seeding never overwrites it. Seeding is first-run only: remove it, or reset the store, and it stays gone — `bounce skills seed --force` puts it back. The store entry is named `agent-orchestrator` rather than `orchestrator` so it cannot collide with a skill of that name you already keep for your own agents; the two are separate copies from then on, and yours is the one bounce leaves alone.
 
 ## Your agents' commands
 

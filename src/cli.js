@@ -94,6 +94,7 @@ TUI commands:
   /skills import [NAME] Pick from the skills an agent already has
   /skills clear         Remove every copy bounce installed
   /skills reset         Delete every bounce skill and withdraw its copies
+  /skills seed --force  Reinstall the skills bounce ships, including ones you deleted
   /quota                Show the subscription usage each agent reports
   /review               Show full text of all session work items
   /retry                Clear locally recorded quota cooldowns

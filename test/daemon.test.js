@@ -531,9 +531,15 @@ test('O2 orchestrator single-provider: the orchestrator submits over the bridge,
     `You are the orchestrator peer of session ${session.id}; the bounce bridge is available via BOUNCE_BUS/BOUNCE_BUS_TOKEN_FILE; see ${ordersFile}.\ngo`);
   const orders = fs.readFileSync(ordersFile, 'utf8');
   assert.equal(orders.includes(path.join(root, 'skills', 'agent-orchestrator', 'SKILL.md')), true);
+  // Seeding runs before the orders are written, so the pointer resolves on a machine that has
+  // never run `skills import`.
+  const skillLine = orders.split('\n').find(line => line.startsWith('Skill: '));
+  assert.equal(fs.existsSync(skillLine.slice('Skill: '.length)), true);
   assert.equal(orders.includes('BOUNCE_BUS_TOKEN_FILE='), true);
   // The stated capability is the bus's own allowlist (src/bus.js PEER_KINDS), verbatim.
-  assert.equal(orders.includes('You may publish only: task.submitted, task.milestone, task.blocked, task.input_required, task.usage, task.activity, message.'), true);
+  assert.equal(orders.includes('You may publish only: task.submitted, task.accepted, task.milestone, task.blocked, task.input_required, task.usage, task.activity, message.'), true);
+  // steps is refused-without when the completion reviewer is a verifier, so the brief has to name it.
+  assert.equal(orders.includes('steps (the verification steps, as text) — required when the completion reviewer is a verifier profile'), true);
   assert.equal(orders.includes('phase, text, next, and evidence'), true, 'workers receive the durable progress checkpoint contract');
   assert.equal(orders.includes('initial inspection, every phase change, and before completion'), true, 'checkpoint cadence is explicit');
 });
