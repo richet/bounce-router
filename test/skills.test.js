@@ -290,6 +290,7 @@ test('seeding ships the bundled agent-orchestrator skill and leaves the user\'s 
   const target = path.join(skillStore(root), 'agent-orchestrator');
   assert.equal(fs.existsSync(path.join(target, 'SKILL.md')), true);
   assert.equal(fs.existsSync(path.join(target, 'references/bounce.md')), true);
+  assert.equal(fs.existsSync(path.join(target, 'agents/orch-builder.md')), true);
   assert.equal(skillMetadata(fs.readFileSync(path.join(target, 'SKILL.md'), 'utf8')).name, 'agent-orchestrator');
 
   // Unchanged bundled source writes nothing on a second pass.
@@ -317,6 +318,8 @@ test('seeding ships the bundled agent-orchestrator skill and leaves the user\'s 
   const synced = syncSkills(options);
   assert.equal(synced.some(r => r.skill === 'agent-orchestrator' && r.action === 'installed'), true);
   assert.equal(fs.existsSync(path.join(home, '.claude/skills/agent-orchestrator/SKILL.md')), true);
+  // The role files the skill installs by hand have to survive both hops to be copyable at all.
+  assert.equal(fs.readdirSync(path.join(home, '.claude/skills/agent-orchestrator/agents')).length, 5);
 });
 
 test('seeding upgrades an untouched seeded copy but yields to the user once they have edited it', t => {
