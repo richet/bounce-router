@@ -2,7 +2,7 @@
 
 ## Workers
 
-If `~/.claude/agents/orch-*.md` exist, use them by `subagent_type` and pass no `model` — the file pins model, effort, and tools, and is the contract.
+The five roles are agent files. If `~/.claude/agents/orch-*.md` exist, use them by `subagent_type` and pass no `model` — the file pins model, effort, and tools, and is the contract.
 
 | Role | `subagent_type` | Model | Tools |
 |---|---|---|---|
@@ -12,7 +12,19 @@ If `~/.claude/agents/orch-*.md` exist, use them by `subagent_type` and pass no `
 | Reviewer | `orch-refuter` | `opus` high | Read, Grep, Glob, Bash |
 | Debugger | `orch-debugger` | `opus` high | Read, Grep, Glob, Bash |
 
-If they are missing, use `Explore` for reconnaissance and `general-purpose` with an explicit `model` for everything else; the brief then has to carry the tool restrictions as instructions.
+### Install the roles once
+
+The five files ship inside this skill, in `agents/` beside `SKILL.md` — `~/.claude/skills/agent-orchestrator/agents/` at user scope, `<workspace>/.claude/skills/agent-orchestrator/agents/` at project scope. Claude Code does not read them from there: agent files are loaded only from `~/.claude/agents`, or `<workspace>/.claude/agents` for that one repository. Nothing installs them for you — a skill carries only itself.
+
+So when the roles are missing, say so before the first delegation and offer to install them:
+
+```sh
+mkdir -p ~/.claude/agents && cp -n ~/.claude/skills/agent-orchestrator/agents/orch-*.md ~/.claude/agents/
+```
+
+Ask first — this writes outside the workspace — and copy only the files that are absent. An existing `orch-*.md` that differs is the user's, to be reported as a conflict rather than overwritten. Agent files are read when a worker is spawned; if a `subagent_type` is still unknown after the copy, restart the session before relying on the roles.
+
+Until they are installed, use `Explore` for reconnaissance and `general-purpose` with an explicit `model` for everything else, and say which roles are running degraded: with no agent file behind them, the tool restrictions are requests the brief has to carry, not facts the harness enforces.
 
 ## Enforcement
 
