@@ -319,7 +319,17 @@ test('seeding ships the bundled agent-orchestrator skill and leaves the user\'s 
   assert.equal(synced.some(r => r.skill === 'agent-orchestrator' && r.action === 'installed'), true);
   assert.equal(fs.existsSync(path.join(home, '.claude/skills/agent-orchestrator/SKILL.md')), true);
   // The role files the skill installs by hand have to survive both hops to be copyable at all.
-  assert.equal(fs.readdirSync(path.join(home, '.claude/skills/agent-orchestrator/agents')).length, 5);
+  for (const provider of ['claude', 'codex', 'muse']) {
+    const installed = path.join(skillDir(provider, options), 'agent-orchestrator/agents');
+    for (const role of ['scout', 'researcher', 'builder', 'refuter', 'debugger']) {
+      for (const extension of ['md', 'toml']) {
+        const file = `orch-${role}.${extension}`;
+        const source = fs.readFileSync(new URL(`../skills/agent-orchestrator/agents/${file}`, import.meta.url), 'utf8');
+        assert.equal(fs.readFileSync(path.join(target, 'agents', file), 'utf8'), source);
+        assert.equal(fs.readFileSync(path.join(installed, file), 'utf8'), source);
+      }
+    }
+  }
 });
 
 test('seeding upgrades an untouched seeded copy but yields to the user once they have edited it', t => {
