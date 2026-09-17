@@ -10,7 +10,8 @@ import {installUpdate} from './update.js';
 import {spawn} from 'node:child_process';
 import {parseArgs} from 'node:util';
 import {Session, config, dataRoot, pidAlive} from './core.js';
-import {seedSkills} from './skills.js';
+import {seedSkills, seedSummary} from './skills.js';
+const SEED_NOTABLE = ['invalid', 'unmanaged', 'modified', 'withdrawn', 'failed'];
 import {resolveSessionRef} from './sessions.js';
 export {pidAlive};
 import {createBus, connectBus} from './bus.js';
@@ -247,8 +248,15 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   const orchestratorProfile = orchestrating ? orchestration.profiles[orchestration.orchestrator] : null;
   const orchestratorGrant = orchestrating ? bus.grant({peer: 'orchestrator', canSubmit: true, tasks: [], context: session.id}) : null;
   // A read-only home or similar must not take the session down: the ORDERS.md pointer would
-  // simply dangle, same as before this skill existed.
-  if (orchestrating) { try { seedSkills({root}); } catch {} }
+  // simply dangle, same as before this skill existed. Silence is the wrong answer for the
+  // outcomes that leave the pointer dangling or the skill stale, though — those are said out
+  // loud, because the orchestrator is about to be told to read a file that may not be there.
+  if (orchestrating) {
+    let notable = [];
+    try { notable = seedSkills({root}).filter(row => SEED_NOTABLE.includes(row.action)); }
+    catch (error) { notable = [{skill: 'bundled skills', action: 'failed', detail: error.message}]; }
+    if (notable.length) session.append({kind: 'status', text: seedSummary(notable)});
+  }
   if (orchestrating) writeOrders({session, root, bus, grant: orchestratorGrant, profiles: orchestration.profiles, orchestrator: orchestration.orchestrator});
   if (orchestrating) session.append({kind: 'operation', operation: 'orchestrator', orchestrator: orchestration.orchestrator, shape: orchestration.shape, text: `Operation: orchestrator on ${orchestration.orchestrator} (${orchestration.shape})`});
   const main = orchestrating && positionals[0] !== 'run' ? createMainService({session, adapters, profile: orchestratorProfile, settings,
