@@ -12,7 +12,8 @@ Workers are **profiles**, declared in `config.json` and listed in your ORDERS.md
 
 - `adapter` is `claude`, `codex`, `muse` or `local`; `model` is passed through to that CLI.
 - `role` is a free label, default `builder`. `critic`, `verifier` and `analyst` default to
-  `policy: read-only`; anything else defaults to `write`.
+  `policy: read-only`, and so does every `local` profile whatever its role; anything else
+  defaults to `write`.
 - The profile named by `orchestrator` is you. You cannot submit to yourself.
 
 Map the skill's tiers onto the roster you were given:
@@ -56,7 +57,13 @@ Submit a task, then wait for it:
 Fields: `parent` (null for a root task), `profile` (a name from the roster), `orders` (the
 brief — the six parts from the skill go here, as text), `deadline` (ms, optional),
 `depends_on` (task ids, optional), `review` (`{"prelaunch": <profile>, "completion":
-<profile>}`, optional, review-role profiles only).
+<profile>}`, optional, review-role profiles only), `steps` (the verification steps, as text).
+
+`steps` is **required** whenever the `completion` reviewer is a `verifier` profile — which is
+where the tier table sends the strongest tier — and the submission is refused with reason
+`steps` without it. A verifier is handed `steps` alone as its orders, so write them to stand
+on their own: what to run, and what the result has to be. In a strict session both review
+stages are required too, and a submission missing either is refused with reason `review`.
 
 The publish reply carries the task id. `wait` follows replacements and waits for completion
 review when one is configured. Read the returned row's `kind`:
@@ -77,14 +84,15 @@ before completion. Phases: `inspect`, `plan`, `implement`, `test`, `verify`, `re
 names the concrete file, command, test result or artifact. Publish `task.blocked` the
 moment progress stops.
 
-You may publish only: `task.submitted`, `task.milestone`, `task.blocked`,
+You may publish only: `task.submitted`, `task.accepted`, `task.milestone`, `task.blocked`,
 `task.input_required`, `task.usage`, `task.activity`, `message`. Everything else — `user`,
-`control.*`, and every task lifecycle row the scheduler owns — is refused.
+`control.*`, and every other task lifecycle row the scheduler owns — is refused.
 
 Workers report with `bounce report --report <json>`; a Codex worker calls its scoped
-`bounce_report` tool instead. A report requires `op`, `phase`, `text` and `next`; a final
-report additionally requires `outcome` (`completed|failed|blocked|input_required`) and
-`summary`. `publish` is not a channel for a final report.
+`bounce_report` tool instead. A report requires `op` (`milestone`, `blocked`,
+`input_required` or `final`), `phase`, `text` and `next`; a final report additionally
+requires `outcome` (`completed|failed|blocked|input_required`) and `summary`. `publish` is
+not a channel for a final report. You write the briefs that have to say this.
 
 Capacity waits, progress and failures are all journaled, so silence tells you nothing:
 inspect a worker's latest task state before concluding it crashed.
