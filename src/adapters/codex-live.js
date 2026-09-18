@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import codex from './codex.js';
 import {connectBus} from '../bus.js';
 import {resolveExecutable} from '../executable.js';
+import {limitPattern} from '../providers.js';
 import {spawnLive, vendorEnv, verifiedCancel, TEXT_MAX} from './live-common.js';
 import {validateReport} from '../reporting.js';
 import {version} from '../update.js';
@@ -211,6 +212,8 @@ function rows(handle, message) {
     }
     else {
       if (event.kind === 'assistant') handle.lastAssistant = event.text;
+      // Only the error channel can classify a failed turn as exhaustion; assistant text may quote errors.
+      if (event.kind === 'error') handle.lastError = event.text;
       handle.stream.push(event);
     }
   }
@@ -225,8 +228,13 @@ function receive(handle, line) {
     if (!pending) return; // an unmatched response id is ignored
     handle.pending.delete(message.id);
     handle.clearTimeout(pending.timer);
-    return message.error ? pending.reject(new Error(message.error.message ?? `codex error ${message.error.code}`))
-      : pending.resolve(message.result ?? {});
+    if (!message.error) return pending.resolve(message.result ?? {});
+    // The vendor refuses a request (turn/start, observed live) with its usage-limit text when the
+    // account is exhausted: the same detector the classic path uses (providers.limitPattern)
+    // tags the rejection so a launch failure becomes task.failed{reason:'limited'}, not 'error'.
+    const error = new Error(message.error.message ?? `codex error ${message.error.code}`);
+    if (limitPattern.test(error.message)) error.code = 'limited';
+    return pending.reject(error);
   }
   if (message.method === 'item/tool/call') {
     void handleReportTool(handle, message);
@@ -242,19 +250,23 @@ function receive(handle, line) {
   rows(handle, message);
   if (!completed) return;
   const terminal = message.params?.turn?.status ?? message.params?.status ?? 'completed';
-  const status = terminal === 'completed' ? 'completed' : terminal === 'failed' ? 'failed'
-    : terminal === 'interrupted' ? 'interrupted' : terminal === 'limited' ? 'limited' : 'failed';
   const failure = message.params?.turn?.error?.message ?? message.params?.turn?.error?.detail
     ?? message.params?.error?.message ?? message.params?.error?.detail;
-  const summary = status === 'completed' ? (handle.lastAssistant ?? 'turn completed') : (failure ?? terminal ?? 'turn failed');
+  // A failed turn whose error (the turn's own, or an error notification during it) is the
+  // vendor's usage-limit text is `limited`: the scheduler's fallback chain reads that status.
+  const limited = terminal === 'limited' || (terminal !== 'completed' && terminal !== 'interrupted'
+    && [failure, handle.lastError].some(text => typeof text === 'string' && limitPattern.test(text)));
+  const status = terminal === 'completed' ? 'completed' : terminal === 'interrupted' ? 'interrupted' : limited ? 'limited' : 'failed';
+  const summary = status === 'completed' ? (handle.lastAssistant ?? 'turn completed') : (failure ?? handle.lastError ?? terminal ?? 'turn failed');
   handle.lastAssistant = null;
+  handle.lastError = null;
   handle.turnId = null;
   if (status === 'completed' && handle.queue.length) {
     handle.stream.push({kind: 'milestone', text: summary});
     startTurn(handle, handle.queue.shift()).catch(error => {
       if (handle.cancelled || handle.resulted) return;
       handle.resulted = true;
-      handle.stream.push({kind: 'result', status: 'failed', text: error.message});
+      handle.stream.push({kind: 'result', status: error.code === 'limited' ? 'limited' : 'failed', text: error.message});
       try { handle.child.stdin.end(); } catch {}
     });
     return;
@@ -310,7 +322,7 @@ export function createCodexLive({spawn = spawnProcess, kill = process.kill, conn
     const handle = {provider: 'codex', peer, child: live.child, pid: live.child.pid, cwd, dir,
       task: report ? peer.slice('worker:'.length) : null, report, connectBus: connectBusImpl, model: profile.model ?? null,
       permissions: permissionsFor(profile, peer), threadId: null, queue: [], pending: new Map(), nextId: 1,
-      reportCalls: new Set(), running: false, exited: false, cancelled: false, resulted: false, lastAssistant: null, turnId: null, stream: makeStream(), stop: () => stop(handle)};
+      reportCalls: new Set(), running: false, exited: false, cancelled: false, resulted: false, lastAssistant: null, lastError: null, turnId: null, stream: makeStream(), stop: () => stop(handle)};
     handle.requestTimeoutMs = requestTimeoutMs;
     handle.setTimeout = setTimeoutImpl;
     handle.clearTimeout = clearTimeoutImpl;

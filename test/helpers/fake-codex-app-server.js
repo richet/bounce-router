@@ -16,10 +16,16 @@
 //   anything else                  → error {code:-32601}
 // Every received line is appended verbatim to the file named by env FAKE_LOG; a line that
 // does not parse is ignored. One object per line, `jsonrpc` omitted, numeric ids on requests.
+// FAKE_LIMIT=launch  → turn/start is refused with the vendor's usage-limit text (observed live:
+//                      codex-cli answers turn/start with this error once the account is exhausted)
+// FAKE_LIMIT=turn    → the turn ends with turn/completed status:failed carrying the same text
+// FAKE_LIMIT=notify  → an `error` notification carries the text, then turn/completed fails bare
 import fs from 'node:fs';
 
 const logFile = process.env.FAKE_LOG;
 const delay = Number(process.env.FAKE_DELAY_MS ?? 0);
+const limitMode = process.env.FAKE_LIMIT ?? '';
+export const USAGE_LIMIT_TEXT = "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 2:50 PM.";
 // FAKE_USAGE=<json>   v2 TokenUsageBreakdown (default includes each schema-required field)
 const defaultUsage = process.env.FAKE_USAGE ? JSON.parse(process.env.FAKE_USAGE) : {
   inputTokens: 1, cachedInputTokens: 0, outputTokens: 1, reasoningOutputTokens: 0, totalTokens: 2,
@@ -66,9 +72,15 @@ const handlers = {
     if (!['never', 'on-request'].includes(params?.approvalPolicy) || !params?.sandboxPolicy?.type) {
       throw Object.assign(new Error('turn/start requires App Server permission settings'), {code: -32602});
     }
+    if (limitMode === 'launch') throw Object.assign(new Error(USAGE_LIMIT_TEXT), {code: -32000});
     const turnId = `u-${++turns}`;
     const text = params?.input?.[0]?.text ?? '';
     running = {turnId, timer: setTimeout(() => {
+      if (limitMode === 'turn') return complete({status: 'failed', error: USAGE_LIMIT_TEXT});
+      if (limitMode === 'notify') {
+        notify('error', {threadId: params.threadId, turnId, error: {message: USAGE_LIMIT_TEXT}});
+        return complete({status: 'failed'});
+      }
       complete();
     }, delay), threadId: params.threadId, text};
     return {turn: {id: turnId}};

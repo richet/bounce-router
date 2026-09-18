@@ -73,6 +73,13 @@ where the tier table sends the strongest tier — and the submission is refused 
 on their own: what to run, and what the result has to be. In a strict session both review
 stages are required too, and a submission missing either is refused with reason `review`.
 
+`--timeout` is seconds and may be as long as the task's deadline: the bridge re-arms the
+bus's 600 s wait for you. A `null` reply means the timeout expired, not that the task ended —
+wait again, or end your turn: every outcome of a task you submitted that no `wait` of yours
+returned is handed to you by bounce — as your next turn when you are idle (a `handoff` row in
+the journal, one per batch of outcomes) or in front of the next prompt — so you never need to
+poll to learn of a completion. Ending a turn without waiting does not lose the outcome.
+
 When Jev completion verdicts are on (ORDERS.md says so), a root task you submit without a
 `completion` reviewer is checked by Jev before it is accepted — a fast accept/rework decision
 over the orders, the worker's final report and its diff — and a confident `rework` sends the
@@ -91,12 +98,15 @@ Steer a running worker instead of resubmitting:
 
     bounce publish --event '{"kind":"message","to":"worker:<task id>","text":"..."}'
 
-**Progress is a durable contract, not a heartbeat.** Publish `task.milestone` with `phase`,
-`text`, `next` and `evidence` after your initial inspection, at every phase change, and
-before completion. Phases: `inspect`, `plan`, `implement`, `test`, `verify`, `review`,
+**Progress is a durable contract, not a heartbeat.** Publish `task.milestone` with `task`,
+`phase`, `text`, `next` and `evidence` after your initial inspection, at every phase change,
+and before completion. Phases: `inspect`, `plan`, `implement`, `test`, `verify`, `review`,
 `document`, `done`. `text` says what changed, `next` says what happens next, `evidence`
 names the concrete file, command, test result or artifact. Publish `task.blocked` the
-moment progress stops.
+moment progress stops. Every `task.*` row you publish needs `task` — an id from your own
+publish replies; without it the bus refuses the row as `invalid event: … requires task`:
+
+    bounce publish --event '{"kind":"task.milestone","task":"<task id>","phase":"inspect","text":"…","next":"…","evidence":["…"]}'
 
 You may publish only: `task.submitted`, `task.accepted`, `task.milestone`, `task.blocked`,
 `task.input_required`, `task.usage`, `task.activity`, `message`. Everything else — `user`,

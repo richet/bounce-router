@@ -6,6 +6,7 @@
 // Probes E1, E3, E4 and E6 of the T8 brief are NOT here: they need a worker to actually launch
 // on a live adapter, which no shipped surface can do yet. The gap is pinned by the last test in
 // this file (see its comment) and reported with the task.
+import './helpers/env.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';

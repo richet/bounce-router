@@ -243,6 +243,25 @@ test('S11 missing adapter fails then falls back to the next profile', async t =>
   await waitFor(() => scheduler.tasks()[retry.task]?.state === 'completed');
 });
 
+test('S11b a launch refused as limited (a vendor quota, codex-live) fails with that reason, keeps the vendor text, and falls back', async t => {
+  const {session} = setup(t);
+  const adapterA = fakeAdapter(() => ({launchError: 'limited'}));
+  const adapterB = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done via B'}]);
+  const profiles = {
+    A: {adapter: 'fakeA', model: 'x', mode: 'yolo', fallback: ['B']},
+    B: {adapter: 'fakeB', model: 'x', mode: 'yolo', fallback: []},
+  };
+  const scheduler = createScheduler({session, adapters: {fakeA: adapterA, fakeB: adapterB}, profiles});
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null});
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'failed');
+  assert.equal(scheduler.tasks()[row.task].reason, 'limited');
+  assert.equal(scheduler.tasks()[row.task].error, 'fake adapter launch failed: limited');
+  assert.equal(session.events.find(e => e.kind === 'budget.released' && e.task === row.task)?.text, 'limited');
+  const retry = await waitFor(() => session.events.find(e => e.kind === 'task.submitted' && e.profile === 'B'));
+  assert.equal(retry.replaces, row.task);
+  await waitFor(() => scheduler.tasks()[retry.task]?.state === 'completed');
+});
+
 test('S12 live activity is delivered live and never journaled', async t => {
   const {session} = setup(t);
   const adapter = fakeAdapter(() => [{kind: 'activity', text: 'tick'}, {kind: 'result', status: 'completed', text: 'done'}]);

@@ -197,6 +197,10 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         // reviewer for a root task that names none); the decorated row is what everyone reads.
         if (typeof prepare === 'function') e = prepare(e);
       } else if (e.kind.startsWith('task.')) {
+        // A task.* row without its task is a malformed event, not an authority failure: say so
+        // (observed live: an orchestrator publishing a task.milestone with no `task` got a bare
+        // `unauthorized` and could not tell what it had done wrong).
+        if (typeof e.task !== 'string' || !e.task) return refuse(id, -32602, `invalid event: ${e.kind} requires task`);
         if (!authenticated.tasks.includes(e.task)) return refuse(id, -32001, 'unauthorized');
         // A peer may close out a task that has no completion reviewer of its own; one with
         // review.completion set is only ever accepted by the review policy (task.rejected/
@@ -256,6 +260,11 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         settled = true;
         cleanup();
         send({jsonrpc: '2.0', id, result: row ?? null});
+        // The orchestrator has now been handed this outcome by its own `wait`: main-service's
+        // wake-up on terminal rows (pendingHandoffs) treats the task as seen, nothing else does.
+        if (row && authenticated.peer === 'orchestrator' && typeof row.task === 'string' && TASK_TERMINAL.has(row.kind)) {
+          session.append({kind: 'wait.served', task: row.task, served: row.seq ?? null, outcome: row.kind, from: 'orchestrator', context: authenticated.context});
+        }
       };
       const unsubscribe = session.subscribe(row => { if (matches(row)) finish(row); });
       const timer = setTimeout(() => finish(null), timeout);

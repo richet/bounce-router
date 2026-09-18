@@ -2,6 +2,7 @@ import {createConnection as nodeConnect} from 'node:net';
 import nodeFs from 'node:fs';
 import claude from './claude.js';
 import {resolveExecutable} from '../executable.js';
+import {limitPattern} from '../providers.js';
 import {spawnLive, vendorEnv, verifiedCancel, appendPending, readPending, takePending, TEXT_MAX} from './live-common.js';
 
 const WRITE_WAIT = 2000; // how long a live push waits for the turn to take the message
@@ -54,13 +55,16 @@ export function createClaudeLive({connect = nodeConnect, fs = nodeFs, kill = pro
     },
 
     // Never throws: every terminal condition of the process becomes an event and ends the stream.
+    // A failed result is `limited` when the error channel (an is_error result, a rejected
+    // rate_limit_event, or the stderr tail on exit) carries the vendor's usage-limit text —
+    // the same providers.limitPattern the classic runProcess path classifies with.
     async *events(handle) {
-      let sawResult = false;
+      let sawResult = false, limited = false;
       for await (const event of handle.live.events) {
         if (event.kind === 'diagnostic') { yield event; continue; }
         if (event.kind === 'error') { yield {kind: 'error', code: event.code, text: event.text}; return; }
         if (event.kind === 'exit') {
-          if (!sawResult) yield {kind: 'result', status: 'failed', text: 'protocol error: claude exited without result'};
+          if (!sawResult) yield {kind: 'result', status: event.limited ? 'limited' : 'failed', text: 'protocol error: claude exited without result'};
           return;
         }
         let raw;
@@ -72,9 +76,10 @@ export function createClaudeLive({connect = nodeConnect, fs = nodeFs, kill = pro
             yield {kind: 'native', provider: normalized.provider, sessionId: normalized.sessionId};
             continue;
           }
+          if (normalized.kind === 'error') limited ||= limitPattern.test(normalized.text);
           if (normalized.kind === 'result') {
             sawResult = true;
-            yield {kind: 'result', text: normalized.text, success: normalized.success, status: normalized.success ? 'completed' : 'failed'};
+            yield {kind: 'result', text: normalized.text, success: normalized.success, status: normalized.success ? 'completed' : limited ? 'limited' : 'failed'};
             continue;
           }
           if (normalized.kind === 'usage') { yield {kind: 'usage', usage: mapUsage(normalized.usage)}; continue; }

@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {Session} from '../src/core.js';
+import {createBus, connectBus} from '../src/bus.js';
 import {createMainService} from '../src/main-service.js';
 
 function fixture(t, provider = 'codex') {
@@ -135,4 +136,307 @@ test('daemon main records the slash line a request was expanded from and rejects
   assert.equal(user.typed, '/triage REC-1');
   assert.match(user.text, /Triage REC-1/);
   f.pending.shift()?.({kind: 'result', status: 'completed', text: 'Done'});
+});
+
+// --- wake-up on worker outcomes (fix/orchestrator-handoff) ---------------------------------
+// The daemon owns the main agent: when it is idle and a root task it submitted ends, the daemon
+// starts the next turn itself with the outcome in front of it.
+function wakeFixture(t, {handoffDelayMs = 10} = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-main-wake-'));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const session = new Session(root, {root});
+  const pending = [], calls = [], launchErrors = []; // launchErrors: messages the next launches/resumes reject with
+  const adapter = {
+    async launch(args) { calls.push(['launch', args]); if (launchErrors.length) throw new Error(launchErrors.shift()); return {turnId: `turn-${calls.length}`}; },
+    async resume(args) { calls.push(['resume', args]); if (launchErrors.length) throw new Error(launchErrors.shift()); return {turnId: `turn-${calls.length}`}; },
+    async *events() {
+      yield {kind: 'native', provider: 'codex', sessionId: 'native-thread'};
+      yield await new Promise(resolve => pending.push(resolve));
+    },
+    async deliver() { return 'live'; },
+    async cancel() { pending.shift()?.({kind: 'result', status: 'interrupted'}); return {verified: true}; },
+  };
+  const main = createMainService({session, adapters: {codex: adapter}, profile: {adapter: 'codex', mode: 'plan'}, settings: {executables: {}}, brief: 'Orders', handoffDelayMs});
+  t.after(() => main.close());
+  const finishTurn = async (text = 'Done') => {
+    while (!pending.length) await new Promise(resolve => setImmediate(resolve)); // the turn's stream is being consumed
+    const ended = nextEvent(main, 'main.terminal');
+    pending.shift()({kind: 'result', status: 'completed', text});
+    await ended;
+  };
+  // One completed orchestrator turn behind us, so the wake-up is a resume, not the first turn.
+  const settle = async () => {
+    const started = nextEvent(main, 'main.started');
+    main.run({id: 'first', text: 'delegate'});
+    await started;
+    await finishTurn('Two workers running; I will synthesize when they report.');
+  };
+  const submit = (task, {from = 'orchestrator', parent = null, profile = 'build', replaces = null, review = null} = {}) => {
+    session.append({kind: 'task.submitted', task, parent, from, profile, orders: 'go', deadline: null, replaces, review});
+    session.append({kind: 'task.started', task, attempt: 1, from: `worker:${task}`});
+  };
+  const quiet = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const promptOf = call => call[1].message ?? call[1].orders;
+  // A real bus over the same session, so a peer's `wait` journals (or does not) exactly as in the daemon.
+  let bus = null;
+  const peer = async (name, tasks = []) => {
+    bus ??= await createBus({session, dir: session.dir});
+    t.after(() => bus.close());
+    const client = await connectBus({path: bus.path, token: bus.grant({peer: name, canSubmit: true, tasks, context: session.id}).token});
+    t.after(() => client.close());
+    return client;
+  };
+  return {main, session, calls, pending, launchErrors, finishTurn, settle, submit, quiet, promptOf, peer};
+}
+
+test('an idle orchestrator is woken with the completed task summary as a new, distinctly journaled turn', async t => {
+  const f = wakeFixture(t);
+  await f.settle();
+  f.submit('a2cf5450');
+  const woken = nextEvent(f.main, 'main.starting');
+  f.session.append({kind: 'task.reported', task: 'a2cf5450', attempt: 1, outcome: 'completed', summary: 'Wrote tasks/jev/jev-facts.md'});
+  f.session.append({kind: 'task.completed', task: 'a2cf5450', summary: 'Wrote tasks/jev/jev-facts.md', from: 'worker:a2cf5450'});
+  assert.equal((await woken).handoff, true);
+  await nextEvent(f.main, 'main.started');
+  const prompt = f.promptOf(f.calls.at(-1));
+  assert.match(prompt, /task a2cf5450 · profile build · task\.completed/);
+  assert.match(prompt, /Wrote tasks\/jev\/jev-facts\.md/);
+  assert.match(prompt, /Continue your orders/);
+  const row = f.session.events.findLast(e => e.kind === 'handoff');
+  assert.equal(row.wake, true);
+  assert.deepEqual(row.tasks, ['a2cf5450']);
+  assert.equal(row.from, 'bounce');
+  assert.match(row.text, /Wrote tasks\/jev\/jev-facts\.md/);
+  // The synthetic prompt is never a `user` row: the transcript and --json can tell them apart.
+  assert.equal(f.session.events.filter(e => e.kind === 'user').length, 1);
+  assert.equal(f.main.state().state, 'running');
+  await f.finishTurn('Synthesized.');
+  // Nothing new ended: idle again, and no second wake-up for the same outcome.
+  await f.quiet(40);
+  assert.equal(f.session.events.filter(e => e.kind === 'handoff').length, 1);
+  assert.equal(f.main.state().state, 'idle');
+});
+
+test('several tasks ending within the window become one wake-up turn, failures with reason and text', async t => {
+  const f = wakeFixture(t, {handoffDelayMs: 30});
+  await f.settle();
+  f.submit('t-done'); f.submit('t-fail', {profile: 'build_claude'});
+  const woken = nextEvent(f.main, 'main.starting');
+  f.session.append({kind: 'task.completed', task: 't-done', summary: 'x'.repeat(5000), from: 'worker:t-done'});
+  f.session.append({kind: 'task.failed', task: 't-fail', reason: 'reported_failure', text: 'tests red', from: 'worker:t-fail'});
+  await woken;
+  await nextEvent(f.main, 'main.started');
+  assert.equal(f.session.events.filter(e => e.kind === 'main.starting').length, 2);
+  const row = f.session.events.findLast(e => e.kind === 'handoff');
+  assert.deepEqual(row.tasks, ['t-done', 't-fail']);
+  assert.match(row.text, /task t-fail · profile build_claude · task\.failed · reason: reported_failure\n  tests red/);
+  assert.ok(row.text.length < 5000 + 1000, 'per-task outcome text is capped');
+  await f.finishTurn();
+});
+
+test('a user prompt that arrives first carries the outcomes instead of being raced by a wake-up', async t => {
+  const f = wakeFixture(t, {handoffDelayMs: 50});
+  await f.settle();
+  f.submit('t1');
+  f.session.append({kind: 'task.completed', task: 't1', summary: 'the summary', from: 'worker:t1'});
+  const started = nextEvent(f.main, 'main.started');
+  assert.equal(f.main.run({id: 'typed', text: 'what happened?'}).accepted, true);
+  await started;
+  const prompt = f.promptOf(f.calls.at(-1));
+  assert.match(prompt, /task t1 · profile build · task\.completed\n  the summary/);
+  assert.match(prompt, /what happened\?$/);
+  const row = f.session.events.findLast(e => e.kind === 'handoff');
+  assert.equal(row.wake, false);
+  assert.equal(f.session.events.findLast(e => e.kind === 'user').text, 'what happened?');
+  await f.finishTurn();
+  await f.quiet(80); // the wake timer fires into an already-answered outcome: no synthetic turn
+  assert.equal(f.session.events.filter(e => e.kind === 'main.starting').length, 2);
+  assert.equal(f.session.events.filter(e => e.kind === 'handoff').length, 1);
+});
+
+test('a task that ends during a turn and is not returned by one of its waits wakes the orchestrator at its next idle', async t => {
+  const f = wakeFixture(t);
+  await f.settle();
+  const started = nextEvent(f.main, 'main.started');
+  f.main.run({id: 'busy', text: 'more'});
+  await started;
+  f.submit('unwaited');
+  f.session.append({kind: 'task.completed', task: 'unwaited', summary: 'ended mid-turn', from: 'worker:unwaited'});
+  await f.quiet(40);
+  assert.equal(f.session.events.filter(e => e.kind === 'main.starting').length, 2, 'no wake while a turn is running');
+  const woken = nextEvent(f.main, 'main.starting');
+  await f.finishTurn('Turn over without waiting.');
+  assert.equal((await woken).handoff, true);
+  const row = f.session.events.findLast(e => e.kind === 'handoff');
+  assert.deepEqual(row.tasks, ['unwaited']);
+  assert.match(row.text, /task unwaited · profile build · task\.completed\n  ended mid-turn/);
+  await nextEvent(f.main, 'main.started');
+  await f.finishTurn();
+  await f.quiet(40);
+  assert.equal(f.session.events.filter(e => e.kind === 'handoff').length, 1, 'delivered once');
+});
+
+test('a terminal row returned by the orchestrator\'s own wait is seen (no wake); one returned to the user grant is not', async t => {
+  const f = wakeFixture(t);
+  await f.settle();
+  const orchestrator = await f.peer('orchestrator');
+  const user = await f.peer('user');
+  f.submit('waited'); f.submit('theirs-to-wait');
+  const started = nextEvent(f.main, 'main.started');
+  f.main.run({id: 'busy', text: 'more'});
+  await started;
+  const waited = orchestrator.wait({match: {kind: 'task.completed', task: 'waited'}, timeout: 5000});
+  const observed = user.wait({match: {kind: 'task.completed', task: 'theirs-to-wait'}, timeout: 5000});
+  f.session.append({kind: 'task.completed', task: 'waited', summary: 'seen by wait', from: 'worker:waited'});
+  f.session.append({kind: 'task.completed', task: 'theirs-to-wait', summary: 'seen by the user only', from: 'worker:theirs-to-wait'});
+  assert.equal((await waited).kind, 'task.completed');
+  assert.equal((await observed).kind, 'task.completed');
+  const served = f.session.events.filter(e => e.kind === 'wait.served');
+  assert.deepEqual(served.map(e => [e.task, e.outcome, e.from]), [['waited', 'task.completed', 'orchestrator']]);
+  assert.equal(served[0].served, f.session.events.find(e => e.kind === 'task.completed' && e.task === 'waited').seq);
+  const woken = nextEvent(f.main, 'main.starting');
+  await f.finishTurn();
+  await woken;
+  const row = f.session.events.findLast(e => e.kind === 'handoff');
+  assert.deepEqual(row.tasks, ['theirs-to-wait']);
+  await nextEvent(f.main, 'main.started');
+  await f.finishTurn();
+  // Idle now, with a wait answered from the journal: still seen, still no wake.
+  f.submit('later');
+  f.session.append({kind: 'task.failed', task: 'later', reason: 'reported_failure', text: 'red', from: 'worker:later'});
+  assert.equal((await orchestrator.wait({match: {kind: 'task.completed', task: 'later'}, timeout: 5000})).kind, 'task.failed');
+  await f.quiet(40);
+  assert.equal(f.session.events.filter(e => e.kind === 'handoff').length, 1);
+  assert.equal(f.main.state().state, 'idle');
+});
+
+test('a task the orchestrator waited on and then accepted itself is not re-announced at its next idle', async t => {
+  const f = wakeFixture(t);
+  await f.settle();
+  const orchestrator = await f.peer('orchestrator', ['self-accepted']);
+  f.submit('self-accepted');
+  const started = nextEvent(f.main, 'main.started');
+  f.main.run({id: 'busy', text: 'more'});
+  await started;
+  const waited = orchestrator.wait({match: {kind: 'task.completed', task: 'self-accepted'}, timeout: 5000});
+  f.session.append({kind: 'task.completed', task: 'self-accepted', summary: 'seen by wait', from: 'worker:self-accepted'});
+  assert.equal((await waited).kind, 'task.completed');
+  const accepted = await orchestrator.publish({kind: 'task.accepted', task: 'self-accepted', stage: 'completion'});
+  assert.equal(accepted.from, 'orchestrator');
+  assert.ok(accepted.seq > f.session.events.find(e => e.kind === 'wait.served').served, 'the accept lands after the served row');
+  await f.finishTurn();
+  await f.quiet(40);
+  assert.equal(f.session.events.filter(e => e.kind === 'handoff').length, 0);
+  assert.equal(f.main.state().state, 'idle');
+});
+
+test('a user-grant accept after the orchestrator\'s wait is not re-announced; one on a task no wait returned still wakes', async t => {
+  const f = wakeFixture(t);
+  await f.settle();
+  const orchestrator = await f.peer('orchestrator');
+  const user = await f.peer('user', ['waited', 'unwaited']);
+  f.submit('waited'); f.submit('unwaited');
+  const started = nextEvent(f.main, 'main.started');
+  f.main.run({id: 'busy', text: 'more'});
+  await started;
+  const waited = orchestrator.wait({match: {kind: 'task.completed', task: 'waited'}, timeout: 5000});
+  f.session.append({kind: 'task.completed', task: 'waited', summary: 'seen by wait', from: 'worker:waited'});
+  assert.equal((await waited).kind, 'task.completed');
+  await user.publish({kind: 'task.accepted', task: 'waited', stage: 'completion'});
+  await f.finishTurn();
+  await f.quiet(40);
+  assert.equal(f.session.events.filter(e => e.kind === 'handoff').length, 0);
+  assert.equal(f.main.state().state, 'idle');
+  // Idle, and the user closes a task the orchestrator was never handed: that is news.
+  f.session.append({kind: 'task.completed', task: 'unwaited', summary: 'never waited', from: 'worker:unwaited'});
+  const woken = nextEvent(f.main, 'main.starting');
+  await user.publish({kind: 'task.accepted', task: 'unwaited', stage: 'completion'});
+  await woken;
+  await nextEvent(f.main, 'main.started');
+  const row = f.session.events.findLast(e => e.kind === 'handoff');
+  assert.deepEqual(row.tasks, ['unwaited']);
+  assert.match(row.text, /task unwaited · profile build · task\.accepted/);
+  await f.finishTurn();
+});
+
+test('a wake-up whose turn fails to launch keeps the outcomes pending: one re-arm, then the next prompt carries them', async t => {
+  const f = wakeFixture(t, {handoffDelayMs: 20});
+  await f.settle();
+  f.submit('lost');
+  f.launchErrors.push('codex: usage limit reached', 'codex: usage limit reached');
+  const failed = nextEvent(f.main, 'main.terminal');
+  f.session.append({kind: 'task.completed', task: 'lost', summary: 'must not be lost', from: 'worker:lost'});
+  assert.equal((await failed).status, 'failed');
+  const again = nextEvent(f.main, 'main.terminal');
+  assert.equal((await again).status, 'failed');
+  await f.quiet(60);
+  const attempts = f.session.events.filter(e => e.kind === 'main.starting' && e.handoff);
+  assert.equal(attempts.length, 2, 'one re-arm, no retry loop');
+  assert.equal(f.session.events.filter(e => e.kind === 'main.started').length, 1, 'neither wake-up began');
+  assert.match(f.session.events.findLast(e => e.kind === 'status').text, /ride on the next prompt/);
+  assert.equal(f.main.state().state, 'idle');
+  const started = nextEvent(f.main, 'main.started');
+  assert.equal(f.main.run({id: 'typed', text: 'status?'}).accepted, true);
+  await started;
+  assert.match(f.promptOf(f.calls.at(-1)), /task lost · profile build · task\.completed\n  must not be lost[\s\S]*status\?$/);
+  const rows = f.session.events.filter(e => e.kind === 'handoff');
+  assert.deepEqual(rows.map(r => [r.wake, r.tasks, r.requestId]), [[true, ['lost'], attempts[0].requestId], [true, ['lost'], attempts[1].requestId], [false, ['lost'], 'typed']]);
+  await f.finishTurn();
+  await f.quiet(60);
+  assert.equal(f.session.events.filter(e => e.kind === 'handoff').length, 3, 'delivered by the turn that began');
+  assert.equal(f.main.state().state, 'idle');
+});
+
+test('no wake-up for a child task, a user-submitted task, or a replaced failure', async t => {
+  const f = wakeFixture(t);
+  await f.settle();
+  f.submit('parent');
+  f.submit('child', {parent: 'parent'});
+  f.session.append({kind: 'task.completed', task: 'child', summary: 'child done', from: 'worker:child'});
+  f.submit('theirs', {from: 'user'});
+  f.session.append({kind: 'task.completed', task: 'theirs', summary: 'user task', from: 'worker:theirs'});
+  f.submit('limited-one');
+  f.session.append({kind: 'task.failed', task: 'limited-one', reason: 'limited', text: 'usage limit', from: 'worker:limited-one'});
+  f.session.append({kind: 'policy.fallback', task: 'limited-one', from_profile: 'build', to_profile: 'build_claude', reason: 'limited'});
+  f.submit('limited-two', {profile: 'build_claude', replaces: 'limited-one', from: 'bounce'});
+  await f.quiet(60);
+  assert.equal(f.session.events.filter(e => e.kind === 'main.starting').length, 1);
+  assert.equal(f.session.events.some(e => e.kind === 'handoff'), false);
+  // The replacement is the orchestrator's own work: its end wakes, naming what it replaced.
+  const woken = nextEvent(f.main, 'main.starting');
+  f.session.append({kind: 'task.completed', task: 'limited-two', summary: 'done on claude', from: 'worker:limited-two'});
+  await woken;
+  const row = f.session.events.findLast(e => e.kind === 'handoff');
+  assert.deepEqual(row.tasks, ['limited-two']);
+  assert.match(row.text, /task limited-two · profile build_claude · task\.completed · replaces limited-one\n  done on claude/);
+  assert.match(row.text, /Still running: parent \(build, running\)/);
+  await nextEvent(f.main, 'main.started');
+  await f.finishTurn();
+});
+
+test('a completed task awaiting its completion review is not an outcome until it is accepted', async t => {
+  const f = wakeFixture(t);
+  await f.settle();
+  f.submit('reviewed', {review: {completion: 'critic'}});
+  f.session.append({kind: 'task.completed', task: 'reviewed', summary: 'draft', from: 'worker:reviewed'});
+  await f.quiet(40);
+  assert.equal(f.session.events.some(e => e.kind === 'handoff'), false);
+  const woken = nextEvent(f.main, 'main.starting');
+  f.session.append({kind: 'task.accepted', task: 'reviewed', stage: 'completion', by: 'review:reviewed'});
+  await woken;
+  const row = f.session.events.findLast(e => e.kind === 'handoff');
+  assert.match(row.text, /task reviewed · profile build · task\.accepted\n  draft/);
+  await nextEvent(f.main, 'main.started');
+  await f.finishTurn();
+});
+
+test('a wake-up honours the same refusals as a typed prompt and is dropped once the service closes', async t => {
+  const f = wakeFixture(t, {handoffDelayMs: 20});
+  await f.settle();
+  f.submit('late');
+  await f.main.close();
+  f.session.append({kind: 'task.completed', task: 'late', summary: 'after close', from: 'worker:late'});
+  await f.quiet(60);
+  assert.equal(f.session.events.some(e => e.kind === 'handoff'), false);
+  assert.equal(f.session.events.filter(e => e.kind === 'main.starting').length, 1);
 });
