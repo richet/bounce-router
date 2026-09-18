@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {Session} from '../src/core.js';
+import {createBus, connectBus} from '../src/bus.js';
 import {createMainService} from '../src/main-service.js';
 
 function fixture(t, provider = 'codex') {
@@ -144,10 +145,10 @@ function wakeFixture(t, {handoffDelayMs = 10} = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-main-wake-'));
   t.after(() => fs.rmSync(root, {recursive: true, force: true}));
   const session = new Session(root, {root});
-  const pending = [], calls = [];
+  const pending = [], calls = [], launchErrors = []; // launchErrors: messages the next launches/resumes reject with
   const adapter = {
-    async launch(args) { calls.push(['launch', args]); return {turnId: `turn-${calls.length}`}; },
-    async resume(args) { calls.push(['resume', args]); return {turnId: `turn-${calls.length}`}; },
+    async launch(args) { calls.push(['launch', args]); if (launchErrors.length) throw new Error(launchErrors.shift()); return {turnId: `turn-${calls.length}`}; },
+    async resume(args) { calls.push(['resume', args]); if (launchErrors.length) throw new Error(launchErrors.shift()); return {turnId: `turn-${calls.length}`}; },
     async *events() {
       yield {kind: 'native', provider: 'codex', sessionId: 'native-thread'};
       yield await new Promise(resolve => pending.push(resolve));
@@ -163,7 +164,7 @@ function wakeFixture(t, {handoffDelayMs = 10} = {}) {
     pending.shift()({kind: 'result', status: 'completed', text});
     await ended;
   };
-  // One idle orchestrator turn behind us, so `since it last went idle` has a real boundary.
+  // One completed orchestrator turn behind us, so the wake-up is a resume, not the first turn.
   const settle = async () => {
     const started = nextEvent(main, 'main.started');
     main.run({id: 'first', text: 'delegate'});
@@ -176,7 +177,16 @@ function wakeFixture(t, {handoffDelayMs = 10} = {}) {
   };
   const quiet = ms => new Promise(resolve => setTimeout(resolve, ms));
   const promptOf = call => call[1].message ?? call[1].orders;
-  return {main, session, calls, pending, finishTurn, settle, submit, quiet, promptOf};
+  // A real bus over the same session, so a peer's `wait` journals (or does not) exactly as in the daemon.
+  let bus = null;
+  const peer = async name => {
+    bus ??= await createBus({session, dir: session.dir});
+    t.after(() => bus.close());
+    const client = await connectBus({path: bus.path, token: bus.grant({peer: name, canSubmit: true, tasks: [], context: session.id}).token});
+    t.after(() => client.close());
+    return client;
+  };
+  return {main, session, calls, pending, launchErrors, finishTurn, settle, submit, quiet, promptOf, peer};
 }
 
 test('an idle orchestrator is woken with the completed task summary as a new, distinctly journaled turn', async t => {
@@ -244,15 +254,93 @@ test('a user prompt that arrives first carries the outcomes instead of being rac
   assert.equal(f.session.events.filter(e => e.kind === 'handoff').length, 1);
 });
 
-test('no wake-up for a task that ended while the orchestrator was awake, a child task, a user-submitted task, or a replaced failure', async t => {
+test('a task that ends during a turn and is not returned by one of its waits wakes the orchestrator at its next idle', async t => {
   const f = wakeFixture(t);
   await f.settle();
   const started = nextEvent(f.main, 'main.started');
   f.main.run({id: 'busy', text: 'more'});
   await started;
-  f.submit('seen');
-  f.session.append({kind: 'task.completed', task: 'seen', summary: 'seen by wait', from: 'worker:seen'}); // orchestrator was running: it waited on this itself
+  f.submit('unwaited');
+  f.session.append({kind: 'task.completed', task: 'unwaited', summary: 'ended mid-turn', from: 'worker:unwaited'});
+  await f.quiet(40);
+  assert.equal(f.session.events.filter(e => e.kind === 'main.starting').length, 2, 'no wake while a turn is running');
+  const woken = nextEvent(f.main, 'main.starting');
+  await f.finishTurn('Turn over without waiting.');
+  assert.equal((await woken).handoff, true);
+  const row = f.session.events.findLast(e => e.kind === 'handoff');
+  assert.deepEqual(row.tasks, ['unwaited']);
+  assert.match(row.text, /task unwaited · profile build · task\.completed\n  ended mid-turn/);
+  await nextEvent(f.main, 'main.started');
   await f.finishTurn();
+  await f.quiet(40);
+  assert.equal(f.session.events.filter(e => e.kind === 'handoff').length, 1, 'delivered once');
+});
+
+test('a terminal row returned by the orchestrator\'s own wait is seen (no wake); one returned to the user grant is not', async t => {
+  const f = wakeFixture(t);
+  await f.settle();
+  const orchestrator = await f.peer('orchestrator');
+  const user = await f.peer('user');
+  f.submit('waited'); f.submit('theirs-to-wait');
+  const started = nextEvent(f.main, 'main.started');
+  f.main.run({id: 'busy', text: 'more'});
+  await started;
+  const waited = orchestrator.wait({match: {kind: 'task.completed', task: 'waited'}, timeout: 5000});
+  const observed = user.wait({match: {kind: 'task.completed', task: 'theirs-to-wait'}, timeout: 5000});
+  f.session.append({kind: 'task.completed', task: 'waited', summary: 'seen by wait', from: 'worker:waited'});
+  f.session.append({kind: 'task.completed', task: 'theirs-to-wait', summary: 'seen by the user only', from: 'worker:theirs-to-wait'});
+  assert.equal((await waited).kind, 'task.completed');
+  assert.equal((await observed).kind, 'task.completed');
+  const served = f.session.events.filter(e => e.kind === 'wait.served');
+  assert.deepEqual(served.map(e => [e.task, e.outcome, e.from]), [['waited', 'task.completed', 'orchestrator']]);
+  assert.equal(served[0].served, f.session.events.find(e => e.kind === 'task.completed' && e.task === 'waited').seq);
+  const woken = nextEvent(f.main, 'main.starting');
+  await f.finishTurn();
+  await woken;
+  const row = f.session.events.findLast(e => e.kind === 'handoff');
+  assert.deepEqual(row.tasks, ['theirs-to-wait']);
+  await nextEvent(f.main, 'main.started');
+  await f.finishTurn();
+  // Idle now, with a wait answered from the journal: still seen, still no wake.
+  f.submit('later');
+  f.session.append({kind: 'task.failed', task: 'later', reason: 'reported_failure', text: 'red', from: 'worker:later'});
+  assert.equal((await orchestrator.wait({match: {kind: 'task.completed', task: 'later'}, timeout: 5000})).kind, 'task.failed');
+  await f.quiet(40);
+  assert.equal(f.session.events.filter(e => e.kind === 'handoff').length, 1);
+  assert.equal(f.main.state().state, 'idle');
+});
+
+test('a wake-up whose turn fails to launch keeps the outcomes pending: one re-arm, then the next prompt carries them', async t => {
+  const f = wakeFixture(t, {handoffDelayMs: 20});
+  await f.settle();
+  f.submit('lost');
+  f.launchErrors.push('codex: usage limit reached', 'codex: usage limit reached');
+  const failed = nextEvent(f.main, 'main.terminal');
+  f.session.append({kind: 'task.completed', task: 'lost', summary: 'must not be lost', from: 'worker:lost'});
+  assert.equal((await failed).status, 'failed');
+  const again = nextEvent(f.main, 'main.terminal');
+  assert.equal((await again).status, 'failed');
+  await f.quiet(60);
+  const attempts = f.session.events.filter(e => e.kind === 'main.starting' && e.handoff);
+  assert.equal(attempts.length, 2, 'one re-arm, no retry loop');
+  assert.equal(f.session.events.filter(e => e.kind === 'main.started').length, 1, 'neither wake-up began');
+  assert.match(f.session.events.findLast(e => e.kind === 'status').text, /ride on the next prompt/);
+  assert.equal(f.main.state().state, 'idle');
+  const started = nextEvent(f.main, 'main.started');
+  assert.equal(f.main.run({id: 'typed', text: 'status?'}).accepted, true);
+  await started;
+  assert.match(f.promptOf(f.calls.at(-1)), /task lost · profile build · task\.completed\n  must not be lost[\s\S]*status\?$/);
+  const rows = f.session.events.filter(e => e.kind === 'handoff');
+  assert.deepEqual(rows.map(r => [r.wake, r.tasks, r.requestId]), [[true, ['lost'], attempts[0].requestId], [true, ['lost'], attempts[1].requestId], [false, ['lost'], 'typed']]);
+  await f.finishTurn();
+  await f.quiet(60);
+  assert.equal(f.session.events.filter(e => e.kind === 'handoff').length, 3, 'delivered by the turn that began');
+  assert.equal(f.main.state().state, 'idle');
+});
+
+test('no wake-up for a child task, a user-submitted task, or a replaced failure', async t => {
+  const f = wakeFixture(t);
+  await f.settle();
   f.submit('parent');
   f.submit('child', {parent: 'parent'});
   f.session.append({kind: 'task.completed', task: 'child', summary: 'child done', from: 'worker:child'});
@@ -263,7 +351,7 @@ test('no wake-up for a task that ended while the orchestrator was awake, a child
   f.session.append({kind: 'policy.fallback', task: 'limited-one', from_profile: 'build', to_profile: 'build_claude', reason: 'limited'});
   f.submit('limited-two', {profile: 'build_claude', replaces: 'limited-one', from: 'bounce'});
   await f.quiet(60);
-  assert.equal(f.session.events.filter(e => e.kind === 'main.starting').length, 2);
+  assert.equal(f.session.events.filter(e => e.kind === 'main.starting').length, 1);
   assert.equal(f.session.events.some(e => e.kind === 'handoff'), false);
   // The replacement is the orchestrator's own work: its end wakes, naming what it replaced.
   const woken = nextEvent(f.main, 'main.starting');

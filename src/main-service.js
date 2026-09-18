@@ -9,7 +9,7 @@ import {tasks, TERMINAL} from './reducers.js';
 const HANDOFF_KINDS = new Set(['task.completed', 'task.accepted', 'task.failed', 'task.cancelled', 'task.deadline', 'task.rejected']);
 const HANDOFF_TEXT_MAX = 2000; // per task: a final report summary or failure text, never a transcript
 const HANDOFF_DELAY_MS = 1000; // several tasks ending together become one wake-up turn
-const WAKE_PROMPT = 'Continue your orders. The worker outcomes above ended while you were idle and have not been reported to the user: synthesize them now (what each task produced, what failed and why, what remains). If a task you still need is listed as running, wait on it with `bounce wait` before reporting. Do not re-run finished work.';
+const WAKE_PROMPT = 'Continue your orders. The worker outcomes above were not returned by any wait of yours and have not been reported to the user: synthesize them now (what each task produced, what failed and why, what remains). If a task you still need is listed as running, wait on it with `bounce wait` before reporting. Do not re-run finished work.';
 
 // A task is the orchestrator's when the root of its `replaces` lineage was submitted by the
 // orchestrator peer: a fallback replacement is journaled by the scheduler (`from: bounce`), yet
@@ -21,13 +21,13 @@ function orchestratorsTask(session, view, id) {
 }
 const replaced = (session, id) => session.events.some(e => e.kind === 'task.submitted' && e.replaces === id && e.task !== id);
 
-// The wake-up block: one entry per task that ended since the orchestrator last went idle, with
+// The wake-up block: one entry per task whose end the orchestrator has not been handed, with
 // the terminal row's outcome — the final report summary (task.reported, folded by the scheduler
 // into task.completed's `summary`) or the failure text — and the roots still running.
 export function handoffBlock(session, ended) {
   const view = tasks(session.events);
   const running = Object.values(view).filter(t => !t.parent && !TERMINAL.has(t.state) && orchestratorsTask(session, view, t.id));
-  const lines = ['Worker outcomes since your last turn (delivered by bounce, not typed by the user):'];
+  const lines = ['Worker outcomes not yet handed to you (delivered by bounce, not typed by the user):'];
   for (const row of ended) {
     const t = view[row.task] ?? {};
     const outcome = row.summary ?? row.text ?? (Array.isArray(row.questions) && row.questions.length ? row.questions.join('; ') : null) ?? t.summary ?? t.error ?? '';
@@ -61,6 +61,17 @@ export function createMainService({session, adapters, profile, settings, orchest
     if (current === run) current = null;
     session.append({kind: 'turn', provider: run.provider, text: status === 'interrupted' ? 'cancelled' : status, status: status === 'interrupted' ? 'cancelled' : status});
     emit({kind: 'main.terminal', requestId: run.id, turnId: run.turnId, state: 'idle', status, ...(reason ? {reason, text: reason} : {})});
+    // A turn that never launched (the orchestrator's own vendor limited or missing) told the
+    // orchestrator nothing: its outcomes are still pending. A wake-up gets one more attempt
+    // after the usual delay, then they ride on the next prompt rather than a retry loop.
+    if (!run.started) {
+      if (!run.wake) return;
+      if (status === 'failed' && !wakeRetried) { wakeRetried = true; arm(); return; }
+      session.append({kind: 'status', text: `Worker outcomes not handed to the orchestrator: ${reason ?? status}; they ride on the next prompt`});
+      return;
+    }
+    // Whatever ended during the turn without being returned by one of its waits wakes it now.
+    if (pendingHandoffs().length) arm();
   }
   async function execute(run, params) {
     const adapter = adapters[run.provider];
@@ -85,6 +96,8 @@ export function createMainService({session, adapters, profile, settings, orchest
         finish(run, 'interrupted'); return;
       }
       run.turnId = run.handle.turnId ?? run.id;
+      run.started = true;
+      wakeRetried = false;
       emit({kind: 'main.started', requestId: run.id, turnId: run.turnId, state: 'running'});
       for await (const event of adapter.events(run.handle)) {
         if (event.kind === 'native') {
@@ -116,23 +129,27 @@ export function createMainService({session, adapters, profile, settings, orchest
       finish(run, run.cancelled ? 'interrupted' : 'failed', error.message);
     }
   }
-  // Root tasks the orchestrator submitted that reached a terminal state since it last went idle
-  // (rows after the last main.terminal): the ones nobody has told it about. Log-derived, so a
-  // daemon restart or a turn that never saw them changes nothing; one entry per task, its last
-  // terminal row. A task that ended while a turn was running is not here: the orchestrator was
-  // awake to `wait` on it, and re-announcing it would cost a whole turn. A failure the scheduler
-  // has already replaced (policy.fallback) is not an outcome yet: its replacement's end is.
+  // Root tasks the orchestrator submitted that reached a terminal state and were never handed
+  // to it: "seen" means a `bounce wait` under the orchestrator's grant returned that terminal
+  // row (the bus journals `wait.served` for it), or a handoff block carried it into a turn that
+  // really began (main.started for the block's requestId). Ending while a turn was running is
+  // not seeing: an orchestrator that finishes its turn without waiting still gets the outcome.
+  // Log-derived, so a daemon restart changes nothing; one entry per task, its last terminal
+  // row. A failure the scheduler has already replaced (policy.fallback) is not an outcome yet:
+  // its replacement's end is.
   function pendingHandoffs() {
-    const idleSeq = session.events.findLast(event => event.kind === 'main.terminal')?.seq ?? 0;
     const view = tasks(session.events);
+    const started = new Set(session.events.filter(event => event.kind === 'main.started').map(event => event.requestId));
+    const seen = row => session.events.some(e => (e.kind === 'wait.served' && e.task === row.task && !(e.served < row.seq))
+      || (e.kind === 'handoff' && started.has(e.requestId) && e.seq > row.seq && e.tasks?.includes(row.task)));
     const byTask = new Map();
     for (const row of session.events) {
-      if (!HANDOFF_KINDS.has(row.kind) || (row.seq ?? 0) <= idleSeq) continue;
+      if (!HANDOFF_KINDS.has(row.kind)) continue;
       const t = view[row.task];
       if (!t || t.parent || !TERMINAL.has(t.state) || replaced(session, row.task) || !orchestratorsTask(session, view, row.task)) continue;
       byTask.set(row.task, row);
     }
-    return [...byTask.values()];
+    return [...byTask.values()].filter(row => !seen(row));
   }
   function start(params, {wake}) {
     if (closed) return {accepted: false, reason: 'daemon_closed'};
@@ -147,17 +164,18 @@ export function createMainService({session, adapters, profile, settings, orchest
     let images;
     try { images = saveImages([...new Set([...(params.files ?? []), ...imagePaths(params.text, session.cwd)])], session); }
     catch (error) { return {accepted: false, reason: error.message}; }
-    const run = {id: params.id ?? randomUUID(), provider, images,
+    const run = {id: params.id ?? randomUUID(), provider, images, wake,
       previousProvider: session.events.findLast(event => event.kind === 'main.starting')?.provider,
-      handle: null, turnId: null, cancelled: false, finished: false};
+      handle: null, turnId: null, cancelled: false, finished: false, started: false};
     // Outcomes are journaled here, synchronously with the prompt row, and the very same text
     // is what execute() prepends — the log and the prompt can never disagree about what the
     // orchestrator was told. A typed prompt carries them too (`wake: false`): the user's own
-    // turn is never raced by a synthetic one.
+    // turn is never raced by a synthetic one. The block counts as delivered only once this
+    // requestId reaches main.started; a launch that fails leaves the outcomes pending.
     const ended = pendingHandoffs();
     if (ended.length) {
       run.outcomes = handoffBlock(session, ended);
-      session.append({kind: 'handoff', wake, tasks: ended.map(row => row.task), text: wake ? `${run.outcomes}\n\n${params.text}` : run.outcomes, from: 'bounce'});
+      session.append({kind: 'handoff', wake, requestId: run.id, tasks: ended.map(row => row.task), text: wake ? `${run.outcomes}\n\n${params.text}` : run.outcomes, from: 'bounce'});
     }
     current = run;
     session.active = provider;
@@ -171,7 +189,7 @@ export function createMainService({session, adapters, profile, settings, orchest
   // happened?". Coalesced over a short window; a user prompt that lands first wins (start()
   // gives it the same block) and the timer finds nothing left to do. Classic mode never
   // constructs this service (reload.js), so nothing here can fire outside orchestrator mode.
-  let wakeTimer = null;
+  let wakeTimer = null, wakeRetried = false;
   function wake() {
     wakeTimer = null;
     if (closed || current) return;
@@ -180,11 +198,14 @@ export function createMainService({session, adapters, profile, settings, orchest
     const result = start({text: WAKE_PROMPT}, {wake: true});
     if (!result.accepted && result.reason !== 'busy') session.append({kind: 'status', text: `Worker outcomes not handed to the orchestrator: ${result.reason}; they ride on the next prompt`});
   }
-  const unsubscribeHandoff = session.subscribe(row => {
-    if (!HANDOFF_KINDS.has(row.kind) || closed || current || wakeTimer) return;
-    if (!pendingHandoffs().some(ended => ended.task === row.task)) return;
+  function arm() {
+    if (closed || current || wakeTimer) return;
     wakeTimer = setTimeout(wake, handoffDelayMs);
     wakeTimer.unref?.();
+  }
+  const unsubscribeHandoff = session.subscribe(row => {
+    if (!HANDOFF_KINDS.has(row.kind) || closed || current || wakeTimer) return;
+    if (pendingHandoffs().some(ended => ended.task === row.task)) arm();
   });
   const service = {
     state,

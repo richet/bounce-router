@@ -257,6 +257,11 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         settled = true;
         cleanup();
         send({jsonrpc: '2.0', id, result: row ?? null});
+        // The orchestrator has now been handed this outcome by its own `wait`: main-service's
+        // wake-up on terminal rows (pendingHandoffs) treats the task as seen, nothing else does.
+        if (row && authenticated.peer === 'orchestrator' && typeof row.task === 'string' && TASK_TERMINAL.has(row.kind)) {
+          session.append({kind: 'wait.served', task: row.task, served: row.seq ?? null, outcome: row.kind, from: 'orchestrator', context: authenticated.context});
+        }
       };
       const unsubscribe = session.subscribe(row => { if (matches(row)) finish(row); });
       const timer = setTimeout(() => finish(null), timeout);

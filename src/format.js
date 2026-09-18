@@ -127,7 +127,7 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
   const who = e => [role?.(e) ?? null, e.provider || 'Bounce'].filter(Boolean).join(' · ');
   function event(e, width) {
     // `model` carries no text: it is what the header's model label reads, not a transcript row.
-    if (['raw', 'usage', 'model', 'peer.native', 'peer.joined', 'task.attempt.ended', 'task.report.staged', 'checkpoint'].includes(e.kind) || e.kind.startsWith('budget.')) return [];
+    if (['raw', 'usage', 'model', 'peer.native', 'peer.joined', 'task.attempt.ended', 'task.report.staged', 'checkpoint', 'wait.served'].includes(e.kind) || e.kind.startsWith('budget.')) return [];
     if (e.kind === 'attempt' && e.status === 'started') return event({...e, kind: 'status', text: 'Starting provider…'}, width);
     if (e.kind.startsWith('main.')) {
       const label = {'main.starting': 'Starting', 'main.started': 'Running', 'main.terminal': 'Finished', 'main.blocked': 'Blocked', 'main.delivery': 'Message'}[e.kind] ?? 'Orchestrator';

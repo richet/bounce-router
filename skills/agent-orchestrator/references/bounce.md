@@ -67,9 +67,10 @@ stages are required too, and a submission missing either is refused with reason 
 
 `--timeout` is seconds and may be as long as the task's deadline: the bridge re-arms the
 bus's 600 s wait for you. A `null` reply means the timeout expired, not that the task ended —
-wait again, or end your turn: when a task you submitted ends while you are idle, bounce starts
-your next turn itself with that outcome in front of you (a `handoff` row in the journal, one
-per batch of outcomes), so you never need to poll to learn of a completion.
+wait again, or end your turn: every outcome of a task you submitted that no `wait` of yours
+returned is handed to you by bounce — as your next turn when you are idle (a `handoff` row in
+the journal, one per batch of outcomes) or in front of the next prompt — so you never need to
+poll to learn of a completion. Ending a turn without waiting does not lose the outcome.
 
 The publish reply carries the task id. `wait` follows replacements and waits for completion
 review when one is configured. Read the returned row's `kind`:
