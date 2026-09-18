@@ -65,7 +65,7 @@ test('P4 error messages, one case each', () => {
   assert.throws(() => validateOrchestration({...base, orchestrator: 'nope'}), {message: 'orchestrator must name a profile'});
   assert.throws(() => validateOrchestration({...base, profiles: {}}), {message: 'profiles must be a nonempty object'});
   assert.throws(() => validateOrchestration({...base, profiles: {main: {adapter: 'gpt5'}}}),
-    {message: 'profile main: adapter must be one of claude, codex, muse, local'});
+    {message: 'profile main: adapter must be one of claude, codex, muse, local, typesafe'});
   assert.throws(() => validateOrchestration({...base, profiles: {main: {adapter: 'claude', mode: 'sideways'}}}),
     {message: 'profile main: mode must be yolo or plan'});
   assert.throws(() => validateOrchestration({...base, profiles: {main: {adapter: 'claude', policy: 'delete'}}}),
@@ -144,4 +144,25 @@ test('profileFor returns a profile from a validated view', () => {
 test('profileFor throws on an unknown profile name', () => {
   const view = validateOrchestration({order: ['claude'], mode: 'yolo'});
   assert.throws(() => profileFor(view, 'ghost'), {message: 'unknown profile: ghost'});
+});
+
+// Jev (src/jev.js): the typesafe adapter validates, defaults to read-only and refuses write;
+// an optional `tier` rides along for the router, any other value is dropped.
+test('typesafe profiles default to read-only, refuse write, and tier is kept only when valid', () => {
+  const settings = {operation: 'orchestrator', mode: 'yolo', orchestrator: 'main', profiles: {
+    main: {adapter: 'claude'},
+    verdict: {adapter: 'typesafe', model: 'jev-1.13.0', role: 'critic'},
+    scout: {adapter: 'claude', model: 'haiku', tier: 'cheapest'},
+    build: {adapter: 'codex', tier: 'huge'},
+  }};
+  const view = validateOrchestration(settings);
+  assert.equal(view.profiles.verdict.policy, 'read-only');
+  assert.equal(view.profiles.verdict.role, 'critic');
+  assert.equal(view.profiles.verdict.model, 'jev-1.13.0');
+  assert.equal(view.profiles.scout.tier, 'cheapest');
+  assert.equal(Object.hasOwn(view.profiles.build, 'tier'), false);
+  assert.equal(Object.hasOwn(view.profiles.main, 'tier'), false);
+  assert.throws(() => validateOrchestration({...settings, profiles: {...settings.profiles, verdict: {adapter: 'typesafe', policy: 'write'}}}), {message: 'profile verdict: typesafe must be read-only'});
+  // the default adapter list (used by nine callers) accepts typesafe without the daemon's registry
+  assert.doesNotThrow(() => validateOrchestration({operation: 'orchestrator', mode: 'yolo', orchestrator: 'main', profiles: {main: {adapter: 'claude'}, v: {adapter: 'typesafe'}}}));
 });

@@ -7,6 +7,8 @@ import {POLICY_RANK, effectivePolicy} from './profiles.js';
 import {defaultStrategy} from './strategy.js';
 import {reportEvent, validateReport} from './reporting.js';
 import {createLocalAdmission} from './local-admission.js';
+import {routingFallback} from './jev.js';
+import {execFileSync} from 'node:child_process';
 
 const FALLBACK_REASONS = new Set(['limited', 'missing', 'backend_unavailable', 'watchdog', 'local_unavailable', 'local_protocol', 'incomplete_report']);
 const RISKS = new Set(['boundary', 'process-model', 'logic', 'extraction']);
@@ -17,6 +19,14 @@ const READONLY_ROLES = new Set(['critic', 'verifier', 'analyst']);
 // The depends_on hold/fail decision (which dependency states fail a dependent outright vs.
 // merely hold it — A1) now lives in the strategy (src/strategy.js's DEPENDENCY_FAIL_STATES),
 // not here: this scheduler only executes the intent onSubmitted returns.
+
+// The tree's HEAD when a worker starts, recorded on task.started so a completion verdict can
+// diff the worker's whole contribution (committed or not). Null outside a git repository.
+export function defaultGitHead(cwd) {
+  try { return execFileSync('git', ['rev-parse', 'HEAD'], {cwd, encoding: 'utf8', timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true}).trim() || null; }
+  catch { return null; }
+}
+const AUTO_PROFILE = 'auto';
 
 const isNonNegativeInt = n => Number.isInteger(n) && n >= 0;
 const isPositiveInt = n => Number.isInteger(n) && n > 0;
@@ -45,7 +55,7 @@ function parseVerdict(status, text) {
 // Dispatch, fallback, permission ratchet, cancellation, review and reconcile as policies over
 // the log, driven by adapters. Everything the scheduler knows is re-derived from session.events
 // via the reducers — it keeps only a live-handle map, which cannot survive a restart by design.
-export function createScheduler({session, adapters, profiles, localSettings, localAdmission = createLocalAdmission({local: localSettings}), localRuntimeReconcile = async args => (await import('./local-runtime.js')).reconcileLocalRuntime(args), sessionMode = 'yolo', depthCap = 1, checkpointRunner, limits: suppliedLimits = {}, strict = false, requireFinalReport = false, reportGrant = null, clock = () => Date.now(), watchdog: suppliedWatchdog = {}, strategy = defaultStrategy}) {
+export function createScheduler({session, adapters, profiles, localSettings, localAdmission = createLocalAdmission({local: localSettings}), localRuntimeReconcile = async args => (await import('./local-runtime.js')).reconcileLocalRuntime(args), sessionMode = 'yolo', depthCap = 1, checkpointRunner, limits: suppliedLimits = {}, strict = false, requireFinalReport = false, reportGrant = null, clock = () => Date.now(), watchdog: suppliedWatchdog = {}, strategy = defaultStrategy, jev = null, gitHead = defaultGitHead}) {
   // Sizing limits (lines/probes/minutes) gate dispatch ONLY when the caller configures them: a
   // task's declared size is otherwise informational. The old built-in 150/6/15 defaults refused
   // real orchestrations (a 400-line brief) with no way to see why — a shallow rule, removed.
@@ -64,7 +74,15 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   const activity = new Map();
   const workerFrom = task => `worker:${task}`;
   const reviewFrom = task => `review:${task}`;
-  const submittedRow = task => session.events.find(e => e.kind === 'task.submitted' && e.task === task);
+  // A task submitted with `profile: "auto"` is routed at dispatch (jev.routed): every reader of
+  // the submitted row sees the routed profile, exactly as if it had been submitted that way.
+  const rawSubmittedRow = task => session.events.find(e => e.kind === 'task.submitted' && e.task === task);
+  const submittedRow = task => {
+    const row = rawSubmittedRow(task);
+    if (row?.profile !== AUTO_PROFILE) return row;
+    const routed = session.events.findLast(e => e.kind === 'jev.routed' && e.task === task);
+    return routed ? {...row, profile: routed.chosen} : row;
+  };
   // Every row the scheduler itself writes is stamped from the injected clock, not the journal's
   // own wall-clock default — the watchdog's `now` and every row `time` it compares against must
   // live on the same timeline. Under the default `clock = Date.now`, this is the same wall-clock
@@ -170,7 +188,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   }
 
   const validate = (spec, view) => {
-    if (!profiles[spec.profile]) return 'profile';
+    if (spec.profile === AUTO_PROFILE ? !routingFallback(profiles) : !profiles[spec.profile]) return 'profile';
     if (typeof spec.orders !== 'string' || !spec.orders) return 'orders';
     if (spec.deadline !== null && spec.deadline !== undefined && !Number.isFinite(spec.deadline)) return 'deadline';
     if (spec.parent != null && !view[spec.parent]) return 'parent';
@@ -207,7 +225,23 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return null;
   };
 
-  function submit(spec) {
+  // Jev completion verdicts (src/jev.js): a root task submitted under the default strategy with
+  // no completion reviewer of its own gets the daemon's read-only `jev` critic as
+  // review.completion — decided when the row is journaled (here for submit(), and by the bus
+  // through the exported `prepare` for a peer's task.submitted), so the reducer, `wait` and the
+  // strategy all see an ordinary completion review. An explicit review.completion always wins;
+  // with Jev disabled or off for review, the row is untouched and behaviour is exactly today's.
+  function prepare(spec) {
+    if (!jev || strategy !== defaultStrategy || !profiles[jev.reviewer]) return spec;
+    if (spec.parent != null || spec.review?.completion) return spec;
+    let settings;
+    try { settings = jev.settings(); } catch { return spec; }
+    if (!settings?.enabled || !settings.review) return spec;
+    return {...spec, review: {...(spec.review ?? {}), completion: jev.reviewer}};
+  }
+
+  function submit(rawSpec) {
+    const spec = prepare(rawSpec);
     const view = reducers.tasks(session.events);
     const problem = validate(spec, view);
     if (problem) throw new Error(`malformed: ${problem}`);
@@ -429,6 +463,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
           case 'blocked': append({kind: 'task.blocked', task, text: event.text, from, context}); break;
           case 'usage': append({kind: 'task.usage', task, usage: event.usage, from, context}); break;
           case 'native': append({kind: 'peer.native', from, provider: event.provider, sessionId: event.sessionId, context}); break;
+          case 'jev': append({kind: `jev.${event.name}`, ...(event.data ?? {}), text: event.text, task, from, context}); break;
           case 'result':
             // A terminal provider row is not a licence to overlap writers: prove the process
             // has exited before publishing a lifecycle event that can release dependents or
@@ -550,7 +585,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     }
     handles.set(task, {adapter, handle});
     append({kind: 'peer.joined', name: workerFrom(task), role: 'worker', adapter: profile.adapter, profile: row.profile, from: workerFrom(task), context});
-      append({kind: 'task.started', task, attempt, requested: profile.model ?? '', from: workerFrom(task), context});
+      append({kind: 'task.started', task, attempt, requested: profile.model ?? '', head: attempt === 1 ? gitHead(session.cwd) : undefined, from: workerFrom(task), context});
     for (const staged of launchingAttempts.get(task)?.reports ?? []) report({task, attempt, report: staged.payload, from: staged.from, context: staged.context});
     launchingAttempts.delete(task);
     publish({kind: 'task.activity', task, text: 'Worker started · waiting for first activity', startup: true, from: workerFrom(task), context});
@@ -644,7 +679,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // its own `reviews` map (A3, separate from a worker's `handles`) for the window between
   // launch and the stream ending, so cancel()/stop() can reach it; a throwing stream (A4) ends
   // the same way a broken worker stream does — unreadable, handle cancelled, never left open.
-  async function runReview({task, stage, round, profileName, profile, orders, dir, context, peer = reviewFrom(task)}) {
+  async function runReview({task, stage, round, profileName, profile, orders, dir, context, peer = reviewFrom(task), review = {stage, round, orders}}) {
     append({kind: 'review.started', task, stage, round, profile: profileName, from: peer, context});
     let adapter = adapters[profile.adapter];
     let admission;
@@ -656,7 +691,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         admission = await admitLocal(profile, task, round, context, launchState);
         ({profile, adapter} = admission);
       }
-      handle = await adapter.launch({peer, profile, orders, cwd: session.cwd, dir, task, attempt: round, context, signal: admission?.signal});
+      handle = await adapter.launch({peer, profile, orders, cwd: session.cwd, dir, task, attempt: round, context, signal: admission?.signal, review});
       if (launchState.cancelReason) {
         const stopped = await adapter.cancel(handle);
         if (stopped?.verified === true) reviews.delete(peer);
@@ -689,6 +724,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
           case 'raw': append({kind: 'raw', raw: event.raw ?? null, provider: profile.adapter, task, from: peer, context}); break;
           case 'model': append({kind: 'model', model: String(event.model), provider: profile.adapter, task, from: peer, context}); break;
           case 'native': append({kind: 'peer.native', from: peer, provider: event.provider, sessionId: event.sessionId, context}); break;
+          // A decision-model reviewer's own rows (jev.verdict / jev.skipped): the answer, never the request.
+          case 'jev': append({kind: `jev.${event.name}`, ...(event.data ?? {}), text: event.text, task, from: peer, context}); break;
           case 'activity': case 'assistant': case 'tool': case 'progress': case 'diagnostic': case 'status':
             publish({kind: 'task.activity', task, text: event.text, from: peer, context}); break;
           case 'error': publish({kind: 'task.activity', task, text: `error: ${event.text}`, from: peer, context}); break;
@@ -829,7 +866,14 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       const orders = stage === 'completion'
         ? (reviewProfile.role === 'verifier' ? row.steps : `${row.orders}\n\n--- worker report ---\n${reducers.tasks(session.events)[task]?.summary ?? ''}`)
         : row.orders;
-      const verdict = await runReview({task, stage, round, profileName, profile: reviewProfile, orders, dir, context, peer});
+      // What a decision-model reviewer (typesafe) judges: the raw orders, the worker's final
+      // report and the tree's HEAD when the lineage's first worker started — the diff base.
+      const reported = session.events.findLast(e => e.kind === 'task.reported' && e.task === task);
+      const lineageRoot = lineageRootOf(task, reducers.tasks(session.events));
+      const review = {stage, round, orders: row.orders, summary: reducers.tasks(session.events)[task]?.summary ?? null,
+        report: reported ? {summary: reported.summary, text: reported.text, evidence: reported.evidence, remaining: reported.remaining, phase: reported.phase} : null,
+        head: session.events.find(e => e.kind === 'task.started' && e.task === lineageRoot)?.head ?? null};
+      const verdict = await runReview({task, stage, round, profileName, profile: reviewProfile, orders, dir, context, peer, review});
       if (verdict.launchFailed) append({kind: 'budget.released', task, root, amount: {starts: 1}, text: 'review launch failed', context});
       if (verdict.cancelled) return null;
       verdicts.push(verdict);
@@ -901,6 +945,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
 
   async function dispatch(row) {
     const {task, parent, context} = row;
+    row = submittedRow(task) ?? row; // a re-dispatch (held task, restart) sees an already-routed profile
     // Sizing refusal, first of all: a task over the skill's sizing rule never launches,
     // checked in a fixed field order so the reported field is deterministic.
     // submit() always stores size; the fallback only covers rows journaled directly (legacy/test rows), never a defaulting path.
@@ -921,6 +966,21 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (parent != null && 1 + depthOf(parent) > depthCap) {
       append({kind: 'task.failed', task, reason: 'depth', text: `depth exceeds cap ${depthCap}`, context});
       return;
+    }
+    // `profile: "auto"`: route before anything reads the profile. Jev picks (when enabled for
+    // routing and confident, with a policy fitting the orders' access needs); otherwise the
+    // fallback builder — an orchestrator that uses `auto` never breaks. A task cancelled while
+    // the decision was in flight gets no routing row.
+    if (row.profile === AUTO_PROFILE) {
+      const decision = jev ? await jev.route({task, orders: row.orders, profiles}) : {chosen: routingFallback(profiles), fallback: true, reason: 'routing unavailable', probabilities: {}, confidence: 0};
+      if (reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) return;
+      if (!decision?.chosen || !profiles[decision.chosen]) {
+        append({kind: 'task.failed', task, reason: 'error', text: 'malformed: profile (no worker profile to route auto to)', context});
+        return;
+      }
+      append({kind: 'jev.routed', task, chosen: decision.chosen, probabilities: decision.probabilities ?? {}, confidence: decision.confidence ?? 0, fallback: decision.fallback === true, reason: decision.reason ?? null, model: decision.model ?? null,
+        text: decision.fallback ? `Routed auto → ${decision.chosen} (fallback: ${decision.reason ?? 'unavailable'})` : `Routed auto → ${decision.chosen} (Jev, confidence ${Number(decision.confidence ?? 0).toFixed(2)})`, context});
+      row = submittedRow(task);
     }
     const profile = profiles[row.profile];
     if (!profile) {
@@ -1349,6 +1409,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     },
     // The submit predicate, exposed so the bus refuses a malformed task.submitted before it is journaled.
     validate: spec => validate(spec, reducers.tasks(session.events)),
+    // The submit decoration the bus applies before journaling a peer's task.submitted (Jev review).
+    prepare,
     submit, report, cancel, stop, tick, reconcile,
     tasks: () => reducers.tasks(session.events),
     budgets: () => reducers.budgets(session.events),

@@ -29,6 +29,13 @@ export function tasks(events) {
     if (parent.children.every(id => TERMINAL.has(result[id]?.state))) parent.state = priorState[parentId];
   };
   for (const e of events) {
+    // A `profile: "auto"` submission takes its real profile from the routing row the scheduler
+    // journals at dispatch (src/jev.js): the one non-task.* row that shapes a task.
+    if (e.kind === 'jev.routed') {
+      const t = typeof e.task === 'string' ? result[e.task] : undefined;
+      if (t && !TERMINAL.has(t.state) && typeof e.chosen === 'string' && e.chosen) t.profile = e.chosen;
+      continue;
+    }
     if (!e.kind?.startsWith('task.')) continue;
     if (typeof e.task !== 'string' || !e.task) continue; // a malformed row never becomes a task
     if (e.kind === 'task.submitted') {

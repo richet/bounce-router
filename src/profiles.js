@@ -6,6 +6,7 @@
 // write ratchet itself keys on `policy`, never on the label (CONTRACT.md §4).
 import {defaultStrategy, noReviewStrategy, quorumStrategy} from './strategy.js';
 import {normalizeLocalProfile} from './local-profiles.js';
+import {PROFILE_TIERS} from './jev.js';
 
 const READ_ONLY_ROLES = new Set(['critic', 'verifier', 'analyst']);
 
@@ -45,7 +46,7 @@ export function effectivePolicy(profile) {
   return 'yolo';
 }
 
-export function validateOrchestration(settings, adapterNames = ['claude', 'codex', 'muse', 'local']) {
+export function validateOrchestration(settings, adapterNames = ['claude', 'codex', 'muse', 'local', 'typesafe']) {
   const strategy = resolveStrategy(settings.strategy);
   if (settings.operation === undefined || settings.operation === 'classic') {
     return {operation: 'classic', orchestrator: null, profiles: {}, shape: 'none', strict: false, strategy};
@@ -70,14 +71,18 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
     let role = raw.role ?? 'builder';
     if (typeof role !== 'string' || !role) throw new Error(`profile ${name}: role must be a non-empty string`);
     if (name === settings.orchestrator) role = 'orchestrator';
-    const policy = raw.policy ?? (raw.adapter === 'local' || READ_ONLY_ROLES.has(role) ? 'read-only' : 'write');
+    const policy = raw.policy ?? (raw.adapter === 'local' || raw.adapter === 'typesafe' || READ_ONLY_ROLES.has(role) ? 'read-only' : 'write');
     if (!['write', 'read-only'].includes(policy)) throw new Error(`profile ${name}: policy must be write or read-only`);
+    // A decision model (typesafe) has no tools: it can only ever be a read-only reviewer.
+    if (raw.adapter === 'typesafe' && policy === 'write') throw new Error(`profile ${name}: typesafe must be read-only`);
     const fallback = raw.fallback ?? [];
     if (!Array.isArray(fallback) || fallback.some(f => !names.includes(f))) throw new Error(`profile ${name}: fallback must list known profiles`);
     if (fallback.includes(name)) throw new Error(`profile ${name}: fallback may not include itself`);
     if (mode === 'yolo' && settings.mode === 'plan') throw new Error(`profile ${name}: mode exceeds session mode`);
     if (READ_ONLY_ROLES.has(role) && policy === 'write') throw new Error(`profile ${name}: ${role} must be read-only`);
     profiles[name] = {adapter: raw.adapter, model: typeof raw.model === 'string' ? raw.model : '', mode, policy, fallback: [...fallback], role, executables: {...(settings.executables ?? {})}};
+    // Optional cost tier a router (src/jev.js routingQuestions) may read; any other value is dropped.
+    if (PROFILE_TIERS.includes(raw.tier)) profiles[name].tier = raw.tier;
     if (raw.adapter === 'local') {
       Object.assign(profiles[name], normalizeLocalProfile({raw, policy, role, settings}));
     }

@@ -97,7 +97,7 @@ export async function reapStaleSockets({platform = process.platform, uid = proce
 
 // Resolves once actually listening; rejects (never throws async/uncaught) on any
 // bind/chmod failure — a stale non-socket file at the chosen path, EADDRINUSE, etc.
-export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = AUTH_TIMEOUT, validate = () => null, report: receiveReport = null}) {
+export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = AUTH_TIMEOUT, validate = () => null, prepare = null, report: receiveReport = null}) {
   const grants = new Map(); // peer -> {peer, tasks, canSubmit, context, token, file, sockets}
   const tokenToPeer = new Map();
   const tokensDir = path.join(dir, 'tokens');
@@ -170,7 +170,7 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
     function handlePublish(id, event) {
       const peer = authenticated.peer;
       if (authenticated.report) return refuse(id, -32001, 'unauthorized');
-      const e = {...event};
+      let e = {...event};
       // A peer never sets its own id/time/seq (Session.append/publish would keep a
       // forged one), and never picks its own context — that's the grant's job, so
       // a worker cannot write into a thread it wasn't assigned.
@@ -193,6 +193,9 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         if (typeof e.profile !== 'string' || !e.profile) return refuse(id, -32602, 'invalid event');
         const problem = validate(e);
         if (problem) return refuse(id, -32602, `invalid event: ${problem}`);
+        // The scheduler may decorate a valid submission before it is journaled (a Jev completion
+        // reviewer for a root task that names none); the decorated row is what everyone reads.
+        if (typeof prepare === 'function') e = prepare(e);
       } else if (e.kind.startsWith('task.')) {
         if (!authenticated.tasks.includes(e.task)) return refuse(id, -32001, 'unauthorized');
         // A peer may close out a task that has no completion reviewer of its own; one with
