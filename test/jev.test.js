@@ -9,8 +9,9 @@ import {
   JEV_DEFAULT_MODEL, JEV_ENDPOINT, JEV_KEY_ENV, VERDICT_CHECKS,
   normalizeJevSettings, persistedJevSettings, readJevSettings, jevStatusLine, jevSidebarLabel,
   readJevKey, writeJevKey, clearJevKey, retryAfterMs, createJevClient,
-  verdictQuestions, decideVerdict, routingFallback, routingQuestions, decideRoute, routeTask, jevReviewerProfile,
+  verdictQuestions, decideVerdict, routingFallback, routingQuestions, decideRoute, routeTask, jevReviewerProfile, createJevActivation,
 } from '../src/jev.js';
+import {Session} from '../src/core.js';
 
 const tmpRoot = t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-jev-'));
@@ -66,8 +67,9 @@ test('the key lives in a 0600 secrets file, the env var overrides it, and it is 
 
 test('sidebar label is empty while disabled and names what Jev does when enabled', () => {
   assert.equal(jevSidebarLabel({}), '');
-  assert.equal(jevSidebarLabel({enabled: true}), 'jev review');
-  assert.equal(jevSidebarLabel({enabled: true, routing: true}), 'jev review+routing');
+  assert.equal(jevSidebarLabel({enabled: true}), 'jev');
+  assert.equal(jevSidebarLabel({enabled: true, routing: true}), 'jev+routing');
+  assert.equal(jevSidebarLabel({enabled: true, review: false, routing: true}), 'jev routing');
   assert.equal(jevSidebarLabel({enabled: true, review: false}), 'jev idle');
 });
 
@@ -223,4 +225,21 @@ test('routeTask: disabled / routing off / Jev failure all resolve to the fallbac
 
 test('the synthetic reviewer profile is a read-only typesafe critic whose model follows the settings', () => {
   assert.deepEqual(jevReviewerProfile({mode: 'plan', executables: {claude: '/x'}}), {adapter: 'typesafe', model: '', mode: 'plan', policy: 'read-only', fallback: [], role: 'critic', executables: {claude: '/x'}});
+});
+
+test('the daemon answers a user control.jev row with a status row (last 4 key chars only) and refreshes the orders', t => {
+  const root = tmpRoot(t);
+  const session = new Session(root, {root});
+  writeJevKey('ts-secret-key-abcd', {root});
+  let refreshed = 0;
+  const close = createJevActivation({session, readSettings: () => ({enabled: true, routing: true}), readKey: () => readJevKey({root, env: {}}), refresh: () => { refreshed++; }});
+  session.append({kind: 'control.jev', from: 'user'});
+  const status = session.events.at(-1);
+  assert.equal(status.kind, 'status');
+  assert.match(status.text, /Jev \(TypeSafe\): enabled · key …abcd \(file\) .* routing on .* applies to the next decision/);
+  assert.equal(refreshed, 1);
+  session.append({kind: 'control.jev', from: 'orchestrator'}); // not the user peer: ignored
+  assert.equal(session.events.at(-1).kind, 'control.jev');
+  close();
+  assert.equal(fs.readFileSync(session.file, 'utf8').includes('ts-secret-key-abcd'), false);
 });

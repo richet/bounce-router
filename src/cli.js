@@ -14,6 +14,8 @@ import {previewLocalProfile} from './local-setup.js';
 import {runLocalSetup} from './local-wizard.js';
 import {createLocalSetupView} from './local-setup-view.js';
 import {activateLocalProfiles} from './local-activation.js';
+import {jevCommand} from './jev-command.js';
+import {jevSidebarLabel, writeJevKey} from './jev.js';
 import {createInterface} from 'node:readline';
 import {inspectLocalToolchain, prepareLocalToolchain} from './local-toolchain.js';
 import stringWidth from 'string-width';
@@ -52,6 +54,7 @@ const help = `bounce — one terminal, your coding agents
   bounce local check [IMAGE]       Diagnose Docker/image/project setup (no build)
   bounce local prepare [IMAGE] [--allow-network]  Explicitly cache Linux npm dependencies
   bounce quota [--json]
+  bounce jev [key KEY|key clear|on|off|review on|off|routing on|off|model ID|confidence N|test]   Jev (TypeSafe) decision model; no arg shows status
   bounce skills [list|sync|new NAME|add PATH|remove NAME|import [NAME] [--list]|clear|reset] [--scope user|project]
   bounce sessions [--json]      List sessions: name, age, mode, id, workspace (● = live)
   bounce rename SESSION NAME    Name a session (SESSION = name, id or id prefix; --resume takes the same)
@@ -75,6 +78,9 @@ TUI commands:
   /order [claude,codex,muse]  Show the fallback order, or save a new one
   /mode yolo|plan       YOLO default; plan uses restrictive provider flags
   /operation [NAME]     Switch/pick classic|orchestrator — no arg opens a menu, Ctrl+O toggles
+  /jev                  Jev (TypeSafe) decision model status: key (last 4 chars), model, review/routing flags; /jev help lists subcommands
+  /jev key [KEY|clear]  Store the API key in a 0600 file (TYPESAFE_API_KEY overrides); no KEY opens a masked prompt
+  /jev on|off           Enable everything Jev does; /jev review on|off · /jev routing on|off · /jev model ID · /jev confidence N · /jev test
   /stop [TASK]          Orchestrator: cancel one task, or every running task with no arg
   /msg TASK TEXT        Orchestrator: send a message to a running worker
   /agents [TASK]        Interactive split panes for the orchestrator and every worker; optionally focus one
@@ -184,6 +190,13 @@ async function main() {
       return;
     }
     throw new Error('Use bounce local setup, bounce local models or bounce local profile NAME JSON [--save]');
+  }
+  if (positionals[0] === 'jev' || positionals[0] === 'typesafe') {
+    // Headless twin of /jev: the same command over the saved config, written back whole.
+    const saved = config(root);
+    const result = await jevCommand(positionals.slice(1), {root, settings: saved, save: () => saveJSON(path.join(root, 'config.json'), saved)});
+    console.log(result.text + (result.changed ? ' · saved; a running daemon reads it at its next decision' : ''));
+    return;
   }
   if (positionals[0] === 'update') {
     if (values.check) {
@@ -392,6 +405,15 @@ async function main() {
   let mouseScroll = true;
   let picker = null;
   let localSetup = null;
+  // A one-line answer the TUI collects in place of a prompt (the /jev key entry): the draft is
+  // masked on screen while it is open and never lands in history or the journal.
+  let textPrompt = null; // {label, mask, onAnswer}
+  function openTextPrompt({label, mask = false, hint, onAnswer}) {
+    picker = null; input = ''; inputCursor = 0;
+    textPrompt = {label, mask, onAnswer};
+    notice = hint;
+    render();
+  }
   // The agents' own commands for this workspace join the picker after bounce's; a name bounce
   // already uses (Muse ships a review skill) is bounce's. The directories are small but the
   // picker redraws per keystroke, so the survey is kept briefly.
@@ -590,7 +612,7 @@ async function main() {
     const {content: width} = workspaceColumns(process.stdout.columns || 80, {sidebar: settings.sidebar});
     const terminalRows = process.stdout.rows || 24;
     const headerRows = 1;
-    const target = localSetup ? 'setup › ' : agentsOpen ? `${inputTarget()} › ` : '';
+    const target = textPrompt ? `${textPrompt.label} › ` : localSetup ? 'setup › ' : agentsOpen ? `${inputTarget()} › ` : '';
     const promptWidth = Math.max(1, width - 2 - stringWidth(target));
     const draft = inputLayout(input, promptWidth, Math.max(1, Math.min(Math.floor(terminalRows / 3), terminalRows - headerRows - 5)));
     const options = suggestions();
@@ -639,14 +661,14 @@ async function main() {
     }
     menu.length = Math.min(menu.length, menuBudget);
     terminal.update({
-      agentsOpen, details, sidebar: settings.sidebar, selectedId: selectedAgentPane, input, inputCursor: clampCursor(input, inputCursor), inputTarget: localSetup ? 'setup' : inputTarget(), scroll, busy, progress,
+      agentsOpen, details, sidebar: settings.sidebar, selectedId: selectedAgentPane, input: textPrompt?.mask ? '•'.repeat(input.length) : input, inputCursor: clampCursor(input, inputCursor), inputTarget: textPrompt ? textPrompt.label : localSetup ? 'setup' : inputTarget(), scroll, busy, progress,
       paneScrolls: {...Object.fromEntries([...paneInputs].map(([id, value]) => [id, value.scroll])), [selectedAgentPane]: scroll},
       main: {...session.main, text: progress || notice, operation: orchestration.operation},
       notice: localSetup?.state.question || notice, paused: copyPaused, mouseScroll,
       menu: menu.map(([text, paint]) => paint(clean(text))),
       metadata: {
         provider: selected(), model: settings.models[selected()] || '', mode: settings.mode,
-        cwd: session.cwd, sessionId: session.id, operation: orchestration.operation,
+        cwd: session.cwd, sessionId: session.id, operation: orchestration.operation, jev: jevSidebarLabel(settings.jev),
         orchestrator: orchestration.orchestrator ?? 'main', pendingTurns: pendingTurns.length,
         // The sidebar spends 11 rows on the header block, the AGENTS list and the two gaps, plus one per worker.
         quotaLines: quotaPanel(quotas, quotaOrder(), {
@@ -753,6 +775,24 @@ async function main() {
           }
           if (!['', 'setup', 'setup loaded', 'setup --loaded', 'loaded'].includes(arg)) throw new Error('Use /local setup [loaded], /local activate [NAME], or /local cancel');
           openLocalSetup(arg.includes('loaded')); return;
+        }
+        if (command === 'jev') {
+          const result = await jevCommand(parts, {root, settings, save, interactive: true});
+          if (result.prompt === 'key') {
+            openTextPrompt({label: 'jev key', mask: true, hint: result.text, onAnswer: async answer => {
+              if (!answer.trim()) { notice = 'No key entered · nothing changed'; render(); return; }
+              const saved = await jevCommand(['key', answer.trim()], {root, settings, save});
+              session.append({kind: 'status', text: saved.text});
+              if (orchestrating) session.append({kind: 'control.jev', from: 'user'});
+              render();
+            }});
+            return;
+          }
+          session.append({kind: 'status', text: result.text});
+          // The daemon re-reads config.json at each decision; the control row refreshes its orders and confirms.
+          if (result.changed && orchestrating) session.append({kind: 'control.jev', from: 'user'});
+          render();
+          return;
         }
         if (localSetup && ['new', 'resume', 'restart', 'update', 'login', 'quit', 'detach'].includes(command)) cancelLocalSetup();
         if (command === 'quit') return quit();
@@ -984,6 +1024,19 @@ async function main() {
       }
       else if (str && !key.ctrl && !key.meta && /^[1-9]$/.test(str) && Number(str) <= picker.entries.length) picker.index = Number(str) - 1;
       else if (key.name === 'return') {const entry = picker.entries[picker.index]; const kind = picker.kind; picker = null; if (kind === 'operation') applyOperation(entry); else if (kind === 'session') switchSession(entry.id).catch(e => { notice = e.message; render(); }); else applyModel(entry);}
+      render(); return;
+    }
+    if (textPrompt) {
+      if (key.name === 'escape') { textPrompt = null; input = ''; inputCursor = 0; notice = 'Cancelled · nothing changed'; render(); return; }
+      if (key.name === 'return' || key.name === 'enter') {
+        const prompt = textPrompt; const answer = input;
+        textPrompt = null; input = ''; inputCursor = 0;
+        void Promise.resolve(prompt.onAnswer(answer)).catch(error => { notice = error.message; render(); });
+        render(); return;
+      }
+      if (key.name === 'backspace') ({input, cursor: inputCursor} = backspace(input, inputCursor));
+      else if (key.ctrl && key.name === 'u') { input = ''; inputCursor = 0; }
+      else if (str && !key.ctrl && !key.meta && !['left', 'right', 'up', 'down', 'home', 'end', 'delete', 'tab'].includes(key.name)) ({input, cursor: inputCursor} = insertText(input, inputCursor, clean(str).replace(/\s/g, '')));
       render(); return;
     }
     if (key.name === 'escape' && agentsOpen && !input) {agentsOpen = false; changePane('orchestrator'); notice = 'Agent workspace closed'; render(); return;}

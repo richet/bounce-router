@@ -4,7 +4,7 @@ import {commandCatalog, classifyInput, inputDisposition} from '../src/commands.j
 
 test('classifyInput classifies every TUI command exactly once', () => {
   const expected = {
-    immediate: ['provider', 'model', 'local', 'order', 'mode', 'note', 'btw', 'rename', 'sessions', 'skills', 'review', 'quota', 'retry', 'operation', 'stop', 'msg', 'agents', 'tasks', 'help', 'detach', 'details', 'sidebar'],
+    immediate: ['provider', 'model', 'local', 'order', 'mode', 'note', 'btw', 'rename', 'sessions', 'skills', 'review', 'quota', 'retry', 'operation', 'stop', 'msg', 'agents', 'tasks', 'help', 'detach', 'details', 'sidebar', 'jev'],
     turn: ['continue'],
     lifecycle: ['login', 'new', 'resume', 'update', 'restart', 'quit'],
   };
@@ -19,7 +19,12 @@ test('classifyInput classifies every TUI command exactly once', () => {
     }
   }
   assert.equal(new Set(seen).size, seen.length);
-  assert.equal(seen.length, 29);
+  assert.equal(seen.length, 30);
+});
+
+test('classifyInput folds /typesafe into /jev, keeping its arguments', () => {
+  assert.deepEqual(classifyInput('/typesafe key clear'), {kind: 'immediate', command: 'jev', parts: ['key', 'clear'], arg: 'key clear'});
+  assert.deepEqual(classifyInput('/JEV'), {kind: 'immediate', command: 'jev', parts: [], arg: ''});
 });
 
 test('classifyInput preserves prompt input and parses command arguments once', () => {

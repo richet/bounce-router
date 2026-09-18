@@ -138,3 +138,29 @@ test('bounce task compare exits 1 on stderr for an unknown session', async t => 
   assert.match(stderr, /ghost-session/);
   assert.equal(stdout, '');
 });
+
+// `bounce jev …`: the headless twin of /jev over the saved config (src/jev-command.js).
+test('bounce jev shows status, saves switches under config.jev, and keeps the key out of config.json', async t => {
+  const root = tmpRoot('bounce-cli-jev-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  writeConfig(root);
+  const env = bounceEnv(root);
+  delete env.TYPESAFE_API_KEY;
+  const status = await run(['jev'], env);
+  assert.equal(status.code, 0, status.stderr);
+  assert.match(status.stdout, /Jev \(TypeSafe\): disabled · no key · model jev-1\.13\.0 · review on · routing off · confidence 0\.8/);
+  const on = await run(['jev', 'on'], env);
+  assert.equal(on.code, 0, on.stderr);
+  assert.match(on.stdout, /enabled .* · saved; a running daemon reads it at its next decision/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root, 'config.json'), 'utf8')).jev, {enabled: true, model: 'jev-1.13.0', review: true, routing: false, confidence: 0.8});
+  const key = await run(['typesafe', 'key', 'sk-cli-secret-7777'], env);
+  assert.equal(key.code, 0, key.stderr);
+  assert.match(key.stdout, /TypeSafe key stored \(…7777\)/);
+  assert.equal(key.stdout.includes('sk-cli-secret-7777'), false);
+  assert.equal(fs.readFileSync(path.join(root, 'config.json'), 'utf8').includes('sk-cli-secret-7777'), false);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'secrets.json'), 'utf8')).typesafe, 'sk-cli-secret-7777');
+  assert.equal(fs.statSync(path.join(root, 'secrets.json')).mode & 0o777, 0o600);
+  const bad = await run(['jev', 'review', 'sometimes'], env);
+  assert.notEqual(bad.code, 0);
+  assert.match(bad.stderr, /Use \/jev review on\|off/);
+});

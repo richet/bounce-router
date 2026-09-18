@@ -60,12 +60,14 @@ export function jevStatusLine(settings, key) {
   return `Jev (TypeSafe): ${s.enabled ? 'enabled' : 'disabled'} · ${keyText} · model ${s.model} · review ${s.review ? 'on' : 'off'} · ${routing} · confidence ${s.confidence}`;
 }
 
-// One short token for the sidebar's operation line; empty when Jev does nothing.
+// One short token for the sidebar's provider · mode line (≤ 11 chars so the 30-column rail
+// keeps the whole line); empty when Jev does nothing.
 export function jevSidebarLabel(settings) {
   const s = normalizeJevSettings(settings);
   if (!s.enabled) return '';
-  const parts = [s.review ? 'review' : '', s.routing.enabled ? 'routing' : ''].filter(Boolean);
-  return `jev ${parts.length ? parts.join('+') : 'idle'}`;
+  if (s.review && s.routing.enabled) return 'jev+routing';
+  if (s.routing.enabled) return 'jev routing';
+  return s.review ? 'jev' : 'jev idle';
 }
 
 // ---- the key: env overrides a 0600 file under the data root; never config.json, never a journal ----
