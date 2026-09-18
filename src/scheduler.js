@@ -377,6 +377,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // accepted directly) gets no further row from this stale trigger (A3-style guard).
       const state = reducers.tasks(session.events)[task]?.state;
       if (state !== 'completed' && state !== 'reviewing') return;
+      // This append nests inside the task.completed notification (the scheduler subscribed
+      // before any bus wait, and nothing above awaited), so a `bounce wait` on the task sees
+      // this task.accepted first, by subscriber order, and resolves with it: the bus's
+      // `wait.served` names this row's seq, and main-service's pendingHandoffs() has nothing
+      // later to announce.
       append({kind: 'task.accepted', task, stage: 'completion', by: 'strategy', context});
       return;
     }

@@ -134,13 +134,17 @@ export function createMainService({session, adapters, profile, settings, orchest
   // row (the bus journals `wait.served` for it), or a handoff block carried it into a turn that
   // really began (main.started for the block's requestId). Ending while a turn was running is
   // not seeing: an orchestrator that finishes its turn without waiting still gets the outcome.
-  // Log-derived, so a daemon restart changes nothing; one entry per task, its last terminal
-  // row. A failure the scheduler has already replaced (policy.fallback) is not an outcome yet:
-  // its replacement's end is.
+  // A later terminal row the orchestrator or the user published by hand on a task a wait had
+  // already returned (a `task.accepted` after the wait's task.completed) is not news either:
+  // it acts on the outcome the wait handed over. Hand-closing a task no wait ever returned
+  // still wakes. Log-derived, so a daemon restart changes nothing; one entry per task, its
+  // last terminal row. A failure the scheduler has already replaced (policy.fallback) is not
+  // an outcome yet: its replacement's end is.
   function pendingHandoffs() {
     const view = tasks(session.events);
     const started = new Set(session.events.filter(event => event.kind === 'main.started').map(event => event.requestId));
-    const seen = row => session.events.some(e => (e.kind === 'wait.served' && e.task === row.task && !(e.served < row.seq))
+    const byHand = row => row.from === 'orchestrator' || row.from === 'user';
+    const seen = row => session.events.some(e => (e.kind === 'wait.served' && e.task === row.task && (!(e.served < row.seq) || byHand(row)))
       || (e.kind === 'handoff' && started.has(e.requestId) && e.seq > row.seq && e.tasks?.includes(row.task)));
     const byTask = new Map();
     for (const row of session.events) {

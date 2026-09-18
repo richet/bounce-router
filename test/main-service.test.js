@@ -179,10 +179,10 @@ function wakeFixture(t, {handoffDelayMs = 10} = {}) {
   const promptOf = call => call[1].message ?? call[1].orders;
   // A real bus over the same session, so a peer's `wait` journals (or does not) exactly as in the daemon.
   let bus = null;
-  const peer = async name => {
+  const peer = async (name, tasks = []) => {
     bus ??= await createBus({session, dir: session.dir});
     t.after(() => bus.close());
-    const client = await connectBus({path: bus.path, token: bus.grant({peer: name, canSubmit: true, tasks: [], context: session.id}).token});
+    const client = await connectBus({path: bus.path, token: bus.grant({peer: name, canSubmit: true, tasks, context: session.id}).token});
     t.after(() => client.close());
     return client;
   };
@@ -308,6 +308,55 @@ test('a terminal row returned by the orchestrator\'s own wait is seen (no wake);
   await f.quiet(40);
   assert.equal(f.session.events.filter(e => e.kind === 'handoff').length, 1);
   assert.equal(f.main.state().state, 'idle');
+});
+
+test('a task the orchestrator waited on and then accepted itself is not re-announced at its next idle', async t => {
+  const f = wakeFixture(t);
+  await f.settle();
+  const orchestrator = await f.peer('orchestrator', ['self-accepted']);
+  f.submit('self-accepted');
+  const started = nextEvent(f.main, 'main.started');
+  f.main.run({id: 'busy', text: 'more'});
+  await started;
+  const waited = orchestrator.wait({match: {kind: 'task.completed', task: 'self-accepted'}, timeout: 5000});
+  f.session.append({kind: 'task.completed', task: 'self-accepted', summary: 'seen by wait', from: 'worker:self-accepted'});
+  assert.equal((await waited).kind, 'task.completed');
+  const accepted = await orchestrator.publish({kind: 'task.accepted', task: 'self-accepted', stage: 'completion'});
+  assert.equal(accepted.from, 'orchestrator');
+  assert.ok(accepted.seq > f.session.events.find(e => e.kind === 'wait.served').served, 'the accept lands after the served row');
+  await f.finishTurn();
+  await f.quiet(40);
+  assert.equal(f.session.events.filter(e => e.kind === 'handoff').length, 0);
+  assert.equal(f.main.state().state, 'idle');
+});
+
+test('a user-grant accept after the orchestrator\'s wait is not re-announced; one on a task no wait returned still wakes', async t => {
+  const f = wakeFixture(t);
+  await f.settle();
+  const orchestrator = await f.peer('orchestrator');
+  const user = await f.peer('user', ['waited', 'unwaited']);
+  f.submit('waited'); f.submit('unwaited');
+  const started = nextEvent(f.main, 'main.started');
+  f.main.run({id: 'busy', text: 'more'});
+  await started;
+  const waited = orchestrator.wait({match: {kind: 'task.completed', task: 'waited'}, timeout: 5000});
+  f.session.append({kind: 'task.completed', task: 'waited', summary: 'seen by wait', from: 'worker:waited'});
+  assert.equal((await waited).kind, 'task.completed');
+  await user.publish({kind: 'task.accepted', task: 'waited', stage: 'completion'});
+  await f.finishTurn();
+  await f.quiet(40);
+  assert.equal(f.session.events.filter(e => e.kind === 'handoff').length, 0);
+  assert.equal(f.main.state().state, 'idle');
+  // Idle, and the user closes a task the orchestrator was never handed: that is news.
+  f.session.append({kind: 'task.completed', task: 'unwaited', summary: 'never waited', from: 'worker:unwaited'});
+  const woken = nextEvent(f.main, 'main.starting');
+  await user.publish({kind: 'task.accepted', task: 'unwaited', stage: 'completion'});
+  await woken;
+  await nextEvent(f.main, 'main.started');
+  const row = f.session.events.findLast(e => e.kind === 'handoff');
+  assert.deepEqual(row.tasks, ['unwaited']);
+  assert.match(row.text, /task unwaited · profile build · task\.accepted/);
+  await f.finishTurn();
 });
 
 test('a wake-up whose turn fails to launch keeps the outcomes pending: one re-arm, then the next prompt carries them', async t => {
