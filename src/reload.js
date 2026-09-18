@@ -265,7 +265,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   }
   if (orchestrating) writeOrders({session, root, bus, grant: orchestratorGrant, profiles: orchestration.profiles, orchestrator: orchestration.orchestrator});
   if (orchestrating) session.append({kind: 'operation', operation: 'orchestrator', orchestrator: orchestration.orchestrator, shape: orchestration.shape, text: `Operation: orchestrator on ${orchestration.orchestrator} (${orchestration.shape})`});
-  const main = orchestrating && positionals[0] !== 'run' ? createMainService({session, adapters, profile: orchestratorProfile, settings,
+  const main = orchestrating && positionals[0] !== 'run' ? createMainService({session, adapters, profile: orchestratorProfile, settings, profiles: orchestration.profiles, readRouting: () => config(root),
     orchestratorEnv: {BOUNCE_BUS: bus.path, BOUNCE_BUS_TOKEN_FILE: orchestratorGrant.file, BOUNCE_ROLE: 'orchestrator', BOUNCE_ORCHESTRATOR_PROFILE: JSON.stringify(orchestratorProfile)},
     brief: `Read and follow ${path.join(session.dir, 'orchestrator', 'ORDERS.md')}.`}) : null;
   const closeLocalActivation = createLocalActivation({session, scheduler, profiles, settings,

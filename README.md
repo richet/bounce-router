@@ -294,6 +294,22 @@ Default order: Claude → Codex → Muse. Successful fallback becomes sticky for
 
 A provider hitting limits is skipped for a configurable local delay (30 minutes by default). This is **not** a subscription reset estimate. `/retry` clears the local delay. Usage events are recorded when supplied by the CLI; no account percentages or costs are invented.
 
+Orchestrator main turns also fail over on provider exhaustion or a missing CLI. The main
+profile chooses the initial provider and model (an omitted model uses `models[provider]`).
+If that profile explicitly declares `fallback`, its ordered profile chain is authoritative;
+`fallback: []` disables automatic fallback. Otherwise the configured provider `order` and
+per-provider `models` apply, including `/order` and `/model` changes on the next request.
+Profile-table changes take effect when the daemon is reloaded. Local profiles are not eligible
+main agents. Each provider is tried at most once per logical request, exhausted providers
+observe `cooldownMinutes`, and `/retry` clears the journaled cooldowns.
+
+The daemon verifies the old process has stopped before starting a fallback with the standing
+orders, current request, saved images and bounded workspace/history handoff. Ordinary failures
+and cancellation stop the request. Unverified termination blocks further launches. Selection
+is journaled and shared with attached views; the chosen provider, model and any narrower
+mode/policy persist across later turns and daemon restarts. A fallback cannot widen the
+request's mode or read-only policy. Exhausting the eligible routes ends as `unavailable`.
+
 Every turn starts a fresh native CLI process with a handoff. The handoff includes the original request, a bounded recent journal suffix, current request, and Git HEAD/status/diff-stat. It asks the next agent to inspect partially completed work. Full raw provider events and normalized conversation/tool events remain in the journal. Git observation does not commit, stash, reset, or roll back files. Switching is not transactional: an exhausted agent may already have performed side effects.
 
 ## Quota

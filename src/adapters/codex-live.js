@@ -109,7 +109,7 @@ function finish(handle) {
   handle.running = false;
   for (const pending of handle.pending.values()) {
     handle.clearTimeout(pending.timer);
-    pending.reject(new Error('codex app-server closed'));
+    pending.reject(handle.launchError ?? new Error('codex app-server closed'));
   }
   handle.pending.clear();
   handle.stream.end();
@@ -287,7 +287,12 @@ async function pump(handle, source) {
       continue;
     }
     if (event.kind === 'diagnostic') { handle.stream.push(event); continue; }
-    if (event.kind === 'error') { handle.stream.push({kind: 'error', code: event.code, text: event.text}); terminalEvent = true; break; }
+    if (event.kind === 'error') {
+      handle.launchError = Object.assign(new Error(event.text), {code: event.code});
+      handle.stream.push({kind: 'error', code: event.code, text: event.text});
+      terminalEvent = true;
+      break;
+    }
     if (!handle.cancelled && !handle.resulted) {
       handle.resulted = true;
       handle.stream.push({kind: 'result', status: 'failed', text: 'protocol error: codex app-server exited without turn/completed'});
@@ -308,7 +313,12 @@ export function createCodexLive({spawn = spawnProcess, kill = process.kill, conn
   const stop = handle => verifiedCancel(handle.child, {kill});
   // A failed handshake leaves no orphan: the process is killed before the caller sees the error.
   const begin = async (handle, run) => {
-    try { return await run(); } catch (error) { await stop(handle); throw error; }
+    try { return await run(); } catch (error) {
+      // Retain ownership for callers if cleanup cannot be verified, including launch failures.
+      error.handle = handle;
+      await stop(handle);
+      throw error;
+    }
   };
 
   async function connect({profile = {}, peer, cwd, dir}) {
@@ -385,7 +395,7 @@ export function createCodexLive({spawn = spawnProcess, kill = process.kill, conn
     async cancel(handle) {
       handle.cancelled = true;
       if (!handle.exited && handle.threadId && handle.turnId) await bounded(request(handle, REQUESTS.turnInterrupt({threadId: handle.threadId, turnId: handle.turnId})));
-      const result = handle.exited ? {verified: true} : await stop(handle);
+      const result = await stop(handle);
       finish(handle);
       return result;
     },

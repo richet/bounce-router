@@ -501,7 +501,7 @@ test('a pinned model rides on every turn/start', async t => {
   assert.deepEqual(h.methods('turn/start').map(message => message.params.model), ['gpt-5-codex', 'gpt-5-codex']);
 });
 
-test('a handshake that never answers rejects launch and leaves no process behind', async () => {
+test('a missing executable during handshake retains classification and process ownership', async () => {
   const server = scriptedServer();
   let killed = 0;
   const adapter = createCodexLive({spawn: () => server.child, kill: (...args) => { killed++; return goneKill(); }});
@@ -509,7 +509,11 @@ test('a handshake that never answers rejects launch and leaves no process behind
     orders: 'go', cwd: '/tmp', dir: '/tmp'});
   await server.expect(1);
   server.fail(Object.assign(new Error('spawn codex ENOENT'), {code: 'ENOENT'}));
-  await assert.rejects(launching, /codex app-server closed/);
+  await assert.rejects(launching, error => {
+    assert.equal(error.code, 'missing');
+    assert.equal(error.handle.child, server.child);
+    return true;
+  });
   assert.equal(killed >= 1, true); // verifiedCancel probed the pid rather than leaving it running
 });
 

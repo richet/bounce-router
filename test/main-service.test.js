@@ -440,3 +440,207 @@ test('a wake-up honours the same refusals as a typed prompt and is dropped once 
   assert.equal(f.session.events.some(e => e.kind === 'handoff'), false);
   assert.equal(f.session.events.filter(e => e.kind === 'main.starting').length, 1);
 });
+
+// Fake process events pass through the real Claude live normalizer for the incident.
+async function failoverFixture(t, {status = 'limited', verified = true, fallback, codexStatus = 'completed', stop, backup = {}, launchError} = {}) {
+  const {createClaudeLive} = await import('../src/adapters/claude-live.js');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-main-failover-'));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const session = new Session(root, {root}), calls = [];
+  const normalizer = createClaudeLive();
+  const line = raw => ({kind: 'line', text: JSON.stringify(raw)});
+  const claude = {
+    async launch(args) { calls.push(['claude', args]); if (launchError) throw launchError; return {turnId: 'claude-turn'}; },
+    async *events() {
+      yield {kind: 'assistant', text: 'Partial work: inspect the existing patch.'};
+      if (status === 'missing-event') { yield {kind: 'error', code: 'missing', text: 'spawn ENOENT'}; return; }
+      if (status !== 'limited') { yield {kind: 'result', status, text: 'ordinary failure'}; return; }
+      yield* normalizer.events({live: {events: (async function* () {
+        yield line({type: 'rate_limit_event', rate_limit_info: {status: 'rejected', rateLimitType: 'five_hour', resetsAt: 1900000000}});
+        yield line({type: 'result', subtype: 'error', is_error: true, result: 'request aborted'});
+      })()}});
+    },
+    async cancel() { calls.push(['stop-claude']); if (stop) await stop(); return {verified}; },
+  };
+  const codex = {
+    async launch(args) { calls.push(['codex', args]); return {turnId: 'codex-turn'}; },
+    async resume(args) { calls.push(['resume-codex', args]); return {turnId: 'codex-next'}; },
+    async *events() { yield {kind: 'native', sessionId: 'astra-thread'}; yield {kind: 'result', status: codexStatus}; },
+    async cancel() { calls.push(['stop-codex']); return {verified: true}; },
+  };
+  const profile = {adapter: 'claude', model: 'opus', mode: 'plan', role: 'orchestrator', fallback: fallback ?? []};
+  const settings = {order: ['codex', 'claude', 'codex'], models: {codex: 'gpt-6-astra'}, cooldownMinutes: 30,
+    orchestrator: 'main', profiles: {main: {...profile}}};
+  if (fallback === undefined) delete settings.profiles.main.fallback;
+  const profiles = {backup: {adapter: 'codex', model: 'explicit-astra', mode: 'yolo', fallback: ['backup'], ...backup}};
+  const main = createMainService({session, adapters: {claude, codex}, profile, settings, profiles, brief: 'Standing orchestrator orders'});
+  t.after(() => main.close());
+  const run = async params => { const done = nextEvent(main, 'main.terminal'); main.run({text: 'Finish the requested fix', ...params}); return done; };
+  return {session, calls, main, run, adapters: {claude, codex}, profile, settings, profiles};
+}
+
+test('structured Claude five_hour rejection resumes logical request on Astra after termination, then stays sticky', async t => {
+  const f = await failoverFixture(t);
+  f.session.append({kind: 'note', text: 'Keep the prior design'});
+  assert.equal((await f.run({id: 'logical', model: 'explicit-opus'})).status, 'completed');
+  assert.deepEqual(f.calls.map(c => c[0]), ['claude', 'stop-claude', 'codex', 'stop-codex']);
+  assert.equal(f.calls[0][1].profile.model, 'explicit-opus');
+  const args = f.calls[2][1];
+  assert.equal(args.profile.model, 'gpt-6-astra');
+  assert.equal(args.profile.role, 'orchestrator');
+  assert.equal(args.profile.mode, 'plan');
+  assert.match(args.orders, /Standing orchestrator orders/);
+  assert.match(args.orders, /Partial work/);
+  assert.match(args.orders, /Keep the prior design/);
+  assert.match(args.orders, /Finish the requested fix/);
+  assert.equal(f.session.events.filter(e => e.kind === 'user').length, 1);
+  assert.equal(f.session.events.filter(e => e.kind === 'main.terminal').length, 1);
+  assert.deepEqual(f.session.events.filter(e => e.kind === 'main.starting').map(e => [e.requestId, e.provider]), [['logical', 'claude'], ['logical', 'codex']]);
+  assert.ok(f.session.events.find(e => e.kind === 'cooldown').until > Date.now());
+  assert.equal(f.main.state().provider, 'codex');
+  assert.equal(f.session.active, 'codex');
+  await f.run();
+  assert.equal(f.calls.at(-2)[0], 'resume-codex');
+  assert.equal(f.calls.at(-2)[1].profile.model, 'gpt-6-astra');
+});
+
+for (const status of ['failed', 'interrupted']) test(`main ${status} stops without fallback`, async t => {
+  const f = await failoverFixture(t, {status});
+  assert.equal((await f.run()).status, status);
+  assert.equal(f.calls.some(c => c[0] === 'codex'), false);
+});
+
+test('exhausted routes attempt each provider once and cooldown prevents subsequent launches', async t => {
+  const f = await failoverFixture(t, {codexStatus: 'limited'});
+  assert.equal((await f.run()).status, 'unavailable');
+  assert.equal(f.calls.filter(c => ['claude', 'codex'].includes(c[0])).length, 2);
+  const count = f.calls.length;
+  assert.equal((await f.run()).status, 'unavailable');
+  assert.equal(f.calls.length, count);
+});
+
+test('explicit empty main fallback disables routing; explicit profile uses its model and narrows mode', async t => {
+  const disabled = await failoverFixture(t, {fallback: []});
+  assert.equal((await disabled.run()).status, 'unavailable');
+  assert.equal(disabled.calls.some(c => c[0] === 'codex'), false);
+  const enabled = await failoverFixture(t, {fallback: ['backup']});
+  assert.equal((await enabled.run()).status, 'completed');
+  assert.equal(enabled.calls[2][1].profile.model, 'explicit-astra');
+  assert.equal(enabled.calls[2][1].profile.mode, 'plan');
+});
+
+test('unverified termination blocks fallback and new requests', async t => {
+  const f = await failoverFixture(t, {verified: false});
+  const blocked = nextEvent(f.main, 'main.blocked');
+  f.main.run({text: 'work'});
+  await blocked;
+  assert.equal(f.main.run({text: 'more'}).reason, 'termination_unverified');
+  assert.equal(f.calls.some(c => c[0] === 'codex'), false);
+});
+
+test('cancel during termination verification prevents fallback', async t => {
+  let release;
+  const barrier = new Promise(resolve => { release = resolve; });
+  const f = await failoverFixture(t, {stop: () => barrier});
+  const ended = f.run();
+  while (!f.calls.some(c => c[0] === 'stop-claude')) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.calls.some(c => c[0] === 'codex'), false);
+  const cancelled = f.main.cancel();
+  release();
+  await cancelled;
+  assert.equal((await ended).status, 'interrupted');
+  assert.equal(f.calls.some(c => c[0] === 'codex'), false);
+});
+
+test('fallback profile restrictions survive subsequent turns and daemon restart', async t => {
+  const f = await failoverFixture(t, {fallback: ['backup'], backup: {mode: 'plan', policy: 'read-only'}});
+  f.profile.mode = 'yolo';
+  await f.run();
+  await f.run({mode: 'yolo'});
+  assert.equal(f.calls.at(-2)[1].profile.mode, 'plan');
+  assert.equal(f.calls.at(-2)[1].profile.policy, 'read-only');
+  await f.main.close();
+  const main = createMainService(f);
+  t.after(() => main.close());
+  assert.equal(main.state().mode, 'plan');
+  assert.equal(main.state().policy, 'read-only');
+  const done = nextEvent(main, 'main.terminal');
+  main.run({text: 'continue after restart', mode: 'yolo'});
+  await done;
+  assert.equal(f.calls.at(-2)[0], 'resume-codex');
+  assert.equal(f.calls.at(-2)[1].profile.model, 'explicit-astra');
+  assert.equal(f.calls.at(-2)[1].profile.mode, 'plan');
+  assert.equal(f.calls.at(-2)[1].profile.policy, 'read-only');
+});
+
+test('routing snapshots current view settings; explicit profile policy still wins', async t => {
+  const f = await failoverFixture(t);
+  const routing = {order: ['codex'], models: {codex: 'next-request-model'}};
+  const done = f.run({routing});
+  routing.models.codex = 'changed-too-late';
+  await done;
+  assert.equal(f.calls[2][1].profile.model, 'next-request-model');
+  const explicit = await failoverFixture(t, {fallback: []});
+  assert.equal((await explicit.run({routing})).status, 'unavailable');
+  assert.equal(explicit.calls.some(c => c[0] === 'codex'), false);
+});
+
+for (const status of ['missing-event', 'missing']) test(`main routes missing CLI (${status}) without cooldown`, async t => {
+  const f = await failoverFixture(t, status === 'missing' ? {launchError: Object.assign(new Error('CLI missing'), {code: 'missing'})} : {status});
+  assert.equal((await f.run()).status, 'completed');
+  assert.equal(f.calls.some(c => c[0] === 'codex'), true);
+  assert.equal(f.session.events.some(e => e.kind === 'cooldown'), false);
+});
+
+test('launch rejection retaining a process handle must verify termination before fallback', async t => {
+  const f = await failoverFixture(t, {verified: false,
+    launchError: Object.assign(new Error('usage limit'), {code: 'limited', handle: {turnId: 'owned-launch'}})});
+  const blocked = nextEvent(f.main, 'main.blocked');
+  f.main.run({text: 'work'});
+  await blocked;
+  assert.equal(f.calls.some(c => c[0] === 'codex'), false);
+  assert.equal(f.main.state().state, 'blocked');
+});
+
+test('fallback waits for verified termination even after the limited result arrived', async t => {
+  let release;
+  const barrier = new Promise(resolve => { release = resolve; });
+  const f = await failoverFixture(t, {stop: () => barrier});
+  const done = f.run();
+  while (!f.calls.some(c => c[0] === 'stop-claude')) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.main.run({text: 'second writer'}).reason, 'busy');
+  assert.equal(f.calls.some(c => c[0] === 'codex'), false);
+  release();
+  assert.equal((await done).status, 'completed');
+  assert.equal(f.calls.some(c => c[0] === 'codex'), true);
+});
+
+test('daemon reload reads new configured routes while keeping the sticky selection', async t => {
+  const f = await failoverFixture(t);
+  await f.run();
+  await f.main.close();
+  f.session.append({kind: 'cooldown', provider: 'claude', until: 0});
+  f.adapters.codex.events = async function* () { yield {kind: 'result', status: 'limited'}; };
+  f.adapters.claude.events = async function* () { yield {kind: 'result', status: 'completed'}; };
+  const before = f.calls.length;
+  let reads = 0;
+  const main = createMainService({...f, readRouting: () => { reads++; return {order: ['claude'], models: {claude: 'reloaded-opus'}}; }});
+  t.after(() => main.close());
+  const done = nextEvent(main, 'main.terminal');
+  main.run({text: 'after reload'});
+  await done;
+  assert.equal(reads, 1);
+  assert.equal(f.calls[before][0], 'resume-codex');
+  assert.equal(f.calls[before][1].profile.model, 'gpt-6-astra');
+  assert.equal(f.calls.at(-2)[0], 'claude');
+  assert.equal(f.calls.at(-2)[1].profile.model, 'reloaded-opus');
+});
+
+test('a limited launch without process ownership cannot authorize another writer', async t => {
+  const f = await failoverFixture(t, {launchError: Object.assign(new Error('usage limit'), {code: 'limited'})});
+  const blocked = nextEvent(f.main, 'main.blocked');
+  f.main.run({text: 'work'});
+  await blocked;
+  assert.equal(f.main.run({text: 'another writer'}).reason, 'termination_unverified');
+  assert.equal(f.calls.some(c => c[0] === 'codex'), false);
+});

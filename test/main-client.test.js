@@ -56,3 +56,17 @@ test('main client snapshots configuration and rejects refused or disconnected ru
   await assert.rejects(client.run('more'), /busy/);
   assert.equal(f.listeners.size, 0);
 });
+
+test('main client snapshots next-turn routing and derives cooldowns from the shared journal', async () => {
+  const f = fixture(), settings = {order: ['claude', 'codex'], models: {codex: 'gpt-6-astra'}, mode: 'plan'};
+  f.session.events = [{kind: 'cooldown', provider: 'claude', until: Date.now() + 60000}];
+  const client = createMainClient(f.session, settings);
+  const done = client.run('work');
+  settings.order.reverse(); settings.models.codex = 'later';
+  assert.deepEqual(f.calls[0][1].routing, {order: ['claude', 'codex'], models: {codex: 'gpt-6-astra'}});
+  assert.ok(client.cooldowns.claude > Date.now());
+  f.session.events.push({kind: 'cooldown', provider: 'claude', until: 0});
+  assert.deepEqual(client.cooldowns, {});
+  f.emit({kind: 'main.terminal', requestId: f.calls[0][1].id, status: 'completed'});
+  await done;
+});
