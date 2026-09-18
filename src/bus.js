@@ -194,6 +194,10 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         const problem = validate(e);
         if (problem) return refuse(id, -32602, `invalid event: ${problem}`);
       } else if (e.kind.startsWith('task.')) {
+        // A task.* row without its task is a malformed event, not an authority failure: say so
+        // (observed live: an orchestrator publishing a task.milestone with no `task` got a bare
+        // `unauthorized` and could not tell what it had done wrong).
+        if (typeof e.task !== 'string' || !e.task) return refuse(id, -32602, `invalid event: ${e.kind} requires task`);
         if (!authenticated.tasks.includes(e.task)) return refuse(id, -32001, 'unauthorized');
         // A peer may close out a task that has no completion reviewer of its own; one with
         // review.completion set is only ever accepted by the review policy (task.rejected/

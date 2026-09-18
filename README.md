@@ -194,6 +194,8 @@ Enabling it with no profile table installs a starter one: `main` on your first p
 
 Each task carries its orders, an optional deadline, `depends_on` (held until those tasks are accepted), and optional `review` stages: a *prelaunch* review can reject the plan before a worker starts; a *completion* review can accept it or send it back for a bounded number of rework rounds through the worker's native session. Budgets are reserved per task and released on completion; a watchdog times out a task past its deadline. Every state change is a journal row (`task.submitted`, `task.milestone`, `task.blocked`, `task.completed`, `task.failed`, `task.cancelled`, `task.deadline`, `task.rejected`, `task.accepted`), so `bounce attach --json` and `bounce task compare SESSION A B` work from the log alone. Workers publish milestones with a phase, text, what happens next and evidence; a refusal is a `task.failed` row with its reason, never a silent stop.
 
+The orchestrator does not have to poll. When it is idle and a task it submitted ends, the daemon starts its next turn itself with the outcome in front of it — task id, profile, how it ended, the reason, and the final report summary or failure text — and asks it to synthesize; several tasks ending together become one turn, and a prompt you type first carries the same block instead. That block is journaled as a `handoff` row (`wake: true` for a turn bounce started, `false` when it rode on your prompt), distinct from a `user` row, so `bounce attach --json` and the transcript can tell them apart. A worker whose vendor account is exhausted mid-task or at launch (Codex's "You've hit your usage limit", a rejected Claude rate limit, a Muse quota refusal) ends as `task.failed` with reason `limited` and is replaced on the profile's `fallback` chain.
+
 In the TUI:
 
 - `/agents [TASK]` opens split panes for the orchestrator and every worker; Tab and Shift+Tab cycle the focused pane, or name a task to focus it. With a worker focused, Enter and `/btw` deliver to that worker. `/agents` again, or Esc on an empty prompt, returns to the transcript. `/zoom` and `/attach` are aliases.
@@ -207,8 +209,11 @@ Workers and the orchestrator talk to the daemon through a token-scoped Unix sock
 ```sh
 bounce publish --event '{"kind":"task.submitted","parent":null,"profile":"build","orders":"…","deadline":3600000}'
 bounce wait --match '{"kind":"task.completed","task":"TASK_ID"}' --timeout 3600
+bounce publish --event '{"kind":"task.milestone","task":"TASK_ID","phase":"inspect","text":"…","next":"…","evidence":["…"]}'
 bounce report --report '{"op":"milestone","phase":"test","text":"…","next":"…"}'
 ```
+
+`wait`'s `--timeout` is seconds and may run to the task deadline (the bridge re-arms the bus's 600 s wait); a `null` reply is an expired timeout, exit code 1. Every `task.*` row a peer publishes needs its `task`; without it the bus answers `invalid event: <kind> requires task`.
 
 A grant can publish only what its role allows: the orchestrator submits tasks and messages, a worker reports on its own task, and `control.*` rows belong to the user peer alone.
 

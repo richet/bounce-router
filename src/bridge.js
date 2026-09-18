@@ -7,6 +7,8 @@ import fs from 'node:fs';
 import {parseArgs} from 'node:util';
 import {connectBus} from './bus.js';
 
+const WAIT_CHUNK_MS = 600_000;
+
 function formatRow(row, json) {
   if (row == null) return 'null';
   if (json) return JSON.stringify(row);
@@ -19,7 +21,7 @@ function parseJsonArg(value, label) {
   catch (error) { throw new Error(`invalid ${label}: ${error.message}`); }
 }
 
-export async function bridgeCommand(argv, env = process.env) {
+export async function bridgeCommand(argv, env = process.env, {waitChunkMs = WAIT_CHUNK_MS} = {}) {
   const [command, ...rest] = argv;
   // Reporting is deliberately a separate, attempt-scoped credential. A worker cannot turn a
   // report capability into the general publish/wait capability even by invoking this CLI.
@@ -73,7 +75,14 @@ export async function bridgeCommand(argv, env = process.env) {
       const row = await client.report(report);
       return {stdout: formatRow(row, values.json) + '\n', exitCode: 0};
     }
-    const row = await client.wait({match, timeout, afterSeq});
+    // One bus wait is capped at 600 s (src/bus.js handleWait); a longer --timeout — the task
+    // deadline is the natural one — is re-armed here in chunks. Every chunk re-scans the log
+    // before subscribing, so a row that lands between two chunks is still returned.
+    const deadline = Date.now() + timeout;
+    let row = null;
+    do {
+      row = await client.wait({match, timeout: Math.min(Math.max(deadline - Date.now(), 0), waitChunkMs), afterSeq});
+    } while (!row && Date.now() < deadline);
     return {stdout: formatRow(row, values.json) + '\n', exitCode: row ? 0 : 1};
   } catch (error) {
     return {stdout: `bounce: ${error.code ?? -32001} ${error.message}\n`, exitCode: 3};
