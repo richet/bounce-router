@@ -1,10 +1,12 @@
 import {randomUUID} from 'node:crypto';
+import {cooldowns} from './reducers.js';
 
 // Provider ownership stays in the daemon; this facade only waits for its events.
 export function createMainClient(session, settings) {
   let activeRequest = null;
   return {
-    cooldowns: {},
+    get cooldowns() { return cooldowns(session.events ?? [], Date.now()); },
+    set cooldowns(value) { /* /retry journals the authoritative reset rows. */ },
     select(provider) { session.active = provider; },
     async run(text, files = [], {typed} = {}) {
       if (activeRequest) throw new Error('A main turn is already active');
@@ -24,7 +26,7 @@ export function createMainClient(session, settings) {
         }
       });
       try {
-        const ack = await session.runMain({id, text, files, provider, model: settings.models[provider] || '', mode: settings.mode, ...(typed ? {typed} : {})});
+        const ack = await session.runMain({id, text, files, provider, model: settings.models[provider] || '', mode: settings.mode, routing: {order: [...settings.order], models: {...settings.models}}, ...(typed ? {typed} : {})});
         if (ack.accepted === false) throw new Error(ack.reason || 'Main turn refused');
         return await terminal;
       } finally {

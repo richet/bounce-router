@@ -136,7 +136,11 @@ async function main() {
     settings.order = [values.provider, ...settings.order.filter(p => p !== values.provider)];
   }
   if (values.mode && !restarted) { if (!['yolo', 'plan'].includes(values.mode)) throw new Error('Mode must be yolo or plan'); settings.mode = values.mode; }
-  if (values.model && !restarted) settings.models[settings.order[0]] = values.model;
+  if (values.model && !restarted) {
+    const initialProvider = values.provider ?? (settings.operation === 'orchestrator'
+      ? settings.profiles?.[settings.orchestrator]?.adapter : null) ?? settings.order[0];
+    settings.models[initialProvider] = values.model;
+  }
   if (positionals[0] === 'local') {
     if (positionals[1] === 'setup') {
       if (values.json || values.save) throw new Error('Guided setup uses interactive confirmation; use local profile NAME JSON --save for manual automation');
@@ -281,13 +285,14 @@ async function main() {
   // orchestrator's own profile here, so the main conversation runs on that adapter/model/mode.
   // Both vars are set (or removed) by the supervisor on every spawn from the validated config,
   // so this is the config's decision, never something inherited from the surrounding shell.
-  // In orchestrator mode the profile table is authoritative over config.models/order/mode: the
-  // profile is what the session was validated against, so it wins over the legacy fields here.
+  // The main profile selects the initial provider/model/mode. Keep legacy order available
+  // for daemon failover when the profile has no explicit fallback list.
   const orchestrating = process.env.BOUNCE_ROLE === 'orchestrator' && !!process.env.BOUNCE_ORCHESTRATOR_PROFILE;
   if (orchestrating) {
     const profile = JSON.parse(process.env.BOUNCE_ORCHESTRATOR_PROFILE);
-    settings.order = [profile.adapter];
-    settings.models[profile.adapter] = profile.model;
+    settings.order = positionals[0] === 'run' ? [profile.adapter]
+      : [profile.adapter, ...settings.order.filter(provider => provider !== profile.adapter)];
+    settings.models[profile.adapter] = profile.model || settings.models[profile.adapter] || '';
     settings.mode = profile.mode;
   }
   let session = process.env.BOUNCE_REMOTE_SESSION === '1'
@@ -303,11 +308,16 @@ async function main() {
   const noOwnSubagents = provider => provider === 'claude' ? ['--disallowedTools', 'Agent,Task'] : [];
   const routerOptions = orchestrating ? {runner: options => runProcess({...options, keepBus: true}), extraArgs: noOwnSubagents} : {};
   const remoteMain = orchestrating && positionals[0] !== 'run' && typeof session.runMain === 'function';
+  if (remoteMain && session.main?.provider) {
+    settings.models[session.main.provider] = session.main.model ?? '';
+    settings.mode = session.main.mode ?? settings.mode;
+  }
   let router = remoteMain ? createMainClient(session, settings) : new Router(session, settings, routerOptions);
   const orchestratorBrief = orchestrating
     ? `You are the orchestrator peer of session ${session.id}; the bounce bridge is available via BOUNCE_BUS/BOUNCE_BUS_TOKEN_FILE; see ${path.join(session.dir, 'orchestrator', 'ORDERS.md')}.\n`
     : '';
   if (restarted?.provider || values.provider) session.active = restarted?.provider || values.provider;
+  if (remoteMain && values.model && !restarted) settings.models[session.active || settings.order[0]] = values.model;
   process.on('exit', () => session.unlock?.());
   // Quota readings survive restarts, so the display starts with the last known usage.
   const quotas = loadQuota(root);
@@ -659,6 +669,10 @@ async function main() {
   }
   let renderTimer;
   function scheduleRender(event) {
+    if (remoteMain && event?.kind === 'main.starting' && event.provider) {
+      settings.models[event.provider] = event.model ?? '';
+      settings.mode = event.mode ?? settings.mode;
+    }
     // A turn this view did not start — the daemon waking the orchestrator on worker outcomes
     // (main-service.js) — is held exactly like a turn found running at attach: new prompts are
     // refused with a notice, /btw steers it, Esc cancels it, its terminal row releases the input.
@@ -813,9 +827,9 @@ async function main() {
             if (!order.length || order.some(p => !providers[p]) || new Set(order).size !== order.length) throw new Error('Use unique provider names separated by commas');
             settings.order = order; router.select(order[0]); save();
           }
-          // In orchestrator operation the order was narrowed to the orchestrator's adapter above.
+          // Explicit profile fallback takes precedence over this legacy provider order.
           const reading = settings.order.map(p => `${p} (${settings.models[p] || 'default'})`).join(' → ');
-          const note = arg ? 'saved' : orchestrating ? 'orchestrator profile decides · /order claude,codex,muse saves the classic order' : '/order claude,codex,muse changes it';
+          const note = arg ? 'saved' : orchestrating ? 'orchestrator profile decides when fallback is explicit; otherwise this order applies' : '/order claude,codex,muse changes it';
           session.append({kind: 'status', text: `Fallback order: ${reading} · ${note}`});
         } else if (command === 'sidebar') {
           if (!['', 'on', 'off'].includes(arg)) throw new Error('Use /sidebar [on|off]');

@@ -108,7 +108,14 @@ export function createRemoteSession(channel) {
       set(provider) { activeValue = provider; channel.send({type: 'session.active', provider}); },
     });
 
-    const emit = row => { remote.onEvent?.(row); for (const fn of listeners) fn(row); };
+    const emit = row => {
+      if (row.kind === 'main.starting' && row.provider) {
+        activeValue = row.provider;
+        remote.main = {...remote.main, provider: row.provider, model: row.model, mode: row.mode, policy: row.policy, currentTurnId: null, state: 'starting', requestId: row.requestId};
+      }
+      remote.onEvent?.(row);
+      for (const fn of listeners) fn(row);
+    };
 
     // The provisional row is inserted synchronously so events.length/at(-1) reflect
     // it immediately, but it is never delivered to onEvent/subscribers — only the

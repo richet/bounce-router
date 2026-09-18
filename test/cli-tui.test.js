@@ -128,4 +128,17 @@ test('CLI commands and live steering work while the daemon main turn is held', {
   session.append({kind: 'task.completed', task: 'bbb', summary: 'Done'});
   await waitFor(() => session.events.some(row => row.kind === 'note' && row.text?.includes('Unsent draft for worker:aaa')));
   assert.equal(calls.filter(([kind]) => kind === 'run').length, 1, 'retired pane draft never becomes an orchestrator prompt');
+  // A daemon fallback updates both the selected provider and the next turn's model.
+  const requestId = calls.find(([kind]) => kind === 'run')[1].id;
+  const selected = session.append({kind: 'main.starting', provider: 'claude', model: 'fallback-opus', mode: 'plan', requestId, state: 'starting'});
+  for (const fn of listeners) fn(selected);
+  for (const fn of listeners) fn({kind: 'main.terminal', requestId, status: 'completed', state: 'idle'});
+  running = false;
+  child.stdin.write('/agents main\r');
+  await waitFor(() => output.includes('Focused orchestrator pane'));
+  child.stdin.write('next turn\r');
+  await waitFor(() => calls.filter(([kind]) => kind === 'run').length === 2);
+  assert.equal(calls.at(-1)[1].provider, 'claude');
+  assert.equal(calls.at(-1)[1].model, 'fallback-opus');
+
 });

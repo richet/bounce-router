@@ -3,7 +3,7 @@ import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {handoff} from './core.js';
 import {imagePaths, saveImages, providerInput} from './images.js';
-import {tasks, TERMINAL} from './reducers.js';
+import {cooldowns, tasks, TERMINAL} from './reducers.js';
 
 // The rows that end a task for the orchestrator's purposes (mirrors bus.js's TASK_TERMINAL).
 const HANDOFF_KINDS = new Set(['task.completed', 'task.accepted', 'task.failed', 'task.cancelled', 'task.deadline', 'task.rejected']);
@@ -38,11 +38,32 @@ export function handoffBlock(session, ended) {
   return lines.join('\n');
 }
 
-export function createMainService({session, adapters, profile, settings, orchestratorEnv = {}, brief = '', handoffDelayMs = HANDOFF_DELAY_MS}) {
+export function createMainService({session, adapters, profile, settings, profiles = {}, readRouting = () => settings, orchestratorEnv = {}, brief = '', handoffDelayMs = HANDOFF_DELAY_MS}) {
   const listeners = new Set(), native = new Map();
   for (const event of session.events) {
     if (event.kind === 'peer.native' && event.from === 'main') native.set(event.provider, {provider: event.provider, sessionId: event.sessionId});
   }
+  // Profile fallback is daemon-owned; the view may change legacy order/models between turns.
+  function fallbackRoutes(routing) {
+    const explicit = Object.hasOwn(settings.profiles?.[settings.orchestrator] ?? {}, 'fallback');
+    const routes = [], seen = new Set();
+    function add(name) {
+      if (seen.has(name)) return;
+      seen.add(name);
+      const candidate = profiles[name];
+      if (!candidate || candidate.adapter === 'local') return;
+      routes.push({...candidate, model: candidate.model || routing.models?.[candidate.adapter] || ''});
+      for (const next of candidate.fallback ?? []) add(next);
+    }
+    if (explicit) for (const name of profile.fallback ?? []) add(name);
+    else for (const provider of routing.order ?? []) {
+      if (provider !== 'local') routes.push({...profile, adapter: provider, model: routing.models?.[provider] ?? ''});
+    }
+    return routes;
+  }
+  let selection = session.events.findLast(e => e.kind === 'route' && e.from === 'main') ??
+    {provider: profile.adapter, model: profile.model || settings.models?.[profile.adapter] || '', mode: profile.mode, policy: profile.policy};
+  session.active = selection.provider;
   let current = null, closed = false;
   const previousState = session.events.findLast(event => ['main.starting', 'main.started', 'main.terminal', 'main.blocked'].includes(event.kind));
   if (previousState && previousState.kind !== 'main.terminal') {
@@ -50,7 +71,7 @@ export function createMainService({session, adapters, profile, settings, orchest
     session.append({kind: 'main.blocked', from: 'main', requestId: current.id, turnId: current.turnId, state: 'blocked', reason: 'orphaned', text: 'Termination unverified after daemon restart; inspect the previous orchestrator process before continuing'});
   }
   const state = () => ({state: current?.unverified ? 'blocked' : current ? current.handle ? 'running' : 'starting' : 'idle',
-    currentTurnId: current?.turnId ?? null, requestId: current?.id ?? null});
+    provider: selection.provider, model: selection.model, mode: selection.mode, policy: selection.policy, currentTurnId: current?.turnId ?? null, requestId: current?.id ?? null});
   function emit(event) {
     const row = session.append({...event, from: 'main', context: session.id});
     for (const listener of listeners) listener(row);
@@ -74,18 +95,47 @@ export function createMainService({session, adapters, profile, settings, orchest
     if (pendingHandoffs().length) arm();
   }
   async function execute(run, params) {
+    const tried = new Set();
+    const candidates = [run.selected, ...run.routes];
+    for (const candidate of candidates) {
+      if (run.cancelled || closed || run.finished) { finish(run, 'interrupted'); return; }
+      const provider = candidate.adapter;
+      if (tried.has(provider) || !adapters[provider]) continue;
+      tried.add(provider);
+      if (cooldowns(session.events, Date.now())[provider] > Date.now()) continue;
+      run.provider = provider;
+      run.selected = {...profile, ...candidate, role: 'orchestrator',
+        policy: run.selected.policy === 'read-only' || profile.policy === 'read-only' ? 'read-only' : candidate.policy,
+        mode: run.selected.mode === 'plan' || params.mode === 'plan' || profile.mode === 'plan' || candidate.mode === 'plan' ? 'plan' : 'yolo'};
+      run.handle = null;
+      run.turnId = null;
+      selection = {provider, model: run.selected.model ?? '', mode: run.selected.mode, policy: run.selected.policy};
+      session.active = provider;
+      session.append({kind: 'route', from: 'main', ...selection, text: `Orchestrator selected ${provider}`});
+      emit({kind: 'main.starting', ...selection, requestId: run.id, turnId: null, state: 'starting', ...(run.wake ? {handoff: true} : {})});
+      const result = await attempt(run, params);
+      if (run.unverified || run.finished) return;
+      if (run.cancelled || closed) { finish(run, 'interrupted'); return; }
+      if (!['limited', 'missing'].includes(result)) return;
+      run.previousProvider = provider;
+      if (result === 'limited') session.append({kind: 'cooldown', provider,
+        until: Date.now() + (settings.cooldownMinutes ?? 30) * 60000,
+        text: 'Main provider quota exhausted; trying the next eligible provider.'});
+    }
+    finish(run, run.cancelled || closed ? 'interrupted' : 'unavailable', 'No main provider available. Check fallback configuration or clear local cooldowns with /retry.');
+  }
+  async function attempt(run, params) {
     const adapter = adapters[run.provider];
     const dir = path.join(session.dir, 'orchestrator', run.provider);
-    fs.mkdirSync(dir, {recursive: true, mode: 0o700});
-    const selectedProfile = {...profile, adapter: run.provider, model: params.model ?? profile.model ?? '',
-      mode: params.mode ?? profile.mode, executables: settings.executables ?? {}, orchestratorEnv};
+    const selectedProfile = {...run.selected, executables: settings.executables ?? {}, orchestratorEnv};
     let result;
     try {
+      fs.mkdirSync(dir, {recursive: true, mode: 0o700});
       const previous = native.get(run.provider);
       const options = {peer: 'orchestrator', profile: selectedProfile, cwd: session.cwd, dir, userImages: run.images};
       const roster = session.events.findLast(event => event.kind === 'local.profiles.activated')?.text;
       const text0 = run.outcomes ? `${run.outcomes}\n\n${params.text}` : params.text;
-      const prompt = [brief, roster, previous && run.previousProvider === run.provider ? text0 : handoff(session, text0)].filter(Boolean).join('\n');
+      const prompt = [brief, roster, previous && run.previousProvider === run.provider ? text0 : handoff(session, text0, settings.contextChars)].filter(Boolean).join('\n');
       const text = providerInput(run.provider, prompt, run.images);
       run.handle = previous && adapter.resume
         ? await adapter.resume({...options, native: previous, message: text})
@@ -106,6 +156,7 @@ export function createMainService({session, adapters, profile, settings, orchest
           continue;
         }
         if (event.kind === 'result') { result = event; break; }
+        if (event.kind === 'error' && event.code === 'missing') result = {status: 'missing', text: event.text};
         const row = {...event, provider: run.provider, from: 'main', context: session.id};
         if (['delta', 'progress', 'activity'].includes(event.kind)) session.publish(row);
         else session.append(row);
@@ -114,10 +165,19 @@ export function createMainService({session, adapters, profile, settings, orchest
       // writer is admitted. Native identity survives separately for the next turn's resume.
       const stopped = await adapter.cancel(run.handle);
       if (!stopped?.verified) throw new Error('Main provider termination unverified');
-      const status = run.cancelled ? 'interrupted' : result?.status;
+      run.handle = null;
+      if (run.finished) return;
+      const status = run.cancelled || closed ? 'interrupted' : result?.status;
+      if (['limited', 'missing'].includes(status)) return status;
       finish(run, ['completed', 'failed', 'limited', 'interrupted'].includes(status) ? status : 'failed',
         result ? result.text : 'Provider exited without a terminal result');
     } catch (error) {
+      run.handle ??= error.handle;
+      if (error.code === 'limited' && !run.handle) {
+        run.unverified = true;
+        emit({kind: 'main.blocked', requestId: run.id, turnId: run.turnId, state: 'blocked', text: 'Main launch termination unverified: no process handle returned'});
+        return;
+      }
       if (run.handle) {
         const stopped = await adapter.cancel(run.handle).catch(() => ({verified: false}));
         if (!stopped?.verified) {
@@ -126,7 +186,9 @@ export function createMainService({session, adapters, profile, settings, orchest
           return;
         }
       }
-      finish(run, run.cancelled ? 'interrupted' : 'failed', error.message);
+      run.handle = null;
+      if (!run.cancelled && !closed && !run.finished && ['missing', 'limited'].includes(error.code)) return error.code;
+      finish(run, run.cancelled || closed ? 'interrupted' : 'failed', error.message);
     }
   }
   // Root tasks the orchestrator submitted that reached a terminal state and were never handed
@@ -163,12 +225,21 @@ export function createMainService({session, adapters, profile, settings, orchest
     if (params.files !== undefined && (!Array.isArray(params.files) || params.files.some(file => typeof file !== 'string'))) return {accepted: false, reason: 'invalid_attachments'};
     if (params.mode !== undefined && !['yolo', 'plan'].includes(params.mode)) return {accepted: false, reason: 'invalid_mode'};
     if (params.typed !== undefined && (typeof params.typed !== 'string' || !params.typed.startsWith('/'))) return {accepted: false, reason: 'invalid_typed'};
-    const provider = params.provider ?? profile.adapter;
-    if (!adapters[provider]) return {accepted: false, reason: 'unknown_provider'};
+    if (params.routing !== undefined && (!params.routing || !Array.isArray(params.routing.order)
+      || params.routing.order.some(p => !['claude', 'codex', 'muse'].includes(p))
+      || !params.routing.models || typeof params.routing.models !== 'object'
+      || Object.values(params.routing.models).some(m => typeof m !== 'string'))) return {accepted: false, reason: 'invalid_routing'};
+    const provider = params.provider ?? selection.provider;
+    if (provider === 'local' || !adapters[provider]) return {accepted: false, reason: 'unknown_provider'};
     let images;
     try { images = saveImages([...new Set([...(params.files ?? []), ...imagePaths(params.text, session.cwd)])], session); }
     catch (error) { return {accepted: false, reason: error.message}; }
-    const run = {id: params.id ?? randomUUID(), provider, images, wake,
+    let routes;
+    try { routes = fallbackRoutes(params.routing ?? readRouting()); }
+    catch (error) { return {accepted: false, reason: error.message}; }
+    const selected = {...profile, ...(provider === selection.provider ? {mode: selection.mode ?? profile.mode, policy: selection.policy ?? profile.policy} : {}), adapter: provider, model: params.model ??
+      (provider === selection.provider ? selection.model : settings.models?.[provider] ?? '')};
+    const run = {id: params.id ?? randomUUID(), provider, selected, routes, images, wake,
       previousProvider: session.events.findLast(event => event.kind === 'main.starting')?.provider,
       handle: null, turnId: null, cancelled: false, finished: false, started: false};
     // Outcomes are journaled here, synchronously with the prompt row, and the very same text
@@ -184,7 +255,6 @@ export function createMainService({session, adapters, profile, settings, orchest
     current = run;
     session.active = provider;
     if (!wake) session.append({kind: 'user', text: params.text, ...(params.typed ? {typed: params.typed} : {}), ...(images.length ? {images} : {})});
-    emit({kind: 'main.starting', provider, requestId: run.id, state: 'starting', ...(wake ? {handoff: true} : {})});
     run.done = Promise.resolve().then(() => execute(run, {...params}));
     return {accepted: true, requestId: run.id, state: 'started'};
   }

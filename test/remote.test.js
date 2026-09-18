@@ -281,3 +281,16 @@ test('ref race: the broadcast of a ref collision arrives before our own ack — 
   const matchingDeliveries = deliveries.filter(d => d.id === 'parent-row-y');
   assert.equal(matchingDeliveries.length, 1);
 });
+
+test('main provider selection is applied before UI events and survives view replay', async () => {
+  const {channel, remote} = await attachFake();
+  const observed = [];
+  remote.subscribe(row => { if (row.kind === 'main.starting') observed.push([remote.active, remote.main.model]); });
+  const row = {id: 'route-start', seq: 1, kind: 'main.starting', provider: 'codex', model: 'gpt-6-astra', requestId: 'same-request', turnId: null};
+  channel.deliver({type: 'session.event', row});
+  channel.deliver({type: 'main.event', event: row});
+  assert.deepEqual(observed, [['codex', 'gpt-6-astra']]);
+  channel.deliver({type: 'session.replay', events: [row], active: 'codex', mainState: {provider: 'codex', model: 'gpt-6-astra', state: 'idle'}});
+  assert.equal(remote.active, 'codex');
+  assert.equal(remote.main.model, 'gpt-6-astra');
+});
