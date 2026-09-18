@@ -202,10 +202,12 @@ export function createMainService({session, adapters, profile, settings, orchest
     const result = start({text: WAKE_PROMPT}, {wake: true});
     if (!result.accepted && result.reason !== 'busy') session.append({kind: 'status', text: `Worker outcomes not handed to the orchestrator: ${result.reason}; they ride on the next prompt`});
   }
+  // The timer is ref'd on purpose: a pending wake-up is work the daemon owes, not something to
+  // drop if the loop happens to empty (Node 22 does exactly that; an unref'd timer stranded the
+  // outcomes). It cannot outlive the daemon — close() clears it before the bus goes down.
   function arm() {
     if (closed || current || wakeTimer) return;
     wakeTimer = setTimeout(wake, handoffDelayMs);
-    wakeTimer.unref?.();
   }
   const unsubscribeHandoff = session.subscribe(row => {
     if (!HANDOFF_KINDS.has(row.kind) || closed || current || wakeTimer) return;
