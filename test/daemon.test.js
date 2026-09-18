@@ -6,6 +6,7 @@ import path from 'node:path';
 import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {supervise, installControlAuthority, pidAlive} from '../src/reload.js';
+import {createTypesafeLive} from '../src/adapters/typesafe-live.js';
 import {socketPathFor, connectBus} from '../src/bus.js';
 
 const cliPath = fileURLToPath(new URL('../src/cli.js', import.meta.url));
@@ -677,4 +678,43 @@ test('O9 the orchestrator may publish a milestone for the task it submitted, and
   assert.equal(milestone.task, submitted.task);
   assert.equal(milestone.text, 'mine');
   assert.equal(session.events.some(e => e.kind === 'task.milestone' && e.task === 'foreign-task-id'), false);
+});
+
+// Jev (src/jev.js) end to end through the daemon: the config's `jev` block, the registered
+// `jev` critic, the bus's prepare hook, the typesafe adapter on a stubbed fetch, and the
+// orchestrator's wait resolving on the accept — plus the ORDERS.md lines that tell it.
+test('O-jev orchestrator with Jev review on: the root task is Jev-reviewed before its wait resolves, and ORDERS.md says so', async t => {
+  const root = tmpRoot('bounce-ojev-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  writeOrchestratorConfig(root, {profiles: {main: {adapter: 'codex'}, build: {adapter: 'codex', tier: 'mid'}}});
+  const config = JSON.parse(fs.readFileSync(path.join(root, 'config.json'), 'utf8'));
+  fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify({...config, jev: {enabled: true, review: true, routing: false}}));
+  const bodies = [];
+  const fetchImpl = async (url, options) => {
+    bodies.push(JSON.parse(options.body));
+    return {ok: true, status: 200, headers: {get: () => null}, json: async () => ({model: 'jev-1.13.0', answers: {decision: {type: 'choice', choice: 'accept', probabilities: {accept: 0.96, rework: 0.04}, confidence: 0.93}}, usage: {input_tokens: 40, output_tokens: 2}})};
+  };
+  const typesafe = createTypesafeLive({fetchImpl, readKey: () => ({key: 'daemon-test-key-4242', source: 'env'}), readSettings: () => ({enabled: true, model: 'jev-1.13.0', review: true, routing: {enabled: false, default: null}, confidence: 0.8}), git: async () => ''});
+  const session = await runOrchestratorSession(root, {adapters: {codex: completingAdapter(), typesafe}});
+
+  const submitted = session.events.find(e => e.kind === 'task.submitted');
+  assert.deepEqual(submitted.review, {completion: 'jev'}, 'the bus journaled the decorated row');
+  const kinds = session.events.filter(e => e.task === submitted.task).map(e => e.kind);
+  assert.ok(kinds.indexOf('task.completed') < kinds.indexOf('review.started') && kinds.indexOf('review.started') < kinds.indexOf('jev.verdict') && kinds.indexOf('jev.verdict') < kinds.indexOf('task.accepted'), kinds.join(','));
+  const verdict = session.events.find(e => e.kind === 'jev.verdict');
+  assert.equal(verdict.verdict, 'accept');
+  assert.equal(verdict.confidence, 0.93);
+  assert.equal(session.events.find(e => e.kind === 'review.started').profile, 'jev');
+  assert.equal(session.events.some(e => e.kind === 'assistant' && e.text === 'child ended: task.accepted'), true, 'the orchestrator\'s wait resolved on the accept');
+  assert.equal(bodies.length, 1);
+  assert.equal(bodies[0].state.orders, 'child orders');
+  assert.equal(bodies[0].state.report.summary, 'child done');
+  const journal = fs.readFileSync(path.join(session.dir, 'journal.jsonl'), 'utf8');
+  assert.equal(journal.includes('daemon-test-key-4242'), false);
+  assert.equal(fs.readFileSync(path.join(root, 'config.json'), 'utf8').includes('daemon-test-key-4242'), false);
+  const orders = fs.readFileSync(path.join(session.dir, 'orchestrator', 'ORDERS.md'), 'utf8');
+  assert.match(orders, /build → codex \(builder\) \[tier mid\]/);
+  assert.equal(orders.includes('jev →'), false, 'the synthetic reviewer is not a roster entry');
+  assert.match(orders, /auto → Jev routing is off \(\/jev routing on\): resolves to build/);
+  assert.match(orders, /Jev completion verdicts are on/);
 });

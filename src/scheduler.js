@@ -232,7 +232,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // strategy all see an ordinary completion review. An explicit review.completion always wins;
   // with Jev disabled or off for review, the row is untouched and behaviour is exactly today's.
   function prepare(spec) {
-    if (!jev || strategy !== defaultStrategy || !profiles[jev.reviewer]) return spec;
+    const reviewer = jev && profiles[jev.reviewer];
+    if (!reviewer || reviewer.adapter !== 'typesafe' || !READONLY_ROLES.has(reviewer.role) || strategy !== defaultStrategy) return spec;
     if (spec.parent != null || spec.review?.completion) return spec;
     let settings;
     try { settings = jev.settings(); } catch { return spec; }

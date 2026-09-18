@@ -15,7 +15,7 @@ import {runLocalSetup} from './local-wizard.js';
 import {createLocalSetupView} from './local-setup-view.js';
 import {activateLocalProfiles} from './local-activation.js';
 import {jevCommand} from './jev-command.js';
-import {jevSidebarLabel, writeJevKey} from './jev.js';
+import {jevSidebarLabel} from './jev.js';
 import {createInterface} from 'node:readline';
 import {inspectLocalToolchain, prepareLocalToolchain} from './local-toolchain.js';
 import stringWidth from 'string-width';

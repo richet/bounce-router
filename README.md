@@ -186,7 +186,7 @@ Enabling it with no profile table installs a starter one: `main` on your first p
 }
 ```
 
-- `adapter` is `claude`, `codex`, `muse` or `local`; `model` is passed through to that CLI. `orchestrator` names the profile that coordinates; its role is derived, never declared.
+- `adapter` is `claude`, `codex`, `muse`, `local` or `typesafe`; `model` is passed through to that CLI. `orchestrator` names the profile that coordinates; its role is derived, never declared. An optional `tier` (`cheapest`, `mid`, `strongest`) is shown in the roster and read by [Jev routing](#jev-typesafe-decisions).
 - `role` is a free label (default `builder`) the orchestrator sees beside each profile. `critic`, `verifier` and `analyst` default to `policy: read-only`; any other role defaults to `write`. A read-only profile is never escalated: a task that needs writes is refused rather than downgraded.
 - `mode` (`yolo` or `plan`) defaults to the session mode and may not exceed it. Execution policy only ratchets down across dispatch, fallback and review.
 - `fallback` lists profiles to try, in order, when the first one's provider is exhausted or missing. Role and policy are preserved across a fallback.
@@ -227,6 +227,27 @@ bounce local prepare [IMAGE]     # cache Linux npm dependencies for the containe
 In the TUI, `/local setup` runs the same wizard without interrupting running agents (`/local setup loaded` limits it to already-loaded models; `/local cancel` abandons it), `/local activate [NAME]` brings saved local workers into the current session without a restart, and `/model worker PROFILE [auto|endpoint/model|refresh]` picks the model a worker uses — `prefer`/`exclude REF,REF` edit its preferences, `--save` persists any of these.
 
 Endpoints live under `local.endpoints` in `config.json`; the default is `lmstudio` at `http://127.0.0.1:1234`, `loadPolicy: loaded-only` (a downloaded model that is not loaded is not eligible) and `maxConcurrent: 3`. Eligibility is checked at dispatch, so the orchestrator is told when no model is available rather than handed a cloud worker instead. `localOptions` bounds each run: `maxSteps` (32), `maxOutputTokens` (2048), `timeoutMs` (120000) and `maxContextBytes` (200000).
+
+## Jev (TypeSafe) decisions
+
+Optional, off by default. [Jev](https://docs.typesafe.ai) is TypeSafe's decision model: it answers typed questions over a state in ~150 ms and returns probabilities and a confidence, never text. bounce uses it for two harness decisions, both gated on confidence so an unconfident answer means today's behaviour, and both skipped — with a `jev.skipped` row saying why — whenever the key is missing or the API is unreachable, times out (10 s), or errors (one retry on 429/529).
+
+    /jev                  status: enabled?, key (last 4 chars), model, review/routing flags
+    /jev key [KEY|clear]  store the key in ~/.bounce/secrets.json (0600); no KEY opens a masked prompt
+    /jev on | off         enable or disable everything Jev does
+    /jev review on|off    completion verdicts (default on when enabled)
+    /jev routing on|off   model routing for "profile":"auto" (default off when enabled)
+    /jev model ID         default jev-1.13.0 — pinned, because an alias like jev-latest moves between releases and shifts the calibrated thresholds
+    /jev confidence N     threshold, default 0.8
+    /jev test             one live noul call ("Is this a test?"): latency and the answer, or the error
+
+`/typesafe` is an alias; `bounce jev …` is the headless twin. The key never enters `config.json` or a journal.
+
+**Completion verdicts.** With `jev.enabled` and `jev.review`, a root task submitted without a `review.completion` profile is reviewed by Jev before it is accepted: the state is the orders, the worker's final report, the `git diff` of the tree against the task's start (bounded to ~24k tokens) and the test-result lines found in the report; the questions are one accept/rework choice plus narrow yes/no checks (diff outside the owned paths, forbidden files changed, tests claimed without output, work named as remaining, an acceptance criterion unmet, unverified claims, an empty diff). A `rework` with confidence ≥ the threshold takes the same path a critic's rework does — one rework round to the same worker with the checks that fired as its must-fix list; anything else accepts. The verdict is journaled (`jev.verdict`, probabilities and confidence, never the request) and shown like any review verdict. An explicit `review.completion` always wins, and only the default strategy is decorated.
+
+**Model routing.** With `jev.routing`, the orchestrator may submit `"profile":"auto"`: bounce classifies the orders against the roster — a choice over each profile's adapter/model/role/policy and `tier`, plus whether the orders need write or shell access — and dispatches the top pick when it is confident and its policy fits; otherwise `jev.routing.default` (`/jev routing default NAME`) or the first writing builder that is not the orchestrator. With routing off or Jev unavailable, `auto` resolves to that same fallback, so an orchestrator that uses it never breaks. Each decision is a `jev.routed` row.
+
+A `typesafe` profile can also be declared in `config.json` (`{"adapter": "typesafe", "role": "critic"}`) and named as a `review.completion` reviewer explicitly; it is always read-only and never runs a task.
 
 ## Skills
 
@@ -305,7 +326,8 @@ The fallback order in the header carries each agent's short reading, e.g. `claud
 
 `~/.bounce` (override with `BOUNCE_HOME`). A `~/.localrouter` directory left by the previous name is moved to `~/.bounce` on first launch, keeping existing config, sessions and quota readings:
 
-- `config.json`: order, mode, per-provider models, cooldownMinutes, contextChars, executable overrides, skill scope and auto-sync; in orchestrator mode also `operation`, `orchestrator`, `profiles`, `strategy`, `strict` and `local`.
+- `config.json`: order, mode, per-provider models, cooldownMinutes, contextChars, executable overrides, skill scope and auto-sync, `jev` (never its key); in orchestrator mode also `operation`, `orchestrator`, `profiles`, `strategy`, `strict` and `local`.
+- `secrets.json` (0600): the TypeSafe API key stored by `/jev key`; `TYPESAFE_API_KEY` in the environment overrides it.
 - `skills/<name>/SKILL.md`: the skills bounce manages and installs into every agent.
 - `quota.json`: the latest usage reading each agent reported, kept across restarts.
 - `sessions/<uuid>/journal.jsonl`: append-only normalized and raw events.

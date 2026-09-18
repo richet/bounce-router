@@ -10,11 +10,19 @@ to use it. Do not read bounce's own source to learn the bridge.
 Workers are **profiles**, declared in `config.json` and listed in your ORDERS.md as
 `name → adapter/model (role)`:
 
-- `adapter` is `claude`, `codex`, `muse` or `local`; `model` is passed through to that CLI.
+- `adapter` is `claude`, `codex`, `muse`, `local` or `typesafe`; `model` is passed through to
+  that CLI. A `typesafe` profile is Jev, a decision model: it can only ever be a completion
+  reviewer, never carry out a task.
 - `role` is a free label, default `builder`. `critic`, `verifier` and `analyst` default to
-  `policy: read-only`, and so does every `local` profile whatever its role; anything else
-  defaults to `write`.
+  `policy: read-only`, and so does every `local` or `typesafe` profile whatever its role;
+  anything else defaults to `write`. A profile may also declare a cost `tier`
+  (`cheapest`, `mid`, `strongest`), shown in the roster as `[tier …]`.
 - The profile named by `orchestrator` is you. You cannot submit to yourself.
+- `auto` is a routing pseudo-profile, listed in the roster when the session can resolve it:
+  with Jev routing on (`/jev routing on`), bounce classifies the orders against the roster
+  and picks the profile whose adapter/model/role/policy/tier fits, falling back to the named
+  default builder when unconfident or when the pick cannot write what the orders need; with
+  routing off, `auto` simply resolves to that default builder, so it never breaks a submit.
 
 Map the skill's tiers onto the roster you were given:
 
@@ -64,6 +72,12 @@ where the tier table sends the strongest tier — and the submission is refused 
 `steps` without it. A verifier is handed `steps` alone as its orders, so write them to stand
 on their own: what to run, and what the result has to be. In a strict session both review
 stages are required too, and a submission missing either is refused with reason `review`.
+
+When Jev completion verdicts are on (ORDERS.md says so), a root task you submit without a
+`completion` reviewer is checked by Jev before it is accepted — a fast accept/rework decision
+over the orders, the worker's final report and its diff — and a confident `rework` sends the
+same worker one rework round with the failed checks as its must-fix list; naming your own
+`completion` profile replaces it. You never name `jev` yourself.
 
 The publish reply carries the task id. `wait` follows replacements and waits for completion
 review when one is configured. Read the returned row's `kind`:
