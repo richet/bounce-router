@@ -127,7 +127,7 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
   const who = e => [role?.(e) ?? null, e.provider || 'Bounce'].filter(Boolean).join(' · ');
   function event(e, width) {
     // `model` carries no text: it is what the header's model label reads, not a transcript row.
-    if (['raw', 'usage', 'model', 'peer.native', 'peer.joined', 'task.attempt.ended', 'task.report.staged', 'checkpoint'].includes(e.kind) || e.kind.startsWith('budget.')) return [];
+    if (['raw', 'usage', 'model', 'peer.native', 'peer.joined', 'task.attempt.ended', 'task.report.staged', 'checkpoint', 'wait.served'].includes(e.kind) || e.kind.startsWith('budget.')) return [];
     if (e.kind === 'attempt' && e.status === 'started') return event({...e, kind: 'status', text: 'Starting provider…'}, width);
     if (e.kind.startsWith('main.')) {
       const label = {'main.starting': 'Starting', 'main.started': 'Running', 'main.terminal': 'Finished', 'main.blocked': 'Blocked', 'main.delivery': 'Message'}[e.kind] ?? 'Orchestrator';
@@ -353,7 +353,7 @@ export function taskTree(events) {
 // The legacy conversation kinds a context pane shows directly; every other kind either folds
 // (task.submitted, into a single row) or is invisible here (task.activity and friends are live-
 // only and never reach session.events at all — see src/core.js LIVE_KINDS).
-const FOLDED_THREAD_KINDS = new Set(['user', 'assistant', 'delta', 'tool', 'error', 'note', 'aside', 'route', 'turn', 'status', 'review']);
+const FOLDED_THREAD_KINDS = new Set(['user', 'assistant', 'delta', 'tool', 'error', 'note', 'aside', 'route', 'turn', 'status', 'review', 'handoff']);
 // A row with no context at all predates the context field (pre-Phase-1 journals) and only ever
 // occurred at the session root, so it always belongs wherever it is asked for.
 const belongsToContext = (row, context) => row.context === context || row.context === undefined;

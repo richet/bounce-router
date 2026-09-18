@@ -1,3 +1,4 @@
+import './helpers/env.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -133,4 +134,37 @@ test('D7 (real CLI) bridge invocations create no BOUNCE_HOME session directory',
   // creates a Session of its own.
   assert.equal(fs.existsSync(path.join(bounceHome, 'sessions')), false);
   void busRoot;
+});
+
+// The generated ORDERS.md example is `--timeout 3600`; the bus caps one wait at 600 s and
+// answered it with -32602 (observed live). The bridge now re-arms the wait in chunks.
+test('wait past the bus cap: an existing row answers at once, and a row landing between chunks is returned', async t => {
+  const {bus} = await setup(t);
+  const grant = bus.grant({peer: 'worker:x', tasks: ['t1']});
+  const env = {BOUNCE_BUS: bus.path, BOUNCE_BUS_TOKEN_FILE: grant.file};
+  await bridgeCommand(['publish', '--event', JSON.stringify({kind: 'task.milestone', task: 't1', text: 'early'})], env);
+  const existing = await bridgeCommand(['wait', '--match', JSON.stringify({kind: 'task.milestone', task: 't1'}), '--timeout', '3600', '--json'], env);
+  assert.equal(existing.exitCode, 0);
+  assert.equal(JSON.parse(existing.stdout).text, 'early');
+  const afterSeq = JSON.parse(existing.stdout).seq;
+  const waiting = bridgeCommand(['wait', '--match', JSON.stringify({kind: 'task.milestone', task: 't1'}), '--timeout', '2', '--after-seq', String(afterSeq), '--json'], env, {waitChunkMs: 30});
+  await new Promise(resolve => setTimeout(resolve, 100)); // several 30 ms chunks have expired by now
+  await bridgeCommand(['publish', '--event', JSON.stringify({kind: 'task.milestone', task: 't1', text: 'late'})], env);
+  const late = await waiting;
+  assert.equal(late.exitCode, 0);
+  assert.equal(JSON.parse(late.stdout).text, 'late');
+  const expired = await bridgeCommand(['wait', '--match', JSON.stringify({kind: 'nope'}), '--timeout', '0.1'], env, {waitChunkMs: 30});
+  assert.equal(expired.exitCode, 1);
+  assert.equal(expired.stdout.trim(), 'null');
+});
+
+test('a task.* row published without its task is refused as invalid, naming the field, never as unauthorized', async t => {
+  const {bus} = await setup(t);
+  const grant = bus.grant({peer: 'orchestrator', canSubmit: true, tasks: ['t1']});
+  const env = {BOUNCE_BUS: bus.path, BOUNCE_BUS_TOKEN_FILE: grant.file};
+  const result = await bridgeCommand(['publish', '--event', JSON.stringify({kind: 'task.milestone', phase: 'inspect', text: 'looked', next: 'plan'})], env);
+  assert.equal(result.exitCode, 3);
+  assert.equal(result.stdout.trim(), 'bounce: -32602 invalid event: task.milestone requires task');
+  const foreign = await bridgeCommand(['publish', '--event', JSON.stringify({kind: 'task.milestone', task: 'not-mine', text: 'x'})], env);
+  assert.equal(foreign.stdout.trim(), 'bounce: -32001 unauthorized');
 });

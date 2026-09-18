@@ -1,3 +1,4 @@
+import '../helpers/env.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -281,4 +282,18 @@ test('muse-live: a launched process sees no BOUNCE_BUS* or BOUNCE_REMOTE_SESSION
   const events = await collect(adapter, handle);
   assert.deepEqual(JSON.parse(events.find(e => e.kind === 'delta').text),
     {bus: 'none', token: 'none', remote: 'none', busKeys: []});
+});
+
+// A terminal line whose reason is the vendor's quota text ends as `limited` (the exit-code path
+// above already did; the in-stream error path now classifies with the same limitPattern).
+test('muse-live: a run.terminal.failed whose reason is a usage limit becomes a limited result', async t => {
+  const root = tmp(t), dir = path.join(root, 'task-12');
+  const script = 'for (const line of [' +
+    JSON.stringify(JSON.stringify({payload_type: 'run.terminal.failed', payload: {terminal: 'failed', reason: 'usage limit reached for this account', run_id: 'r-1'}})) +
+    ']) console.log(line);';
+  const spawn = (executable, args, options) => nodeSpawn(process.execPath, ['-e', script], options);
+  const adapter = createMuseLive({spawn});
+  const handle = await adapter.launch({peer: {}, profile: {}, orders: 'o', cwd: root, dir});
+  const events = await collect(adapter, handle);
+  assert.deepEqual(events.filter(e => e.kind === 'result'), [{kind: 'result', text: 'usage limit reached for this account', status: 'limited'}]);
 });
