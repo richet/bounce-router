@@ -120,7 +120,7 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     `    BOUNCE_BUS_TOKEN_FILE=${grant.file}`, '',
     'Worker profiles you can submit to (name → adapter/model):',
     ...Object.entries(profiles).filter(([name]) => name !== orchestrator && name !== JEV_REVIEWER).map(([name, p]) => `    ${name} → ${[p.adapter, p.model].filter(Boolean).join('/')}${p.role ? ` (${p.role})` : ''}${p.tier ? ` [tier ${p.tier}]` : ''}`),
-    ...(autoFallback ? [`    auto → ${routingOn ? 'Jev (TypeSafe) routes each task to the profile above that fits its orders; unconfident picks go to' : 'Jev routing is off (/jev routing on): resolves to'} ${autoFallback}`] : []),
+    ...(jev && autoFallback ? [`    auto → ${routingOn ? 'Jev (TypeSafe) routes each task to the profile above that fits its orders; unconfident picks go to' : 'Jev routing is off (/jev routing on): resolves to'} ${autoFallback}`] : []),
     ...Object.entries(profiles).filter(([, profile]) => profile.adapter === 'local').map(([name, profile]) =>
       `    ${name}: LM Studio endpoint=${profile.endpoint}, model=${profile.model || 'auto'}, policy=${profile.policy}; reads=${JSON.stringify(profile.readPaths)}, writes=${JSON.stringify(profile.writePaths)}, commands=${JSON.stringify(profile.commands)}, localOnly=${profile.localOnly}. Commands use isolated Docker-compatible containers; no host shell fallback.`),
     'Local discovery checks eligibility at dispatch. A downloaded model is not necessarily loaded or tool-capable.',
@@ -131,7 +131,7 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     '',
     'Submit work with `bounce publish --event <json>` and wait for it with `bounce wait --match <json>`.',
     'Example — submit one task, then wait for it to end:',
-    `    bounce publish --event '{"kind":"task.submitted","parent":null,"profile":"${Object.keys(profiles).find(n => n !== orchestrator) ?? 'build'}","orders":"<goal, owned paths, acceptance, how to verify>","deadline":3600000}'`,
+    `    bounce publish --event '{"kind":"task.submitted","parent":null,"profile":"${Object.keys(profiles).find(n => n !== orchestrator && n !== JEV_REVIEWER) ?? 'build'}","orders":"<goal, owned paths, acceptance, how to verify>","deadline":3600000}'`,
     `    bounce wait --match '{"kind":"task.completed","task":"<task id from the publish reply>"}' --timeout 3600`,
     'Fields: parent (null for a root task), profile (a name above), orders (the brief, required), deadline (ms, optional),',
     'depends_on (task ids, optional), review ({"prelaunch": <profile>, "completion": <profile>}, optional, review-role profiles only),',
@@ -268,7 +268,10 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
     catch (error) { notable = [{skill: 'bundled skills', action: 'failed', detail: error.message}]; }
     if (notable.length) session.append({kind: 'status', text: seedSummary(notable)});
   }
-  const orders = () => writeOrders({session, root, bus, grant: orchestratorGrant, profiles, orchestrator: orchestration.orchestrator, jev: readJevSettings(root)});
+  // ORDERS.md mentions Jev (the `auto` roster line) only when config.json has a `jev` block at
+  // all: without one the generated brief is exactly today's.
+  const jevBlock = () => { try { return JSON.parse(fs.readFileSync(path.join(root, 'config.json'), 'utf8')).jev !== undefined; } catch { return false; } };
+  const orders = () => writeOrders({session, root, bus, grant: orchestratorGrant, profiles, orchestrator: orchestration.orchestrator, jev: jevBlock() ? readJevSettings(root) : null});
   if (orchestrating) orders();
   if (orchestrating) session.append({kind: 'operation', operation: 'orchestrator', orchestrator: orchestration.orchestrator, shape: orchestration.shape, text: `Operation: orchestrator on ${orchestration.orchestrator} (${orchestration.shape})`});
   const main = orchestrating && positionals[0] !== 'run' ? createMainService({session, adapters, profile: orchestratorProfile, settings,

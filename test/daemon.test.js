@@ -543,6 +543,11 @@ test('O2 orchestrator single-provider: the orchestrator submits over the bridge,
   assert.equal(orders.includes('steps (the verification steps, as text) — required when the completion reviewer is a verifier profile'), true);
   assert.equal(orders.includes('phase, text, next, and evidence'), true, 'workers receive the durable progress checkpoint contract');
   assert.equal(orders.includes('initial inspection, every phase change, and before completion'), true, 'checkpoint cadence is explicit');
+  // No `jev` block in config.json: the brief is exactly today's — no auto roster line, no Jev
+  // sentence, and the synthetic reviewer is neither a submit target nor the example's profile.
+  assert.equal(orders.includes('auto →'), false);
+  assert.equal(/jev/i.test(orders), false);
+  assert.equal(orders.includes('"profile":"build"'), true);
 });
 
 test('O3 the orchestrator grant cannot publish a user row (even with `from` omitted) nor control.stop', async t => {
@@ -717,4 +722,6 @@ test('O-jev orchestrator with Jev review on: the root task is Jev-reviewed befor
   assert.equal(orders.includes('jev →'), false, 'the synthetic reviewer is not a roster entry');
   assert.match(orders, /auto → Jev routing is off \(\/jev routing on\): resolves to build/);
   assert.match(orders, /Jev completion verdicts are on/);
+  assert.equal(orders.includes('"profile":"build"'), true, 'the example never names the synthetic reviewer');
+  assert.equal('head' in session.events.find(e => e.kind === 'task.started'), true, 'the Jev-reviewed task records its diff base');
 });
