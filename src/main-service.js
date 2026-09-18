@@ -3,9 +3,42 @@ import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {handoff} from './core.js';
 import {imagePaths, saveImages, providerInput} from './images.js';
-import {tasks} from './reducers.js';
+import {tasks, TERMINAL} from './reducers.js';
 
-export function createMainService({session, adapters, profile, settings, orchestratorEnv = {}, brief = ''}) {
+// The rows that end a task for the orchestrator's purposes (mirrors bus.js's TASK_TERMINAL).
+const HANDOFF_KINDS = new Set(['task.completed', 'task.accepted', 'task.failed', 'task.cancelled', 'task.deadline', 'task.rejected']);
+const HANDOFF_TEXT_MAX = 2000; // per task: a final report summary or failure text, never a transcript
+const HANDOFF_DELAY_MS = 1000; // several tasks ending together become one wake-up turn
+const WAKE_PROMPT = 'Continue your orders. The worker outcomes above ended while you were idle and have not been reported to the user: synthesize them now (what each task produced, what failed and why, what remains). If a task you still need is listed as running, wait on it with `bounce wait` before reporting. Do not re-run finished work.';
+
+// A task is the orchestrator's when the root of its `replaces` lineage was submitted by the
+// orchestrator peer: a fallback replacement is journaled by the scheduler (`from: bounce`), yet
+// it is the same work the orchestrator asked for and is what its `wait` follows.
+function orchestratorsTask(session, view, id) {
+  const seen = new Set();
+  while (view[id]?.replaces && view[view[id].replaces] && !seen.has(id)) { seen.add(id); id = view[id].replaces; }
+  return session.events.find(e => e.kind === 'task.submitted' && e.task === id)?.from === 'orchestrator';
+}
+const replaced = (session, id) => session.events.some(e => e.kind === 'task.submitted' && e.replaces === id && e.task !== id);
+
+// The wake-up block: one entry per task that ended since the orchestrator last went idle, with
+// the terminal row's outcome — the final report summary (task.reported, folded by the scheduler
+// into task.completed's `summary`) or the failure text — and the roots still running.
+export function handoffBlock(session, ended) {
+  const view = tasks(session.events);
+  const running = Object.values(view).filter(t => !t.parent && !TERMINAL.has(t.state) && orchestratorsTask(session, view, t.id));
+  const lines = ['Worker outcomes since your last turn (delivered by bounce, not typed by the user):'];
+  for (const row of ended) {
+    const t = view[row.task] ?? {};
+    const outcome = row.summary ?? row.text ?? (Array.isArray(row.questions) && row.questions.length ? row.questions.join('; ') : null) ?? t.summary ?? t.error ?? '';
+    lines.push(`- task ${row.task} · profile ${t.profile ?? '?'} · ${row.kind}${row.reason ? ` · reason: ${row.reason}` : ''}${t.replaces ? ` · replaces ${t.replaces}` : ''}`);
+    if (outcome) lines.push(`  ${String(outcome).slice(0, HANDOFF_TEXT_MAX).replace(/\n/g, '\n  ')}`);
+  }
+  lines.push(running.length ? `Still running: ${running.map(t => `${t.id} (${t.profile}, ${t.state})`).join(', ')}` : 'No other task of yours is still running.');
+  return lines.join('\n');
+}
+
+export function createMainService({session, adapters, profile, settings, orchestratorEnv = {}, brief = '', handoffDelayMs = HANDOFF_DELAY_MS}) {
   const listeners = new Set(), native = new Map();
   for (const event of session.events) {
     if (event.kind === 'peer.native' && event.from === 'main') native.set(event.provider, {provider: event.provider, sessionId: event.sessionId});
@@ -40,7 +73,8 @@ export function createMainService({session, adapters, profile, settings, orchest
       const previous = native.get(run.provider);
       const options = {peer: 'orchestrator', profile: selectedProfile, cwd: session.cwd, dir, userImages: run.images};
       const roster = session.events.findLast(event => event.kind === 'local.profiles.activated')?.text;
-      const prompt = [brief, roster, previous && run.previousProvider === run.provider ? params.text : handoff(session, params.text)].filter(Boolean).join('\n');
+      const text0 = run.outcomes ? `${run.outcomes}\n\n${params.text}` : params.text;
+      const prompt = [brief, roster, previous && run.previousProvider === run.provider ? text0 : handoff(session, text0)].filter(Boolean).join('\n');
       const text = providerInput(run.provider, prompt, run.images);
       run.handle = previous && adapter.resume
         ? await adapter.resume({...options, native: previous, message: text})
@@ -82,32 +116,80 @@ export function createMainService({session, adapters, profile, settings, orchest
       finish(run, run.cancelled ? 'interrupted' : 'failed', error.message);
     }
   }
+  // Root tasks the orchestrator submitted that reached a terminal state since it last went idle
+  // (rows after the last main.terminal): the ones nobody has told it about. Log-derived, so a
+  // daemon restart or a turn that never saw them changes nothing; one entry per task, its last
+  // terminal row. A task that ended while a turn was running is not here: the orchestrator was
+  // awake to `wait` on it, and re-announcing it would cost a whole turn. A failure the scheduler
+  // has already replaced (policy.fallback) is not an outcome yet: its replacement's end is.
+  function pendingHandoffs() {
+    const idleSeq = session.events.findLast(event => event.kind === 'main.terminal')?.seq ?? 0;
+    const view = tasks(session.events);
+    const byTask = new Map();
+    for (const row of session.events) {
+      if (!HANDOFF_KINDS.has(row.kind) || (row.seq ?? 0) <= idleSeq) continue;
+      const t = view[row.task];
+      if (!t || t.parent || !TERMINAL.has(t.state) || replaced(session, row.task) || !orchestratorsTask(session, view, row.task)) continue;
+      byTask.set(row.task, row);
+    }
+    return [...byTask.values()];
+  }
+  function start(params, {wake}) {
+    if (closed) return {accepted: false, reason: 'daemon_closed'};
+    if (current) return {accepted: false, reason: current.unverified ? 'termination_unverified' : 'busy'};
+    if (Object.values(tasks(session.events)).some(t => t.state === 'blocked' && session.events.findLast(e => e.task === t.id && e.kind === 'task.blocked')?.reason === 'orphaned')) return {accepted: false, reason: 'termination_unverified'};
+    if (typeof params?.text !== 'string' || !params.text.trim()) return {accepted: false, reason: 'empty_prompt'};
+    if (params.files !== undefined && (!Array.isArray(params.files) || params.files.some(file => typeof file !== 'string'))) return {accepted: false, reason: 'invalid_attachments'};
+    if (params.mode !== undefined && !['yolo', 'plan'].includes(params.mode)) return {accepted: false, reason: 'invalid_mode'};
+    if (params.typed !== undefined && (typeof params.typed !== 'string' || !params.typed.startsWith('/'))) return {accepted: false, reason: 'invalid_typed'};
+    const provider = params.provider ?? profile.adapter;
+    if (!adapters[provider]) return {accepted: false, reason: 'unknown_provider'};
+    let images;
+    try { images = saveImages([...new Set([...(params.files ?? []), ...imagePaths(params.text, session.cwd)])], session); }
+    catch (error) { return {accepted: false, reason: error.message}; }
+    const run = {id: params.id ?? randomUUID(), provider, images,
+      previousProvider: session.events.findLast(event => event.kind === 'main.starting')?.provider,
+      handle: null, turnId: null, cancelled: false, finished: false};
+    // Outcomes are journaled here, synchronously with the prompt row, and the very same text
+    // is what execute() prepends — the log and the prompt can never disagree about what the
+    // orchestrator was told. A typed prompt carries them too (`wake: false`): the user's own
+    // turn is never raced by a synthetic one.
+    const ended = pendingHandoffs();
+    if (ended.length) {
+      run.outcomes = handoffBlock(session, ended);
+      session.append({kind: 'handoff', wake, tasks: ended.map(row => row.task), text: wake ? `${run.outcomes}\n\n${params.text}` : run.outcomes, from: 'bounce'});
+    }
+    current = run;
+    session.active = provider;
+    if (!wake) session.append({kind: 'user', text: params.text, ...(params.typed ? {typed: params.typed} : {}), ...(images.length ? {images} : {})});
+    emit({kind: 'main.starting', provider, requestId: run.id, state: 'starting', ...(wake ? {handoff: true} : {})});
+    run.done = Promise.resolve().then(() => execute(run, {...params}));
+    return {accepted: true, requestId: run.id, state: 'started'};
+  }
+  // Wake-up on a terminal row: the daemon owns the main agent, so when it is idle and a task it
+  // submitted ends, the daemon starts the next turn itself — the user never has to ask "what
+  // happened?". Coalesced over a short window; a user prompt that lands first wins (start()
+  // gives it the same block) and the timer finds nothing left to do. Classic mode never
+  // constructs this service (reload.js), so nothing here can fire outside orchestrator mode.
+  let wakeTimer = null;
+  function wake() {
+    wakeTimer = null;
+    if (closed || current) return;
+    const ended = pendingHandoffs();
+    if (!ended.length) return;
+    const result = start({text: WAKE_PROMPT}, {wake: true});
+    if (!result.accepted && result.reason !== 'busy') session.append({kind: 'status', text: `Worker outcomes not handed to the orchestrator: ${result.reason}; they ride on the next prompt`});
+  }
+  const unsubscribeHandoff = session.subscribe(row => {
+    if (!HANDOFF_KINDS.has(row.kind) || closed || current || wakeTimer) return;
+    if (!pendingHandoffs().some(ended => ended.task === row.task)) return;
+    wakeTimer = setTimeout(wake, handoffDelayMs);
+    wakeTimer.unref?.();
+  });
   const service = {
     state,
     subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
-    run(params) {
-      if (closed) return {accepted: false, reason: 'daemon_closed'};
-      if (current) return {accepted: false, reason: current.unverified ? 'termination_unverified' : 'busy'};
-      if (Object.values(tasks(session.events)).some(t => t.state === 'blocked' && session.events.findLast(e => e.task === t.id && e.kind === 'task.blocked')?.reason === 'orphaned')) return {accepted: false, reason: 'termination_unverified'};
-      if (typeof params?.text !== 'string' || !params.text.trim()) return {accepted: false, reason: 'empty_prompt'};
-      if (params.files !== undefined && (!Array.isArray(params.files) || params.files.some(file => typeof file !== 'string'))) return {accepted: false, reason: 'invalid_attachments'};
-      if (params.mode !== undefined && !['yolo', 'plan'].includes(params.mode)) return {accepted: false, reason: 'invalid_mode'};
-      if (params.typed !== undefined && (typeof params.typed !== 'string' || !params.typed.startsWith('/'))) return {accepted: false, reason: 'invalid_typed'};
-      const provider = params.provider ?? profile.adapter;
-      if (!adapters[provider]) return {accepted: false, reason: 'unknown_provider'};
-      let images;
-      try { images = saveImages([...new Set([...(params.files ?? []), ...imagePaths(params.text, session.cwd)])], session); }
-      catch (error) { return {accepted: false, reason: error.message}; }
-      const run = {id: params.id ?? randomUUID(), provider, images,
-        previousProvider: session.events.findLast(event => event.kind === 'main.starting')?.provider,
-        handle: null, turnId: null, cancelled: false, finished: false};
-      current = run;
-      session.active = provider;
-      session.append({kind: 'user', text: params.text, ...(params.typed ? {typed: params.typed} : {}), ...(images.length ? {images} : {})});
-      emit({kind: 'main.starting', provider, requestId: run.id, state: 'starting'});
-      run.done = Promise.resolve().then(() => execute(run, {...params}));
-      return {accepted: true, requestId: run.id, state: 'started'};
-    },
+    run(params) { return start(params, {wake: false}); },
     async deliver({id = randomUUID(), text, expectedTurnId}) {
       const run = current;
       if (!run?.handle || run.finished || run.cancelled) return {state: 'failed', reason: 'no_active_turn'};
@@ -139,6 +221,8 @@ export function createMainService({session, adapters, profile, settings, orchest
     async close() {
       closed = true;
       unsubscribeRoster();
+      unsubscribeHandoff();
+      if (wakeTimer) { clearTimeout(wakeTimer); wakeTimer = null; }
       const run = current;
       if (!run) return {verified: true};
       if (run.orphaned) return {verified: false};

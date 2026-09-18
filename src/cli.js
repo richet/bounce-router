@@ -659,6 +659,13 @@ async function main() {
   }
   let renderTimer;
   function scheduleRender(event) {
+    // A turn this view did not start — the daemon waking the orchestrator on worker outcomes
+    // (main-service.js) — is held exactly like a turn found running at attach: new prompts are
+    // refused with a notice, /btw steers it, Esc cancels it, its terminal row releases the input.
+    if (remoteMain && !busy && event?.kind === 'main.starting') {
+      attachedTurn = true; busy = true;
+      notice = event.handoff ? 'Orchestrator woke on worker outcomes · /btw steers it, Esc cancels' : 'Existing turn is active · use /btw to steer it';
+    }
     if (attachedTurn && ['main.terminal', 'main.blocked'].includes(event?.kind)) {
       attachedTurn = false;
       busy = false;

@@ -123,7 +123,8 @@ export function gitSnapshot(cwd) {
 }
 export function handoff(session, prompt, budget = 48000) {
   const git = gitSnapshot(session.cwd);
-  const relevant = session.events.filter(e => ['user', 'assistant', 'delta', 'tool', 'error', 'note'].includes(e.kind));
+  // `handoff` rows are the worker outcomes bounce itself put in front of the orchestrator (main-service.js).
+  const relevant = session.events.filter(e => ['user', 'assistant', 'delta', 'tool', 'error', 'note', 'handoff'].includes(e.kind));
   const original = relevant.find(e => e.kind === 'user')?.text ?? prompt;
   const notes = relevant.filter(e => e.kind === 'note').slice(-10).map(e => e.text).join('\n').slice(-8000);
   const history = relevant.map(e => `[${e.kind}${e.provider ? ':' + e.provider : ''}] ${String(e.text).slice(0, 5000) + (e.images?.length ? '\nSaved images: ' + e.images.map(i => i.path).join(', ') : '')}`).join('\n');
