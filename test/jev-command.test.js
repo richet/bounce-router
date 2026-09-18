@@ -12,7 +12,8 @@ const setup = t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-jev-cmd-'));
   t.after(() => fs.rmSync(root, {recursive: true, force: true}));
   const file = path.join(root, 'config.json');
-  const settings = {order: ['claude'], mode: 'yolo', profiles: {main: {adapter: 'claude'}, build: {adapter: 'codex'}}};
+  // An orchestrator config whose overlay names only `build`; the rest of the roster is shipped.
+  const settings = {operation: 'orchestrator', order: ['claude'], mode: 'yolo', profiles: {main: {adapter: 'claude'}, build: {adapter: 'codex'}}};
   const saves = [];
   const save = () => { saves.push(structuredClone(settings)); fs.writeFileSync(file, JSON.stringify(settings)); };
   const run = (line, extra = {}) => jevCommand(line.split(/\s+/).filter(Boolean), {root, settings, save, env: {}, ...extra});
@@ -23,7 +24,7 @@ const okResponse = body => ({ok: true, status: 200, headers: {get: () => null}, 
 test('status reads disabled/no key by default and help explains why the model is pinned', async t => {
   const {run, saves} = setup(t);
   const status = await run('');
-  assert.match(status.text, /^Jev \(TypeSafe\): disabled · no key · model jev-1\.13\.0 · review on · routing off · confidence 0\.8$/);
+  assert.match(status.text, /^Jev \(TypeSafe\): disabled · no key · model jev-1\.13\.0 · review on · routing on · confidence 0\.8$/);
   assert.equal(status.changed, false);
   assert.equal((await run('help')).text, JEV_HELP);
   assert.match(JEV_HELP, /avoid jev-latest — an alias moves between releases/);
@@ -34,8 +35,11 @@ test('status reads disabled/no key by default and help explains why the model is
 test('switches and settings are parsed, saved under config.jev, and reported back; the key never lands in config.json', async t => {
   const {run, settings, file, root} = setup(t);
   assert.match((await run('on')).text, /enabled · no key .* · no key: \/jev key <KEY> or set TYPESAFE_API_KEY/);
-  assert.deepEqual(settings.jev, {enabled: true, model: 'jev-1.13.0', review: true, routing: false, confidence: 0.8});
+  assert.deepEqual(settings.jev, {enabled: true, model: 'jev-1.13.0', review: true, routing: true, confidence: 0.8}, 'on means everything Jev does');
   await run('review off');
+  assert.equal(settings.jev.review, false);
+  await run('routing off');
+  assert.equal(settings.jev.routing, false);
   await run('routing on');
   await run('routing default build');
   await run('confidence 0.65');
@@ -64,6 +68,24 @@ test('switches and settings are parsed, saved under config.jev, and reported bac
   assert.match((await run('key clear')).text, /Stored TypeSafe key removed/);
   assert.equal(readJevKey({root, env: {}}), null);
   assert.match((await run('key clear')).text, /No stored TypeSafe key/);
+});
+
+// The routing default is checked against the validated roster, not the raw `profiles` block:
+// a shipped builder the config never names is routable, one the overlay dropped is not, and a
+// classic config has no roster to route to at all.
+test('/jev routing default accepts a shipped profile the config never names and refuses a dropped one', async t => {
+  const {run, settings, saves} = setup(t);
+  const ok = await run('routing default claude_haiku');
+  assert.equal(ok.changed, true);
+  assert.deepEqual(settings.jev.routing, {enabled: true, default: 'claude_haiku'});
+  assert.deepEqual(Object.keys(saves.at(-1).profiles), ['main', 'build'], 'the shipped roster is never copied into config.json');
+  settings.profiles.claude_haiku = null;
+  await assert.rejects(run('routing default claude_haiku'), /Unknown profile claude_haiku; choose a worker profile from \/jev roster or none/);
+  await assert.rejects(run('routing default codex_nope'), /Unknown profile codex_nope/);
+  await run('routing default none');
+  delete settings.operation;
+  await assert.rejects(run('routing default claude_haiku'), /No worker roster: routing needs operation "orchestrator"/);
+  assert.equal((await run('routing default none')).changed, true, 'none never needs a roster');
 });
 
 test('/jev key with no value opens the masked prompt in the TUI and is an error headless', async t => {

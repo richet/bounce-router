@@ -695,6 +695,8 @@ test('O-jev orchestrator with Jev review on: the root task is Jev-reviewed befor
   writeOrchestratorConfig(root, {profiles: {main: {adapter: 'codex'}, build: {adapter: 'codex', tier: 'mid'}}});
   const config = JSON.parse(fs.readFileSync(path.join(root, 'config.json'), 'utf8'));
   fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify({...config, jev: {enabled: true, review: true, routing: false}}));
+  // A cached roster note (src/roster-notes.js) reaches ORDERS.md; routing is off here so the daemon never describes anything itself.
+  fs.writeFileSync(path.join(root, 'roster-notes.json'), JSON.stringify({'codex/default': {tier: 'strongest', capabilities: 'Steady on routine implementation.', by: 'claude/opus'}}));
   const bodies = [];
   const fetchImpl = async (url, options) => {
     bodies.push(JSON.parse(options.body));
@@ -719,7 +721,8 @@ test('O-jev orchestrator with Jev review on: the root task is Jev-reviewed befor
   assert.equal(journal.includes('daemon-test-key-4242'), false);
   assert.equal(fs.readFileSync(path.join(root, 'config.json'), 'utf8').includes('daemon-test-key-4242'), false);
   const orders = fs.readFileSync(path.join(session.dir, 'orchestrator', 'ORDERS.md'), 'utf8');
-  assert.match(orders, /build → codex \(builder\) \[tier mid\]/);
+  assert.match(orders, /build → codex \(builder\) \[tier mid\] — Steady on routine implementation\./, 'the profile\'s own tier, the note\'s sentence');
+  assert.equal(session.events.some(e => e.kind === 'jev.roster' || (e.kind === 'jev.skipped' && e.reason === 'roster')), false);
   assert.equal(orders.includes('jev →'), false, 'the synthetic reviewer is not a roster entry');
   assert.match(orders, /auto → Jev routing is off \(\/jev routing on\): resolves to build/);
   assert.match(orders, /Jev completion verdicts are on/);

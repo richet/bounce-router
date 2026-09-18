@@ -1,9 +1,10 @@
 // Jev (TypeSafe AI's System One decision model) as an optional decision primitive: settings,
 // the API key's secret store, the HTTP client, and the pure question/decision helpers the
 // completion-verdict reviewer (src/adapters/typesafe-live.js) and the model router
-// (scheduler dispatch of `profile: "auto"`) share. Everything here is OFF by default; with
-// `jev.enabled` false, or the key/endpoint unavailable, callers fall through to today's
-// behaviour and journal why (`jev.skipped`).
+// (scheduler dispatch of `profile: "auto"`) share. Jev itself is OFF by default; once
+// `jev.enabled` is on, everything it can do (verdicts and routing) is on unless switched off.
+// With it off, or the key/endpoint unavailable, callers fall through to today's behaviour
+// and journal why (`jev.skipped`).
 //
 // Jev answers typed questions over a `state`: a Choice picks one option and carries a
 // probability distribution plus a confidence; a Noul is a yes/no probability. It emits no
@@ -25,11 +26,13 @@ const bool = (value, fallback) => typeof value === 'boolean' ? value : fallback;
 
 // ---- settings (config.json `jev`, never the key) ------------------------------------------
 
+// Both switches default ON: enabling Jev means everything it does, and a switch exists only
+// to turn one part off.
 export function normalizeJevSettings(input) {
   const raw = isObject(input) ? input : {};
   const routing = isObject(raw.routing)
-    ? {enabled: bool(raw.routing.enabled, false), default: typeof raw.routing.default === 'string' && raw.routing.default ? raw.routing.default : null}
-    : {enabled: bool(raw.routing, false), default: null};
+    ? {enabled: bool(raw.routing.enabled, true), default: typeof raw.routing.default === 'string' && raw.routing.default ? raw.routing.default : null}
+    : {enabled: bool(raw.routing, true), default: null};
   const confidence = typeof raw.confidence === 'number' && raw.confidence >= 0 && raw.confidence <= 1 ? raw.confidence : 0.8;
   return {
     enabled: bool(raw.enabled, false),
@@ -223,7 +226,8 @@ export function decideVerdict(answers, {confidence = 0.8} = {}) {
 
 // ---- model routing: a Choice over the roster plus Nouls for the access the orders need ----
 
-const routable = ([, profile]) => profile && profile.role !== 'orchestrator' && profile.adapter !== 'typesafe';
+// Every worker profile is a routing target except the orchestrator and a decision model.
+export const routable = ([, profile]) => Boolean(profile) && profile.role !== 'orchestrator' && profile.adapter !== 'typesafe';
 
 // The profile `auto` resolves to when routing is off, unavailable or unconfident: the configured
 // default if it names a routable profile, else the first writing builder that is not the
@@ -235,19 +239,27 @@ export function routingFallback(profiles = {}, preferred = null) {
     ?? null;
 }
 
-const TIER_HINT = {cheapest: 'cheapest: locating files, symbols and call sites; extracting structured facts', mid: 'mid: research, routine implementation, test triage', strongest: 'strongest: independent review, ambiguous or cross-cutting debugging, security-sensitive work'};
+export const TIER_HINT = {cheapest: 'cheapest: locating files, symbols and call sites; extracting structured facts', mid: 'mid: research, routine implementation, test triage', strongest: 'strongest: independent review, ambiguous or cross-cutting debugging, security-sensitive work'};
 
-export function routingQuestions(profiles = {}) {
-  const criteria = Object.fromEntries(Object.entries(profiles).filter(routable).map(([name, p]) => [name, [
-    `${p.adapter}${p.model ? `/${p.model}` : ''}`, `role ${p.role ?? 'builder'}`, `policy ${p.policy ?? 'write'}${p.policy === 'read-only' ? ' (cannot edit files or run commands)' : ''}`,
-    p.tier ? `tier ${TIER_HINT[p.tier] ?? p.tier}` : '',
-  ].filter(Boolean).join(' · ')]));
+// One criterion per routable profile: what it runs on, what it may do, and — from the profile's
+// own `tier`/`capabilities` or the roster notes bounce wrote for its model (src/roster-notes.js)
+// — what the model is good and bad at, so the choice weighs ability, not just names.
+export function routingQuestions(profiles = {}, notes = {}) {
+  const criteria = Object.fromEntries(Object.entries(profiles).filter(routable).map(([name, p]) => {
+    const tier = p.tier ?? notes[name]?.tier;
+    const capabilities = p.capabilities ?? notes[name]?.capabilities;
+    return [name, [
+      `${p.adapter}${p.model ? `/${p.model}` : ''}`, `role ${p.role ?? 'builder'}`, `policy ${p.policy ?? 'write'}${p.policy === 'read-only' ? ' (cannot edit files or run commands)' : ''}`,
+      tier ? `tier ${TIER_HINT[tier] ?? tier}` : '',
+      capabilities ? `capabilities: ${capabilities}` : '',
+    ].filter(Boolean).join(' · ')];
+  }));
   return {
     profile: {
       type: 'choice',
       instructions: {
         question: 'Which worker profile should carry out these orders?',
-        guidance: 'Prefer the cheapest tier whose contract fits: cheapest for locating files and extracting facts, mid for research and routine implementation, strongest for independent review, ambiguous or cross-cutting debugging and security-sensitive work. A read-only profile cannot edit files or run commands.',
+        guidance: 'Weigh each profile\'s capabilities against what the orders demand, then prefer the cheapest tier whose contract fits: cheapest for locating files and extracting facts, mid for research and routine implementation, strongest for independent review, ambiguous or cross-cutting debugging and security-sensitive work. A read-only profile cannot edit files or run commands.',
       },
       criteria,
     },
@@ -272,14 +284,18 @@ export function decideRoute(answers, {profiles = {}, confidence = 0.8, fallback 
 
 // The whole routing decision for one submitted task. Never throws: any Jev failure is a
 // fallback with its reason, so `profile: "auto"` always resolves when a fallback exists.
-export async function routeTask({orders, profiles, settings, ask, signal} = {}) {
+// `notes` is the roster's per-profile {tier, capabilities} (or a function returning them);
+// notes that cannot be read only narrow the criteria, never the decision.
+export async function routeTask({orders, profiles, settings, ask, notes = {}, signal} = {}) {
   const s = normalizeJevSettings(settings);
   const fallback = routingFallback(profiles, s.routing.default);
   const off = reason => ({chosen: fallback, fallback: true, reason, probabilities: {}, confidence: 0, needs: null, model: null});
   if (!s.enabled) return off('jev disabled');
   if (!s.routing.enabled) return off('routing off');
   if (typeof ask !== 'function') return off('routing unavailable');
-  const questions = routingQuestions(profiles);
+  let known = {};
+  try { known = (typeof notes === 'function' ? await notes() : notes) ?? {}; } catch { known = {}; }
+  const questions = routingQuestions(profiles, known);
   if (!Object.keys(questions.profile.criteria).length) return off('no routable profiles');
   try {
     const result = await ask({state: {orders: String(orders ?? '').slice(0, 24_000)}, questions, model: s.model, signal});
@@ -296,23 +312,30 @@ export function jevReviewerProfile(settings = {}) {
 }
 
 // The scheduler's `jev` seam: settings read at use time, the reviewer name, and the router
-// bound to the typesafe adapter's client.
-export function createJevDecisions({root = dataRoot(), adapter, readSettings = () => readJevSettings(root)} = {}) {
+// bound to the typesafe adapter's client. `notes` (a function, may be async) supplies the
+// roster's {tier, capabilities} per profile at route time — the roster setup of
+// src/roster-notes.js in the daemon; absent, routing sees adapter/model/role/policy only.
+export function createJevDecisions({root = dataRoot(), adapter, readSettings = () => readJevSettings(root), notes = null} = {}) {
   return {
     reviewer: JEV_REVIEWER,
     settings: readSettings,
-    route: ({orders, profiles, signal}) => routeTask({orders, profiles, settings: readSettings(), ask: adapter?.ask, signal}),
+    route: ({orders, profiles, signal}) => routeTask({orders, profiles, settings: readSettings(), ask: adapter?.ask, ...(notes ? {notes} : {}), signal}),
   };
 }
 
 // User-only control row from the TUI after `/jev …` saved config.json: the daemon re-reads the
 // settings, refreshes the orchestrator's standing orders and confirms with a status row.
 // The row carries no key material: the daemon reads the secret store itself for the status.
-export function createJevActivation({session, readSettings, readKey = () => readJevKey(), refresh = () => {}}) {
+// `setup(row)` (the roster setup) runs afterwards when routing is on, so the models a newly
+// enabled router chooses between get described without a restart; `refresh: 'roster'` on the
+// row asks for the notes to be written again.
+export function createJevActivation({session, readSettings, readKey = () => readJevKey(), refresh = () => {}, setup = null}) {
   return session.subscribe(row => {
     if (row.kind !== 'control.jev' || row.from !== 'user') return;
     let warning = '';
     try { refresh(); } catch (error) { warning = ` Standing orders could not be refreshed: ${error.message}.`; }
-    session.append({kind: 'status', text: `${jevStatusLine(readSettings(), readKey())} · applies to the next decision${warning}`});
+    const settings = normalizeJevSettings(readSettings());
+    session.append({kind: 'status', text: `${jevStatusLine(settings, readKey())} · applies to the next decision${warning}`});
+    if (setup && settings.enabled && settings.routing.enabled) Promise.resolve().then(() => setup({force: row.refresh === 'roster'})).catch(() => {});
   });
 }

@@ -25,8 +25,11 @@ const okResponse = (body, {status = 200, headers = {}} = {}) => ({
   json: async () => body, text: async () => JSON.stringify(body),
 });
 
-test('settings: everything is off by default, the model is pinned, and the persisted shape round-trips', () => {
-  assert.deepEqual(normalizeJevSettings(undefined), {enabled: false, model: JEV_DEFAULT_MODEL, review: true, routing: {enabled: false, default: null}, confidence: 0.8});
+test('settings: Jev is off by default, everything it does is on once enabled, the model is pinned, and the persisted shape round-trips', () => {
+  assert.deepEqual(normalizeJevSettings(undefined), {enabled: false, model: JEV_DEFAULT_MODEL, review: true, routing: {enabled: true, default: null}, confidence: 0.8});
+  assert.deepEqual(normalizeJevSettings({enabled: true}), {enabled: true, model: JEV_DEFAULT_MODEL, review: true, routing: {enabled: true, default: null}, confidence: 0.8});
+  assert.equal(normalizeJevSettings({enabled: true, routing: false}).routing.enabled, false);
+  assert.equal(normalizeJevSettings({enabled: true, routing: {enabled: false, default: 'build'}}).routing.enabled, false);
   assert.equal(JEV_DEFAULT_MODEL, 'jev-1.13.0');
   const custom = normalizeJevSettings({enabled: true, model: ' jev-1.12.0 ', review: false, routing: {enabled: true, default: 'build'}, confidence: 0.6});
   assert.deepEqual(custom, {enabled: true, model: 'jev-1.12.0', review: false, routing: {enabled: true, default: 'build'}, confidence: 0.6});
@@ -35,7 +38,7 @@ test('settings: everything is off by default, the model is pinned, and the persi
   // junk never widens what Jev does
   assert.equal(normalizeJevSettings({enabled: 'yes', confidence: 7, routing: 'on'}).enabled, false);
   assert.equal(normalizeJevSettings({confidence: 7}).confidence, 0.8);
-  assert.equal(normalizeJevSettings({routing: 'on'}).routing.enabled, false);
+  assert.equal(normalizeJevSettings({routing: 'on'}).routing.enabled, true, 'junk reads as unset, and unset routing is on');
 });
 
 test('settings are read from config.json at use time and a missing/broken file reads as disabled', t => {
@@ -67,10 +70,10 @@ test('the key lives in a 0600 secrets file, the env var overrides it, and it is 
 
 test('sidebar label is empty while disabled and names what Jev does when enabled', () => {
   assert.equal(jevSidebarLabel({}), '');
-  assert.equal(jevSidebarLabel({enabled: true}), 'jev');
-  assert.equal(jevSidebarLabel({enabled: true, routing: true}), 'jev+routing');
-  assert.equal(jevSidebarLabel({enabled: true, review: false, routing: true}), 'jev routing');
-  assert.equal(jevSidebarLabel({enabled: true, review: false}), 'jev idle');
+  assert.equal(jevSidebarLabel({enabled: true}), 'jev+routing');
+  assert.equal(jevSidebarLabel({enabled: true, routing: false}), 'jev');
+  assert.equal(jevSidebarLabel({enabled: true, review: false}), 'jev routing');
+  assert.equal(jevSidebarLabel({enabled: true, review: false, routing: false}), 'jev idle');
 });
 
 test('retry-after reads seconds or an HTTP date, capped, with a short fallback', () => {
@@ -183,11 +186,16 @@ test('routingFallback: the configured default, else the first writing builder th
   assert.equal(routingFallback({main: roster.main, jev: roster.jev}), null);
 });
 
-test('routingQuestions: a choice over the routable roster with adapter/model/role/policy/tier criteria, plus access nouls', () => {
+test('routingQuestions: a choice over the routable roster with adapter/model/role/policy/tier/capabilities criteria, plus access nouls', () => {
   const questions = routingQuestions(roster);
   assert.deepEqual(Object.keys(questions.profile.criteria), ['scout', 'build', 'build_claude', 'critic']);
-  assert.match(questions.profile.criteria.build, /codex\/gpt-6-astra · role builder · policy write · tier mid/);
+  assert.match(questions.profile.criteria.build, /codex\/gpt-6-astra · role builder · policy write · tier mid: [^·]+$/);
   assert.match(questions.profile.criteria.scout, /read-only \(cannot edit files or run commands\)/);
+  // roster notes fill in what a profile leaves out; a profile's own tier/capabilities win
+  const noted = routingQuestions({...roster, build: {...roster.build, capabilities: 'Careful, slow, thorough.'}}, {build: {tier: 'strongest', capabilities: 'ignored'}, scout: {tier: 'cheapest', capabilities: 'Fast lookups; weak at multi-step edits.'}});
+  assert.match(noted.profile.criteria.build, /tier mid: .* · capabilities: Careful, slow, thorough\.$/);
+  assert.match(noted.profile.criteria.scout, /tier cheapest: .* · capabilities: Fast lookups; weak at multi-step edits\.$/);
+  assert.match(noted.profile.instructions.guidance, /capabilities/);
   assert.equal(questions.needs_write.type, 'noul');
   assert.equal(questions.needs_shell.type, 'noul');
 });
@@ -212,13 +220,19 @@ test('routeTask: disabled / routing off / Jev failure all resolve to the fallbac
   const ask = async ({state, questions, model}) => { asked.push({state, model, keys: Object.keys(questions)}); return {answers: {profile: {choice: 'scout', confidence: 0.9}, needs_write: {noul: 0.05}, needs_shell: {noul: 0.05}}, model: 'jev-1.13.0', latencyMs: 120}; };
   assert.deepEqual((await routeTask({orders: 'find x', profiles: roster, settings: {}, ask})).chosen, 'build');
   assert.equal((await routeTask({orders: 'find x', profiles: roster, settings: {}, ask})).reason, 'jev disabled');
-  assert.equal((await routeTask({orders: 'find x', profiles: roster, settings: {enabled: true}, ask})).reason, 'routing off');
+  assert.equal((await routeTask({orders: 'find x', profiles: roster, settings: {enabled: true, routing: false}, ask})).reason, 'routing off');
   assert.equal(asked.length, 0);
   const routed = await routeTask({orders: 'find x', profiles: roster, settings: {enabled: true, routing: true}, ask});
   assert.equal(routed.chosen, 'scout');
   assert.equal(routed.fallback, false);
   assert.equal(routed.model, 'jev-1.13.0');
   assert.deepEqual(asked[0], {state: {orders: 'find x'}, model: 'jev-1.13.0', keys: ['profile', 'needs_write', 'needs_shell']});
+  // notes may be a (possibly async) function; one that throws only narrows the criteria
+  const noted = [];
+  await routeTask({orders: 'find x', profiles: roster, settings: {enabled: true}, notes: async () => ({scout: {tier: 'cheapest', capabilities: 'Quick.'}}), ask: async ({questions}) => { noted.push(questions.profile.criteria.scout); return {answers: {}}; }});
+  await routeTask({orders: 'find x', profiles: roster, settings: {enabled: true}, notes: async () => { throw new Error('unreadable'); }, ask: async ({questions}) => { noted.push(questions.profile.criteria.scout); return {answers: {}}; }});
+  assert.match(noted[0], /capabilities: Quick\.$/);
+  assert.doesNotMatch(noted[1], /capabilities/);
   const failed = await routeTask({orders: 'find x', profiles: roster, settings: {enabled: true, routing: {enabled: true, default: 'build_claude'}}, ask: async () => { throw Object.assign(new Error('boom'), {code: 'http_500'}); }});
   assert.deepEqual([failed.chosen, failed.fallback, failed.reason], ['build_claude', true, 'http_500']);
 });

@@ -4,7 +4,7 @@ import {stripVTControlCharacters} from 'node:util';
 import {discoverLocalModels, resolveLocalModel} from './local-models.js';
 import {recommendLocalModels, probeLocalModel} from './local-recommend.js';
 import {previewLocalProfile} from './local-setup.js';
-import {starterProfiles, validateOrchestration} from './profiles.js';
+import {validateOrchestration} from './profiles.js';
 import {inspectLocalToolchain, prepareLocalToolchain} from './local-toolchain.js';
 
 const cancelled = Symbol('cancelled');
@@ -38,8 +38,10 @@ export async function runLocalSetup({settings, cwd, ask, write, save, discover =
     if (draft.operation !== 'orchestrator') {
       if (!await yes('Enable orchestrator mode for future sessions? [y/N] ')) return {saved: false};
       draft.operation = 'orchestrator';
+      // The overlay only: the shipped roster stays underneath it in the validated view, so
+      // the switch never copies the roster into config.json (cli.js materialiseRoster does the same).
       draft.orchestrator ??= 'main';
-      draft.profiles ??= starterProfiles(draft);
+      draft.profiles ??= {};
     }
     const purpose = await choose('Workers for research/review, coding, or both? [research/coding/both] ', ['research', 'coding', 'both'], 'research');
     if (purpose !== 'research' && draft.mode !== 'yolo') {
@@ -97,7 +99,8 @@ export async function runLocalSetup({settings, cwd, ask, write, save, discover =
       let name;
       for (;;) {
         name = await prompt('Worker profile name: ', intent === 'coding' ? 'local_build' : 'local_read');
-        if (/^[A-Za-z0-9_-]+$/.test(name) && !Object.hasOwn(draft.profiles ?? {}, name)) break;
+        // Shipped names count as existing: the validated table, not the overlay alone.
+        if (/^[A-Za-z0-9_-]+$/.test(name) && !Object.hasOwn(validateOrchestration(draft).profiles, name)) break;
         write('Use a new name containing letters, numbers, underscores or hyphens. Existing profiles are not overwritten.');
       }
       const slash = ref.indexOf('/');

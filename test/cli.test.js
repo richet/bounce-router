@@ -14,6 +14,7 @@ import path from 'node:path';
 import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {Session} from '../src/core.js';
+import {starterProfiles, validateOrchestration} from '../src/profiles.js';
 
 const cliPath = fileURLToPath(new URL('../src/cli.js', import.meta.url));
 const tmpRoot = prefix => fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
@@ -149,11 +150,11 @@ test('bounce jev shows status, saves switches under config.jev, and keeps the ke
   delete env.TYPESAFE_API_KEY;
   const status = await run(['jev'], env);
   assert.equal(status.code, 0, status.stderr);
-  assert.match(status.stdout, /Jev \(TypeSafe\): disabled · no key · model jev-1\.13\.0 · review on · routing off · confidence 0\.8/);
+  assert.match(status.stdout, /Jev \(TypeSafe\): disabled · no key · model jev-1\.13\.0 · review on · routing on · confidence 0\.8/);
   const on = await run(['jev', 'on'], env);
   assert.equal(on.code, 0, on.stderr);
   assert.match(on.stdout, /enabled .* · saved; a running daemon reads it at its next decision/);
-  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root, 'config.json'), 'utf8')).jev, {enabled: true, model: 'jev-1.13.0', review: true, routing: false, confidence: 0.8});
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root, 'config.json'), 'utf8')).jev, {enabled: true, model: 'jev-1.13.0', review: true, routing: true, confidence: 0.8});
   const key = await run(['typesafe', 'key', 'sk-cli-secret-7777'], env);
   assert.equal(key.code, 0, key.stderr);
   assert.match(key.stdout, /TypeSafe key stored \(…7777\)/);
@@ -164,4 +165,46 @@ test('bounce jev shows status, saves switches under config.jev, and keeps the ke
   const bad = await run(['jev', 'review', 'sometimes'], env);
   assert.notEqual(bad.code, 0);
   assert.match(bad.stderr, /Use \/jev review on\|off/);
+});
+
+// A config that runs the shipped roster (orchestrator, no `profiles` block) gains a worker via
+// `bounce local profile --save`: the saved block holds only the new profile (the user's overlay)
+// and the validated view is the shipped roster plus that profile.
+// Headless `bounce quota` lists every vendor the config can spend on. With no `profiles`
+// block the roster is the shipped one, whose codex builders must show up next to the
+// orchestrator's own claude — the raw block would have hidden them.
+test('bounce quota on an orchestrator config with no profiles block reports the shipped roster vendors', async t => {
+  const root = tmpRoot('bounce-cli-quota-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const config = {operation: 'orchestrator', order: ['claude'], mode: 'yolo', models: {}, skills: {scope: 'user', autoSync: false},
+    executables: {codex: '/nonexistent/test-codex', claude: '/nonexistent/test-claude'}};
+  fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify(config));
+  const roster = await run(['quota'], bounceEnv(root));
+  assert.equal(roster.code, 0, roster.stderr);
+  assert.deepEqual(roster.stdout.trim().split('\n').map(line => line.split(' · ')[0]), ['claude', 'codex']);
+  // Dropping every codex builder from the overlay drops the vendor from the report.
+  const codexNames = Object.entries(starterProfiles(config)).filter(([, p]) => p.adapter === 'codex').map(([name]) => name);
+  fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify({...config, profiles: Object.fromEntries(codexNames.map(name => [name, null]))}));
+  const dropped = await run(['quota'], bounceEnv(root));
+  assert.equal(dropped.code, 0, dropped.stderr);
+  assert.deepEqual(dropped.stdout.trim().split('\n').map(line => line.split(' · ')[0]), ['claude']);
+});
+
+test('bounce local profile --save on a config with no profiles block saves only the worker; the validated view is the roster plus it', async t => {
+  const root = tmpRoot('bounce-cli-roster-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify({
+    operation: 'orchestrator', order: ['claude'], mode: 'yolo', models: {}, skills: {scope: 'user', autoSync: false}, executables: {},
+  }));
+  const result = await run(['local', 'profile', 'local_read', '{"role":"researcher"}', '--save'], bounceEnv(root));
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /Saved\./);
+  const saved = JSON.parse(fs.readFileSync(path.join(root, 'config.json'), 'utf8'));
+  assert.deepEqual(saved.profiles, {local_read: {adapter: 'local', backend: 'lmstudio', model: 'auto', role: 'researcher'}}, 'the overlay only, never a copy of the roster');
+  assert.equal(saved.orchestrator, 'main');
+  const orchestration = validateOrchestration(saved);
+  assert.equal(orchestration.orchestrator, 'main');
+  assert.deepEqual(Object.keys(orchestration.profiles), [...Object.keys(starterProfiles(saved)), 'local_read']);
+  assert.equal(orchestration.profiles.local_read.adapter, 'local');
+  assert.equal(orchestration.profiles.build.adapter, 'codex');
 });

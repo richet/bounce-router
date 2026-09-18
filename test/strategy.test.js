@@ -183,12 +183,14 @@ test('S4 scout/next-wave: onTerminal fans out builders only after the scout is t
   await waitFor(() => scheduler.tasks()[normal.task]?.state === 'completed');
 });
 
+// S5: validated against the default registry — the shipped roster underneath every config spans
+// claude/codex/muse, so a claude-only registry would fail on the shipped builders first.
 test('S5a free roles: a profile with role scout and policy read-only validates and launches', async t => {
   const settings = {
     operation: 'orchestrator', orchestrator: 'main', mode: 'yolo',
     profiles: {main: {adapter: 'claude'}, scoutProfile: {adapter: 'claude', role: 'scout', policy: 'read-only'}},
   };
-  const view = validateOrchestration(settings, ['claude']);
+  const view = validateOrchestration(settings);
   assert.equal(view.profiles.scoutProfile.role, 'scout');
   assert.equal(view.profiles.scoutProfile.policy, 'read-only');
 });
@@ -198,7 +200,7 @@ test('S5b free roles: declaring role orchestrator still throws', t => {
     operation: 'orchestrator', orchestrator: 'main', mode: 'yolo',
     profiles: {main: {adapter: 'claude'}, other: {adapter: 'claude', role: 'orchestrator'}},
   };
-  assert.throws(() => validateOrchestration(settings, ['claude']), {message: 'profile other: role orchestrator is derived, not declared'});
+  assert.throws(() => validateOrchestration(settings), {message: 'profile other: role orchestrator is derived, not declared'});
 });
 
 test('S5c free roles: a critic with no explicit policy still defaults to read-only', t => {
@@ -206,7 +208,7 @@ test('S5c free roles: a critic with no explicit policy still defaults to read-on
     operation: 'orchestrator', orchestrator: 'main', mode: 'yolo',
     profiles: {main: {adapter: 'claude'}, c: {adapter: 'claude', role: 'critic'}},
   };
-  const view = validateOrchestration(settings, ['claude']);
+  const view = validateOrchestration(settings);
   assert.equal(view.profiles.c.role, 'critic');
   assert.equal(view.profiles.c.policy, 'read-only');
 });

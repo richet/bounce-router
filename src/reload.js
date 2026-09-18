@@ -5,6 +5,8 @@ import {createMuseLive} from './adapters/muse-live.js';
 import {createLocalLive} from './adapters/local-live.js';
 import {createTypesafeLive} from './adapters/typesafe-live.js';
 import {JEV_REVIEWER, createJevActivation, createJevDecisions, jevReviewerProfile, readJevSettings, routingFallback} from './jev.js';
+import {createRosterSetup, effectiveNotes, readRosterNotes, setupAgent} from './roster-notes.js';
+import {modelCatalog} from './models.js';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {createHash} from 'node:crypto';
@@ -26,6 +28,7 @@ import {createMainService} from './main-service.js';
 import {createViewServer, connectView, requestViewControl} from './view-transport.js';
 
 const CHILD_KILL_GRACE_MS = 1500; // same grace as runProcess's cancel and live-common's verifiedCancel
+const ROSTER_WAIT_MS = 30_000; // how long an `auto` route waits for roster notes still being written
 
 export const projectRoot = fileURLToPath(new URL('../', import.meta.url));
 const cliPath = fileURLToPath(new URL('./cli.js', import.meta.url));
@@ -102,10 +105,12 @@ const ORCHESTRATOR_ENV = ['BOUNCE_BUS', 'BOUNCE_BUS_TOKEN_FILE', 'BOUNCE_ROLE', 
 
 // The orchestrator profile's standing brief, written once per daemon start: where its skill
 // lives and how to reach the bridge. The prompt line cli.js prepends points at this file.
-function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, jev = null}) {
+function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, jev = null, notes = {}}) {
   const dir = path.join(session.dir, 'orchestrator');
   const autoFallback = routingFallback(profiles, jev?.routing?.default);
   const routingOn = Boolean(jev?.enabled && jev?.routing?.enabled);
+  // What each profile's model is for, from the profile itself or the roster notes bounce wrote.
+  const about = name => notes[name] ?? {};
   fs.mkdirSync(dir, {recursive: true, mode: 0o700});
   const file = path.join(dir, 'ORDERS.md');
   fs.writeFileSync(file, [
@@ -119,7 +124,7 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     `    BOUNCE_BUS=${bus.path}`,
     `    BOUNCE_BUS_TOKEN_FILE=${grant.file}`, '',
     'Worker profiles you can submit to (name → adapter/model):',
-    ...Object.entries(profiles).filter(([name]) => name !== orchestrator && name !== JEV_REVIEWER).map(([name, p]) => `    ${name} → ${[p.adapter, p.model].filter(Boolean).join('/')}${p.role ? ` (${p.role})` : ''}${p.tier ? ` [tier ${p.tier}]` : ''}`),
+    ...Object.entries(profiles).filter(([name]) => name !== orchestrator && name !== JEV_REVIEWER).map(([name, p]) => `    ${name} → ${[p.adapter, p.model].filter(Boolean).join('/')}${p.role ? ` (${p.role})` : ''}${about(name).tier ?? p.tier ? ` [tier ${about(name).tier ?? p.tier}]` : ''}${about(name).capabilities ?? p.capabilities ? ` — ${about(name).capabilities ?? p.capabilities}` : ''}`),
     ...(jev && autoFallback ? [`    auto → ${routingOn ? 'Jev (TypeSafe) routes each task to the profile above that fits its orders; unconfident picks go to' : 'Jev routing is off (/jev routing on): resolves to'} ${autoFallback}`] : []),
     ...Object.entries(profiles).filter(([, profile]) => profile.adapter === 'local').map(([name, profile]) =>
       `    ${name}: LM Studio endpoint=${profile.endpoint}, model=${profile.model || 'auto'}, policy=${profile.policy}; reads=${JSON.stringify(profile.readPaths)}, writes=${JSON.stringify(profile.writePaths)}, commands=${JSON.stringify(profile.commands)}, localOnly=${profile.localOnly}. Commands use isolated Docker-compatible containers; no host shell fallback.`),
@@ -237,7 +242,19 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // whenever orchestrating so `/jev on` mid-session needs no restart; inert until a row names it.
   // A user profile of the same name is left alone. Settings are re-read at each decision.
   if (orchestrating && !profileOverride && !Object.hasOwn(profiles, JEV_REVIEWER)) profiles[JEV_REVIEWER] = jevReviewerProfile(settings);
-  const jev = orchestrating ? createJevDecisions({root, adapter: adapters.typesafe}) : null;
+  // Roster notes (src/roster-notes.js): what each worker model is good for, described once by a
+  // cloud agent from the roster and cached under the data root. The router waits briefly for a
+  // description in flight (the first `auto` after a fresh model) and otherwise routes on what
+  // is known. `orders` (ORDERS.md) is rewritten once notes land; it is bound below.
+  const rosterSetup = orchestrating ? createRosterSetup({root, profiles, session, executables: settings.executables,
+    agent: setupAgent({profiles, orchestrator: orchestration.orchestrator, order: settings.order, models: settings.models}),
+    catalogs: () => modelCatalog(settings), onChange: () => orders()}) : null;
+  const rosterNotes = async () => {
+    const pending = rosterSetup.pending();
+    if (pending) await Promise.race([pending, new Promise(resolve => setTimeout(resolve, ROSTER_WAIT_MS).unref?.())]);
+    return rosterSetup.notes();
+  };
+  const jev = orchestrating ? createJevDecisions({root, adapter: adapters.typesafe, notes: rosterNotes}) : null;
 
   // Phase 8: the strategy seam, same shape as `adapters`/`profiles` above — a test (or, later, a
   // config-driven caller) may inject a strategy object directly; absent, the declarative
@@ -277,8 +294,12 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // ORDERS.md mentions Jev (the `auto` roster line) only when config.json has a `jev` block at
   // all: without one the generated brief is exactly today's.
   const jevBlock = () => { try { return JSON.parse(fs.readFileSync(path.join(root, 'config.json'), 'utf8')).jev !== undefined; } catch { return false; } };
-  const orders = () => writeOrders({session, root, bus, grant: orchestratorGrant, profiles, orchestrator: orchestration.orchestrator, jev: jevBlock() ? readJevSettings(root) : null});
+  const orders = () => writeOrders({session, root, bus, grant: orchestratorGrant, profiles, orchestrator: orchestration.orchestrator, jev: jevBlock() ? readJevSettings(root) : null,
+    notes: effectiveNotes(profiles, readRosterNotes(root))});
   if (orchestrating) orders();
+  // Routing on: describe the roster's models now so the first `auto` need not wait; the outcome
+  // is journaled either way.
+  if (orchestrating) { const jevNow = readJevSettings(root); if (jevNow.enabled && jevNow.routing.enabled) rosterSetup.ensure().catch(() => {}); }
   if (orchestrating) session.append({kind: 'operation', operation: 'orchestrator', orchestrator: orchestration.orchestrator, shape: orchestration.shape, text: `Operation: orchestrator on ${orchestration.orchestrator} (${orchestration.shape})`});
   const main = orchestrating && positionals[0] !== 'run' ? createMainService({session, adapters, profile: orchestratorProfile, settings,
     orchestratorEnv: {BOUNCE_BUS: bus.path, BOUNCE_BUS_TOKEN_FILE: orchestratorGrant.file, BOUNCE_ROLE: 'orchestrator', BOUNCE_ORCHESTRATOR_PROFILE: JSON.stringify(orchestratorProfile)},
@@ -286,7 +307,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   const closeLocalActivation = createLocalActivation({session, scheduler, profiles, settings,
     readSettings: () => config(root),
     refresh: orders});
-  const closeJevActivation = orchestrating ? createJevActivation({session, readSettings: () => readJevSettings(root), refresh: orders}) : () => {};
+  const closeJevActivation = orchestrating ? createJevActivation({session, readSettings: () => readJevSettings(root), refresh: orders, setup: options => rosterSetup.ensure(options)}) : () => {};
   if (values.resume) scheduler.reconcile().catch(error => session.append({kind: 'status', text: `Recovery failed: ${error.message}`}));
 
   // Worker grants are the dispatch policy expressed on the bus: a task that starts gets a grant

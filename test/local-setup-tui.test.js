@@ -11,7 +11,7 @@ import {Session} from '../src/core.js';
 import {hostSession} from '../src/remote.js';
 import {createLocalActivation} from '../src/local-activation.js';
 import {createScheduler} from '../src/scheduler.js';
-import {validateOrchestration} from '../src/profiles.js';
+import {starterProfiles, validateOrchestration} from '../src/profiles.js';
 
 test('TUI setup loaded stays interactive during a held main turn, saves on consent, and Esc cancels only setup', {timeout:20000}, async t => {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'bounce-setup-tui-'));
@@ -46,7 +46,7 @@ test('TUI setup loaded stays interactive during a held main turn, saves on conse
   await answer('/local setup loaded','Workers for');
   await answer('research','Priority:');child.stdin.write('balanced\r');await wait(()=>response);
   child.stdin.write('editable setup draft');await wait(()=>output.includes('editable setup draft'));
-  child.stdin.write('\u0015/help\r');await wait(()=>session.events.some(e=>e.kind==='status'&&e.text?.includes('TUI commands:')));
+  child.stdin.write('\u0015/help\r');await wait(()=>session.events.some(e=>e.kind==='help'&&e.text?.includes('Agents & models')));
   slow=false;response.setHeader('content-type','application/json');response.end(payload);
   await wait(()=>output.includes('Compare 1 loaded models'));
   assert.equal(output.includes('lmstudio/unloaded-choice'),false);
@@ -70,4 +70,56 @@ test('TUI setup loaded stays interactive during a held main turn, saves on conse
   await wait(()=>output.includes('Turn completed'));
   child.stdin.write('next work\r');await wait(()=>runs===2);
   assert.equal(requests[1].mode,'plan','setup must not change permissions on the active session');
+});
+
+// Orchestrator config with no `profiles` block (the shipped roster): /local setup must add the
+// worker rather than TypeError on the absent block, the saved block holds only the worker (the
+// shipped roster stays underneath it in the validated view), and a later `/model worker … --save`
+// persists into the same block.
+test('TUI setup on a config with no profiles block saves only the worker over the shipped roster; /model worker --save keeps it', {timeout:20000}, async t => {
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'bounce-setup-tui-roster-'));
+  const payload=JSON.stringify({models:[{key:'loaded-choice',type:'llm',capabilities:{trained_for_tool_use:true},loaded_instances:[{id:'loaded',config:{context_length:8192}}]}]});
+  const server=http.createServer((req,res)=>{res.setHeader('content-type','application/json');res.end(payload);});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  t.after(()=>{server.closeAllConnections();server.close();});
+  const settings={operation:'orchestrator',mode:'yolo',order:['codex'],models:{},
+    local:{endpoints:{lmstudio:{backend:'lmstudio',url:`http://127.0.0.1:${server.address().port}`}}},
+    executables:{codex:'/nonexistent/test-codex',claude:'/nonexistent/test-claude'},skills:{scope:'user',autoSync:false}};
+  const file=path.join(root,'config.json');fs.writeFileSync(file,JSON.stringify(settings));
+  const session=new Session(root,{root});
+  const profiles = validateOrchestration(settings).profiles;
+  const scheduler = createScheduler({session, profiles, adapters: {}, localSettings: settings.local});
+  const closeActivation = createLocalActivation({session, scheduler, profiles, settings,
+    readSettings: () => JSON.parse(fs.readFileSync(file)), refresh: () => {}});
+  t.after(() => {closeActivation(); scheduler.close();});
+  const main={state:()=>({state:'idle',currentTurnId:null}),subscribe(){return()=>{};},
+    async run(params){return{accepted:true,requestId:params.id};},async cancel(){return{accepted:true};}};
+  const child=fork(fileURLToPath(new URL('./helpers/tui-process.js',import.meta.url)),[],{env:{...process.env,BOUNCE_HOME:root,BOUNCE_SUPERVISED:'1',BOUNCE_REMOTE_SESSION:'1',BOUNCE_ROLE:'orchestrator',BOUNCE_ORCHESTRATOR_PROFILE:JSON.stringify({adapter:'codex',model:'',mode:'plan'}),BOUNCE_NO_UPDATE_CHECK:'1'},stdio:['pipe','pipe','pipe','ipc']});
+  let output='';child.stdout.on('data',d=>output+=d);child.stderr.on('data',d=>output+=d);
+  const hosted=hostSession({session,child,main});
+  t.after(async()=>{hosted.detach();if(child.exitCode===null){child.kill('SIGKILL');await new Promise(r=>child.once('close',r));}fs.rmSync(root,{recursive:true,force:true});});
+  const wait=async(check)=>{const start=Date.now();while(!check()){if(Date.now()-start>4000)throw Error(output.slice(-4000));await new Promise(r=>setTimeout(r,10));}};
+  const answer=async(text,next)=>{const offset=output.length;child.stdin.write(text+'\r');await wait(()=>output.slice(offset).includes(next));};
+  await wait(()=>output.includes('Ready.'));
+  await answer('/local setup loaded','Workers for');
+  await answer('research','Priority:');await answer('balanced','Compare 1 loaded models');
+  await answer('n','Model endpoint/key');await answer('','Worker profile name:');
+  await answer('local_read','Adjust worker');await answer('n','Save this configuration?');
+  child.stdin.write('y\r');await wait(()=>output.includes('workers active in this session'));
+  const saved=JSON.parse(fs.readFileSync(file));
+  assert.equal(saved.orchestrator,'main');
+  assert.equal(saved.profiles.local_read.model,'loaded-choice');
+  assert.deepEqual(Object.keys(saved.profiles),['local_read'],'the overlay only, never a copy of the roster');
+  const view=validateOrchestration(saved);
+  assert.deepEqual(Object.keys(view.profiles),[...Object.keys(starterProfiles(settings)),'local_read']);
+  assert.equal(view.profiles.build.adapter,'codex');
+  assert.equal(view.profiles.local_read.adapter,'local');
+  assert.equal(profiles.local_read.model,'loaded-choice');
+  child.stdin.write('/model worker local_read prefer lmstudio/loaded-choice --save\r');
+  await wait(()=>session.events.some(row=>row.kind==='control.local_preferences'));
+  await wait(()=>JSON.parse(fs.readFileSync(file)).profiles.local_read.prefer);
+  const again=JSON.parse(fs.readFileSync(file));
+  assert.deepEqual(again.profiles.local_read.prefer,['lmstudio/loaded-choice']);
+  assert.deepEqual(Object.keys(again.profiles),Object.keys(saved.profiles),'a later worker save still writes only the overlay');
+  assert.equal(again.orchestrator,'main');
 });

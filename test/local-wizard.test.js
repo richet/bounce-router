@@ -1,6 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {runLocalSetup} from '../src/local-wizard.js';
+import {starterProfiles, validateOrchestration} from '../src/profiles.js';
 
 const settings = {operation:'orchestrator',mode:'yolo',orchestrator:'main',profiles:{main:{adapter:'claude'}}};
 const catalogs = [{provider:'local',backend:'lmstudio',endpoint:'lmstudio',models:[{id:'any',ref:'lmstudio/any',label:'Any',ready:true,type:'llm',tools:true,instances:[{id:'instance',context:8192}],capabilitySource:'server'}]}];
@@ -17,6 +18,33 @@ test('guided setup confirms recommended model and saves a validated read-only pr
   assert.equal(f.saved().profiles.local_read.endpoint,'lmstudio');
   assert.deepEqual(settings.profiles,{main:{adapter:'claude'}});
   assert.match(f.output.join('\n'),/Recommendation/);
+});
+// A worker named after a shipped profile the config never wrote would silently override it in
+// the validated view; the name prompt reads the merged table and asks again instead.
+test('the name prompt refuses a shipped profile name the config never wrote', async () => {
+  const f=fixture(['research','balanced','n','','build','local_read','n','y']);
+  const result=await runLocalSetup(f.options);
+  assert.equal(result.saved,true);
+  assert.deepEqual(result.profiles,['local_read']);
+  assert.deepEqual(Object.keys(f.saved().profiles),['main','local_read'],'build stays shipped, never written');
+  assert.equal(f.output.filter(line=>/Existing profiles are not overwritten/.test(line)).length,1);
+});
+// Switching a classic config to orchestrator writes the overlay only: `{}` plus orchestrator
+// `main`, never a copy of the shipped roster, which the validated view supplies underneath.
+test('the classic-to-orchestrator switch saves an empty overlay, not the shipped roster', async () => {
+  const classic={mode:'yolo'};
+  const f=fixture(['y','research','balanced','n','','local_read','n','y']);
+  const result=await runLocalSetup({...f.options,settings:classic});
+  assert.equal(result.saved,true);
+  assert.deepEqual(classic,{mode:'yolo'},'the input is never mutated');
+  const saved=f.saved();
+  assert.equal(saved.operation,'orchestrator');
+  assert.equal(saved.orchestrator,'main');
+  assert.deepEqual(Object.keys(saved.profiles),['local_read'],'the overlay only, never a copy of the roster');
+  const view=validateOrchestration(saved);
+  assert.deepEqual(Object.keys(view.profiles),[...Object.keys(starterProfiles(saved)),'local_read']);
+  assert.equal(view.profiles.build.adapter,'codex');
+  assert.equal(view.profiles.local_read.adapter,'local');
 });
 test('EOF and final decline never save or infer', async () => {
   for (const answers of [[],['research','balanced','n','','local_read','n','n']]) {

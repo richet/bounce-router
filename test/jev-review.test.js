@@ -247,6 +247,7 @@ test('routing on: a confident, policy-fitting Jev choice dispatches that profile
 test('routing off, low confidence, a policy mismatch, or no Jev at all: auto resolves to the fallback builder and says why', async t => {
   const cases = [
     {name: 'routing off', settings: {enabled: true, routing: {enabled: false, default: null}}, respond: () => { throw new Error('never asked'); }, reason: 'routing off'},
+    {name: 'routing unset is on', settings: {enabled: true, review: false, routing: undefined}, respond: () => ({answers: {profile: {choice: 'B', confidence: 0.95}, needs_write: {noul: 0.9}, needs_shell: {noul: 0.1}}}), reason: null, expected: 'B'},
     {name: 'disabled', settings: {enabled: false, routing: {enabled: true, default: null}}, respond: () => { throw new Error('never asked'); }, reason: 'jev disabled'},
     {name: 'low confidence', settings: {enabled: true, review: false, routing: {enabled: true, default: null}}, respond: () => ({answers: {profile: {choice: 'B', confidence: 0.3}}}), reason: /confidence 0.30 below 0.8/},
     {name: 'policy mismatch', settings: {enabled: true, review: false, routing: {enabled: true, default: null}}, respond: () => ({answers: {profile: {choice: 'R', confidence: 0.95}, needs_write: {noul: 0.9}}}), reason: /R is read-only but the orders need write access/},
@@ -264,9 +265,9 @@ test('routing off, low confidence, a policy mismatch, or no Jev at all: auto res
     await waitFor(() => scheduler.tasks()[row.task]?.state === 'completed' || scheduler.tasks()[row.task]?.state === 'accepted');
     const routed = session.events.find(e => e.kind === 'jev.routed');
     assert.equal(routed.chosen, c.expected ?? 'A', c.name);
-    assert.equal(routed.fallback, true, c.name);
+    assert.equal(routed.fallback, c.reason !== null, c.name);
     if (c.reason instanceof RegExp) assert.match(routed.reason, c.reason, c.name); else assert.equal(routed.reason, c.reason, c.name);
-    assert.match(routed.text, /Routed auto → [AB] \(fallback: /, c.name);
+    assert.match(routed.text, c.reason === null ? /Routed auto → B \(Jev, / : /Routed auto → [AB] \(fallback: /, c.name);
     assert.deepEqual(launches, [c.expected === 'B' ? 'b' : 'a'], c.name);
     assert.equal(scheduler.tasks()[row.task].profile, c.expected ?? 'A', c.name);
   }

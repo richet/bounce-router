@@ -20,7 +20,7 @@ import {createInterface} from 'node:readline';
 import {inspectLocalToolchain, prepareLocalToolchain} from './local-toolchain.js';
 import stringWidth from 'string-width';
 import {clean, createFormatter, createWorkSummary, workReview, withAsides, continueMain} from './format.js';
-import {validateOrchestration, starterProfiles} from './profiles.js';
+import {validateOrchestration} from './profiles.js';
 import {loadQuota, recordQuota, refreshQuota, quotaSnapshot, quotaShort, quotaPanel, quotaReport, quotaUnavailable, usageOrder} from './quota.js';
 import {skillsCommand, syncSkills, inspectSkills, skillsChanged, importCandidates, importSelected, importSummary, importOrigin, syncSummary, skillAreas} from './skills.js';
 import {expandVendorCommand, findVendorCommand, vendorCommandRows} from './vendor-commands.js';
@@ -36,94 +36,19 @@ import {projectRoot, fingerprint, validate, supervise, pidAlive} from './reload.
 import {listSessions, resolveSessionRef, sessionsTable, sessionAge} from './sessions.js';
 import {createRemoteSession} from './remote.js';
 import {version, checkUpdate, globalInstall, installUpdate} from './update.js';
+import {helpText, helpRows} from './help.js';
 
-const help = `bounce — one terminal, your coding agents
+// The `profiles` block is an overlay on the shipped roster (validateOrchestration), so a
+// profile write only needs the block to exist: the saved config holds the user's additions and
+// overrides, never a copy of the roster. `main` is written as orchestrator only because the
+// absent field implied it; a present block or orchestrator is never touched.
+function materialiseRoster(settings) {
+  if (settings.operation !== 'orchestrator') return settings;
+  if (settings.profiles === undefined) settings.profiles = {};
+  settings.orchestrator ??= 'main';
+  return settings;
+}
 
-  bounce [--cwd PATH] [--resume ID] [--provider NAME] [--model ID]
-  bounce run "prompt" [--image PATH ...] [--cwd PATH] [--json] [--mode yolo|plan] [--detach]
-  bounce attach ID [--json]     Reopen its interactive view; --json streams the journal
-  bounce stop ID                Cancel a running session's task tree and exit its daemon
-  bounce publish --event JSON|@FILE [--json]     One-process bridge: publish an event
-  bounce report --report JSON|@FILE [--json]    Worker: report progress or final outcome
-  bounce wait --match JSON --timeout SECONDS [--after-seq N] [--json]     Bridge: wait for one
-  bounce login claude|codex|muse
-  bounce models [--json]
-  bounce local models [--json]     Discover local models without loading them
-  bounce local setup              Guided model recommendation and worker configuration
-  bounce local profile NAME JSON [--save]  Preview/add a local worker; writes require explicit scope
-  bounce local check [IMAGE]       Diagnose Docker/image/project setup (no build)
-  bounce local prepare [IMAGE] [--allow-network]  Explicitly cache Linux npm dependencies
-  bounce quota [--json]
-  bounce jev [key KEY|key clear|on|off|review on|off|routing on|off|model ID|confidence N|test]   Jev (TypeSafe) decision model; no arg shows status
-  bounce skills [list|sync|new NAME|add PATH|remove NAME|import [NAME] [--list]|clear|reset] [--scope user|project]
-  bounce sessions [--json]      List sessions: name, age, mode, id, workspace (● = live)
-  bounce rename SESSION NAME    Name a session (SESSION = name, id or id prefix; --resume takes the same)
-  bounce task compare SESSION A B   Built-in A/B: compare two tasks (tokens, wall, rounds) from the log
-  bounce doctor
-  bounce update [--check]  Check for or install the latest npm release
-  bounce dev        Improve bounce itself; validate/reload after changes
-
-TUI commands:
-  /provider NAME        Select and save the default agent
-  /model                Pick from every model your signed-in agents report
-  /model ID             Set selected agent's model; "default" resets
-  /model refresh        Re-ask each agent for its catalog, then pick
-  /model worker PROFILE [auto|endpoint/model|refresh] [--save]  Select a local worker, not the main agent
-  /model worker PROFILE prefer|exclude REF,REF [--save]  Edit local model preferences
-  /local setup [loaded]  Guided local worker setup here; loaded limits choices to loaded models
-  /local cancel          Cancel setup without interrupting agents
-  /details [on|off]      Expand or fold tool output and worker dispatch details
-  /sidebar [on|off]      Show or hide the status sidebar (saved; needs a 100-column terminal)
-  /local activate [NAME] Activate saved local workers in this session without restarting
-  /order [claude,codex,muse]  Show the fallback order, or save a new one
-  /mode yolo|plan       YOLO default; plan uses restrictive provider flags
-  /operation [NAME]     Switch/pick classic|orchestrator — no arg opens a menu, Ctrl+O toggles
-  /jev                  Jev (TypeSafe) decision model status: key (last 4 chars), model, review/routing flags; /jev help lists subcommands
-  /jev key [KEY|clear]  Store the API key in a 0600 file (TYPESAFE_API_KEY overrides); no KEY opens a masked prompt
-  /jev on|off           Enable everything Jev does; /jev review on|off · /jev routing on|off · /jev model ID · /jev confidence N · /jev test
-  /stop [TASK]          Orchestrator: cancel one task, or every running task with no arg
-  /msg TASK TEXT        Orchestrator: send a message to a running worker
-  /agents [TASK]        Interactive split panes for the orchestrator and every worker; optionally focus one
-  /tasks                Show task states and retained outcomes
-  /login NAME           Open the vendor's native login flow
-  /new                  Start a new session in this workspace
-  /rename NAME          Name this session
-  /resume [SESSION]     Resume another session here; no arg opens a picker
-  /sessions             List this workspace's sessions
-  /note TEXT            Save a durable handoff note
-  /btw TEXT             Steer the focused agent live; when idle, save an aside for its next turn
-  /skills               List bounce skills and where each agent has them
-  /skills sync          Install them into every agent's skills directory
-  /skills new NAME      Scaffold a SKILL.md under ~/.bounce/skills
-  /skills add PATH      Adopt a skill folder or SKILL.md into bounce
-  /skills remove NAME   Delete it from bounce and from every agent
-  /skills import [NAME] Pick from the skills an agent already has
-  /skills clear         Remove every copy bounce installed
-  /skills reset         Delete every bounce skill and withdraw its copies
-  /skills seed --force  Reinstall the skills bounce ships, including ones you deleted
-  /quota                Show the subscription usage each agent reports
-  /review               Show full text of all session work items
-  /retry                Clear locally recorded quota cooldowns
-  /update [check]       Install the latest npm release, or only check
-  /restart              Test and reload updated code, keeping this session
-  /help                 Show commands
-  /detach               Close this view; orchestrator and workers keep running
-  /quit                 Stop this session and exit (Esc cancels an active turn)
-
-Drop PNG/JPEG/GIF/WebP files into your prompt, then press Enter to send.
-
-Keys: / command picker · Tab complete (or next agent) · F2 pause for copying
-      Enter send · Shift+Enter newline (Alt+Enter and Ctrl+J too)
-      PgUp/PgDn or mouse wheel scroll · F3 mouse scroll off (drag-select) · ↑/↓ prompt history
-      Ctrl+C cancel turn / exit when idle · Ctrl+U clear input
-
-You can keep typing while an agent works. Press Enter to queue each next message.
-
-Node.js 22+. Config and journals: BOUNCE_HOME or ~/.bounce.
-YOLO disables provider approvals/sandboxing. Native CLI credentials stay with vendors.
-Model names are passed through to each CLI. Quota comes from the agents themselves:
-Codex answers on demand, Claude reports its windows while a turn runs, Muse reports none.
-`;
 async function main() {
   const {values, positionals} = parseArgs({allowPositionals: true, options: {
     image: {type: 'string', multiple: true}, cwd: {type: 'string'}, resume: {type: 'string'}, provider: {type: 'string'}, model: {type: 'string'},
@@ -131,7 +56,7 @@ async function main() {
     check: {type: 'boolean'}, scope: {type: 'string'}, force: {type: 'boolean'}, list: {type: 'boolean'}, all: {type: 'boolean'},
     save: {type: 'boolean'}, 'allow-network': {type: 'boolean'},
   }});
-  if (values.help) return console.log(help);
+  if (values.help) return console.log(helpText(process.stdout.columns || 100));
   if (values.version) return console.log(`bounce ${version}`);
   const restarted = process.env.BOUNCE_RESTART ? JSON.parse(process.env.BOUNCE_RESTART) : null;
   delete process.env.BOUNCE_RESTART;
@@ -152,7 +77,7 @@ async function main() {
       const lines = createInterface({input: process.stdin, output: process.stdout, terminal: Boolean(process.stdin.isTTY && process.stdout.isTTY)});
       const iterator = lines[Symbol.asyncIterator]();
       try {
-        await runLocalSetup({settings, cwd,
+        await runLocalSetup({settings: materialiseRoster(settings), cwd,
           ask: async question => {process.stdout.write(question); const answer = await iterator.next(); return answer.done ? null : answer.value;},
           write: text => console.log(text),
           save: next => {
@@ -181,6 +106,7 @@ async function main() {
       return;
     }
     if (positionals[1] === 'profile') {
+      materialiseRoster(settings);
       const preview = previewLocalProfile({settings, name: positionals[2], options: JSON.parse(positionals[3] ?? '{}')});
       console.log(JSON.stringify(preview.profile, null, 2));
       if (values.save) {
@@ -232,7 +158,11 @@ async function main() {
   }
   if (positionals[0] === 'quota') {
     const store = await refreshQuota(settings, {root, cwd});
-    const quotaOrder = usageOrder(settings.order, settings.operation === 'orchestrator' ? settings.profiles : {});
+    // Every vendor the config can spend on: the validated roster, so a vendor reached only
+    // through a shipped builder is reported too (the TUI's usage panel reads the same view).
+    let rosterProfiles = {};
+    try { const view = validateOrchestration(settings); if (view.operation === 'orchestrator') rosterProfiles = view.profiles; } catch {}
+    const quotaOrder = usageOrder(settings.order, rosterProfiles);
     if (values.json) return console.log(JSON.stringify(store, null, 2));
     return console.log(quotaReport(store, quotaOrder));
   }
@@ -430,7 +360,9 @@ async function main() {
   const history = session.events.filter(e => e.kind === 'user').map(e => e.typed ?? e.text);
   const selected = () => session.active || settings.order[0];
   const workerOverrides = new Map();
-  const currentWorkerSettings = () => ({...settings, profiles: {...settings.profiles, ...Object.fromEntries(workerOverrides)}});
+  // Validated against what the next save writes (setup may have named the orchestrator there),
+  // with the shipped roster standing in for an absent block.
+  const currentWorkerSettings = () => {const view = materialiseRoster(savedSettings()); return {...view, profiles: {...view.profiles, ...Object.fromEntries(workerOverrides)}};};
   const setupDefaults = {};
   const savedSettings = () => ({...settings, ...setupDefaults});
   const save = () => saveJSON(path.join(root, 'config.json'), savedSettings());
@@ -447,7 +379,7 @@ async function main() {
     const file = path.join(root, 'config.json');
     const current = () => fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
     const baseline = current();
-    const initial = config(root);
+    const initial = materialiseRoster(config(root));
     const view = createLocalSetupView({settings: initial, cwd: session.cwd, loadedOnly, liveActivation: true,
       onChange: render,
       save: async next => {
@@ -461,7 +393,7 @@ async function main() {
         for (const key of ['operation', 'orchestrator', 'mode']) {
           if (Object.hasOwn(next, key)) setupDefaults[key] = next[key];
         }
-        const names = Object.keys(next.profiles).filter(name => next.profiles[name].adapter === 'local' && !Object.hasOwn(initial.profiles ?? {}, name));
+        const names = Object.keys(next.profiles).filter(name => next.profiles[name]?.adapter === 'local' && !Object.hasOwn(initial.profiles ?? {}, name));
         if (names.length) await activateLocalProfiles(session, names);
       }});
     view.loadedOnly = loadedOnly;
@@ -484,7 +416,7 @@ async function main() {
     if (entry.profileName) {
       if (entry.disabled) {notice = entry.description; return;}
       const next = selectWorkerModel({settings: currentWorkerSettings(), profileName: entry.profileName, ref: entry.id});
-      if (entry.save) {settings.profiles[entry.profileName] = next.profiles[entry.profileName]; workerOverrides.delete(entry.profileName); save();}
+      if (entry.save) {materialiseRoster(settings).profiles[entry.profileName] = next.profiles[entry.profileName]; workerOverrides.delete(entry.profileName); save();}
       else workerOverrides.set(entry.profileName, next.profiles[entry.profileName]);
       session.append({kind: 'control.local_model', from: 'user', profile: entry.profileName, model: entry.id});
       notice = `Worker ${entry.profileName}: ${entry.id} · ${entry.save ? 'saved' : 'this session only'}; active attempts unchanged`;
@@ -498,17 +430,15 @@ async function main() {
     notice = `${entry.provider} · ${entry.label}. Saved as the default.`;
   };
   // Shared by the /operation command, its picker (menu) and the Ctrl+O toggle (shortcut) — one
-  // place applies a mode change: bootstrap a default team on the first switch to orchestrator,
-  // validate the whole config, persist, and reflect it in the sidebar. Never throws (the shortcut
+  // place applies a mode change: open an (empty) overlay on the shipped roster on the first
+  // switch to orchestrator, validate the whole config, persist, and reflect it in the sidebar.
+  // Never throws (the shortcut
   // path has no surrounding try) — it reports problems via `notice`.
   function applyOperation(arg) {
     if (!['classic', 'orchestrator'].includes(arg)) { notice = 'Use /operation classic or /operation orchestrator'; return; }
     const previous = {operation: settings.operation, profiles: settings.profiles, orchestrator: settings.orchestrator};
     settings.operation = arg;
-    if (arg === 'orchestrator' && !(settings.profiles && typeof settings.profiles === 'object' && Object.keys(settings.profiles).length)) {
-      settings.profiles = starterProfiles(settings);
-      settings.orchestrator = 'main';
-    }
+    if (arg === 'orchestrator') materialiseRoster(settings);
     try { orchestration = validateOrchestration(settings); }
     catch (error) { Object.assign(settings, previous); notice = `Cannot switch to ${arg}: ${error.message}`; return; }
     delete setupDefaults.operation; delete setupDefaults.orchestrator;
@@ -539,7 +469,7 @@ async function main() {
       const field = preference[1], refs = !preference[2] || preference[2] === 'clear' ? [] : preference[2].split(',').map(ref => ref.trim());
       next.profiles[profileName][field] = refs;
       validateOrchestration(next);
-      if (persist) {settings.profiles[profileName] = next.profiles[profileName]; workerOverrides.delete(profileName); save();}
+      if (persist) {materialiseRoster(settings).profiles[profileName] = next.profiles[profileName]; workerOverrides.delete(profileName); save();}
       else workerOverrides.set(profileName, next.profiles[profileName]);
       session.append({kind: 'control.local_preferences', from: 'user', profile: profileName, field, refs});
       notice = `Worker ${profileName} ${field}: ${refs.join(', ') || 'cleared'} · ${persist ? 'saved' : 'this session only'}; active attempts unchanged`;
@@ -772,7 +702,7 @@ async function main() {
           if (arg === 'activate' || arg.startsWith('activate ')) {
             const saved = config(root);
             const requested = arg.slice('activate'.length).trim();
-            const names = requested ? [requested] : Object.keys(saved.profiles ?? {}).filter(name => saved.profiles[name].adapter === 'local');
+            const names = requested ? [requested] : Object.keys(saved.profiles ?? {}).filter(name => saved.profiles[name]?.adapter === 'local');
             if (!names.length) throw new Error('No saved local workers; use /local setup');
             const result = await activateLocalProfiles(session, names);
             settings.profiles = structuredClone(saved.profiles);
@@ -796,8 +726,9 @@ async function main() {
             return;
           }
           session.append({kind: 'status', text: result.text});
-          // The daemon re-reads config.json at each decision; the control row refreshes its orders and confirms.
-          if (result.changed && orchestrating) session.append({kind: 'control.jev', from: 'user'});
+          // The daemon re-reads config.json at each decision; the control row refreshes its orders and
+          // confirms. `refresh: 'roster'` also has it describe the roster's models again.
+          if ((result.changed || result.refresh) && orchestrating) session.append({kind: 'control.jev', from: 'user', ...(result.refresh ? {refresh: result.refresh} : {})});
           render();
           return;
         }
@@ -813,8 +744,10 @@ async function main() {
         }
         if (command === 'restart') return await restart();
         if (command === 'help') {
-          const rows = vendorRows().map(([name, description, hint]) => `  /${name}${hint ? ' ' + hint : ''}`.padEnd(24) + description);
-          session.append({kind: 'status', text: help + (rows.length ? `\nCommands your agents keep here (expanded by bounce, so they work whichever agent answers):\n${rows.join('\n')}` : '')});
+          // The journal keeps the plain text (handoffs, --json readers); the transcript paints
+          // the same rows from `vendor` (src/format.js), so both stay one source: src/help.js.
+          const vendor = vendorRows();
+          session.append({kind: 'help', text: helpRows({tui: true, vendor}).join('\n'), vendor});
           return;
         }
         if (command === 'review') {

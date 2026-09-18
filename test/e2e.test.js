@@ -231,7 +231,7 @@ test('E5 the orchestrator grant cannot escalate: budget.reserved, task.completed
   assert.equal(journal.some(e => e.kind === 'control.stopped'), false);
   assert.equal(journal.some(e => e.kind === 'budget.reserved' && e.task === 'x'), false);
   assert.equal(journal.some(e => e.kind === 'task.completed' && e.task === 'x'), false);
-  assert.equal(journal.find(e => e.kind === 'operation').shape, 'single-provider');
+  assert.equal(journal.find(e => e.kind === 'operation').shape, 'multi-provider', 'the shipped roster underneath the two codex profiles spans vendors');
 });
 
 // ---- the gap that blocks E1, E3, E4 and E6 -------------------------------
