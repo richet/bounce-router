@@ -83,6 +83,16 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const routed = session.events.findLast(e => e.kind === 'jev.routed' && e.task === task);
     return routed ? {...row, profile: routed.chosen} : row;
   };
+  // Jev's diff base (`head` on the first task.started) is recorded only for a task a
+  // decision-model (typesafe) reviewer will judge — the `jev` critic prepare() names when Jev
+  // review is on. Otherwise the row carries no `head` and no git call is made, so with Jev
+  // off the journal is byte-for-byte today's.
+  const jevReviewed = row => {
+    const completion = row?.review?.completion;
+    const first = Array.isArray(completion) ? completion[0] : completion;
+    return typeof first === 'string' && profiles[first]?.adapter === 'typesafe';
+  };
+  const routing = new Set(); // tasks whose `auto` route is in flight: never dispatched a second time meanwhile
   // Every row the scheduler itself writes is stamped from the injected clock, not the journal's
   // own wall-clock default — the watchdog's `now` and every row `time` it compares against must
   // live on the same timeline. Under the default `clock = Date.now`, this is the same wall-clock
@@ -378,7 +388,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       }
     }
     for (const [task, t] of Object.entries(reducers.tasks(session.events))) {
-      if (t.state !== 'queued' || handles.has(task) || heldTasks.has(task)) continue;
+      if (t.state !== 'queued' || handles.has(task) || heldTasks.has(task) || routing.has(task)) continue;
       const row = submittedRow(task);
       if (row) dispatch(row).catch(error => append({kind: 'task.failed', task, reason: 'error', text: error.message, context: row.context}));
     }
@@ -586,7 +596,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     }
     handles.set(task, {adapter, handle});
     append({kind: 'peer.joined', name: workerFrom(task), role: 'worker', adapter: profile.adapter, profile: row.profile, from: workerFrom(task), context});
-      append({kind: 'task.started', task, attempt, requested: profile.model ?? '', head: attempt === 1 ? gitHead(session.cwd) : undefined, from: workerFrom(task), context});
+      append({kind: 'task.started', task, attempt, requested: profile.model ?? '', ...(attempt === 1 && jevReviewed(row) ? {head: gitHead(session.cwd)} : {}), from: workerFrom(task), context});
     for (const staged of launchingAttempts.get(task)?.reports ?? []) report({task, attempt, report: staged.payload, from: staged.from, context: staged.context});
     launchingAttempts.delete(task);
     publish({kind: 'task.activity', task, text: 'Worker started · waiting for first activity', startup: true, from: workerFrom(task), context});
@@ -833,7 +843,17 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // nothing yet at this point and escalates instead. Every reviewer past the first makes
       // (and, on refusal, releases) its own start reservation, regardless of stage.
       const reviewRefusal = policyRefusal(reviewProfile);
-      if (i === 0 && !reserveFirst) {
+      // A decision-model (typesafe) verdict is a ~100 ms HTTP call, not a worker start: it
+      // reserves nothing of its own, so Jev can never block a task on budget. (The prelaunch
+      // first reviewer's shared reservation is the worker's, made by dispatch — untouched.)
+      const exempt = reviewProfile.adapter === 'typesafe' && (reserveFirst || i > 0);
+      if (exempt) {
+        if (reviewRefusal) {
+          append({kind: 'policy.escalated', task, reason: reviewRefusal.reason, text: reviewRefusal.text, context});
+          append({kind: 'task.blocked', task, text: reviewRefusal.text, context});
+          return null;
+        }
+      } else if (i === 0 && !reserveFirst) {
         if (reviewRefusal) {
           append({kind: 'budget.released', task, root, amount: {starts: 1}, text: reviewRefusal.reason, context});
           append({kind: 'task.failed', task, reason: reviewRefusal.reason, text: reviewRefusal.text, context});
@@ -875,7 +895,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         report: reported ? {summary: reported.summary, text: reported.text, evidence: reported.evidence, remaining: reported.remaining, phase: reported.phase} : null,
         head: session.events.find(e => e.kind === 'task.started' && e.task === lineageRoot)?.head ?? null};
       const verdict = await runReview({task, stage, round, profileName, profile: reviewProfile, orders, dir, context, peer, review});
-      if (verdict.launchFailed) append({kind: 'budget.released', task, root, amount: {starts: 1}, text: 'review launch failed', context});
+      if (verdict.launchFailed && !exempt) append({kind: 'budget.released', task, root, amount: {starts: 1}, text: 'review launch failed', context});
       if (verdict.cancelled) return null;
       verdicts.push(verdict);
     }
@@ -973,7 +993,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // fallback builder — an orchestrator that uses `auto` never breaks. A task cancelled while
     // the decision was in flight gets no routing row.
     if (row.profile === AUTO_PROFILE) {
-      const decision = jev ? await jev.route({task, orders: row.orders, profiles}) : {chosen: routingFallback(profiles), fallback: true, reason: 'routing unavailable', probabilities: {}, confidence: 0};
+      if (routing.has(task)) return; // a reconcile() during the route await: this dispatch already owns the task
+      routing.add(task);
+      let decision;
+      try { decision = jev ? await jev.route({task, orders: row.orders, profiles}) : {chosen: routingFallback(profiles), fallback: true, reason: 'routing unavailable', probabilities: {}, confidence: 0}; }
+      finally { routing.delete(task); }
       if (reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) return;
       if (!decision?.chosen || !profiles[decision.chosen]) {
         append({kind: 'task.failed', task, reason: 'error', text: 'malformed: profile (no worker profile to route auto to)', context});
