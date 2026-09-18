@@ -5,6 +5,7 @@
 //
 // reducers.spend is builder-1's (src/reducers.js); until it lands these assertions are red —
 // marked `// depends on builder-1: reducers.spend` — not weakened to pass early.
+import './helpers/env.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';

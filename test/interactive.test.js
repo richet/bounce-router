@@ -2,6 +2,7 @@
 // interactive-orchestrator path and the steering IPC in-process (real bus + scheduler, fake
 // children). They live in their own file so their in-process daemon apparatus never runs
 // alongside daemon.test.js's real-subprocess tests, whose timing it otherwise perturbed.
+import './helpers/env.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
