@@ -536,6 +536,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       if (error.code === 'LOCAL_CAPACITY_UNCERTAIN') append({kind: 'task.blocked', task, reason: 'termination_unverified', text: error.message, from: workerFrom(task), context});
       else if (error.code?.startsWith('LOCAL_')) append({kind: 'task.failed', task, reason: 'local_unavailable', text: error.message, from: workerFrom(task), context});
       else if (error.code === 'missing' || error.code === 'backend_unavailable') append({kind: 'task.failed', task, reason: error.code, from: workerFrom(task), context});
+      // A vendor that refuses the launch itself because the account is exhausted (codex-live tags
+      // the rejection `limited`) falls back exactly like a limited result would; the vendor's
+      // own text (its reset time) rides along for the orchestrator.
+      else if (error.code === 'limited') append({kind: 'task.failed', task, reason: 'limited', text: error.message, from: workerFrom(task), context});
       else append({kind: 'task.failed', task, reason: 'error', text: error.message, from: workerFrom(task), context});
       return;
     }

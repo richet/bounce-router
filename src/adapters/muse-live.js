@@ -1,7 +1,7 @@
 import {spawn as nodeSpawn} from 'node:child_process';
 import {mkdirSync, writeFileSync} from 'node:fs';
 import {join} from 'node:path';
-import {invocation, normalize} from '../providers.js';
+import {invocation, normalize, limitPattern} from '../providers.js';
 import {resolveExecutable} from '../executable.js';
 import muse from './muse.js';
 import {TEXT_MAX, appendPending, promptSafe, readPending, spawnLive, takePending, vendorEnv, verifiedCancel} from './live-common.js';
@@ -12,7 +12,7 @@ const field = value => value === undefined || value === null || value === '' ? '
 // normalized batch so recordQuota sees the vendor line; the exit code only becomes a
 // result when the stream carried none, so a real terminal line always wins.
 async function* museEvents(live) {
-  let sawResult = false;
+  let sawResult = false, limited = false;
   for await (const event of live.events) {
     if (event.kind === 'line') {
       let raw;
@@ -20,12 +20,14 @@ async function* museEvents(live) {
       yield {kind: 'raw', raw};
       for (const normalized of normalize('muse', raw)) {
         sawResult ||= normalized.kind === 'result';
+        // The error channel alone classifies exhaustion (providers.limitPattern, as runProcess does).
+        if (normalized.kind === 'error') limited ||= limitPattern.test(normalized.text);
         // The scheduler only recognizes the adapter-event spelling 'native' (see scheduler.js);
         // the provider layer emits the journal spelling 'peer.native'.
         if (normalized.kind === 'peer.native') { yield {kind: 'native', provider: normalized.provider, sessionId: normalized.sessionId}; continue; }
         // Same gap for 'result': the provider layer reports success/failure as a boolean, but the
         // scheduler (and the exit-code fallback below) only ever look at event.status.
-        if (normalized.kind === 'result') { yield {kind: 'result', text: normalized.text, status: normalized.success ? 'completed' : 'failed'}; continue; }
+        if (normalized.kind === 'result') { yield {kind: 'result', text: normalized.text, status: normalized.success ? 'completed' : limited ? 'limited' : 'failed'}; continue; }
         yield normalized;
       }
     } else if (event.kind === 'diagnostic') yield event;

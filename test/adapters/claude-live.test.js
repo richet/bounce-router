@@ -246,3 +246,27 @@ test('L11 a clean live-source EOF without a normalizer result fails the adapter 
     kind: 'result', status: 'failed', text: 'protocol error: claude stream ended without result',
   }]);
 });
+
+// A vendor usage limit is reported on the error channel (an is_error result, a rejected
+// rate_limit_event) and must end the worker as `limited`, the status the scheduler's fallback
+// chain reads — classic runProcess already classified it; the live adapter did not.
+test('L12 a usage-limit error result, or a rejected rate_limit_event before a failed result, is a limited result', async () => {
+  const adapter = createClaudeLive({});
+  const line = raw => ({kind: 'line', text: JSON.stringify(raw)});
+  const scripts = [
+    [line({type: 'result', subtype: 'error_during_execution', is_error: true, result: "You've hit your usage limit. Try again at 2:50 PM.", session_id: 's-1'}), {kind: 'exit', code: 1, signal: null, limited: false}],
+    [line({type: 'rate_limit_event', rate_limit_info: {status: 'rejected', resetsAt: 1}}), line({type: 'result', subtype: 'error', is_error: true, result: 'request aborted', session_id: 's-2'}), {kind: 'exit', code: 1, signal: null, limited: false}],
+  ];
+  for (const script of scripts) {
+    const handle = {live: {events: (async function* () { yield* script; })()}};
+    assert.equal((await drain(adapter, handle)).find(e => e.kind === 'result').status, 'limited');
+  }
+  const plain = {live: {events: (async function* () {
+    yield line({type: 'assistant', message: {content: [{type: 'text', text: 'the docs quote a rate limit of 429'}]}});
+    yield line({type: 'result', subtype: 'error', is_error: true, result: 'tests failed', session_id: 's-3'});
+    yield {kind: 'exit', code: 1, signal: null, limited: false};
+  })()}};
+  assert.equal((await drain(adapter, plain)).find(e => e.kind === 'result').status, 'failed', 'assistant text never classifies');
+  const exited = {live: {events: (async function* () { yield {kind: 'exit', code: 1, signal: null, limited: true}; })()}};
+  assert.deepEqual(await drain(adapter, exited), [{kind: 'result', status: 'limited', text: 'protocol error: claude exited without result'}]);
+});

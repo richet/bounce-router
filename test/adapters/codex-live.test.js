@@ -40,14 +40,15 @@ async function drain(iterable) {
 }
 
 // --- the real fake process ------------------------------------------------
-function harness(t, {delay = 0} = {}) {
+function harness(t, {delay = 0, env = {}} = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-codex-live-'));
   const logPath = path.join(root, 'fake.log');
   const spawned = [];
   const adapter = createCodexLive({
     spawn(executable, args, options) {
-      spawned.push({executable, args, options});
-      return spawn(executable, args, {...options, env: {...options.env, FAKE_LOG: logPath, FAKE_DELAY_MS: String(delay)}});
+      const child = spawn(executable, args, {...options, env: {...options.env, FAKE_LOG: logPath, FAKE_DELAY_MS: String(delay), ...env}});
+      spawned.push({executable, args, options, child});
+      return child;
     },
   });
   const handles = [];
@@ -541,4 +542,68 @@ test('a thread response without an id rejects at the adapter boundary and leaves
   await rejected;
   assert.equal(server.lines().length, 3); // invalid state is never forwarded into turn/start
   assert.equal(killed >= 1, true);
+});
+
+// --- vendor usage limits become `limited`, so the scheduler's fallback chain fires ---------------
+// Observed live: a `build` task on codex died as task.failed{reason:'error'} with "You've hit your
+// usage limit …" three seconds after task.started, and its configured fallback never ran.
+import {Session} from '../../src/core.js';
+import {createScheduler} from '../../src/scheduler.js';
+import {fakeAdapter} from '../helpers/fake-adapter.js';
+
+test('a turn/start refused with the usage-limit text rejects launch with code limited and leaves no process', async t => {
+  const h = harness(t, {env: {FAKE_LIMIT: 'launch'}});
+  await assert.rejects(h.launch({orders: 'go'}), error => error.code === 'limited' && /hit your usage limit/.test(error.message));
+  await waitFor(() => h.spawned[0].child.exitCode !== null || h.spawned[0].child.signalCode !== null, 'the refused server to be gone');
+});
+
+test('a turn that fails with the usage-limit text — in turn/completed or an error notification — is a limited result', async t => {
+  for (const mode of ['turn', 'notify']) {
+    const h = harness(t, {env: {FAKE_LIMIT: mode}});
+    const handle = await h.launch({orders: 'go'});
+    const rows = await drain(h.adapter.events(handle));
+    const result = rows.find(row => row.kind === 'result');
+    assert.equal(result.status, 'limited', mode);
+    assert.match(result.text, /hit your usage limit/);
+  }
+});
+
+test('a plain failed turn stays failed: only the error channel classifies exhaustion', async () => {
+  const {adapter, handle, server} = await scriptedLaunch();
+  server.send({method: 'item/completed', params: {threadId: 't-9', turnId: 'u-1', completedAtMs: 1,
+    item: {id: 'i-1', type: 'agentMessage', text: 'the docs mention a rate limit of 429 per hour'}}});
+  server.send({method: 'turn/completed', params: {threadId: 't-9', turn: {id: 'u-1', items: [], status: 'failed', error: {message: 'sandbox denied'}}}});
+  await waitFor(() => handle.resulted, 'terminal result');
+  const rows = drain(adapter.events(handle));
+  server.close(0);
+  assert.deepEqual((await rows).filter(row => row.kind === 'result'), [{kind: 'result', status: 'failed', text: 'sandbox denied'}]);
+});
+
+// Through the scheduler, with the real adapter over the fake app-server: the quota failure is
+// task.failed{reason:'limited'} and the task is replaced on the profile's fallback.
+for (const mode of ['launch', 'turn']) test(`a codex worker limited at ${mode} falls back to the next profile`, async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-codex-fallback-'));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const session = new Session(root, {root});
+  const codex = createCodexLive({spawn: (executable, args, options) => spawn(executable, args, {...options, env: {...options.env, FAKE_LIMIT: mode}})});
+  const claude = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done on claude'}]);
+  const profiles = {
+    build: {adapter: 'codex', model: 'gpt-6-astra', mode: 'yolo', fallback: ['build_claude'], executables: {codex: fakeExecutable}},
+    build_claude: {adapter: 'claude', mode: 'yolo', fallback: []},
+  };
+  const scheduler = createScheduler({session, adapters: {codex, claude}, profiles});
+  t.after(() => scheduler.close());
+  const row = scheduler.submit({parent: null, profile: 'build', orders: 'write the note', deadline: null});
+  const failed = session.events.find(e => e.kind === 'task.failed' && e.task === row.task) ?? await new Promise(resolve => {
+    const stop = session.subscribe(e => { if (e.kind === 'task.failed' && e.task === row.task) { stop(); resolve(e); } });
+  });
+  assert.equal(failed.reason, 'limited');
+  assert.match(failed.text, /hit your usage limit/);
+  await waitFor(() => session.events.some(e => e.kind === 'policy.fallback' && e.task === row.task), 'fallback');
+  const fallback = session.events.find(e => e.kind === 'policy.fallback' && e.task === row.task);
+  assert.deepEqual([fallback.from_profile, fallback.to_profile, fallback.reason], ['build', 'build_claude', 'limited']);
+  const retry = session.events.find(e => e.kind === 'task.submitted' && e.replaces === row.task);
+  assert.equal(retry.profile, 'build_claude');
+  await waitFor(() => scheduler.tasks()[retry.task]?.state === 'completed', 'fallback completion');
+  assert.equal(claude.calls.launch, 1);
 });
