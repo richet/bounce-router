@@ -1,17 +1,20 @@
 // The input lane is deliberately independent from terminal completion and command execution:
 // callers classify before considering whether a main model turn is already busy.
 export const commandCatalog = {
-  immediate: ['provider', 'model', 'local', 'order', 'mode', 'note', 'btw', 'rename', 'sessions', 'skills', 'review', 'quota', 'retry', 'operation', 'stop', 'msg', 'agents', 'tasks', 'help', 'detach', 'details', 'sidebar'],
+  immediate: ['provider', 'model', 'local', 'order', 'mode', 'note', 'btw', 'rename', 'sessions', 'skills', 'review', 'quota', 'retry', 'operation', 'stop', 'msg', 'agents', 'tasks', 'help', 'detach', 'details', 'sidebar', 'jev'],
   turn: ['continue'],
   lifecycle: ['login', 'new', 'resume', 'update', 'restart', 'quit'],
 };
+
+// A second spelling of one command classifies as the command itself.
+export const commandAliases = {typesafe: 'jev'};
 
 const kinds = new Map(Object.entries(commandCatalog).flatMap(([kind, commands]) => commands.map(command => [command, kind])));
 
 export function classifyInput(text) {
   if (!text.startsWith('/')) return {kind: 'prompt', text};
   const [rawCommand = '', ...parts] = text.slice(1).trim().split(/\s+/).filter(Boolean);
-  const command = rawCommand.toLowerCase();
+  const command = commandAliases[rawCommand.toLowerCase()] ?? rawCommand.toLowerCase();
   const kind = kinds.get(command);
   return {kind: kind ?? 'immediate', command, parts, arg: parts.join(' '), ...(kind ? {} : {unknown: true})};
 }

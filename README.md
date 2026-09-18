@@ -170,7 +170,25 @@ A session's `daemon.json` records the live daemon and is removed on a clean exit
 
 `/operation orchestrator` (or Ctrl+O) switches a session from *classic* — one agent answers each turn, with fallback — to *orchestrator*: the main agent coordinates and never edits the repository itself. It reads a standing brief bounce writes at `sessions/<id>/orchestrator/ORDERS.md`, submits tasks to worker profiles over the session bus, and reports outcomes to you. Claude's own Agent/Task tools are switched off for it, and ORDERS.md forbids the other vendors' subagent features, so all delegation is visible in bounce. Switching back is `/operation classic`; the choice is saved in `config.json` and shown in the sidebar and `bounce sessions`.
 
-Enabling it with no profile table installs a starter one: `main` on your first provider, `build` on Codex with a Claude fallback. Edit `config.json` to shape your own:
+Bounce ships a worker roster, so nothing needs configuring to start: `main` (the orchestrator, on your first provider) plus one builder for every model the cloud vendors list in the `/model` picker, each with a cost tier and a note on what it is good for (`src/model-catalog.js`) so [Jev routing](#jev-typesafe-decisions) can choose between them out of the box. That roster is the baseline of every orchestrator config: it is always present, and never copied into `config.json`. The two frontier builders keep their historical names; the rest are `<adapter>_<model>`:
+
+| profile | model | tier |
+| --- | --- | --- |
+| `build` | codex / gpt-6-astra | strongest |
+| `build_claude` | claude / opus[1m] | strongest |
+| `claude_fable` | claude / claude-fable-5-1[1m] | strongest |
+| `codex_sol` | codex / gpt-5.6-sol | mid |
+| `codex_terra` | codex / gpt-5.6-terra | mid |
+| `claude_sonnet` | claude / sonnet | mid |
+| `codex_55` | codex / gpt-5.5 | mid |
+| `muse_spark` | muse / muse-spark-1.3 | mid |
+| `muse_spark_12` | muse / muse-spark-1.2 | mid |
+| `codex_luna` | codex / gpt-5.6-luna | cheapest |
+| `claude_haiku` | claude / haiku | cheapest |
+
+Each builder falls back across vendors at the same tier (`build` → `build_claude`, `codex_terra` → `claude_sonnet`, `codex_luna` → `claude_haiku`, …), so an exhausted account moves a task sideways rather than down. The Muse `-contributor` variants share your prompts and code with the vendor and are not shipped as profiles; local models are added by `/local setup`.
+
+Your `profiles` block in `config.json` is an overlay on that roster: an entry with a new name adds a profile after the shipped ones, an entry with a shipped name replaces that profile outright (its fields are not merged — write the whole entry, fallbacks included), and setting a shipped name to `null` drops it, along with any shipped fallback that pointed at it. Shipped order is kept, so `build` stays the routing fallback unless you drop or reorder around it. The saved config only ever holds your overlay — `/local setup`, `/model worker … --save` and `bounce local profile --save` write just the profile they change — so an upgraded bounce brings new shipped builders with it, and deleting the block returns you to the defaults. `orchestrator` defaults to `main`. With the config below the roster is the shipped builders with `main`, `build` and `build_claude` as written here, plus `scout` and `critic`, minus `muse_spark_12`:
 
 ```json
 {
@@ -179,14 +197,16 @@ Enabling it with no profile table installs a starter one: `main` on your first p
   "strategy": "default",
   "profiles": {
     "main":   {"adapter": "claude"},
-    "build":  {"adapter": "codex", "model": "gpt-5", "fallback": ["build_claude"]},
-    "build_claude": {"adapter": "claude", "model": "sonnet"},
-    "critic": {"adapter": "muse", "role": "critic"}
+    "build":  {"adapter": "codex", "model": "gpt-6-astra", "fallback": ["build_claude"]},
+    "build_claude": {"adapter": "claude", "model": "opus[1m]"},
+    "scout":  {"adapter": "claude", "model": "haiku", "tier": "cheapest", "capabilities": "Finds files and symbols fast; never give it a refactor."},
+    "critic": {"adapter": "muse", "role": "critic"},
+    "muse_spark_12": null
   }
 }
 ```
 
-- `adapter` is `claude`, `codex`, `muse` or `local`; `model` is passed through to that CLI. `orchestrator` names the profile that coordinates; its role is derived, never declared.
+- `adapter` is `claude`, `codex`, `muse`, `local` or `typesafe`; `model` is passed through to that CLI. `orchestrator` names the profile that coordinates; its role is derived, never declared. An optional `tier` (`cheapest`, `mid`, `strongest`) and `capabilities` sentence are shown in the roster and read by [Jev routing](#jev-typesafe-decisions); they override what bounce ships for that model, and for a model bounce does not know (a local model, a new vendor id) bounce describes the model itself.
 - `role` is a free label (default `builder`) the orchestrator sees beside each profile. `critic`, `verifier` and `analyst` default to `policy: read-only`; any other role defaults to `write`. A read-only profile is never escalated: a task that needs writes is refused rather than downgraded.
 - `mode` (`yolo` or `plan`) defaults to the session mode and may not exceed it. Execution policy only ratchets down across dispatch, fallback and review.
 - `fallback` lists profiles to try, in order, when the first one's provider is exhausted or missing. Role and policy are preserved across a fallback.
@@ -232,6 +252,30 @@ bounce local prepare [IMAGE]     # cache Linux npm dependencies for the containe
 In the TUI, `/local setup` runs the same wizard without interrupting running agents (`/local setup loaded` limits it to already-loaded models; `/local cancel` abandons it), `/local activate [NAME]` brings saved local workers into the current session without a restart, and `/model worker PROFILE [auto|endpoint/model|refresh]` picks the model a worker uses — `prefer`/`exclude REF,REF` edit its preferences, `--save` persists any of these.
 
 Endpoints live under `local.endpoints` in `config.json`; the default is `lmstudio` at `http://127.0.0.1:1234`, `loadPolicy: loaded-only` (a downloaded model that is not loaded is not eligible) and `maxConcurrent: 3`. Eligibility is checked at dispatch, so the orchestrator is told when no model is available rather than handed a cloud worker instead. `localOptions` bounds each run: `maxSteps` (32), `maxOutputTokens` (2048), `timeoutMs` (120000) and `maxContextBytes` (200000).
+
+## Jev (TypeSafe) decisions
+
+Optional, off by default. [Jev](https://docs.typesafe.ai) is TypeSafe's decision model: it answers typed questions over a state in ~150 ms and returns probabilities and a confidence, never text. bounce uses it for two harness decisions — both on once Jev is enabled, both gated on confidence so an unconfident answer means today's behaviour, and both skipped — with a `jev.skipped` row saying why — whenever the key is missing or the API is unreachable, times out (10 s), or errors (one retry on 429/529).
+
+    /jev                  status: enabled?, key (last 4 chars), model, review/routing flags
+    /jev key [KEY|clear]  store the key in ~/.bounce/secrets.json (0600); no KEY opens a masked prompt
+    /jev on | off         enable or disable everything Jev does: verdicts and routing
+    /jev review on|off    completion verdicts (default on when enabled)
+    /jev routing on|off   model routing for "profile":"auto" (default on when enabled)
+    /jev roster [refresh] what routing knows about each worker model (tier, capabilities, who described it); refresh describes them again
+    /jev model ID         default jev-1.13.0 — pinned, because an alias like jev-latest moves between releases and shifts the calibrated thresholds
+    /jev confidence N     threshold, default 0.8
+    /jev test             one live noul call ("Is this a test?"): latency and the answer, or the error
+
+`/typesafe` is an alias; `bounce jev …` is the headless twin. The key never enters `config.json` or a journal.
+
+**Completion verdicts.** With `jev.enabled` and `jev.review`, a root task submitted without a `review.completion` profile is reviewed by Jev before it is accepted: the state is the orders, the worker's final report, the `git diff` of the tree against the task's start (bounded to ~24k tokens) and the test-result lines found in the report; the questions are one accept/rework choice plus narrow yes/no checks (diff outside the owned paths, forbidden files changed, tests claimed without output, work named as remaining, an acceptance criterion unmet, unverified claims, an empty diff). A `rework` with confidence ≥ the threshold takes the same path a critic's rework does — one rework round to the same worker with the checks that fired as its must-fix list; anything else accepts. The verdict is journaled (`jev.verdict`, probabilities and confidence, never the request) and shown like any review verdict. An explicit `review.completion` always wins, and only the default strategy is decorated.
+
+**Model routing.** With `jev.routing`, the orchestrator may submit `"profile":"auto"`: bounce classifies the orders against the whole roster — a choice over every worker profile's adapter/model/role/policy, its cost `tier` and a sentence on what its model is good and bad at, plus whether the orders need write or shell access — and dispatches the top pick when it is confident and its policy fits; otherwise `jev.routing.default` (`/jev routing default NAME`) or the first writing builder that is not the orchestrator. With routing off or Jev unavailable, `auto` resolves to that same fallback, so an orchestrator that uses it never breaks. Each decision is a `jev.routed` row.
+
+The tier and capabilities need no configuring. Precedence is: a profile's own `tier`/`capabilities` (`"tier": "mid", "capabilities": "…"`) always win; every model in the vendors' `/model` pickers has a shipped note (`src/model-catalog.js`, shown as source `catalog` in `/jev roster`), so the default roster routes with no agent turn at all; any other model — a local model, a vendor id newer than this bounce — is described once by one of your own cloud agents — the orchestrator's model, else the first cloud profile in the roster — in a single read-only, tool-free turn when the daemon starts with routing on (or on `/jev roster refresh`). Those notes are cached in `~/.bounce/roster-notes.json` per adapter/model, journaled as a `jev.roster` row, shown in ORDERS.md, and listed by `/jev roster`. If the description fails, a `jev.skipped` row says why and routing sees adapter/model/role/policy only for that model.
+
+A `typesafe` profile can also be declared in `config.json` (`{"adapter": "typesafe", "role": "critic"}`) and named as a `review.completion` reviewer explicitly; it is always read-only and never runs a task.
 
 ## Skills
 
@@ -326,7 +370,8 @@ The fallback order in the header carries each agent's short reading, e.g. `claud
 
 `~/.bounce` (override with `BOUNCE_HOME`). A `~/.localrouter` directory left by the previous name is moved to `~/.bounce` on first launch, keeping existing config, sessions and quota readings:
 
-- `config.json`: order, mode, per-provider models, cooldownMinutes, contextChars, executable overrides, skill scope and auto-sync; in orchestrator mode also `operation`, `orchestrator`, `profiles`, `strategy`, `strict` and `local`.
+- `config.json`: order, mode, per-provider models, cooldownMinutes, contextChars, executable overrides, skill scope and auto-sync, `jev` (never its key); in orchestrator mode also `operation`, `orchestrator`, `profiles`, `strategy`, `strict` and `local`.
+- `secrets.json` (0600): the TypeSafe API key stored by `/jev key`; `TYPESAFE_API_KEY` in the environment overrides it.
 - `skills/<name>/SKILL.md`: the skills bounce manages and installs into every agent.
 - `quota.json`: the latest usage reading each agent reported, kept across restarts.
 - `sessions/<uuid>/journal.jsonl`: append-only normalized and raw events.

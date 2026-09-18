@@ -85,8 +85,8 @@ test('the TUI treats an agent-owned /NAME as a turn, offers it in the picker and
   const extra = () => [['triage', 'Triage a ticket (claude · project)', '<REC-####>'], ['seed-account', 'Seed (claude · project)', ''], ['skills', 'a clash', '']];
   assert.deepEqual(completions('/tri', extra).map(r => r[0]), ['triage']);
   assert.deepEqual(completions('/s', extra).map(r => r[0]), ['sessions', 'skills', 'sidebar', 'stop', 'seed-account']);
-  assert.equal(completions('/', extra).length, 31, 'own commands, then the two extras that do not clash');
-  assert.equal(completions('/', ).length, 29);
+  assert.equal(completions('/', extra).length, 32, 'own commands, then the two extras that do not clash');
+  assert.equal(completions('/', ).length, 30);
   assert.equal(typedCommand('/triage', extra), 'triage');
   assert.equal(typedCommand('/seed-account', extra), 'seed-account');
   assert.equal(typedCommand('/triage'), '');

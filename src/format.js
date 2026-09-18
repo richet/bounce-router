@@ -6,6 +6,7 @@ import wrapAnsi from 'wrap-ansi';
 import sliceAnsi from 'slice-ansi';
 import stripAnsi from 'strip-ansi';
 import {tasks, budgets, TERMINAL} from './reducers.js';
+import {helpRows} from './help.js';
 
 // How many lines of a tool result the compact transcript shows before "… +N lines".
 const RESULT_PREVIEW = 3;
@@ -24,7 +25,7 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     title: c.bold.cyan, muted: c.gray, user: c.bold.cyan, assistant: c.bold.green,
     tool: c.magenta, error: c.bold.red, status: c.yellow, result: c.green,
     note: c.blue, diagnostic: c.yellow, selected: c.bold.inverse, prompt: c.cyan, quota: c.bold.blue,
-    skills: c.bold.magenta,
+    skills: c.bold.magenta, help: c.bold.cyan,
   };
   function codeColors(text, language) {
     if (!color) return text;
@@ -172,6 +173,13 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
       const preview = e.preview ? [clip(`  ${style.muted(clean(e.preview))}`, width)] : [];
       if (e.state === 'failed' || e.state === 'timed_out') return [head, ...preview, clip(`  ${style.muted('⎿')}  ${style.muted(`next: ${failureHint(e.reason, e.text)}`)}`, width)];
       return [head, ...preview];
+    }
+    // /help is a reference card, not a status line: headed sections, commands in one colour and
+    // their arguments in another, descriptions aligned in a column that wraps under itself.
+    if (e.kind === 'help') {
+      const paint = {title: style.title, name: style.prompt, hint: style.muted, muted: style.muted, key: c.yellow};
+      const body = helpRows({width: width - 2, paint, vendor: Array.isArray(e.vendor) ? e.vendor : [], tui: true});
+      return [clip(style.help(clean(`${who(e)} · Help`)), width), ...body.map(row => row ? '  ' + row : ''), ''];
     }
     if (compact && e.kind === 'user' && e.typed) return [...block(style.user('>'), wrap(clean(e.typed), width - 2)), clip(`  ${style.muted('⎿')}  ${style.muted(`expanded to ${withoutBrief(e.text).length.toLocaleString()} chars · /details shows it`)}`, width), ''];
     if (compact && e.kind === 'user') return [...block(style.user('>'), wrap(clean(withoutBrief(e.text)), width - 2)), ''];

@@ -125,3 +125,10 @@ test('narrow layout retains compact status and the draft without a squeezed side
   assert.doesNotMatch(output, /BOUNCE/);
   assert.ok(output.split('\n').every(line => stringWidth(line) <= 58));
 });
+
+test('the provider · mode line carries the Jev state only while Jev does something', () => {
+  const rail = view => frame(120, false, view).split('\n').map(line => line.replace(/^.*│ ?/, '').trim());
+  assert.ok(rail({}).some(line => line === 'claude · plan'));
+  assert.ok(rail({metadata: {...metadata, jev: 'jev+routing'}}).some(line => line === 'claude · plan · jev+routing'));
+  assert.ok(rail({metadata: {...metadata, jev: ''}}).some(line => line === 'claude · plan'));
+});

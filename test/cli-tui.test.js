@@ -93,7 +93,7 @@ test('CLI commands and live steering work while the daemon main turn is held', {
   child.stdin.write('editable during discovery');
   await waitFor(() => output.includes('editable during discovery'));
   child.stdin.write('\u0015/help\r');
-  await waitFor(() => session.events.some(row => row.kind === 'status' && row.text?.includes('TUI commands:')));
+  await waitFor(() => session.events.some(row => row.kind === 'help' && row.text?.includes('Agents & models')));
   catalogResponse.setHeader('content-type', 'application/json');
   catalogResponse.end('{"models":[]}');
   await waitFor(() => output.includes('pins for this session'));
@@ -109,7 +109,7 @@ test('CLI commands and live steering work while the daemon main turn is held', {
   child.stdin.write('/agents\r');
   await waitFor(() => output.includes('Agent workspace'));
   child.stdin.write('/help\r');
-  await waitFor(() => session.events.some(row => row.kind === 'status' && row.text?.includes('TUI commands:')));
+  await waitFor(() => session.events.some(row => row.kind === 'help' && row.text?.includes('Agents & models')));
   assert.equal(calls.filter(([kind]) => kind === 'run').length, 1, 'commands never start a second model turn');
   assert.equal(running, true, 'commands completed before the held provider turn ended');
   session.append({kind: 'task.submitted', task: 'aaa', profile: 'build', orders: 'first'});

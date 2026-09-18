@@ -714,3 +714,20 @@ test('P15 a wait for task.completed resolves on the task\'s failure instead of r
   session.append({kind: 'task.completed', task: 'live', summary: 's'});
   assert.equal(await other, null);
 });
+
+// Jev (src/jev.js): a valid peer submission may be decorated by the scheduler's `prepare`
+// before it is journaled (the jev completion reviewer for a root task naming none), so the
+// journaled row — the one the reducer, `wait` and the accepted-refusal read — carries it.
+test('publish applies the scheduler\'s prepare hook to a valid task.submitted and journals the decorated row', async t => {
+  const prepared = [];
+  const {session, bus} = await setup(t, {validate: () => null, prepare: e => { prepared.push(e); return e.parent === null && !e.review?.completion ? {...e, review: {...(e.review ?? {}), completion: 'jev'}} : e; }});
+  const client = await connect(bus, 'orchestrator', {canSubmit: true, tasks: [], context: 'ctx'});
+  t.after(() => client.close());
+  const row = await client.publish({kind: 'task.submitted', parent: null, profile: 'A', orders: 'do it'});
+  assert.equal(prepared.length, 1);
+  assert.deepEqual(row.review, {completion: 'jev'});
+  assert.deepEqual(session.events.find(e => e.kind === 'task.submitted').review, {completion: 'jev'});
+  // a submission that already names its reviewer is journaled as sent
+  const explicit = await client.publish({kind: 'task.submitted', parent: null, profile: 'A', orders: 'do it', review: {completion: 'C'}});
+  assert.deepEqual(explicit.review, {completion: 'C'});
+});

@@ -42,7 +42,7 @@ export function createWorkspace(React, Ink) {
     const status = main.state ?? 'ready';
     const lines = [
       {text: 'BOUNCE', color: 'cyan', bold: true},
-      {text: `${metadata.provider ?? 'agent'} · ${metadata.mode ?? 'plan'}`},
+      {text: [metadata.provider ?? 'agent', metadata.mode ?? 'plan', metadata.jev].filter(Boolean).join(' · ')},
       {text: `Model: ${metadata.model || 'provider default'}`, color: 'gray'},
       {text: `${metadata.operation ?? 'classic'} · ${status}`, color: 'yellow'},
       {text: `${metadata.pendingTurns ?? 0} prompt${metadata.pendingTurns === 1 ? '' : 's'} queued`, color: 'gray'},

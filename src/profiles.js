@@ -6,6 +6,7 @@
 // write ratchet itself keys on `policy`, never on the label (CONTRACT.md §4).
 import {defaultStrategy, noReviewStrategy, quorumStrategy} from './strategy.js';
 import {normalizeLocalProfile} from './local-profiles.js';
+import {PROFILE_TIERS} from './jev.js';
 
 const READ_ONLY_ROLES = new Set(['critic', 'verifier', 'analyst']);
 
@@ -27,13 +28,56 @@ function resolveStrategy(spec) {
 // request; no current bounce profile produces it.
 export const POLICY_RANK = {'read-only': 0, plan: 1, write: 2, yolo: 3};
 
-// Used only when the user enables orchestration without an existing profile table.
-export function starterProfiles(settings) {
+// The shipped worker roster: one builder per model the cloud vendors expose in the `/model`
+// picker, each described in src/model-catalog.js so `profile: "auto"` can route between them
+// out of the box. It is the baseline of every orchestrator config: validateOrchestration lays
+// the config's `profiles` block over it (mergeProfiles), so the saved config only ever holds
+// the user's additions and overrides. Naming: the two frontier builders keep their historical
+// names `build` (Codex) and `build_claude` (Claude) so existing ORDERS and briefs still
+// resolve; every other profile is `<adapter>_<model>`. Roster order matters: `build` is first
+// so it stays the routing fallback (src/jev.js routingFallback). Fallbacks cross vendors at
+// the same tier, so an exhausted account moves a task sideways, not down. The muse
+// -contributor variants share user content with the vendor and are left out.
+export function starterProfiles(settings = {}) {
   return {
-    main: {adapter: settings.order[0]},
-    build: {adapter: 'codex', model: settings.models?.codex || 'gpt-5.6-terra', fallback: ['build_claude']},
-    build_claude: {adapter: 'claude', model: settings.models?.claude || 'sonnet'},
+    main: {adapter: settings.order?.[0] ?? 'claude'},
+    // strongest
+    build: {adapter: 'codex', model: 'gpt-6-astra', fallback: ['build_claude', 'claude_fable']},
+    build_claude: {adapter: 'claude', model: 'opus[1m]', fallback: ['build', 'claude_fable']},
+    claude_fable: {adapter: 'claude', model: 'claude-fable-5-1[1m]', fallback: ['build_claude', 'build']},
+    // mid
+    codex_sol: {adapter: 'codex', model: 'gpt-5.6-sol', fallback: ['claude_sonnet', 'codex_terra']},
+    codex_terra: {adapter: 'codex', model: 'gpt-5.6-terra', fallback: ['claude_sonnet', 'codex_sol']},
+    claude_sonnet: {adapter: 'claude', model: 'sonnet', fallback: ['codex_terra', 'codex_sol']},
+    codex_55: {adapter: 'codex', model: 'gpt-5.5', fallback: ['claude_sonnet', 'codex_terra']},
+    muse_spark: {adapter: 'muse', model: 'muse-spark-1.3', fallback: ['muse_spark_12', 'codex_terra', 'claude_sonnet']},
+    muse_spark_12: {adapter: 'muse', model: 'muse-spark-1.2', fallback: ['muse_spark', 'codex_terra']},
+    // cheapest
+    codex_luna: {adapter: 'codex', model: 'gpt-5.6-luna', fallback: ['claude_haiku']},
+    claude_haiku: {adapter: 'claude', model: 'haiku', fallback: ['codex_luna']},
   };
+}
+
+// The effective profile table: the shipped roster with the config's `profiles` block laid over
+// it by name. A user entry replaces the shipped one of the same name outright (no field-level
+// merge); `null` drops a shipped profile; names the roster lacks are appended after it, so the
+// shipped order — and with it the routing fallback — is kept. A `profiles` block that is absent
+// is an empty overlay; one that is present but not an object is still an error. Every entry,
+// shipped or not, is then validated the same way; `userWritten` only marks which came from the
+// config, so the fallback check never blames the user for a shipped fallback into a profile
+// they dropped.
+function mergeProfiles(settings) {
+  const overlay = settings.profiles === undefined ? {} : settings.profiles;
+  if (!overlay || typeof overlay !== 'object' || Array.isArray(overlay)) throw new Error('profiles must be an object');
+  const shipped = starterProfiles(settings);
+  const input = {}, userWritten = new Set();
+  for (const name of [...Object.keys(shipped), ...Object.keys(overlay).filter(name => !Object.hasOwn(shipped, name))]) {
+    if (!Object.hasOwn(overlay, name)) { input[name] = shipped[name]; continue; }
+    if (overlay[name] === null) continue;
+    input[name] = overlay[name];
+    userWritten.add(name);
+  }
+  return {input, userWritten};
 }
 
 // A profile's effective policy (pure): read-only is absolute; otherwise mode narrows write/unset
@@ -45,17 +89,17 @@ export function effectivePolicy(profile) {
   return 'yolo';
 }
 
-export function validateOrchestration(settings, adapterNames = ['claude', 'codex', 'muse', 'local']) {
+export function validateOrchestration(settings, adapterNames = ['claude', 'codex', 'muse', 'local', 'typesafe']) {
   const strategy = resolveStrategy(settings.strategy);
   if (settings.operation === undefined || settings.operation === 'classic') {
     return {operation: 'classic', orchestrator: null, profiles: {}, shape: 'none', strict: false, strategy};
   }
   if (settings.operation !== 'orchestrator') throw new Error('operation must be classic or orchestrator');
 
-  const input = settings.profiles;
-  if (!input || typeof input !== 'object' || Array.isArray(input) || !Object.keys(input).length) throw new Error('profiles must be a nonempty object');
+  const {input, userWritten} = mergeProfiles(settings);
   const names = Object.keys(input);
-  if (typeof settings.orchestrator !== 'string' || !names.includes(settings.orchestrator)) throw new Error('orchestrator must name a profile');
+  const orchestrator = settings.orchestrator ?? 'main';
+  if (typeof orchestrator !== 'string' || !names.includes(orchestrator)) throw new Error('orchestrator must name a profile');
 
   if (settings.strict !== undefined && typeof settings.strict !== 'boolean') throw new Error('strict must be a boolean');
   const strict = settings.strict === true;
@@ -69,15 +113,26 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
     if (raw.role === 'orchestrator') throw new Error(`profile ${name}: role orchestrator is derived, not declared`);
     let role = raw.role ?? 'builder';
     if (typeof role !== 'string' || !role) throw new Error(`profile ${name}: role must be a non-empty string`);
-    if (name === settings.orchestrator) role = 'orchestrator';
-    const policy = raw.policy ?? (raw.adapter === 'local' || READ_ONLY_ROLES.has(role) ? 'read-only' : 'write');
+    if (name === orchestrator) role = 'orchestrator';
+    const policy = raw.policy ?? (raw.adapter === 'local' || raw.adapter === 'typesafe' || READ_ONLY_ROLES.has(role) ? 'read-only' : 'write');
     if (!['write', 'read-only'].includes(policy)) throw new Error(`profile ${name}: policy must be write or read-only`);
-    const fallback = raw.fallback ?? [];
-    if (!Array.isArray(fallback) || fallback.some(f => !names.includes(f))) throw new Error(`profile ${name}: fallback must list known profiles`);
+    // A decision model (typesafe) has no tools: it can only ever be a read-only reviewer.
+    if (raw.adapter === 'typesafe' && policy === 'write') throw new Error(`profile ${name}: typesafe must be read-only`);
+    // A shipped fallback that points at a profile the user dropped is skipped, not an error;
+    // a user-written one must name a profile in the merged table.
+    let fallback = raw.fallback ?? [];
+    if (!Array.isArray(fallback)) throw new Error(`profile ${name}: fallback must list known profiles`);
+    if (userWritten.has(name)) { if (fallback.some(f => !names.includes(f))) throw new Error(`profile ${name}: fallback must list known profiles`); }
+    else fallback = fallback.filter(f => names.includes(f));
     if (fallback.includes(name)) throw new Error(`profile ${name}: fallback may not include itself`);
     if (mode === 'yolo' && settings.mode === 'plan') throw new Error(`profile ${name}: mode exceeds session mode`);
     if (READ_ONLY_ROLES.has(role) && policy === 'write') throw new Error(`profile ${name}: ${role} must be read-only`);
     profiles[name] = {adapter: raw.adapter, model: typeof raw.model === 'string' ? raw.model : '', mode, policy, fallback: [...fallback], role, executables: {...(settings.executables ?? {})}};
+    // Optional cost tier and a sentence on what the model is good for, both read by the router
+    // (src/jev.js routingQuestions) and shown in the roster; a profile without them is described
+    // once by bounce itself (src/roster-notes.js). Any other value is dropped.
+    if (PROFILE_TIERS.includes(raw.tier)) profiles[name].tier = raw.tier;
+    if (typeof raw.capabilities === 'string' && raw.capabilities.trim()) profiles[name].capabilities = raw.capabilities.trim();
     if (raw.adapter === 'local') {
       Object.assign(profiles[name], normalizeLocalProfile({raw, policy, role, settings}));
     }
@@ -89,10 +144,10 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
     }
   }
 
-  const orchestratorAdapter = profiles[settings.orchestrator].adapter;
+  const orchestratorAdapter = profiles[orchestrator].adapter;
   const shape = names.every(name => profiles[name].adapter === orchestratorAdapter) ? 'single-provider' : 'multi-provider';
 
-  return {operation: 'orchestrator', orchestrator: settings.orchestrator, profiles, shape, strict, strategy};
+  return {operation: 'orchestrator', orchestrator, profiles, shape, strict, strategy};
 }
 
 export function profileFor(view, name) {

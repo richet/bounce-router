@@ -93,6 +93,8 @@ export function createWorkspaceProjection({activityLimit = 400, transcriptLimit 
       }
       return true;
     }
+    // A `profile: "auto"` task takes its real profile from the routing row (src/jev.js).
+    if (event.kind === 'jev.routed' && typeof event.chosen === 'string' && event.chosen) task.profile = event.chosen;
     const state = taskState(event.kind);
     if (state) task.state = state;
     if (event.kind === 'task.started') {

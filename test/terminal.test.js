@@ -4,8 +4,9 @@ import {completions, typedCommand, frameDiff} from '../src/terminal.js';
 import {commandCatalog} from '../src/commands.js';
 import {resolveExecutable} from '../src/executable.js';
 test('slash shows all commands; prefixes narrow and arguments dismiss',()=>{
- assert.equal(completions('/').length,29);
+ assert.equal(completions('/').length,30);
  assert.deepEqual(completions('/re').map(x=>x[0]),['rename','resume','review','retry','restart']);
+ assert.deepEqual(completions('/je').map(x=>x[0]),['jev']);
  assert.deepEqual(completions('/b').map(x=>x[0]),['btw']);
  assert.deepEqual(completions('/ag').map(x=>x[0]),['agents']);
  assert.deepEqual(completions('/co').map(x=>x[0]),['continue']);

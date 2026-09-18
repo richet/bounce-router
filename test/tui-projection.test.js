@@ -120,3 +120,15 @@ test('sustained-output projection stays below the 100ms local input-frame budget
   const p95 = samples[Math.floor(samples.length * 0.95)];
   assert.ok(p95 <= 100, `projection p95 ${p95.toFixed(3)}ms exceeds 100ms`);
 });
+
+test('a task submitted as profile auto shows the profile the jev.routed row chose', () => {
+  const projection = createWorkspaceProjection();
+  projection.replay([
+    {kind: 'task.submitted', id: '1', seq: 1, task: 'build', profile: 'auto'},
+    {kind: 'jev.routed', id: '2', seq: 2, task: 'build', chosen: 'build_claude', fallback: false, confidence: 0.9, text: 'Routed auto → build_claude'},
+    {kind: 'task.started', id: '3', seq: 3, task: 'build', attempt: 1},
+  ]);
+  const pane = projection.snapshot().panes[0];
+  assert.equal(pane.profile, 'build_claude');
+  assert.equal(pane.state, 'running');
+});

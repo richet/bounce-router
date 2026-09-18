@@ -9,7 +9,7 @@ export const commands = [
   ['update', 'Install latest npm release'],
   ['details', 'Expand or fold transcript details'], ['sidebar', 'Show or hide the status sidebar'],
   ['restart', 'Validate and reload'],
-  ['operation', 'Switch classic/orchestrator'], ['stop', 'Cancel a task or all'], ['msg', 'Message a worker'],
+  ['operation', 'Switch classic/orchestrator'], ['jev', 'Jev (TypeSafe) decisions · /jev help'], ['stop', 'Cancel a task or all'], ['msg', 'Message a worker'],
   ['agents', 'Interactive orchestrator and worker panes'], ['tasks', 'Toggle task tree'], ['continue', 'Start an orchestrator turn'],
   ['help', 'Show help'], ['detach', 'Close view; keep agents running'], ['quit', 'Stop session and exit'],
 ];
