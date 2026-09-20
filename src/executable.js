@@ -5,6 +5,10 @@ export function resolveExecutable(provider, override, {env = process.env, home =
   if (override) return override;
   const candidates = (env.PATH || '').split(path.delimiter).filter(Boolean).map(dir => path.join(dir,provider));
   candidates.push(path.join(home,'.local','bin',provider),path.join(home,'.npm-global','bin',provider),`/opt/homebrew/bin/${provider}`,`/usr/local/bin/${provider}`);
+  // opencode's own installer puts the binary here and adds it to the interactive shell's PATH.
+  // A context with a reduced PATH (a GUI-launched terminal, a stripped environment, a daemon that
+  // did not inherit the login profile) would otherwise report it missing while it is installed.
+  if (provider === 'opencode') candidates.push(path.join(home, '.opencode', 'bin', provider));
   if (platform === 'darwin' && provider === 'codex') {
     for (const base of ['/Applications',path.join(home,'Applications')]) for (const app of ['Codex','ChatGPT']) candidates.push(path.join(base,`${app}.app`,'Contents','Resources','codex'));
   }

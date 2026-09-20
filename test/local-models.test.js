@@ -11,13 +11,13 @@ const local = endpoints => ({endpoints});
 test('normalizes the loopback catalog defaults and rejects unsafe endpoint configuration', () => {
   assert.deepEqual(normalizeLocalSettings(), {
     enabled: true,
-    endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234', loadPolicy: 'loaded-only', maxConcurrent: 3}},
+    endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234', loadPolicy: 'on-demand', maxConcurrent: 1}},
     preferences: {}, exclude: [], overrides: {},
   });
   assert.deepEqual(normalizeLocalSettings({endpoints: {}}).endpoints, {});
   const endpoint = {backend: 'lmstudio', url: 'http://127.0.0.1:1234'};
-  assert.equal(normalizeLocalSettings({endpoints: {office: endpoint}}).endpoints.office.maxConcurrent, 3);
-  assert.equal(normalizeLocalSettings({endpoints: {office: {...endpoint, maxConcurrent: 1}}}).endpoints.office.maxConcurrent, 1);
+  assert.equal(normalizeLocalSettings({endpoints: {office: endpoint}}).endpoints.office.maxConcurrent, 1, 'an endpoint that states no limit gets the conservative default');
+  assert.equal(normalizeLocalSettings({endpoints: {office: {...endpoint, maxConcurrent: 4}}}).endpoints.office.maxConcurrent, 4, 'an explicit limit still wins over the default');
   assert.throws(() => normalizeLocalSettings({endpoints: {bad: {backend: 'lmstudio', url: 'https://key@example.test'}}}), {code: 'INVALID_LOCAL_SETTINGS'});
   assert.throws(() => normalizeLocalSettings({endpoints: {bad: {backend: 'lmstudio', url: 'http://host/?x=1'}}}), {code: 'INVALID_LOCAL_SETTINGS'});
   assert.throws(() => normalizeLocalSettings({endpoints: {'not ok': {backend: 'lmstudio', url: 'http://localhost'}}}), {code: 'INVALID_LOCAL_SETTINGS'});
@@ -95,7 +95,7 @@ test('resolves exact pins before preferences, honors exclusions and uses loaded 
     {id: 'same', ref: 'b/same', label: 'same', type: 'llm', tools: false, context: 16000, ready: false, instances: []},
   ]}];
   const selected = resolveLocalModel({local: settings, catalogs, profile: {backend: 'lmstudio', endpoint: 'a', model: 'same', prefer: ['b/same']}, requirements: {tools: true, context: 6000}, override: 'a/same'});
-  assert.deepEqual(selected, {endpoint: 'a', backend: 'lmstudio', url: 'http://127.0.0.1:1243', model: 'same', instance: 'large', context: 8000, tools: true, loadPolicy: 'loaded-only', reason: 'override', ref: 'a/same'});
+  assert.deepEqual(selected, {endpoint: 'a', backend: 'lmstudio', url: 'http://127.0.0.1:1243', model: 'same', instance: 'large', context: 8000, tools: true, loadPolicy: 'on-demand', reason: 'override', ref: 'a/same'});
   assert.throws(() => resolveLocalModel({local: {...settings, exclude: ['a/same']}, catalogs, profile: {backend: 'lmstudio', endpoint: 'a', model: 'same'}}), {code: 'LOCAL_MODEL_EXCLUDED'});
   assert.throws(() => resolveLocalModel({local: settings, catalogs, profile: {backend: 'lmstudio', endpoint: 'a', model: 'missing'}}), {code: 'LOCAL_MODEL_UNAVAILABLE'});
 });
@@ -107,7 +107,7 @@ test('selects preference order and rejects unknown/embedding/unloaded models for
     {id: 'loaded', ref: 'a/loaded', type: 'llm', tools: null, context: 4000, ready: true, instances: [{id: 'j', context: 4000}]},
     {id: 'unknown', ref: 'a/unknown', type: 'unknown', tools: null, context: null, ready: null, instances: []},
   ]}];
-  const changed = normalizeLocalSettings({endpoints: {a: {backend: 'lmstudio', url: 'http://127.0.0.1:1250'}} , preferences: settings.preferences});
+  const changed = normalizeLocalSettings({endpoints: {a: {backend: 'lmstudio', url: 'http://127.0.0.1:1250', loadPolicy: 'loaded-only'}} , preferences: settings.preferences});
   assert.equal(resolveLocalModel({local: changed, catalogs, profile: {backend: 'lmstudio', role: 'builder'}, requirements: {tools: true}}).ref, 'a/tool');
   assert.throws(() => resolveLocalModel({local: changed, catalogs, profile: {backend: 'lmstudio', model: 'unknown'}}), {code: 'LOCAL_MODEL_UNAVAILABLE'});
 });
@@ -174,7 +174,7 @@ test('missing configured auth is reported and on-demand permits known downloaded
   const settings = normalizeLocalSettings(local({a: {backend: 'lmstudio', url: 'http://127.0.0.1:1275', loadPolicy: 'on-demand'}}));
   const catalogs = [{provider: 'local', endpoint: 'a', backend: 'lmstudio', stale: false, models: [{id: 'org/m', ref: 'a/org/m', type: 'llm', tools: null, context: 4096, ready: null, instances: []}]}];
   assert.equal(resolveLocalModel({local: settings, catalogs, profile: {backend: 'lmstudio', endpoint: 'a', model: 'org/m'}, requirements: {context: 4000}}).ref, 'a/org/m');
-  assert.throws(() => resolveLocalModel({local: normalizeLocalSettings(local({a: {backend: 'lmstudio', url: 'http://127.0.0.1:1275'}})), catalogs, profile: {backend: 'lmstudio', endpoint: 'a', model: 'org/m'}}), {code: 'LOCAL_MODEL_UNAVAILABLE'});
+  assert.throws(() => resolveLocalModel({local: normalizeLocalSettings(local({a: {backend: 'lmstudio', url: 'http://127.0.0.1:1275', loadPolicy: 'loaded-only'}})), catalogs, profile: {backend: 'lmstudio', endpoint: 'a', model: 'org/m'}}), {code: 'LOCAL_MODEL_UNAVAILABLE'});
 });
 
 test('v1 metadata without loaded_instances remains unknown instead of being called downloaded', async () => {
@@ -210,4 +210,45 @@ test('cached and stale rows preserve the server observation time', async () => {
 test('rejects non-finite discovery timing options', async () => {
   await assert.rejects(discoverLocalModels({}, {timeout: Infinity}), {code: 'INVALID_LOCAL_DISCOVERY_OPTIONS'});
   await assert.rejects(discoverLocalModels({}, {maxAge: Number.NaN}), {code: 'INVALID_LOCAL_DISCOVERY_OPTIONS'});
+});
+
+// A profile may pin the identifier a LOADED INSTANCE is served under — the name the user gave it in
+// LM Studio (`bounce-coder` for a loaded qwen3-coder-next) — and that exact instance is selected.
+test('a pin may name a loaded instance identifier, resolving to that model and that instance', () => {
+  const settings = normalizeLocalSettings(local({a: {backend: 'lmstudio', url: 'http://127.0.0.1:1290'}}));
+  const catalogs = [{provider: 'local', endpoint: 'a', backend: 'lmstudio', stale: false, models: [
+    {id: 'qwen3-coder-next', ref: 'a/qwen3-coder-next', type: 'llm', tools: true, context: 65536, ready: true,
+      instances: [{id: 'bounce-coder', context: 32768}, {id: 'qwen3-coder-next', context: 65536}]},
+  ]}];
+  const byAlias = resolveLocalModel({local: settings, catalogs, profile: {backend: 'lmstudio', endpoint: 'a', model: 'bounce-coder'}, requirements: {tools: true}});
+  assert.equal(byAlias.model, 'qwen3-coder-next');
+  assert.equal(byAlias.instance, 'bounce-coder', 'the aliased instance itself, not the largest one');
+  assert.equal(byAlias.context, 32768);
+  assert.throws(() => resolveLocalModel({local: settings, catalogs, profile: {backend: 'lmstudio', endpoint: 'a', model: 'bounce-coder'}, requirements: {tools: true, context: 40000}}), {code: 'LOCAL_MODEL_UNAVAILABLE'});
+  assert.throws(() => resolveLocalModel({local: settings, catalogs, profile: {backend: 'lmstudio', endpoint: 'a', model: 'bounce-nope'}}), {code: 'LOCAL_MODEL_UNAVAILABLE'});
+});
+
+// With several models loaded, automatic selection was picking the alphabetically-first one — in
+// practice the smallest. Otherwise-equal candidates now tiebreak on loaded capacity.
+test('automatic selection prefers the larger loaded model over the alphabetically first', () => {
+  const settings = normalizeLocalSettings(local({a: {backend: 'lmstudio', url: 'http://127.0.0.1:1291'}}));
+  const catalogs = [{provider: 'local', endpoint: 'a', backend: 'lmstudio', stale: false, models: [
+    {id: 'aaa-4b', ref: 'a/aaa-4b', type: 'llm', tools: true, context: 32768, ready: true, instances: [{id: 'aaa-4b', context: 32768}]},
+    {id: 'zzz-27b', ref: 'a/zzz-27b', type: 'llm', tools: true, context: 262144, ready: true, instances: [{id: 'zzz-27b', context: 262144}]},
+  ]}];
+  assert.equal(resolveLocalModel({local: settings, catalogs, profile: {backend: 'lmstudio', endpoint: 'a'}, requirements: {tools: true}}).instance, 'zzz-27b');
+});
+
+test('a pinned model that cannot be used says why, not just that it "does not meet requirements"', () => {
+  const catalogs = [{provider: 'local', backend: 'lmstudio', endpoint: 'lmstudio', models: [
+    {id: 'big', ref: 'lmstudio/big', type: 'llm', tools: true, ready: false, context: 262144, instances: [], capabilitySource: 'server'},
+    {id: 'notools', ref: 'lmstudio/notools', type: 'llm', tools: false, ready: true, context: 8192, instances: [{id: 'notools', context: 8192}], capabilitySource: 'server'},
+  ]}];
+  const profile = (model) => ({adapter: 'opencode', backend: 'lmstudio', endpoint: 'lmstudio', model, policy: 'read-only', localOptions: {maxOutputTokens: 2048, timeoutMs: 1000}});
+  assert.throws(() => resolveLocalModel({local: {endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234', loadPolicy: 'loaded-only'}}}, catalogs, profile: profile('big'), requirements: {tools: true, context: 3072}}),
+    /Pinned model lmstudio\/big cannot be used: downloaded but not loaded, and lmstudio's loadPolicy is loaded-only \(load it in LM Studio, or set loadPolicy on-demand\)/);
+  assert.throws(() => resolveLocalModel({local: {endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234'}}}, catalogs, profile: profile('notools'), requirements: {tools: true, context: 3072}}),
+    /Pinned model lmstudio\/notools cannot be used: it does not support tool calls/);
+  assert.throws(() => resolveLocalModel({local: {endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234'}}}, catalogs, profile: profile('big'), requirements: {tools: true, context: 300000}}),
+    /Pinned model lmstudio\/big cannot be used: context 262144 is below the 300000 the profile needs/);
 });

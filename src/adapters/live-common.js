@@ -39,6 +39,50 @@ export function spawnLive({executable, args, cwd, env = vendorEnv(), stdin, keep
   return {child, events, exited: () => done};
 }
 
+// A worker's scoped report grant, shared by every adapter that can offer a report tool. The task is
+// bound twice: derived from the worker peer here, and re-checked against the bus's own authenticated
+// task list before anything is published.
+export const peerTask = peer =>
+  typeof peer === 'string' && peer.startsWith('worker:') ? peer.slice('worker:'.length) : null;
+
+export const reportGrant = (profile, peer) => {
+  const grant = profile?.report;
+  const task = peerTask(peer);
+  if (!task || !grant || typeof grant.BOUNCE_REPORT_BUS !== 'string' || !grant.BOUNCE_REPORT_BUS
+    || typeof grant.BOUNCE_REPORT_TOKEN_FILE !== 'string' || !grant.BOUNCE_REPORT_TOKEN_FILE
+    || (grant.task !== undefined && grant.task !== task)) return null;
+  return grant;
+};
+
+// One iterable per handle, alive across turns: the reader pushes, the consumer pulls. No return() —
+// a `break` in a for-await leaves the stream open for the next turn, which is what lets a worker be
+// driven turn by turn from one handle.
+export function makeStream() {
+  const ready = [], waiting = [];
+  let ended = false;
+  const iterator = {
+    [Symbol.asyncIterator]() { return iterator; },
+    next() {
+      if (ready.length) return Promise.resolve({value: ready.shift(), done: false});
+      if (ended) return Promise.resolve({value: undefined, done: true});
+      return new Promise(resolve => waiting.push(resolve));
+    },
+  };
+  return {
+    iterator,
+    push(event) {
+      if (ended) return;
+      const waiter = waiting.shift();
+      waiter ? waiter({value: event, done: false}) : ready.push(event);
+    },
+    end() {
+      if (ended) return;
+      ended = true;
+      for (const waiter of waiting.splice(0)) waiter({value: undefined, done: true});
+    },
+  };
+}
+
 export const PENDING_MAX = 50, TEXT_MAX = 1_000_000;
 const rawLines = file => { try { return fs.readFileSync(file, 'utf8').split('\n').filter(Boolean); } catch { return []; } };
 // A torn line (a crash mid-append) is skipped on read but still occupies its slot, so the cap cannot be bypassed by corruption.

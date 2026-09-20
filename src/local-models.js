@@ -1,7 +1,17 @@
 import {createHash} from 'node:crypto';
 
 const cache = new Map();
-const DEFAULT_ENDPOINT = {backend: 'lmstudio', url: 'http://127.0.0.1:1234', loadPolicy: 'loaded-only', maxConcurrent: 3};
+// Phase 2 (docs/plans/opencode-adapter.md): local workers now run a full `opencode serve` per
+// worker instead of a single in-process loop, so the concurrency that was safe before has not been
+// measured for the new shape. Default to one until it is.
+// on-demand by default: LM Studio unloads idle models on its own, and its server loads a requested
+// model just in time (measured live: nothing loaded → a completed turn through OpenCode in 9.2s).
+// A loaded model is still preferred when one exists (see the ranking in resolveLocalModel); this only
+// stops "nothing is loaded right now" from being a dead end. `loaded-only` remains available for
+// setups that must never trigger a load.
+// maxConcurrent is still accepted so existing configs load; nothing reads it (LM Studio queues
+// concurrent requests itself).
+const DEFAULT_ENDPOINT = {backend: 'lmstudio', url: 'http://127.0.0.1:1234', loadPolicy: 'on-demand', maxConcurrent: 1};
 const endpointIdPattern = /^[A-Za-z0-9_-]+$/;
 const maxBodyBytes = 1024 * 1024;
 
@@ -23,7 +33,7 @@ function endpointConfig(id, input) {
   if (input.trusted !== undefined && typeof input.trusted !== 'boolean') throw error(`Endpoint ${id} trusted must be boolean`);
   if (input.loadPolicy !== undefined && !['loaded-only', 'on-demand'].includes(input.loadPolicy)) throw error(`Endpoint ${id} has an invalid loadPolicy`);
   if (input.maxConcurrent !== undefined && (!Number.isInteger(input.maxConcurrent) || input.maxConcurrent < 1)) throw error(`Endpoint ${id} maxConcurrent must be a positive integer`);
-  const normalized = {backend: 'lmstudio', url: parsed.href.replace(/\/$/, ''), loadPolicy: input.loadPolicy ?? 'loaded-only', maxConcurrent: input.maxConcurrent ?? DEFAULT_ENDPOINT.maxConcurrent};
+  const normalized = {backend: 'lmstudio', url: parsed.href.replace(/\/$/, ''), loadPolicy: input.loadPolicy ?? DEFAULT_ENDPOINT.loadPolicy, maxConcurrent: input.maxConcurrent ?? DEFAULT_ENDPOINT.maxConcurrent};
   if (input.apiKeyEnv) normalized.apiKeyEnv = input.apiKeyEnv;
   if (input.trusted) normalized.trusted = true;
   return normalized;
@@ -242,36 +252,60 @@ export function resolveLocalModel({local, profile, catalogs, requirements = {}, 
     if (exclusions.has(exact.ref)) fail(`Pinned model ${exact.ref} is excluded`, 'LOCAL_MODEL_EXCLUDED');
     const endpoint = settings.endpoints[parsed.endpoint];
     if (!endpointAllowed(parsed.endpoint, endpoint)) fail(`Pinned endpoint ${parsed.endpoint} is unavailable or untrusted`, 'LOCAL_MODEL_UNAVAILABLE');
-    const candidate = all.find(item => item.endpoint === parsed.endpoint && item.model.id === parsed.key);
+    let candidate = all.find(item => item.endpoint === parsed.endpoint && item.model.id === parsed.key);
+    // A pin may also be the identifier of a LOADED INSTANCE — the name the user gave it in LM Studio
+    // (e.g. `bounce-coder` for a loaded qwen3-coder-next). That is the natural way to say "this
+    // role uses that loaded model", and it is exactly the id the worker must ask the server for.
+    let instanceId = null;
+    if (!candidate) {
+      candidate = all.find(item => item.endpoint === parsed.endpoint && (item.model.instances ?? []).some(instance => instance.id === parsed.key));
+      if (candidate) instanceId = parsed.key;
+    }
     if (!candidate) fail(`Pinned model ${exact.ref} is unavailable; refresh its endpoint or choose another pin`, 'LOCAL_MODEL_UNAVAILABLE');
-    return selected(candidate, endpoint, requirements, exact.reason, true);
+    return selected(candidate, endpoint, requirements, exact.reason, true, instanceId);
   }
   const preference = [...(profile.prefer ?? []), ...(rolePreference.prefer ?? [])];
   const allowed = all.filter(candidate => (!profile.endpoint || candidate.endpoint === profile.endpoint) && endpointAllowed(candidate.endpoint, settings.endpoints[candidate.endpoint]) && !exclusions.has(candidate.model.ref));
   const eligible = allowed.filter(candidate => eligibleModel(candidate.model, settings.endpoints[candidate.endpoint], requirements));
   if (!eligible.length) fail('No eligible local LLM is available; refresh catalogs, relax requirements, or configure an eligible model', 'LOCAL_MODEL_UNAVAILABLE');
   const rank = candidate => { const index = preference.indexOf(candidate.model.ref); return index === -1 ? Number.MAX_SAFE_INTEGER : index; };
-  eligible.sort((a, b) => rank(a) - rank(b) || Number(b.model.tools === true) - Number(a.model.tools === true) || Number(b.model.ready === true) - Number(a.model.ready === true) || a.model.ref.localeCompare(b.model.ref));
+  // Tiebreak among otherwise-equal candidates by capacity, not by name: with several models loaded,
+  // alphabetical order was picking the smallest one.
+  const capacity = candidate => bestInstance(candidate.model)?.context ?? candidate.model.context ?? 0;
+  eligible.sort((a, b) => rank(a) - rank(b) || Number(b.model.tools === true) - Number(a.model.tools === true) || Number(b.model.ready === true) - Number(a.model.ready === true) || capacity(b) - capacity(a) || a.model.ref.localeCompare(b.model.ref));
   const winner = eligible[0];
   return selected(winner, settings.endpoints[winner.endpoint], requirements, rank(winner) === Number.MAX_SAFE_INTEGER ? 'automatic selection' : 'preference', false);
 }
 
 function eligibleModel(model, endpoint, requirements) {
-  if (model.type !== 'llm') return false;
-  if (requirements.tools === true && model.tools !== true) return false;
-  if (endpoint.loadPolicy === 'loaded-only' && model.ready !== true) return false;
-  if (requirements.context && !bestInstance(model, requirements.context) && !(endpoint.loadPolicy === 'on-demand' && model.ready !== true && model.context >= requirements.context)) return false;
-  return true;
+  return ineligibleReason(model, endpoint, requirements) === null;
+}
+
+// Why a model cannot be used — the message a pinned profile fails with. "Does not meet the
+// requirements" sent a user looking at OpenCode's configuration when the model was simply not loaded.
+function ineligibleReason(model, endpoint, requirements) {
+  if (model.type !== 'llm') return 'it is not an LLM';
+  if (requirements.tools === true && model.tools !== true) return 'it does not support tool calls';
+  if (endpoint.loadPolicy === 'loaded-only' && model.ready !== true) return `downloaded but not loaded, and ${endpoint.id ?? 'the endpoint'}'s loadPolicy is loaded-only (load it in LM Studio, or set loadPolicy on-demand)`;
+  if (requirements.context && !bestInstance(model, requirements.context) && !(endpoint.loadPolicy === 'on-demand' && model.ready !== true && model.context >= requirements.context)) {
+    const have = bestInstance(model)?.context ?? model.context;
+    return `context ${have ?? 'unknown'} is below the ${requirements.context} the profile needs`;
+  }
+  return null;
 }
 
 function bestInstance(model, minimum = 0) {
   return (model.instances ?? []).filter(instance => positive(instance.context) >= minimum).sort((a, b) => b.context - a.context)[0] ?? null;
 }
 
-function selected(candidate, endpoint, requirements, reason, pinned) {
+function selected(candidate, endpoint, requirements, reason, pinned, instanceId = null) {
   const {model} = candidate;
-  if (!eligibleModel(model, endpoint, requirements)) throw error(`${pinned ? 'Pinned' : 'Selected'} model ${model.ref} does not meet the local profile requirements`, 'LOCAL_MODEL_UNAVAILABLE');
-  const instance = bestInstance(model, requirements.context ?? 0);
+  const why = ineligibleReason(model, {...endpoint, id: candidate.endpoint}, requirements);
+  if (why) throw error(`${pinned ? 'Pinned' : 'Selected'} model ${model.ref} cannot be used: ${why}`, 'LOCAL_MODEL_UNAVAILABLE');
+  const instance = instanceId
+    ? (model.instances ?? []).find(item => item.id === instanceId && positive(item.context) >= (requirements.context ?? 0)) ?? null
+    : bestInstance(model, requirements.context ?? 0);
+  if (instanceId && !instance) throw error(`Pinned instance ${instanceId} does not meet the local profile context requirement`, 'LOCAL_MODEL_UNAVAILABLE');
   const context = instance?.context ?? model.context ?? null;
   return Object.freeze({endpoint: candidate.endpoint, backend: 'lmstudio', url: endpoint.url, model: model.id, instance: instance?.id ?? null, context, tools: model.tools, loadPolicy: endpoint.loadPolicy, reason, ref: model.ref});
 }

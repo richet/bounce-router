@@ -10,8 +10,7 @@ import {createScheduler} from '../../src/scheduler.js';
 import {createClaudeLive} from '../../src/adapters/claude-live.js';
 import {createCodexLive} from '../../src/adapters/codex-live.js';
 import {createMuseLive} from '../../src/adapters/muse-live.js';
-import {createLocalLive} from '../../src/adapters/local-live.js';
-import {createFakeBackend} from '../../src/adapters/backends/fake.js';
+import {createOpencodeLive} from '../../src/adapters/opencode-live.js';
 
 // The adapter interface (docs/local-orchestration.md "Peers and adapters") as an executable contract: every live
 // adapter is driven through the REAL scheduler with its fake CLI. Phase 3's wide critic found three blockers that
@@ -21,6 +20,7 @@ const adapters = {
   claude: {make: () => createClaudeLive({}), executable: helper('fake-claude.js'), env: {FAKE_SESSION: 'sess-conf'}},
   codex: {make: () => createCodexLive({}), executable: helper('fake-codex-app-server.js'), env: {}},
   muse: {make: () => createMuseLive({}), executable: helper('fake-muse.js'), env: {}},
+  opencode: {make: () => createOpencodeLive({}), executable: helper('fake-opencode.js'), env: {}},
 };
 const setup = t => { const root = fs.mkdtempSync(path.join(os.tmpdir(), 'conformance-')); t.after(() => fs.rmSync(root, {recursive: true, force: true})); return {root, session: new Session(root, {root})}; };
 const waitFor = async (cond, ms = 8000) => { const t0 = Date.now(); while (!cond()) { if (Date.now() - t0 > ms) throw new Error('timed out'); await new Promise(r => setTimeout(r, 20)); } };
@@ -86,10 +86,12 @@ const usageEnv = {
     input_tokens: 11, cache_read_input_tokens: 3, cache_creation_input_tokens: 2, output_tokens: 7})},
   codex: {FAKE_USAGE: JSON.stringify({inputTokens: 11, cachedInputTokens: 3, outputTokens: 7, reasoningOutputTokens: 0, totalTokens: 21})},
   muse: {},
+  opencode: {FAKE_OC_USAGE: JSON.stringify({total: 21, input: 11, output: 7, reasoning: 4, cache: {read: 3, write: 2}})},
 };
 const expectedUsage = {
   claude: {input: 11, cache_read: 3, cache_write: 2, output: 7},
   codex: {input: 11, cache_read: 3, output: 7},
+  opencode: {input: 11, cache_read: 3, cache_write: 2, output: 7},
 };
 for (const [name, {make, executable}] of Object.entries(adapters)) {
   test(`${name}: usage events normalize to {input, cache_read, cache_write, output} only, integers, only vendor-reported keys`, async t => {
@@ -118,60 +120,10 @@ for (const [name, {make, executable}] of Object.entries(adapters)) {
 // muse's resume used to re-create the task dir itself ("dir may not exist" — Phase 3 leftover,
 // since resume was not yet scheduler-driven). Phase 4 makes resume scheduler-driven like launch,
 // so that workaround must be gone: resume must fail rather than silently paper over a missing dir.
-// The `local` adapter has no executable — it owns its own tool loop over a pluggable backend
-// (docs/local-orchestration.md "Peers and adapters", `local` row) — so it does not fit the
-// executable/env-driven table above. It is still driven through the REAL scheduler here, with
-// the `fake` backend standing in for the executable: never a real model, never the network.
-test('local: launch runs through the real scheduler, completes, and the task dir is scheduler-owned', async t => {
-  const {session} = setup(t);
-  const script = [
-    [{kind: 'tool_call', id: 't1', name: 'read_file', arguments: {path: 'orders.txt'}}],
-    [{kind: 'done', text: 'hello'}],
-  ];
-  const adapter = createLocalLive({backends: {fake: createFakeBackend()}});
-  // Phase 7: local only enforces read-only (executionPolicies: ['read-only']), so this profile's
-  // effective policy must be read-only, not yolo (CONTRACT.md §5) — the honest replacement for
-  // the old yolo-local conformance launch (E7 in test/policy-exec.test.js covers the refusal).
-  const scheduler = createScheduler({session, adapters: {local: adapter}, profiles: {p: {adapter: 'local', backend: 'fake', model: '', policy: 'read-only', fallback: [], script}}});
-  t.after(async () => { await scheduler.cancel(row.task); scheduler.close(); });
-  const row = scheduler.submit({parent: null, profile: 'p', orders: 'say hello'});
-  await waitFor(() => ['completed', 'failed'].includes(scheduler.tasks()[row.task].state));
-  const task = scheduler.tasks()[row.task];
-  assert.equal(task.state, 'completed', JSON.stringify(session.events.filter(e => e.task === row.task).map(e => [e.kind, e.reason, e.text])));
-  assert.equal(fs.existsSync(path.join(session.dir, 'tasks', row.task)), true, 'scheduler owns <session.dir>/tasks/<task> and passes it as dir');
-  assert.equal(session.events.some(e => e.kind === 'peer.joined' && e.from === `worker:${row.task}`), true);
-});
-
-test('local: deliver contract — non-string text is coerced, oversize text is queued, launch result is the handle itself, cancel is verified', async () => {
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'conformance-local-'));
-  const adapter = createLocalLive({backends: {fake: createFakeBackend()}});
-  const script = [[{kind: 'done', text: 'ok'}]];
-  const handle = await adapter.launch({peer: {}, profile: {backend: 'fake', model: '', script}, orders: 'x', cwd, dir: path.join(cwd, 'd')});
-  assert.equal(typeof handle, 'object', 'launch resolves to the handle, not {handle}');
-  assert.equal(['live', 'next-turn', 'queued'].includes(await adapter.deliver(handle, {text: 42})), true);
-  assert.equal(await adapter.deliver(handle, {text: 'x'.repeat(1_000_001)}), 'queued');
-  for await (const event of adapter.events(handle)) if (event.kind === 'result') break;
-  assert.deepEqual(await adapter.cancel(handle), {verified: true});
-  fs.rmSync(cwd, {recursive: true, force: true});
-});
-
-test('local: resume resolves to the bare handle, and its events end with a result', async () => {
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'conformance-local-resume-'));
-  const adapter = createLocalLive({backends: {fake: createFakeBackend()}});
-  const script = [[{kind: 'done', text: 'first'}], [{kind: 'done', text: 'resumed'}]];
-  const dir = path.join(cwd, 'd'), profile = {backend: 'fake', model: '', script};
-  const first = await adapter.launch({peer: {}, profile, orders: 'first question', cwd, dir});
-  for await (const event of adapter.events(first)) { if (event.kind === 'result') break; }
-  await adapter.cancel(first);
-  const handle = await adapter.resume({peer: {}, profile, native: {sessionId: path.join(dir, 'local-live-history.json')}, message: 'continue', cwd, dir});
-  assert.equal(typeof handle, 'object', 'resume resolves to the handle, not {handle}');
-  const events = [];
-  for await (const event of adapter.events(handle)) { events.push(event); if (event.kind === 'result') break; }
-  assert.equal(events.at(-1)?.kind, 'result');
-  assert.equal(typeof events.at(-1)?.status, 'string');
-  fs.rmSync(cwd, {recursive: true, force: true});
-});
-
+//
+// The `local` adapter's bespoke cases lived here because it owned an in-house tool loop with no
+// executable. It was removed in Phase 4 (docs/plans/opencode-adapter.md); `opencode` is an ordinary
+// executable-driven adapter and is covered by the table above like every other live adapter.
 test('muse: resume never creates the task dir itself — a missing dir is the caller\'s bug, not papered over', async t => {
   const {root} = setup(t);
   const adapter = createMuseLive({});
