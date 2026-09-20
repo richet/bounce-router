@@ -9,7 +9,7 @@ import crypto from 'node:crypto';
 
 // Peers publish from a positive allowlist: everything a session, the scheduler or the daemon writes is refused regardless of `from`,
 // because handoff() folds user/note rows into every later prompt and Router reads cooldown rows.
-const PEER_KINDS = new Set(['task.submitted', 'task.milestone', 'task.blocked', 'task.input_required', 'task.usage', 'task.activity', 'message', 'task.accepted']);
+const PEER_KINDS = new Set(['task.submitted', 'task.milestone', 'task.blocked', 'task.input_required', 'task.usage', 'task.activity', 'message', 'task.accepted', 'agents.defined']);
 const USER_ONLY_PREFIX = 'control.';
 // The scheduler alone owns task lifecycle transitions; a peer may report progress
 // (milestone/blocked/input_required/usage/activity), ask for work (submitted) or
@@ -234,7 +234,7 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
     // never come. The caller reads `kind` to learn which outcome it got.
     const TASK_TERMINAL = new Set(['task.completed', 'task.failed', 'task.cancelled', 'task.deadline', 'task.rejected', 'task.accepted']);
     function handleWait(id, {match = {}, timeout, afterSeq = 0}) {
-      if (!Number.isInteger(timeout) || timeout > 600000) return refuse(id, -32602, 'invalid params');
+      if (!Number.isInteger(timeout) || timeout > 600000) return refuse(id, -32602, 'invalid params: timeout must be an integer number of ms, at most 600000 (10 minutes); wait again to keep waiting');
       const outcomeWait = typeof match.task === 'string' && TASK_TERMINAL.has(match.kind);
       const latestReplacement = task => {
         let current = task;

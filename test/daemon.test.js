@@ -549,6 +549,13 @@ test('O2 orchestrator single-provider: the orchestrator submits over the bridge,
   assert.equal(orders.includes('auto →'), false);
   assert.equal(/jev/i.test(orders), false);
   assert.equal(orders.includes('"profile":"build"'), true);
+  // The team block: where the roster comes from, which AIs exist here, and how to change it —
+  // the orchestrator specialises the shipped defaults through the bridge, never by hand.
+  assert.match(orders, /^Team: analyst, builder, integrator, reviewer ← skill agent-orchestrator$/m);
+  assert.match(orders, /^AIs on this machine: codex, lmstudio\/<loaded model> \(via opencode\)$/m);
+  assert.match(orders, /bounce agents set NAME --scope project/);
+  assert.match(orders, /references\/agents\.md/);
+  assert.match(orders, /^`bounce agents set` journals agents\.defined for you\.$/m);
 });
 
 test('O3 the orchestrator grant cannot publish a user row (even with `from` omitted) nor control.stop', async t => {

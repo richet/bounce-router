@@ -12,7 +12,9 @@ const WAIT_CHUNK_MS = 600_000;
 function formatRow(row, json) {
   if (row == null) return 'null';
   if (json) return JSON.stringify(row);
-  return `[${row.from}:${row.kind}] ${row.text ?? ''}`;
+  // A task row leads with its id: the orchestrator needs it for the very next `wait`, and the plain
+  // form used to hide it (observed: an orchestrator digging the id out of the tasks/ directory).
+  return `[${row.from}:${row.kind}]${typeof row.task === 'string' ? ` task=${row.task}` : ''} ${row.text ?? ''}`;
 }
 
 function parseJsonArg(value, label) {

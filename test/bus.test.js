@@ -77,7 +77,7 @@ const rawConnect = async (bus, t) => {
 test('legacy: importing src/bus.js does not change Session exports or defaults()', () => {
   const before = ['order', 'mode', 'models', 'cooldownMinutes', 'contextChars', 'executables', 'skills', 'sidebar'];
   assert.deepEqual(Object.keys(defaults()).sort(), before.sort());
-  assert.deepEqual(Object.keys(core).sort(), ['LIVE_KINDS', 'Router', 'Session', 'config', 'dataRoot', 'defaults', 'gitSnapshot', 'handoff', 'pidAlive', 'saveJSON'].sort());
+  assert.deepEqual(Object.keys(core).sort(), ['LIVE_KINDS', 'Router', 'Session', 'config', 'dataRoot', 'defaults', 'gitSnapshot', 'handoff', 'migrateSettings', 'pidAlive', 'saveJSON'].sort());
 });
 
 test('P1 round trip: publish as the granted peer lands in the journal', async t => {

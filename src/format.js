@@ -404,6 +404,7 @@ const WORKER_ROW = {
   'task.submitted': e => ({kind: 'note', text: `Task submitted · ${e.profile}${e.orders ? `\n${e.orders}` : ''}`}),
   'task.started': e => ({kind: 'status', text: `started · attempt ${e.attempt}${e.requested ? ` · model ${e.requested}` : ''}`}),
   'task.milestone': e => ({kind: 'note', text: `milestone · ${e.text}`}),
+  'agents.defined': e => ({kind: 'note', text: e.text ?? `agent ${e.name} defined (${e.scope})`}),
   'task.blocked': e => ({kind: 'error', text: `blocked · ${e.text}`}),
   'task.delivered': e => ({kind: 'status', text: `delivered (${e.tier})${e.text ? ` · ${e.text}` : ''}`}),
   'task.rework': e => ({kind: 'status', text: `rework round ${e.round}${Array.isArray(e.findings) && e.findings.length ? `\n${e.findings.map(f => `- ${typeof f === 'string' ? f : f.text ?? JSON.stringify(f)}`).join('\n')}` : ''}`}),
