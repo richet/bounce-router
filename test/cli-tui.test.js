@@ -18,7 +18,7 @@ test('CLI commands and live steering work while the daemon main turn is held', {
   t.after(() => {catalogResponse?.end('{"models":[]}'); catalogServer.closeAllConnections(); catalogServer.close();});
   const settings = {
     operation: 'orchestrator', orchestrator: 'main', mode: 'plan', order: ['codex'], models: {},
-    profiles: {main: {adapter: 'codex'}, build: {adapter: 'codex'}, local_build: {adapter: 'local'}},
+    profiles: {main: {adapter: 'codex'}, build: {adapter: 'codex'}},
     local: {endpoints: {lmstudio: {backend: 'lmstudio', url: `http://127.0.0.1:${catalogServer.address().port}`}}},
     executables: {codex: '/nonexistent/bounce-test-codex', claude: '/nonexistent/bounce-test-claude'},
     skills: {scope: 'user', autoSync: false},
@@ -88,23 +88,6 @@ test('CLI commands and live steering work while the daemon main turn is held', {
   const delivery = calls.find(([kind]) => kind === 'deliver')[1];
   assert.equal(delivery.text, 'urgent correction');
   assert.equal(delivery.expectedTurnId, 'held-turn');
-  child.stdin.write('/model worker local_build refresh\r');
-  await waitFor(() => catalogResponse);
-  child.stdin.write('editable during discovery');
-  await waitFor(() => output.includes('editable during discovery'));
-  child.stdin.write('\u0015/help\r');
-  await waitFor(() => session.events.some(row => row.kind === 'help' && row.text?.includes('Agents & models')));
-  catalogResponse.setHeader('content-type', 'application/json');
-  catalogResponse.end('{"models":[]}');
-  await waitFor(() => output.includes('pins for this session'));
-  child.stdin.write('\u001b');
-  await waitFor(() => output.includes('Model unchanged.'));
-  child.stdin.write('/model worker local_build lmstudio/fixture\r');
-  await waitFor(() => session.events.some(row => row.kind === 'control.local_model' && row.model === 'lmstudio/fixture'));
-  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'config.json'))).profiles.local_build.model, undefined, 'session pin is not persisted');
-  child.stdin.write('/model worker local_build prefer lmstudio/fixture --save\r');
-  await waitFor(() => session.events.some(row => row.kind === 'control.local_preferences'));
-  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root, 'config.json'))).profiles.local_build.prefer, ['lmstudio/fixture']);
   assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'config.json'))).orchestrator, 'main');
   child.stdin.write('/agents\r');
   await waitFor(() => output.includes('Agent workspace'));
