@@ -71,6 +71,8 @@ bounce doctor
 bounce models
 bounce quota
 bounce skills
+bounce agents                       # the team: which AI plays each job
+bounce local                        # local models, the OpenCode bridge, agents a local model may play
 bounce --cwd /path/to/repo
 bounce run "Implement the feature and run relevant tests" --cwd /path/to/repo
 bounce run "Refactor the parser" --detach   # keep working in the background
@@ -142,6 +144,7 @@ Headless usage: `bounce run "Explain this screenshot" --image "/path/Screen shot
 - `/mode yolo` (default) bypasses native approvals and sandboxing.
 - `/mode plan` requests Claude plan mode, Codex read-only sandbox, or Muse disabled write/shell. It is not an interactive approval bridge, and provider-native tools/configuration determine exact restrictions.
 - `/quota` refreshes and prints the usage each agent reports. On terminals at least 100 columns wide, a right sidebar topped by the BOUNCE wordmark shows the provider, mode, model, operation mode and state, queued prompts, workspace, session id, each agent's short quota reading, and an AGENTS list of the main agent and every worker with its state. It is on by default; `/sidebar` toggles it (`/sidebar on|off` sets it) and the choice is saved in `config.json` as `sidebar`. Narrower terminals keep the header. Use `/review` to print the full text of every completed turn's result in chronological order.
+- `/local` shows local models, the OpenCode bridge and the agents a local model may play; `/local verify` runs one real turn; `/local setup [loaded]` picks which model plays each agent and applies it to this session; `/local activate [AGENT]` re-reads agent files into the running session.
 - `/skills` lists bounce's skills and where each agent has them; `/skills sync`, `/skills new NAME`, `/skills add PATH`, `/skills remove NAME`, `/skills import [provider]`, `/skills clear`, `/skills reset` and `/skills seed --force` manage them. See [Skills](#skills).
 - `/btw TEXT` steers the focused agent while it works — the message is delivered into the running turn (or to the selected worker when the AGENTS pane is open). When nothing is running it is saved as an aside for the next turn.
 - `/sessions`, `/rename NAME`, `/resume [SESSION]` and `/detach` manage sessions; see [Sessions](#sessions). `/agents`, `/tasks`, `/stop` and `/msg` are orchestrator commands; see [Orchestrator mode](#orchestrator-mode).
@@ -237,21 +240,47 @@ bounce report --report '{"op":"milestone","phase":"test","text":"…","next":"�
 
 A grant can publish only what its role allows: the orchestrator submits tasks and messages, a worker reports on its own task, and `control.*` rows belong to the user peer alone.
 
-## Local workers
+## Agents and local models
 
-A profile with `"adapter": "local"` runs a model served by [LM Studio](https://lmstudio.ai) on this machine as a worker. Local workers need orchestrator mode; a local orchestrator is not supported. The model runs a bounded tool loop — read files under `readPaths` (default: the whole workspace), and only with `"policy": "write"` write under `writePaths` and run the exact `commands` you list. Commands run inside a Docker container (`node:22-alpine` by default, set `container.image`) with no host shell fallback; a builder's changes are published into the workspace only after the container has terminated and its tests were observed. `.git`, `.env*`, vendor config directories and similar are never readable or writable.
+The orchestrator can submit work to two kinds of target. A **profile** is one AI (the shipped roster above, routed by tier and capabilities when `profile: "auto"` is on — see Jev below). An **agent** is a job — one markdown file: frontmatter for what bounce routes on, the body as the worker's system prompt.
 
-```sh
-bounce local models              # what each endpoint has loaded, without loading anything
-bounce local setup               # recommend a model and write a worker profile
-bounce local profile NAME JSON   # preview a profile; --save writes it
-bounce local check [IMAGE]       # diagnose Docker, the image and the project, without building
-bounce local prepare [IMAGE]     # cache Linux npm dependencies for the container (--allow-network)
+```markdown
+---
+name: reviewer
+description: Reads and probes the integrated tree for defects; never edits.
+policy: read-only                 # read-only | write (default)
+maxSteps: 40
+models: [lmstudio/qwen3.8-27b-mlx@4bit, claude/default]
+---
+You are the reviewer. …
 ```
 
-In the TUI, `/local setup` runs the same wizard without interrupting running agents (`/local setup loaded` limits it to already-loaded models; `/local cancel` abandons it), `/local activate [NAME]` brings saved local workers into the current session without a restart, and `/model worker PROFILE [auto|endpoint/model|refresh]` picks the model a worker uses — `prefer`/`exclude REF,REF` edit its preferences, `--save` persists any of these.
+`models:` lists the AIs that may play the agent, in fallback order, named by **provider** (`claude/sonnet`, `codex/gpt-5.6-terra`, `muse`, `lmstudio/<model>`; `provider/default` is that provider's default model). A fallback is therefore always the same job on another AI. With no `models:`, every signed-in provider plays it in your routing order, then a local model.
 
-Endpoints live under `local.endpoints` in `config.json`; the default is `lmstudio` at `http://127.0.0.1:1234`, `loadPolicy: loaded-only` (a downloaded model that is not loaded is not eligible) and `maxConcurrent: 3`. Eligibility is checked at dispatch, so the orchestrator is told when no model is available rather than handed a cloud worker instead. `localOptions` bounds each run: `maxSteps` (32), `maxOutputTokens` (2048), `timeoutMs` (120000) and `maxContextBytes` (200000).
+Agent files are layered, later ones shadowing by name: the four shipped with bounce (`analyst`, `builder`, `integrator`, `reviewer`) → `~/.bounce/agents/` → `<workspace>/.bounce/agents/`.
+
+```sh
+bounce agents                                  # the team in force: name · policy · source · who may play it
+bounce agents show reviewer
+bounce agents set coder --scope project < coder.md    # validated against this machine before it lands
+bounce agents remove coder
+```
+
+### Local models (LM Studio, through OpenCode)
+
+A local model is just another AI that can play an agent. bounce runs it the way it runs Claude Code and Codex: one [`opencode run`](https://opencode.ai) process per turn **in your workspace**, prompt in, JSON events out, process exit = turn done. Read-only agents get read/grep/glob only; write agents edit files and run commands exactly like a cloud worker in YOLO mode — so review their diff the same way. Out-of-workspace paths are refused by OpenCode itself, and vendor API keys are never passed to a local worker.
+
+The only local-specific step is setup: install the `opencode` CLI, start LM Studio's server, then
+
+```sh
+bounce local            # what is loaded, whether OpenCode is installed, which agents a local model may play
+bounce local --verify   # additionally run one real one-line turn through OpenCode
+bounce local setup      # pick which model plays each agent — Enter accepts the suggestion
+```
+
+or `/local`, `/local verify`, `/local setup` inside the TUI (setup applies to the running session). Loaded models are listed first; downloaded ones load on first use. Setup writes `lmstudio/<model>` first in the agent's `models:` and keeps your cloud providers behind it as fallbacks.
+
+What to expect from small models: below roughly 20–30B a local model is a single-shot reader, not an agent — it tends to repeat the same tool call instead of concluding. bounce stops a worker that repeats a call four times with nothing changed, or spins on empty steps, and hands the job to the next AI in the agent's list. A local worker's answer is its result; on tasks that matter, have a `reviewer` check it.
 
 ## Jev (TypeSafe) decisions
 
@@ -372,6 +401,7 @@ The fallback order in the header carries each agent's short reading, e.g. `claud
 
 - `config.json`: order, mode, per-provider models, cooldownMinutes, contextChars, executable overrides, skill scope and auto-sync, `jev` (never its key); in orchestrator mode also `operation`, `orchestrator`, `profiles`, `strategy`, `strict` and `local`.
 - `secrets.json` (0600): the TypeSafe API key stored by `/jev key`; `TYPESAFE_API_KEY` in the environment overrides it.
+- `agents/<name>.md`: your agent files (the team); a workspace may add its own under `.bounce/agents/`.
 - `skills/<name>/SKILL.md`: the skills bounce manages and installs into every agent.
 - `quota.json`: the latest usage reading each agent reported, kept across restarts.
 - `sessions/<uuid>/journal.jsonl`: append-only normalized and raw events.
@@ -406,7 +436,7 @@ npm test
 npm run check
 ```
 
-Tests use fixture processes and temporary directories, without subscription calls. The Muse adapter was additionally checked against the installed CLI's offline echo event stream. Live authenticated coding runs and browser login flows require manual integration validation.
+Tests use fixture processes and temporary directories, without subscription calls. Two checks touch the real OpenCode: `test/opencode-contract.test.js` holds the installed binary to every flag, event name and tool id the adapter relies on (skipped when `opencode` is absent), and `BOUNCE_LIVE_OPENCODE=1 node --test test/local-opencode.live.test.js` runs real turns against LM Studio — run it after upgrading OpenCode or changing how local workers run. The Muse adapter was additionally checked against the installed CLI's offline echo event stream. Live authenticated coding runs and browser login flows require manual integration validation.
 
 Protocol references: [Codex non-interactive execution](https://learn.chatgpt.com/docs/non-interactive-mode), [Claude programmatic execution](https://code.claude.com/docs/en/headless), and installed `muse exec --help` plus `muse exec --provider echo --no-session-log --json` (verified 2026-09-08).
 
