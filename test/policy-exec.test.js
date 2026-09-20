@@ -10,8 +10,7 @@ import {effectivePolicy} from '../src/profiles.js';
 import {createClaudeLive} from '../src/adapters/claude-live.js';
 import {createCodexLive} from '../src/adapters/codex-live.js';
 import {createMuseLive} from '../src/adapters/muse-live.js';
-import {createLocalLive} from '../src/adapters/local-live.js';
-import {createFakeBackend} from '../src/adapters/backends/fake.js';
+import {createOpencodeLive, toolsFor} from '../src/adapters/opencode-live.js';
 import {fakeAdapter} from './helpers/fake-adapter.js';
 
 const setup = t => {
@@ -36,6 +35,13 @@ test('E1 effectivePolicy: read-only absolute, otherwise mode narrows write/unset
   assert.equal(effectivePolicy({policy: 'write', mode: 'plan'}), 'plan');
   assert.equal(effectivePolicy({mode: 'yolo'}), 'yolo');
   assert.equal(effectivePolicy({}), 'yolo');
+  // The write tier belongs to the adapters that can actually confine a write to a scope — since
+  // Phase 4 that is `opencode` alone, via the task-local copy and the publish gate
+  // (docs/plans/opencode-adapter.md, Q1(a)). Every other adapter's `write` is yolo, including the
+  // removed `local`, so a stale config naming it cannot quietly claim a confined write tier.
+  assert.equal(effectivePolicy({adapter: 'opencode', policy: 'write'}), 'write');
+  assert.equal(effectivePolicy({adapter: 'claude', policy: 'write'}), 'yolo');
+  assert.equal(effectivePolicy({adapter: 'local', policy: 'write'}), 'yolo');
 });
 
 // E2: ratchet — a yolo profile under a plan session fails before launch; plan and read-only
@@ -134,35 +140,40 @@ test('E5 backward compat: no executionPolicies key means unconstrained', async t
 });
 
 // E6: live-adapter capabilities — exact executionPolicies lists.
-test('E6 live-adapter capabilities: executionPolicies deepEqual the declared ladder rungs', () => {
-  assert.deepEqual(createClaudeLive().capabilities().executionPolicies, ['read-only', 'plan', 'yolo']);
-  assert.deepEqual(createCodexLive().capabilities().executionPolicies, ['read-only', 'plan', 'yolo']);
-  assert.deepEqual(createMuseLive().capabilities().executionPolicies, ['read-only', 'plan', 'yolo']);
-  assert.deepEqual(createLocalLive().capabilities().executionPolicies, ['read-only', 'plan', 'write']);
+test('E6-opencode live-adapter capabilities: executionPolicies deepEqual the declared ladder rungs', () => {
+  assert.deepEqual(createOpencodeLive().capabilities().executionPolicies, ['read-only', 'plan', 'write', 'yolo']);
 });
 
-// E7: real seam — local through the real scheduler with an effective-yolo profile is
-// unsupported; with a read-only profile it launches (drives the fake backend).
-test('E7 real seam: local refuses effective-yolo, launches effective-read-only', async t => {
-  {
-    const {session} = setup(t);
-    const script = [[{kind: 'done', text: 'hello'}]];
-    const adapter = createLocalLive({backends: {fake: createFakeBackend()}});
-    const scheduler = createScheduler({session, adapters: {local: adapter}, profiles: {p: {adapter: 'local', backend: 'fake', model: '', mode: 'yolo', fallback: [], script}}});
-    const row = scheduler.submit({parent: null, profile: 'p', orders: 'say hello'});
-    await waitFor(() => scheduler.tasks()[row.task]?.state === 'failed');
-    assert.equal(scheduler.tasks()[row.task].reason, 'unsupported');
-  }
-  {
-    const {session} = setup(t);
-    const script = [[{kind: 'done', text: 'hello'}]];
-    const adapter = createLocalLive({backends: {fake: createFakeBackend()}});
-    const scheduler = createScheduler({session, adapters: {local: adapter}, profiles: {p: {adapter: 'local', backend: 'fake', model: '', policy: 'read-only', fallback: [], script}}});
-    t.after(async () => { await scheduler.cancel(row.task); scheduler.close(); });
-    const row = scheduler.submit({parent: null, profile: 'p', orders: 'say hello'});
-    await waitFor(() => scheduler.tasks()[row.task]?.state === 'completed');
-    assert.equal(scheduler.tasks()[row.task].state, 'completed');
-  }
+// E7-opencode (ported from the legacy `local` read-only refusal case): opencode's enforcement is
+// not a wrapped adapter refusing to launch — it is the per-prompt `tools` map from toolsFor()
+// (src/adapters/opencode-live.js §"the effective policy tier becomes a tools map"). A read-only
+// tier must have every writing tool false, so a read-only worker cannot write or run bash
+// regardless of what the model asks for.
+test('E7-opencode read-only profile: toolsFor(read-only) refuses every writing tool', () => {
+  const tools = toolsFor('read-only');
+  assert.equal(tools.write, false);
+  assert.equal(tools.edit, false);
+  assert.equal(tools.apply_patch, false);
+  assert.equal(tools.bash, false);
+  assert.equal(tools.task, false);
+  assert.equal(tools.websearch, false);
+  assert.equal(tools.webfetch, false);
+  // Reads stay available: a read-only tier is still allowed to look.
+  assert.equal(tools.read, true);
+  assert.equal(tools.grep, true);
+  assert.equal(tools.glob, true);
+  // Exact shape, not just "no writes" — a tool added later and left unclassified must default to
+  // denied, not silently pass this assertion by being absent.
+  assert.deepEqual(tools, {
+    read: true, grep: true, glob: true, todowrite: false,
+    write: false, edit: false, apply_patch: false,
+    task: false, websearch: false, webfetch: false, skill: false, question: false, invalid: false,
+    bash: false,
+  });
+  // write and yolo both unlock the writing tools; plan stays confined to reads, same as read-only.
+  assert.equal(toolsFor('write').write, true);
+  assert.equal(toolsFor('yolo').write, true);
+  assert.equal(toolsFor('plan').write, false);
 });
 
 // E8 (Amendment A1): a completion review is a review launch too — gated the same way as the

@@ -176,7 +176,7 @@ test('window titles and reset text read the way a plan states them', () => {
 });
 
 test('usageOrder: the fallback order first, then every profile adapter, deduped, quota-reporting vendors only', () => {
-  const profiles = {main: {adapter: 'claude'}, build: {adapter: 'codex'}, critic: {adapter: 'claude'}, local: {adapter: 'local'}};
+  const profiles = {main: {adapter: 'claude'}, build: {adapter: 'codex'}, critic: {adapter: 'claude'}, local: {adapter: 'opencode'}};
   assert.deepEqual(usageOrder(['claude'], profiles, ['claude', 'codex', 'muse']), ['claude', 'codex']);
   assert.deepEqual(usageOrder(['codex', 'claude'], {}, ['claude', 'codex', 'muse']), ['codex', 'claude']);
   assert.deepEqual(usageOrder(['muse'], profiles, ['claude', 'codex', 'muse']), ['muse', 'claude', 'codex']);
