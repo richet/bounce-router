@@ -65,7 +65,7 @@ test('the shipped agents come from the orchestration skill and are present with 
   assert.deepEqual([...roles.keys()].sort(), ['analyst', 'builder', 'integrator', 'reviewer']);
   assert.equal(roles.get('reviewer').source, 'skill');
   assert.deepEqual([...readOnlyRoles(roles)].sort(), ['analyst', 'reviewer']);
-  assert.equal(roles.get('builder').models, undefined, 'shipped agents name no models: any signed-in AI may play them');
+  assert.deepEqual(roles.get('builder').models, ['auto'], 'shipped agents name no AI: Jev picks one per task when it is on, else any signed-in AI plays them');
   assert.equal(roles.get('integrator').policy, 'write');
 });
 
@@ -221,7 +221,7 @@ test('agents set validates the file against this machine, writes it in the chose
   // list and show read the layered set; remove takes only a file in a writable store.
   const list = agentsCommand(['list'], options());
   assert.match(list.text, /^  coder · write · project · claude\/sonnet, lmstudio\/auto \(via opencode\)$/m);
-  assert.match(list.text, /^  reviewer · read-only · skill · claude\/sonnet, codex\/gpt-5.6-terra, muse, lmstudio\/auto \(via opencode\)$/m);
+  assert.match(list.text, /^  reviewer · read-only · skill · auto \(Jev\), claude\/sonnet, codex\/gpt-5.6-terra, muse, lmstudio\/auto \(via opencode\)$/m);
   assert.equal(agentsCommand(['show', 'coder'], options()).text, fs.readFileSync(set.report.file, 'utf8'));
   assert.throws(() => agentsCommand(['show', 'nope'], options()), /no agent named nope/);
   assert.throws(() => agentsCommand(['remove', 'reviewer'], options()), /shipped with skill agent-orchestrator/);
