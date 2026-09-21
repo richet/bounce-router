@@ -219,3 +219,43 @@ export function quotaPanel(store, order, {width = 30, now = Date.now(), rows = I
   }
   return built.slice(0, Math.max(0, rows));
 }
+
+// --- Model usage panel ---------------------------------------------------
+// A count reads at a glance only once it stops being an exact integer: 1.2M, not 1234567.
+const trimZero = s => s.replace(/\.0$/, '');
+const compactTokens = n => !Number.isFinite(n) || n <= 0 ? '0'
+  : n >= 1e6 ? `${trimZero((n / 1e6).toFixed(1))}M` : n >= 1e3 ? `${trimZero((n / 1e3).toFixed(1))}k` : `${Math.round(n)}`;
+// Name left, count right; the name gives way first since the count is what ranks the row.
+const modelLabelRow = (name, count, width, p) => {
+  const room = Math.max(1, width - count.length - 1);
+  const label = name.length > room ? `${name.slice(0, Math.max(1, room - 1))}…` : name;
+  return p.text(label) + ' '.repeat(Math.max(1, width - label.length - count.length)) + p.text(count);
+};
+const modelBar = (fraction, width, p) => {
+  const cells = Math.max(4, width);
+  const fill = Math.min(cells, Math.round(Math.max(0, Math.min(1, fraction)) * cells));
+  return p.ok(BAR.used.repeat(fill)) + p.muted(BAR.free.repeat(cells - fill));
+};
+// Ranked by reducers.modelUsage, so entries[0] is already the top spender: its bar is always
+// full and every other bar reads as a share of it. No usage yet means nothing to rank — hidden,
+// not a placeholder. Same bars -> lines -> compact degradation as quotaPanel, for the same reason.
+export function modelPanel(entries, {width = 28, rows = Infinity, paint} = {}) {
+  const p = {...noPaint, ...paint};
+  // Fewer than a title plus one line can't say anything: hidden, same as no usage at all.
+  if (!entries?.length || rows < 2) return [];
+  const top = entries[0].tokens || 1;
+  const build = detail => {
+    const title = p.title('MODELS');
+    if (detail === 'compact') return [title, p.muted(entries.map(e => `${e.model} ${compactTokens(e.tokens)}`).join(' · '))];
+    return [title, ...entries.flatMap(e => {
+      const head = modelLabelRow(e.model, compactTokens(e.tokens), width, p);
+      return detail === 'bars' ? [head, modelBar(e.tokens / top, width, p)] : [head];
+    })];
+  };
+  let built = [];
+  for (const detail of ['bars', 'lines', 'compact']) {
+    built = build(detail);
+    if (built.length <= rows) return built;
+  }
+  return built.slice(0, Math.max(0, rows));
+}

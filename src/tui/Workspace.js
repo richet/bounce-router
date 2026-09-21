@@ -50,6 +50,7 @@ export function createWorkspace(React, Ink) {
       {text: `Session ${(metadata.sessionId ?? '').slice(0, 8)}`, color: 'gray'},
       {text: ''},
       ...(metadata.quotaLines ?? []).map(text => ({text})),
+      ...(metadata.modelLines?.length ? [{text: ''}, ...metadata.modelLines.map(text => ({text}))] : []),
       {text: ''},
       {text: `AGENTS · ${panes.length + 1}`, color: 'cyan', bold: true},
       {text: `● ${metadata.orchestrator ?? 'main'} · ${status}`},

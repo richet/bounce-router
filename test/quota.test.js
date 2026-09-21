@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {EventEmitter} from 'node:events';
 import {PassThrough} from 'node:stream';
-import {quotaSnapshot, readQuota, loadQuota, recordQuota, quotaShort, quotaReport, quotaPanel, windowLabel, windowTitle, resetText, usageOrder} from '../src/quota.js';
+import {quotaSnapshot, readQuota, loadQuota, recordQuota, quotaShort, quotaReport, quotaPanel, modelPanel, windowLabel, windowTitle, resetText, usageOrder} from '../src/quota.js';
 
 const fake = script => (executable, args) => {
   const child = new EventEmitter();
@@ -173,6 +173,59 @@ test('window titles and reset text read the way a plan states them', () => {
   assert.match(resetText({resetsAt: now + 90 * 60000}, now), /^resets \d{1,2}:\d{2}(am|pm)$/);
   assert.equal(resetText({resetsAt: null}, now), '');
   assert.equal(resetText({resetsAt: now - 1}, now), '');
+});
+
+test('modelPanel: ranked entries each get a labelled row and a bar sized against the top spender', () => {
+  const entries = [
+    {model: 'claude-opus-5[1m]', provider: 'claude', tokens: 762000, usage: {}, turns: 1},
+    {model: 'gpt-5-codex', provider: 'codex', tokens: 381000, usage: {}, turns: 1},
+    {model: 'sonnet', provider: null, tokens: 42000, usage: {}, turns: 1},
+  ];
+  const panel = modelPanel(entries, {width: 28});
+  assert.deepEqual(panel, [
+    'MODELS',
+    'claude-opus-5[1m]       762k',
+    '■'.repeat(28),
+    'gpt-5-codex             381k',
+    // Half the top spender's tokens: half the bar, rounded to the nearest cell.
+    '■'.repeat(14) + '□'.repeat(14),
+    'sonnet                   42k',
+    '■'.repeat(2) + '□'.repeat(26),
+  ]);
+  for (const row of panel) assert.ok(row.length <= 28, `row too wide: ${row}`);
+});
+
+test('modelPanel: no usage yet hides the section entirely, rather than a placeholder', () => {
+  assert.deepEqual(modelPanel([], {width: 28}), []);
+  assert.deepEqual(modelPanel(undefined, {width: 28}), []);
+});
+
+test('modelPanel: a name too long for the width is truncated, the count always stays on the right', () => {
+  const entries = [{model: 'super-duper-extremely-long-model-name-v3', provider: 'claude', tokens: 1234567, usage: {}, turns: 1}];
+  const panel = modelPanel(entries, {width: 28});
+  assert.equal(panel[1], 'super-duper-extremely-… 1.2M');
+  assert.equal(panel[1].length, 28);
+});
+
+test('modelPanel gives up bars, then per-model lines, then one compact line, as the sidebar runs out of rows', () => {
+  const entries = [
+    {model: 'claude-opus-5', provider: 'claude', tokens: 762000, usage: {}, turns: 1},
+    {model: 'gpt-5-codex', provider: 'codex', tokens: 84000, usage: {}, turns: 1},
+  ];
+  const rows = budget => modelPanel(entries, {width: 28, rows: budget});
+  assert.equal(rows(Infinity).length, 5); // title + 2 * (label + bar)
+  assert.deepEqual(rows(3), ['MODELS', 'claude-opus-5           762k', 'gpt-5-codex              84k']);
+  assert.deepEqual(rows(2), ['MODELS', 'claude-opus-5 762k · gpt-5-codex 84k']);
+  // A title with nothing under it says nothing: hidden below a 2-row budget, same as no usage.
+  assert.deepEqual(rows(1), []);
+});
+
+test('modelPanel: below a 2-row budget the section hides entirely rather than showing a bare title', () => {
+  const entries = [{model: 'x', provider: null, tokens: 10, usage: {}, turns: 1}];
+  assert.deepEqual(modelPanel(entries, {rows: 1}), []);
+  const panel = modelPanel(entries, {rows: 2});
+  assert.equal(panel.length, 2);
+  assert.equal(panel[0], 'MODELS');
 });
 
 test('usageOrder: the fallback order first, then every profile adapter, deduped, quota-reporting vendors only', () => {

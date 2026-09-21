@@ -48,6 +48,21 @@ test('the sidebar separates its header, each quota group and the agents list wit
   assert.equal(rail[at('CODEX') + 3], 'AGENTS · 2');
 });
 
+test('the MODELS block, when present, sits between the quota panel and AGENTS with a blank separator', () => {
+  const quotaLines = ['CLAUDE', '5-hour limit 38%'];
+  const modelLines = ['MODELS', 'claude-opus-5[1m]       762k', '■'.repeat(28)];
+  const rail = frame(120, false, {metadata: {...metadata, quotaLines, modelLines}}).split('\n').map(line => line.replace(/^.*│ ?/, '').trim());
+  const at = text => rail.findIndex(line => line.startsWith(text));
+  assert.equal(rail[at('CLAUDE') + 2], '');
+  assert.equal(rail[at('CLAUDE') + 3], 'MODELS');
+  assert.equal(rail[at('MODELS') + 3], '');
+  assert.equal(rail[at('MODELS') + 4], 'AGENTS · 2');
+  // No usage yet (modelLines omitted or empty): no MODELS section, no stray blank row either.
+  const withoutModels = frame(120, false, {metadata: {...metadata, quotaLines, modelLines: []}}).split('\n').map(line => line.replace(/^.*│ ?/, '').trim());
+  assert.equal(withoutModels.some(line => line === 'MODELS'), false);
+  assert.equal(withoutModels[withoutModels.findIndex(line => line.startsWith('CLAUDE')) + 3], 'AGENTS · 2');
+});
+
 test('config keeps the sidebar on unless told otherwise, and rejects a non-boolean', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-sidebar-config-'));
   try {
