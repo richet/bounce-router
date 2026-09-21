@@ -21,7 +21,10 @@ export function runProcess({provider, executable = provider, args, prompt, cwd, 
     // bounce believe it is the orchestrator: it acts through its own adapter, not as a peer.
     // The single exception (T3b): the orchestrator profile's own CLI *is* a peer — it holds the
     // orchestrator grant and talks to the bridge — so only that one child keeps BOUNCE_BUS*.
-    const {BOUNCE_BUS, BOUNCE_BUS_TOKEN_FILE, BOUNCE_REMOTE_SESSION, BOUNCE_ROLE, BOUNCE_ORCHESTRATOR_PROFILE, ...env} = process.env;
+    // The supervisor's own flags go too (same set as live-common's DAEMON_FLAGS): a nested
+    // `bounce` in the vendor's shell must not think it is the supervised child or a daemon.
+    const {BOUNCE_BUS, BOUNCE_BUS_TOKEN_FILE, BOUNCE_REMOTE_SESSION, BOUNCE_ROLE, BOUNCE_ORCHESTRATOR_PROFILE,
+      BOUNCE_SUPERVISED, BOUNCE_DETACHED, BOUNCE_VIEW_DAEMON, BOUNCE_PERSISTENT_VIEW, BOUNCE_RESTART, ...env} = process.env;
     if (keepBus && BOUNCE_BUS !== undefined) { env.BOUNCE_BUS = BOUNCE_BUS; env.BOUNCE_BUS_TOKEN_FILE = BOUNCE_BUS_TOKEN_FILE; }
     const child = spawn(executable, args, {cwd, env, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe']});
     const finish = result => { if (!closed) { closed = true; clearTimeout(killTimer); signal?.removeEventListener('abort', cancel); resolve(result); } };

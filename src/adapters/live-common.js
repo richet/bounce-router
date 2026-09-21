@@ -10,8 +10,13 @@ import {limitPattern} from '../providers.js';
 // explicit capability set for an orchestrator/report endpoint; arbitrary profile env is never
 // forwarded.
 const VENDOR_CAPS = new Set(['BOUNCE_BUS', 'BOUNCE_BUS_TOKEN_FILE', 'BOUNCE_ROLE', 'BOUNCE_ORCHESTRATOR_PROFILE', 'BOUNCE_REPORT_BUS', 'BOUNCE_REPORT_TOKEN_FILE']);
+// The daemon's own process flags (src/reload.js) describe how *this* bounce was started, and
+// a child that inherits them lies to any bounce it runs from its shell: a worker probing
+// `bounce` for usage under BOUNCE_VIEW_DAEMON=1 became a second, headless daemon that drained
+// forever (observed: 120 s Bash stalls, empty sessions, orphaned daemons). Never forwarded.
+export const DAEMON_FLAGS = new Set(['BOUNCE_SUPERVISED', 'BOUNCE_DETACHED', 'BOUNCE_VIEW_DAEMON', 'BOUNCE_PERSISTENT_VIEW', 'BOUNCE_RESTART']);
 export const vendorEnv = (env = process.env, capabilities = {}) => ({
-  ...Object.fromEntries(Object.entries(env).filter(([k]) => !k.startsWith('BOUNCE_BUS') && k !== 'BOUNCE_REMOTE_SESSION' && !VENDOR_CAPS.has(k))),
+  ...Object.fromEntries(Object.entries(env).filter(([k]) => !k.startsWith('BOUNCE_BUS') && k !== 'BOUNCE_REMOTE_SESSION' && !VENDOR_CAPS.has(k) && !DAEMON_FLAGS.has(k))),
   ...Object.fromEntries(Object.entries(capabilities).filter(([k, value]) => VENDOR_CAPS.has(k) && typeof value === 'string')),
 });
 

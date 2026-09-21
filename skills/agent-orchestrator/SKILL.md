@@ -1,6 +1,6 @@
 ---
 name: agent-orchestrator
-description: Coordinate decomposable work across whichever workers the active harness can actually reach — bounce worker profiles, Claude Code subagents, or Codex workers — choosing by task, capability, and cost rather than vendor. Use when the user asks to delegate, orchestrate, use workers, or save their limit, or when a multi-step change means parallel research, a bounded build, or an independent review — not for trivial or tightly coupled work.
+description: Coordinate decomposable work across whichever workers the active harness can actually reach — bounce worker profiles, Claude Code subagents, or Codex workers — choosing by task, capability, and cost rather than vendor. Use only when the user explicitly asks to delegate, orchestrate, use workers or subagents, or save their limit, or when you are a bounce orchestrator (BOUNCE_BUS is set / an ORDERS.md was handed to you). Do not trigger on the shape of the task alone — a multi-step change, research or a review is done directly unless delegation was asked for.
 ---
 
 # Agent orchestrator

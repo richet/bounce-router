@@ -11,7 +11,9 @@ const text = value => typeof value === 'string' && value.length <= TEXT_MAX;
 export function validateReport(report) {
   if (!report || typeof report !== 'object' || Array.isArray(report)) return 'report';
   if (!REPORT_OPS.has(report.op)) return 'op';
-  if (!text(report.phase) || !text(report.text) || !text(report.next)) return 'content';
+  // Named per field: a worker reads this off `bounce report`'s one-line error, and "content" sent
+  // it hunting through the CLI for the schema (observed: minutes per task, and a nested bounce).
+  for (const field of ['phase', 'text', 'next']) if (!text(report[field])) return `${field} (required string)`;
   if (report.evidence !== undefined && (!Array.isArray(report.evidence) || report.evidence.length > EVIDENCE_MAX || report.evidence.some(item => !text(item)))) return 'evidence';
   if (report.op === 'final') {
     if (!OUTCOMES.has(report.outcome) || !text(report.summary)) return 'final';

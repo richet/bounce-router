@@ -51,40 +51,59 @@ export function createClaudeLive({connect = nodeConnect, fs = nodeFs, kill = pro
 
     async resume({peer, profile, native, message, cwd, dir, userImages = []}) {
       const texts = takePending(pendingPath(dir));
-      return start({profile: {...profile, images: userImages}, extraArgs: ['--resume', native.sessionId], stdin: [...texts, message].join('\n'), cwd, dir});
+      const spec = {profile: {...profile, images: userImages}, extraArgs: ['--resume', native.sessionId], stdin: [...texts, message].join('\n'), cwd, dir};
+      // Kept for events(): a resume whose turn the CLI dropped is relaunched once from this.
+      return {...start(spec), relaunch: () => start(spec)};
     },
 
     // Never throws: every terminal condition of the process becomes an event and ends the stream.
     // A failed result is `limited` when the error channel (an is_error result, a rejected
     // rate_limit_event, or the stderr tail on exit) carries the vendor's usage-limit text —
     // the same providers.limitPattern the classic runProcess path classifies with.
+    // A resumed session can come back with a zero-turn result (num_turns 0, no API time): the
+    // CLI spends the resume on the "background task stopped" notice left by the previous turn and
+    // never reads the prompt (observed on every rework and report-only resume after a worker
+    // backgrounded a command). That is not the worker's answer, so the resume is relaunched once
+    // — the notice is consumed by then — before a zero-turn result is passed on as the outcome.
     async *events(handle) {
       let sawResult = false, limited = false;
-      for await (const event of handle.live.events) {
-        if (event.kind === 'diagnostic') { yield event; continue; }
-        if (event.kind === 'error') { yield {kind: 'error', code: event.code, text: event.text}; return; }
-        if (event.kind === 'exit') {
-          if (!sawResult) yield {kind: 'result', status: event.limited ? 'limited' : 'failed', text: 'protocol error: claude exited without result'};
-          return;
-        }
-        let raw;
-        try { raw = JSON.parse(event.text); } catch { yield {kind: 'status', text: event.text}; continue; }
-        yield {kind: 'raw', raw}; // the scheduler journals raw rows for quota, before the normalized view
-        for (const normalized of claude.normalize(raw)) {
-          if (normalized.kind === 'peer.native') {
-            handle.sessionId = normalized.sessionId;
-            yield {kind: 'native', provider: normalized.provider, sessionId: normalized.sessionId};
-            continue;
+      for (;;) {
+        let relaunch = null;
+        for await (const event of handle.live.events) {
+          if (event.kind === 'diagnostic') { yield event; continue; }
+          if (event.kind === 'error') { yield {kind: 'error', code: event.code, text: event.text}; return; }
+          if (event.kind === 'exit') {
+            if (relaunch) break;
+            if (!sawResult) yield {kind: 'result', status: event.limited ? 'limited' : 'failed', text: 'protocol error: claude exited without result'};
+            return;
           }
-          if (normalized.kind === 'error') limited ||= limitPattern.test(normalized.text);
-          if (normalized.kind === 'result') {
-            sawResult = true;
-            yield {kind: 'result', text: normalized.text, success: normalized.success, status: normalized.success ? 'completed' : limited ? 'limited' : 'failed'};
-            continue;
+          let raw;
+          try { raw = JSON.parse(event.text); } catch { yield {kind: 'status', text: event.text}; continue; }
+          yield {kind: 'raw', raw}; // the scheduler journals raw rows for quota, before the normalized view
+          for (const normalized of claude.normalize(raw)) {
+            if (normalized.kind === 'peer.native') {
+              handle.sessionId = normalized.sessionId;
+              yield {kind: 'native', provider: normalized.provider, sessionId: normalized.sessionId};
+              continue;
+            }
+            if (normalized.kind === 'error') limited ||= limitPattern.test(normalized.text);
+            if (normalized.kind === 'result') {
+              if (normalized.success && raw.num_turns === 0 && handle.relaunch) {
+                relaunch = handle.relaunch; handle.relaunch = null;
+                yield {kind: 'status', text: 'Resumed session returned no turn (the CLI spent it on a stopped background task); relaunching the resume once'};
+                continue;
+              }
+              sawResult = true;
+              yield {kind: 'result', text: normalized.text, success: normalized.success, status: normalized.success ? 'completed' : limited ? 'limited' : 'failed'};
+              continue;
+            }
+            if (normalized.kind === 'usage') { yield {kind: 'usage', usage: mapUsage(normalized.usage)}; continue; }
+            yield normalized;
           }
-          if (normalized.kind === 'usage') { yield {kind: 'usage', usage: mapUsage(normalized.usage)}; continue; }
-          yield normalized;
         }
+        if (!relaunch) break;
+        const next = relaunch();
+        Object.assign(handle, {live: next.live, child: next.child, pid: next.pid});
       }
       if (!sawResult) yield {kind: 'result', status: 'failed', text: 'protocol error: claude stream ended without result'};
     },

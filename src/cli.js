@@ -21,7 +21,7 @@ import {inspectLocalToolchain, prepareLocalToolchain} from './local-toolchain.js
 import stringWidth from 'string-width';
 import {clean, createFormatter, createWorkSummary, workReview, withAsides, continueMain} from './format.js';
 import {validateOrchestration} from './profiles.js';
-import {loadQuota, recordQuota, refreshQuota, quotaSnapshot, quotaShort, quotaPanel, quotaReport, quotaUnavailable, usageOrder} from './quota.js';
+import {loadQuota, recordQuota, refreshQuota, quotaSnapshot, quotaShort, quotaPanel, modelPanel, quotaReport, quotaUnavailable, usageOrder} from './quota.js';
 import {skillsCommand, syncSkills, inspectSkills, skillsChanged, importCandidates, importSelected, importSummary, importOrigin, syncSummary, skillAreas} from './skills.js';
 import {expandVendorCommand, findVendorCommand, vendorCommandRows} from './vendor-commands.js';
 import fs from 'node:fs';
@@ -333,6 +333,13 @@ async function main() {
   let orchestration;
   try { orchestration = validateOrchestration(settings); }
   catch { orchestration = {operation: 'classic', orchestrator: null, profiles: {}, shape: 'none', strict: false}; }
+  // The mode this session actually runs in is fixed when the supervisor spawned it (the daemon
+  // and its workers exist or they don't), so /operation saves the config and restarts the
+  // session into the chosen mode (applyOperation). The sidebar shows the running mode and names
+  // the saved one whenever they still differ (a refused or failed restart) — otherwise a session
+  // switched to "classic" would keep dispatching workers under a classic label.
+  const sessionOperation = orchestrating ? 'orchestrator' : 'classic';
+  const pendingOperation = () => orchestration.operation === sessionOperation ? null : orchestration.operation;
   // The usage panel covers every vendor the session can spend on: in orchestrator mode the
   // workers' vendors too, not just the orchestrator's own (settings.order is narrowed to it).
   const quotaOrder = () => usageOrder(settings.order, orchestration.operation === 'orchestrator' ? orchestration.profiles : {});
@@ -439,13 +446,21 @@ async function main() {
     session.append({kind: 'status', text: `Model: ${entry.provider} · ${entry.label}${entry.id ? ` (${entry.id})` : ''}`});
     notice = `${entry.provider} · ${entry.label}. Saved as the default.`;
   };
-  // Shared by the /operation command, its picker (menu) and the Ctrl+O toggle (shortcut) — one
-  // place applies a mode change: open an (empty) overlay on the shipped roster on the first
-  // switch to orchestrator, validate the whole config, persist, and reflect it in the sidebar.
-  // Never throws (the shortcut
-  // path has no surrounding try) — it reports problems via `notice`.
+  // Shared by the /operation command and its picker (menu, also behind Ctrl+O) — one place
+  // applies a mode change: open an (empty) overlay on the shipped roster on the first switch to
+  // orchestrator, validate the whole config, persist, and — when the chosen mode is not the one
+  // this session runs in — restart the session into it (same id, same transcript) through the
+  // supervisor's restart channel; src/reload.js picks the other hosting path from the state's
+  // `operation`. Refused before anything is saved while workers still run (a restart would orphan
+  // them) or without a supervisor to restart under. Never throws — problems go to `notice`.
   function applyOperation(arg) {
     if (!['classic', 'orchestrator'].includes(arg)) { notice = 'Use /operation classic or /operation orchestrator'; return; }
+    const restarting = arg !== sessionOperation;
+    if (restarting) {
+      const open = Object.values(reducers.tasks(session.events)).filter(t => !reducers.TERMINAL.has(t.state));
+      if (open.length) { notice = `Cannot switch to ${arg}: ${open.length} worker${open.length === 1 ? ' is' : 's are'} still running · /stop first`; return; }
+      if (!process.send) { notice = `Cannot switch to ${arg}: switching needs the bounce supervisor`; return; }
+    }
     const previous = {operation: settings.operation, profiles: settings.profiles, orchestrator: settings.orchestrator};
     settings.operation = arg;
     if (arg === 'orchestrator') materialiseRoster(settings);
@@ -453,13 +468,15 @@ async function main() {
     catch (error) { Object.assign(settings, previous); notice = `Cannot switch to ${arg}: ${error.message}`; return; }
     delete setupDefaults.operation; delete setupDefaults.orchestrator;
     save();
-    session.append({kind: 'status', text: arg === 'orchestrator'
-      ? `Operation: orchestrator · ${orchestration.orchestrator} · ${Object.entries(orchestration.profiles).map(([n, pr]) => `${n}(${pr.adapter})`).join(', ')} — saved; applies to the next \`bounce run\`.`
-      : 'Operation: classic — saved.'});
+    const roster = arg === 'orchestrator' ? ` · ${orchestration.orchestrator} · ${Object.entries(orchestration.profiles).map(([n, pr]) => `${n}(${pr.adapter})`).join(', ')}` : '';
+    if (!restarting) { session.append({kind: 'status', text: `Operation: ${arg}${roster} — saved; already how this session runs.`}); return; }
+    session.append({kind: 'status', text: `Operation: ${arg}${roster} — saved; restarting this session into ${arg}…`});
+    notice = `Restarting into ${arg}…`;
+    restartInto(arg).catch(error => { notice = `Restart into ${arg} failed: ${error.message} — it applies to the next session.`; render(); });
   }
   function openOperationPicker() {
     picker = {kind: 'operation', entries: ['classic', 'orchestrator'], index: orchestration.operation === 'orchestrator' ? 1 : 0, notes: []};
-    notice = 'Pick an operation mode. Esc cancels · Ctrl+O toggles.';
+    notice = 'Pick an operation mode. Enter restarts this session into it · Esc cancels.';
   }
   async function openModelPicker(refresh) {
     notice = 'Asking each signed-in agent for its models…'; render();
@@ -573,8 +590,8 @@ async function main() {
       menu.push(['\u2191/\u2193 choose \u00b7 Enter resume \u00b7 Esc cancel', style.muted]);
     } else if (picker?.kind === 'operation') {
       menu.push(['Operation mode', style.title]);
-      picker.entries.forEach((name, i) => menu.push([`${i === picker.index ? '\u203a' : ' '} ${name}${name === orchestration.operation ? '  (current)' : ''}`, i === picker.index ? style.selected : plain]));
-      menu.push(['\u2191/\u2193 choose \u00b7 Enter switch \u00b7 Esc cancel \u00b7 Ctrl+O toggles', style.muted]);
+      picker.entries.forEach((name, i) => menu.push([`${i === picker.index ? '\u203a' : ' '} ${name}${name === sessionOperation ? '  (running)' : name === orchestration.operation ? '  (saved)' : ''}`, i === picker.index ? style.selected : plain]));
+      menu.push(['\u2191/\u2193 choose \u00b7 Enter switch (restarts the session) \u00b7 Esc cancel', style.muted]);
     } else if (picker) {
       const rows = modelRows(picker.entries, picker.index, width - 1);
       const {start, end} = windowAround(rows.length, picker.index, Math.max(1, menuBudget - 2 - picker.notes.length));
@@ -608,14 +625,22 @@ async function main() {
       menu: menu.map(([text, paint]) => paint(clean(text))),
       metadata: {
         provider: selected(), model: settings.models[selected()] || '', mode: settings.mode,
-        cwd: session.cwd, sessionId: session.id, operation: orchestration.operation, jev: jevSidebarLabel(settings.jev),
+        cwd: session.cwd, sessionId: session.id, operation: sessionOperation, pendingOperation: pendingOperation(), jev: jevSidebarLabel(settings.jev),
         orchestrator: orchestration.orchestrator ?? 'main', pendingTurns: pendingTurns.length,
-        // The sidebar spends 11 rows on the header block, the AGENTS list and the two gaps, plus one per worker.
-        quotaLines: quotaPanel(quotas, quotaOrder(), {
-          width: 28, now: Date.now(), rows: Math.max(4, terminalRows - 11 - (terminal?.snapshot().panes.length ?? 0)), cooldowns: router.cooldowns,
-          paint: {title: style.title, text: plain, muted: style.muted, ok: style.result,
-            warn: style.status, high: style.error, tick: style.note},
-        }),
+        // The sidebar spends 11 rows on the header block, the AGENTS list and the two gaps, plus
+        // one per worker; whatever is left (sidebarRows) is split between MODELS and quota, with
+        // MODELS capped at 40% (and its own blank separator row when non-empty) so quota never
+        // loses its floor of 4 rows to a long model list.
+        ...(() => {
+          const paint = {title: style.title, text: plain, muted: style.muted, ok: style.result,
+            warn: style.status, high: style.error, tick: style.note};
+          const sidebarRows = Math.max(4, terminalRows - 11 - (pendingOperation() ? 1 : 0) - (terminal?.snapshot().panes.length ?? 0));
+          const modelLines = modelPanel(reducers.modelUsage(session.events), {width: 28, rows: Math.floor(sidebarRows * 0.4), paint});
+          const quotaLines = quotaPanel(quotas, quotaOrder(), {
+            width: 28, now: Date.now(), rows: Math.max(4, sidebarRows - (modelLines.length ? modelLines.length + 1 : 0)), cooldowns: router.cooldowns, paint,
+          });
+          return {quotaLines, modelLines};
+        })(),
       },
     });
   }
@@ -663,6 +688,15 @@ async function main() {
     const state = {id: id ?? undefined, settings: savedSettings(), provider: selected(), dev};
     await new Promise((resolve, reject) => process.send({type: 'restart', state}, error => error ? reject(error) : resolve()));
     leave(); session.unlock();
+    process.exit(75);
+  }
+  // The mode switch's restart: like restart() below but without the dev-code validation, and
+  // the state names the mode so the supervisor re-hosts the session under the other path.
+  async function restartInto(operation) {
+    const state = {id: session.id, settings: savedSettings(), provider: selected(), dev, operation};
+    await new Promise((resolve, reject) => process.send({type: 'restart', state}, error => error ? reject(error) : resolve()));
+    leave(); session.unlock();
+    try { await session.flush?.(); } catch {}
     process.exit(75);
   }
   async function restart() {
@@ -781,7 +815,7 @@ async function main() {
           if (!['yolo','plan'].includes(arg)) throw new Error('Use /mode yolo or /mode plan'); settings.mode = arg; delete setupDefaults.mode; save();
         } else if (command === 'operation') {
           if (!arg) { openOperationPicker(); return; }
-          applyOperation(arg);
+          applyOperation(arg); return; // its own notice: a refusal, or the restart under way
         } else if (command === 'stop') {
           if (orchestration.operation !== 'orchestrator') throw new Error('/stop is only available in orchestrator mode');
           if (!process.send) throw new Error('/stop needs the orchestrator daemon (run bounce with an orchestrator config)');
@@ -963,7 +997,7 @@ async function main() {
       render(); return;
     }
     if (key.ctrl && key.name === 'c') { if (busy) {void Promise.resolve(router.cancel()).catch(error => { notice = error.message; render(); }); notice = 'Cancelling…'; render();} else quit(); return; }
-    if (key.ctrl && key.name === 'o') { applyOperation(orchestration.operation === 'classic' ? 'orchestrator' : 'classic'); render(); return; }
+    if (key.ctrl && key.name === 'o') { if (picker?.kind === 'operation') picker = null; else openOperationPicker(); render(); return; }
     if (key.name === 'pageup') {if (localSetup) localSetup.scroll = (localSetup.scroll ?? 0) + 8; else scroll += 8; render(); return;}
     if (key.name === 'pagedown') {if (localSetup) localSetup.scroll = Math.max(0, (localSetup.scroll ?? 0) - 8); else scroll = Math.max(0, scroll - 8); render(); return;}
     if (picker) {

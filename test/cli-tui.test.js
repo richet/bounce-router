@@ -141,4 +141,25 @@ test('CLI commands and live steering work while the daemon main turn is held', {
   assert.equal(calls.at(-1)[1].provider, 'claude');
   assert.equal(calls.at(-1)[1].model, 'fallback-opus');
 
+  // /operation to the other mode restarts the session into it — refused (and not saved) while a
+  // worker still runs, then a restart request naming the mode and exit 75 once the tree is idle.
+  const restarts = [];
+  child.on('message', message => { if (message?.type === 'restart') restarts.push(message); });
+  session.append({kind: 'task.submitted', task: 'ccc', profile: 'build', orders: 'still busy'});
+  session.append({kind: 'task.started', task: 'ccc', attempt: 1});
+  await waitFor(() => output.includes('build · running'));
+  child.stdin.write('/operation classic\r');
+  await waitFor(() => output.includes('Cannot switch to classic: 1 worker is still running'));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'config.json'))).operation, 'orchestrator');
+  assert.equal(restarts.length, 0);
+  session.append({kind: 'task.completed', task: 'ccc', summary: 'Done'});
+  await waitFor(() => !output.slice(-3000).includes('build · running'));
+  const exited = new Promise(resolve => child.once('close', resolve));
+  child.stdin.write('/operation classic\r');
+  await waitFor(() => restarts.length === 1);
+  assert.equal(restarts[0].state.operation, 'classic');
+  assert.equal(restarts[0].state.id, session.id);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'config.json'))).operation, 'classic');
+  assert.equal(await exited, 75);
+  assert.ok(session.events.some(row => row.kind === 'status' && row.text === 'Operation: classic — saved; restarting this session into classic…'));
 });
