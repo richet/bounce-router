@@ -255,7 +255,7 @@ models: [lmstudio/qwen3.8-27b-mlx@4bit, claude/default]
 You are the reviewer. …
 ```
 
-`models:` lists the AIs that may play the agent, in fallback order, named by **provider** (`claude/sonnet`, `codex/gpt-5.6-terra`, `muse`, `lmstudio/<model>`; `provider/default` is that provider's default model). A fallback is therefore always the same job on another AI. With no `models:`, every signed-in provider plays it in your routing order, then a local model.
+`models:` lists the AIs that may play the agent, in fallback order, named by **provider** (`claude/sonnet`, `codex/gpt-5.6-terra`, `muse`, `lmstudio/<model>`; `provider/default` is that provider's default model). A fallback is therefore always the same job on another AI. With no `models:`, every signed-in provider plays it in your routing order, then a local model. Put `auto` first (`models: [auto, claude/default]`) to let Jev pick the AI for each task; what follows `auto` is what the agent runs on when Jev is off or unsure.
 
 Agent files are layered, later ones shadowing by name: the four shipped with bounce (`analyst`, `builder`, `integrator`, `reviewer`) → `~/.bounce/agents/` → `<workspace>/.bounce/agents/`.
 
@@ -293,6 +293,7 @@ Optional, off by default. [Jev](https://docs.typesafe.ai) is TypeSafe's decision
     /jev routing on|off   model routing for "profile":"auto" (default on when enabled)
     /jev roster [refresh] what routing knows about each worker model (tier, capabilities, who described it); refresh describes them again
     /jev model ID         default jev-1.13.0 — pinned, because an alias like jev-latest moves between releases and shifts the calibrated thresholds
+    /jev routing local on|off   prefer a local model for an auto agent's AI (default off)
     /jev confidence N     threshold, default 0.8
     /jev test             one live noul call ("Is this a test?"): latency and the answer, or the error
 
@@ -302,9 +303,15 @@ Optional, off by default. [Jev](https://docs.typesafe.ai) is TypeSafe's decision
 
 **Model routing.** With `jev.routing`, the orchestrator may submit `"profile":"auto"`: bounce classifies the orders against the whole roster — a choice over every worker profile's adapter/model/role/policy, its cost `tier` and a sentence on what its model is good and bad at, plus whether the orders need write or shell access — and dispatches the top pick when it is confident and its policy fits; otherwise `jev.routing.default` (`/jev routing default NAME`) or the first writing builder that is not the orchestrator. With routing off or Jev unavailable, `auto` resolves to that same fallback, so an orchestrator that uses it never breaks. Each decision is a `jev.routed` row.
 
+**Tier first.** The same call asks which cost tier the orders need (`cheapest`, `mid`, `strongest`). A tier chosen at 0.6 or above decides: bounce takes the first profile of that tier, in your provider order (`order`), whose policy fits the access the orders need. Picking between named profiles of one tier is not a question a model answers reliably — they are near-equal — so the named choice is only the second chance, at the usual threshold, when the tier is unsure or no profile of it fits. An `auto` agent's AI is chosen the same way, without the access gate (the policy is the job's).
+
+**Local models as the AI.** For an `auto` agent — and only there, since a local model is always an agent's backend — the candidates also include the tool-capable models LM Studio has **loaded**; when nothing is loaded, the downloaded ones, marked as costing a load. Each is described by its roster note (`lmstudio/<model>`; the roster setup describes them like any other model) and, with no note, conservatively as `cheapest`. Cloud AIs of the tier come first by default; `/jev routing local on` puts a local model of the needed tier first. A local pick that fails falls to the agent's own list like any other.
+
 The tier and capabilities need no configuring. Precedence is: a profile's own `tier`/`capabilities` (`"tier": "mid", "capabilities": "…"`) always win; every model in the vendors' `/model` pickers has a shipped note (`src/model-catalog.js`, shown as source `catalog` in `/jev roster`), so the default roster routes with no agent turn at all; any other model — a local model, a vendor id newer than this bounce — is described once by one of your own cloud agents — the orchestrator's model, else the first cloud profile in the roster — in a single read-only, tool-free turn when the daemon starts with routing on (or on `/jev roster refresh`). Those notes are cached in `~/.bounce/roster-notes.json` per adapter/model, journaled as a `jev.roster` row, shown in ORDERS.md, and listed by `/jev roster`. If the description fails, a `jev.skipped` row says why and routing sees adapter/model/role/policy only for that model.
 
 A `typesafe` profile can also be declared in `config.json` (`{"adapter": "typesafe", "role": "critic"}`) and named as a `review.completion` reviewer explicitly; it is always read-only and never runs a task.
+
+**Routing picks the job, then the AI.** With agent files present, the same routing call also asks *which job the orders describe* — each agent's description and policy, plus `none`. A confident job whose policy can do the work (a read-only job is never given orders that need to edit files) wins: the task goes to that agent, and the agent file's own `models:` order decides the AI — Jev never overrides a list you wrote. With no clear job, or no agent files at all, routing chooses a worker profile exactly as before. An agent whose `models:` opens with `auto` is the exception you asked for: the job is fixed and Jev picks the AI per task from your worker profiles, judged on tier and capabilities alone — mode, policy, role and prompt stay the agent's. Below the confidence threshold, with Jev off, or when the picked AI fails, the agent runs on the rest of its list. `jev.routed` records the job (or why none was chosen) beside the profile decision. For an `auto` agent the row also names the AI (`agent@profile`). A task submitted to an agent is Jev-reviewed like any other, and a local worker's answer is what the verdict judges.
 
 ## Skills
 

@@ -20,6 +20,7 @@ export const JEV_HELP = [
   '/jev review on|off   Completion verdicts: a fast accept/rework check on each root task without its own reviewer (default on)',
   '/jev routing on|off  Model routing for tasks submitted with "profile":"auto" (default on)',
   '/jev routing default PROFILE|none   Where auto falls back when routing is off or unconfident',
+  '/jev routing local on|off   Prefer a local model of the needed tier for an `auto` agent\'s AI (default off: cloud AIs first)',
   '/jev roster          What routing knows about each worker profile\'s model: its tier and capabilities, and who described it',
   '/jev roster refresh  Describe the roster\'s models again (one read-only turn of a cloud agent from the roster; cached per model)',
   `/jev model ID        Pin the Jev version (default ${JEV_DEFAULT_MODEL}); avoid jev-latest — an alias moves between releases and shifts the calibrated confidence thresholds`,
@@ -57,6 +58,11 @@ export async function jevCommand(parts = [], {root = dataRoot(), settings = {}, 
       return update({review: value});
     }
     case 'routing': {
+      if (rest[0] === 'local') {
+        const prefer = flag(rest[1]);
+        if (prefer === null) throw new Error('Use /jev routing local on|off');
+        return update({routing: {...current.routing, preferLocal: prefer}});
+      }
       if (rest[0] === 'default') {
         const name = rest[1];
         if (!name) throw new Error('Use /jev routing default PROFILE|none');
@@ -70,7 +76,7 @@ export async function jevCommand(parts = [], {root = dataRoot(), settings = {}, 
         return update({routing: {...current.routing, default: name === 'none' ? null : name}});
       }
       const value = flag(rest[0]);
-      if (value === null) throw new Error('Use /jev routing on|off, or /jev routing default PROFILE|none');
+      if (value === null) throw new Error('Use /jev routing on|off, /jev routing default PROFILE|none, or /jev routing local on|off');
       return update({routing: {...current.routing, enabled: value}});
     }
     case 'roster': {

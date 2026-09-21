@@ -21,7 +21,7 @@ export {pidAlive};
 import {createBus, connectBus} from './bus.js';
 import {validateOrchestration, LOCAL_ADAPTERS} from './profiles.js';
 import {rolesFor} from './agents.js';
-import {normalizeLocalSettings} from './local-models.js';
+import {normalizeLocalSettings, discoverLocalModels, localCandidates} from './local-models.js';
 import {createLocalActivation} from './local-activation.js';
 import {providers} from './providers.js';
 import {createScheduler} from './scheduler.js';
@@ -136,7 +136,7 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
         const chain = []; let current = name;
         while (current && !seen.has(current)) { seen.add(current); chain.push(profiles[current]); current = profiles[current].derived ? profiles[current].fallback[0] : null; }
         const head = chain[0];
-        lines.push(`    ${name} → ${chain.map(ref).join(', ')}${head.agent ? ` · ${head.agent.policy} · ${head.agent.description}` : head.role ? ` (${head.role})` : ''}`);
+        lines.push(`    ${name} → ${head.auto && routingOn ? 'Jev picks the AI per task, else ' : ''}${chain.map(ref).join(', ')}${head.agent ? ` · ${head.agent.policy} · ${head.agent.description}` : head.role ? ` (${head.role})` : ''}`);
       }
       return lines;
     })(),
@@ -162,7 +162,7 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     })(),
     'Worker profiles you can submit to (one AI each: name → adapter/model):',
     ...Object.entries(profiles).filter(([name, p]) => name !== orchestrator && name !== JEV_REVIEWER && !p.derived).map(([name, p]) => `    ${name} → ${[p.adapter, p.model].filter(Boolean).join('/')}${p.role ? ` (${p.role})` : ''}${about(name).tier ?? p.tier ? ` [tier ${about(name).tier ?? p.tier}]` : ''}${about(name).capabilities ?? p.capabilities ? ` — ${about(name).capabilities ?? p.capabilities}` : ''}`),
-    ...(jev && autoFallback ? [`    auto → ${routingOn ? 'Jev (TypeSafe) routes each task to the profile above that fits its orders; unconfident picks go to' : 'Jev routing is off (/jev routing on): resolves to'} ${autoFallback}`] : []),
+    ...(jev && autoFallback ? [`    auto → ${routingOn ? 'Jev (TypeSafe) routes each task: to the agent above whose job the orders clearly describe (that agent\'s own models then decide the AI), otherwise by the tier the orders need — the first fitting worker profile of that tier in the provider order; unconfident picks go to' : 'Jev routing is off (/jev routing on): resolves to'} ${autoFallback}`] : []),
     'Local discovery checks eligibility at dispatch. A downloaded model is not necessarily loaded or tool-capable.',
     'When the user requests local/LM Studio workers, use a local profile from this roster. If none is available, report that and request /local setup or /local activate; never substitute a cloud worker.',
     'Capacity waits, progress and failures are journaled. Do not infer a worker crash from silence alone; inspect its latest task state.',
@@ -286,7 +286,15 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // cloud agent from the roster and cached under the data root. The router waits briefly for a
   // description in flight (the first `auto` after a fresh model) and otherwise routes on what
   // is known. `orders` (ORDERS.md) is rewritten once notes land; it is bound below.
-  const rosterSetup = orchestrating ? createRosterSetup({root, profiles, session, executables: settings.executables,
+  // The local models Jev may pick as an `auto` agent's AI: discovered at decision time (no inference,
+  // no loading), described by their roster note; none when local models are off or opencode is absent.
+  const localAIs = async () => {
+    const local = normalizeLocalSettings(settings.local);
+    if (!local.enabled || !adapters.opencode || !Object.values(profiles).some(profile => profile.auto)) return [];
+    return localCandidates(await discoverLocalModels(local), readRosterNotes(root));
+  };
+  const rosterSetup = orchestrating ? createRosterSetup({root, profiles, session,
+    extra: async () => (await localAIs()).map(item => ({key: item.name, adapter: 'opencode', model: item.model, endpoint: item.endpoint})), executables: settings.executables,
     agent: setupAgent({profiles, orchestrator: orchestration.orchestrator, order: settings.order, models: settings.models}),
     catalogs: () => modelCatalog(settings), onChange: () => orders()}) : null;
   const rosterNotes = async () => {
@@ -294,7 +302,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
     if (pending) await Promise.race([pending, new Promise(resolve => setTimeout(resolve, ROSTER_WAIT_MS).unref?.())]);
     return rosterSetup.notes();
   };
-  const jev = orchestrating ? createJevDecisions({root, adapter: adapters.typesafe, notes: rosterNotes}) : null;
+  const jev = orchestrating ? createJevDecisions({root, adapter: adapters.typesafe, notes: rosterNotes, order: () => settings.order ?? [], locals: localAIs}) : null;
 
   // Phase 8: the strategy seam, same shape as `adapters`/`profiles` above — a test (or, later, a
   // config-driven caller) may inject a strategy object directly; absent, the declarative

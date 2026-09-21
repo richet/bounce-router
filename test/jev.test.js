@@ -26,13 +26,13 @@ const okResponse = (body, {status = 200, headers = {}} = {}) => ({
 });
 
 test('settings: Jev is off by default, everything it does is on once enabled, the model is pinned, and the persisted shape round-trips', () => {
-  assert.deepEqual(normalizeJevSettings(undefined), {enabled: false, model: JEV_DEFAULT_MODEL, review: true, routing: {enabled: true, default: null}, confidence: 0.8});
-  assert.deepEqual(normalizeJevSettings({enabled: true}), {enabled: true, model: JEV_DEFAULT_MODEL, review: true, routing: {enabled: true, default: null}, confidence: 0.8});
+  assert.deepEqual(normalizeJevSettings(undefined), {enabled: false, model: JEV_DEFAULT_MODEL, review: true, routing: {enabled: true, default: null, preferLocal: false}, confidence: 0.8});
+  assert.deepEqual(normalizeJevSettings({enabled: true}), {enabled: true, model: JEV_DEFAULT_MODEL, review: true, routing: {enabled: true, default: null, preferLocal: false}, confidence: 0.8});
   assert.equal(normalizeJevSettings({enabled: true, routing: false}).routing.enabled, false);
   assert.equal(normalizeJevSettings({enabled: true, routing: {enabled: false, default: 'build'}}).routing.enabled, false);
   assert.equal(JEV_DEFAULT_MODEL, 'jev-1.13.0');
   const custom = normalizeJevSettings({enabled: true, model: ' jev-1.12.0 ', review: false, routing: {enabled: true, default: 'build'}, confidence: 0.6});
-  assert.deepEqual(custom, {enabled: true, model: 'jev-1.12.0', review: false, routing: {enabled: true, default: 'build'}, confidence: 0.6});
+  assert.deepEqual(custom, {enabled: true, model: 'jev-1.12.0', review: false, routing: {enabled: true, default: 'build', preferLocal: false}, confidence: 0.6});
   assert.deepEqual(persistedJevSettings(custom), {enabled: true, model: 'jev-1.12.0', review: false, routing: {enabled: true, default: 'build'}, confidence: 0.6});
   assert.deepEqual(persistedJevSettings({enabled: true, routing: true}).routing, true);
   // junk never widens what Jev does
@@ -45,7 +45,7 @@ test('settings are read from config.json at use time and a missing/broken file r
   const root = tmpRoot(t);
   assert.equal(readJevSettings(root).enabled, false);
   fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify({order: ['claude'], jev: {enabled: true, routing: true}}));
-  assert.deepEqual(readJevSettings(root).routing, {enabled: true, default: null});
+  assert.deepEqual(readJevSettings(root).routing, {enabled: true, default: null, preferLocal: false});
   fs.writeFileSync(path.join(root, 'config.json'), '{not json');
   assert.equal(readJevSettings(root).enabled, false);
 });
@@ -226,7 +226,7 @@ test('routeTask: disabled / routing off / Jev failure all resolve to the fallbac
   assert.equal(routed.chosen, 'scout');
   assert.equal(routed.fallback, false);
   assert.equal(routed.model, 'jev-1.13.0');
-  assert.deepEqual(asked[0], {state: {orders: 'find x'}, model: 'jev-1.13.0', keys: ['profile', 'needs_write', 'needs_shell']});
+  assert.deepEqual(asked[0], {state: {orders: 'find x'}, model: 'jev-1.13.0', keys: ['tier', 'profile', 'needs_write', 'needs_shell']});
   // notes may be a (possibly async) function; one that throws only narrows the criteria
   const noted = [];
   await routeTask({orders: 'find x', profiles: roster, settings: {enabled: true}, notes: async () => ({scout: {tier: 'cheapest', capabilities: 'Quick.'}}), ask: async ({questions}) => { noted.push(questions.profile.criteria.scout); return {answers: {}}; }});

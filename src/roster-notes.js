@@ -68,13 +68,16 @@ export function effectiveNotes(profiles = {}, cache = {}) {
 
 // The models the roster runs that nobody has described yet: no `capabilities` on any profile
 // running them, not in the shipped catalog, and no cached note. Unique, in roster order.
-export function undescribedModels(profiles = {}, cache = {}) {
+// `extra` are models outside the roster that routing may still pick — the local candidates of an
+// `auto` agent — in the same {key, adapter, model, endpoint} shape.
+export function undescribedModels(profiles = {}, cache = {}, extra = []) {
   const seen = new Map();
   for (const [, p] of rosterEntries(profiles)) {
     const key = modelKey(p);
     if (p.capabilities || noteFor(key, cache)?.capabilities || seen.has(key)) continue;
     seen.set(key, {key, adapter: p.adapter, model: p.model || '', ...(LOCAL_ADAPTERS.has(p.adapter) && p.endpoint ? {endpoint: p.endpoint} : {})});
   }
+  for (const item of extra) if (!noteFor(item.key, cache)?.capabilities && !seen.has(item.key)) seen.set(item.key, item);
   return [...seen.values()];
 }
 
@@ -177,7 +180,7 @@ export async function describeModels({models, agent, catalogs = [], root = dataR
 // agent costs one attempt per daemon, not one per task. Every outcome is journaled: `jev.roster`
 // with the notes written, or `jev.skipped` with the reason. `onChange` (ORDERS.md) runs after
 // notes are written.
-export function createRosterSetup({root = dataRoot(), profiles = {}, agent = null, catalogs = async () => [], session = null, executables = {}, run, timeoutMs, clock, onChange = () => {}} = {}) {
+export function createRosterSetup({root = dataRoot(), profiles = {}, agent = null, catalogs = async () => [], extra = async () => [], session = null, executables = {}, run, timeoutMs, clock, onChange = () => {}} = {}) {
   let inflight = null, failed = false;
   const append = row => { try { session?.append(row); } catch {} };
   const notes = () => effectiveNotes(profiles, readRosterNotes(root));
@@ -185,10 +188,12 @@ export function createRosterSetup({root = dataRoot(), profiles = {}, agent = nul
     if (inflight) return inflight;
     if (failed && !force) return Promise.resolve(null);
     const cache = force ? {} : readRosterNotes(root);
-    const models = undescribedModels(profiles, cache);
-    if (!models.length) return Promise.resolve(null);
     inflight = (async () => {
       try {
+        let others = [];
+        try { others = await extra(); } catch {}
+        const models = undescribedModels(profiles, cache, Array.isArray(others) ? others : []);
+        if (!models.length) return null;
         if (!agent) throw new Error('no cloud agent in the roster or the provider order to describe the models with');
         let known = [];
         try { known = await catalogs(); } catch {}

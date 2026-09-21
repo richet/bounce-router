@@ -171,7 +171,11 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
     if (agent.error || agent.name === orchestrator) continue;
     const local = normalizeLocalSettings(settings.local);
     const isLocal = provider => Object.hasOwn(local.endpoints, provider);
-    const wanted = agent.models?.length ? agent.models
+    // `auto` first in the list: Jev picks the AI at dispatch (the scheduler composes it with playedBy);
+    // the rest — or, with nothing after it, the provider order — is the chain the job falls to.
+    const auto = agent.models?.[0] === 'auto';
+    const listed = (agent.models ?? []).filter(ref => ref !== 'auto');
+    const wanted = listed.length ? listed
       : [...(settings.order ?? []).filter(provider => adapterNames.includes(provider)).map(provider => `${provider}/${settings.models?.[provider] ?? ''}`),
         ...(local.enabled && adapterNames.includes('opencode') ? Object.keys(local.endpoints).map(endpoint => `${endpoint}/auto`) : [])];
     // `provider/default` is the provider's own default model — the written form of what an agent with
@@ -190,9 +194,10 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
       const name = chain[index];
       const mode = settings.mode;
       const policy = agent.policy ?? 'write';
-      const base = {derived: true, adapter: isLocal(provider) ? 'opencode' : provider, model: isLocal(provider) ? model : model, mode, policy,
+      const base = {derived: true, adapter: isLocal(provider) ? 'opencode' : provider, model, mode, policy,
         fallback: chain.slice(index + 1, index + 2), role: agent.name, executables: {...(settings.executables ?? {})},
         agent: {name: agent.name, description: agent.description, policy, prompt: agent.prompt, ...(agent.maxSteps ? {maxSteps: agent.maxSteps} : {})}};
+      if (auto && index === 0) base.auto = true;
       if (isLocal(provider)) {
         // All a local backend adds is where its model lives; src/local-resolve.js does the rest at dispatch.
         Object.assign(base, {backend: 'lmstudio', endpoint: provider, localOptions: {maxOutputTokens: 2048}});
@@ -205,6 +210,16 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
   const shape = names.every(name => profiles[name].adapter === orchestratorAdapter) ? 'single-provider' : 'multi-provider';
 
   return {operation: 'orchestrator', orchestrator, profiles, shape, strict, strategy, skipped};
+}
+
+// A job played by an AI that is not on its own list — Jev's pick for an agent whose `models:` opens
+// with `auto`. The AI brings only what it runs on; mode, policy, role and prompt stay the job's, and
+// a failure falls to the job's own chain.
+// `local` ({endpoint, model}) instead of a profile makes it an ordinary local backend of the job.
+export function playedBy(head, aiName, ai, local = null) {
+  return {derived: true, ai: aiName, adapter: local ? 'opencode' : ai.adapter, model: local ? local.model : ai.model ?? '', mode: head.mode, policy: head.policy,
+    fallback: [head.agent.name], role: head.role, executables: head.executables, agent: head.agent,
+    ...(local ? {backend: 'lmstudio', endpoint: local.endpoint, localOptions: {maxOutputTokens: 2048}} : {})};
 }
 
 export function profileFor(view, name) {

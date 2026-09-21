@@ -24,6 +24,7 @@ export const installedSkillAgents = root => path.join(root, 'skills', SKILL, 'te
 // (orch-*.md for Claude Code, orch-*.toml for Codex), which are a different thing.
 const SHIPPED = fileURLToPath(new URL(`../skills/${SKILL}/team/`, import.meta.url));
 const LISTS = ['models', 'readPaths', 'writePaths', 'commands'];
+export const AUTO_MODEL = 'auto';
 const MODEL_REF = /^[a-z0-9][a-z0-9_-]*\/\S+$/;
 const list = value => value.trim().replace(/^\[([\s\S]*)\]$/, '$1').split(',').map(item => item.trim().replace(/^(["'])([\s\S]*)\1$/, '$2')).filter(Boolean);
 const NAME = /^[a-z0-9][a-z0-9_-]*$/;
@@ -49,7 +50,10 @@ export function agentMetadata(text) {
   }
   const lists = {};
   for (const key of LISTS) if (fields[key] !== undefined) lists[key] = list(fields[key]);
-  for (const ref of lists.models ?? []) {
+  // `auto` hands the choice of AI to Jev at dispatch (src/jev.js); what follows it is the chain the
+  // agent runs on when Jev is off, unavailable or unsure — so it can only lead the list.
+  if ((lists.models ?? []).indexOf(AUTO_MODEL) > 0) throw new Error('auto goes first in models: the entries after it are what the agent falls back to');
+  for (const ref of (lists.models ?? []).filter(ref => ref !== AUTO_MODEL)) {
     if (!MODEL_REF.test(ref)) throw new Error(`models entries are provider/model refs (e.g. claude/sonnet, lmstudio/auto); got ${ref}`);
     // opencode is the runtime, not a provider: a local model is named by its provider (lmstudio/…).
     if (ref.startsWith('opencode/')) throw new Error(`a model ref names its provider, not the runtime; got ${ref} — use lmstudio/<model> for a local model`);
@@ -132,6 +136,7 @@ export function agentTable(roles, settings) {
   return [...roles.values()].map(role => {
     if (role.error) return {name: role.name, error: role.error, backends: [], skipped: []};
     const chain = []; let current = view?.profiles[role.name];
+    if (current?.auto) chain.push('auto (Jev)');
     while (current) { chain.push(ref(current)); current = current.fallback[0] ? view.profiles[current.fallback[0]] : null; }
     return {name: role.name, policy: role.policy, description: role.description, source: role.source, backends: chain,
       skipped: (view?.skipped ?? []).filter(item => item.agent === role.name).map(item => `${item.ref}: ${item.reason}`)};
@@ -172,7 +177,7 @@ export function agentsCommand(words, {root, cwd, settings, scope = 'user', input
   if (agent.name !== name) throw new Error(`the file defines ${agent.name}, not ${name}`);
   if (name === settings.orchestrator) throw new Error(`${name} is the orchestrator; it is configured, not defined as an agent`);
   const providers = ['claude', 'codex', 'muse', ...Object.keys(normalizeLocalSettings(settings.local).endpoints)];
-  for (const ref of agent.models ?? []) {
+  for (const ref of (agent.models ?? []).filter(ref => ref !== AUTO_MODEL)) {
     const provider = ref.slice(0, ref.indexOf('/'));
     if (!providers.includes(provider)) throw new Error(`unknown provider ${provider} in models; providers here: ${providers.join(', ')}`);
   }

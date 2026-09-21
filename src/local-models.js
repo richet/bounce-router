@@ -236,6 +236,18 @@ function splitRef(ref) {
 
 function endpointAllowed(id, endpoint) { return endpoint && (isLoopback(new URL(endpoint.url)) || endpoint.trusted); }
 
+// The local models Jev may pick as the AI of an `auto` agent. Loaded, tool-capable models; only
+// when nothing is loaded are downloaded ones offered (choosing one costs a load). Each is described
+// by its roster note (`<endpoint>/<model>` in roster-notes.json) or, with none, conservatively.
+export function localCandidates(catalogs = [], notes = {}) {
+  const usable = catalogs.flatMap(catalog => (catalog.models ?? []).filter(model => model.type !== 'embedding' && model.tools !== false && (model.ready === true || model.ready === false))
+    .map(model => { const name = `${catalog.endpoint}/${model.id}`; const note = notes[name] ?? {};
+      return {name, endpoint: catalog.endpoint, model: model.id, loaded: model.ready === true, context: model.instances?.[0]?.context ?? model.context ?? null,
+        tier: ['cheapest', 'mid', 'strongest'].includes(note.tier) ? note.tier : 'cheapest', capabilities: note.capabilities || 'unknown local model: single-file reading only'}; }));
+  const loaded = usable.filter(item => item.loaded);
+  return loaded.length ? loaded : usable;
+}
+
 export function resolveLocalModel({local, profile, catalogs, requirements = {}, override} = {}) {
   const settings = normalizeLocalSettings(local);
   const fail = (message, code) => { throw error(message, code); };

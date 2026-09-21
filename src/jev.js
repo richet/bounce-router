@@ -20,6 +20,9 @@ export const JEV_KEY_ENV = 'TYPESAFE_API_KEY';
 export const JEV_ENDPOINT = 'https://api.typesafe.ai/v1/systemone';
 export const JEV_TIMEOUT_MS = 10_000;
 export const PROFILE_TIERS = ['cheapest', 'mid', 'strongest'];
+// A tier is a three-way question Jev answers well (measured live: right 5/5 at 0.60–1.00), so it
+// decides at a lower bar than a choice between named profiles, which never reached 0.8.
+export const JEV_TIER_CONFIDENCE = 0.6;
 
 const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const bool = (value, fallback) => typeof value === 'boolean' ? value : fallback;
@@ -31,8 +34,8 @@ const bool = (value, fallback) => typeof value === 'boolean' ? value : fallback;
 export function normalizeJevSettings(input) {
   const raw = isObject(input) ? input : {};
   const routing = isObject(raw.routing)
-    ? {enabled: bool(raw.routing.enabled, true), default: typeof raw.routing.default === 'string' && raw.routing.default ? raw.routing.default : null}
-    : {enabled: bool(raw.routing, true), default: null};
+    ? {enabled: bool(raw.routing.enabled, true), default: typeof raw.routing.default === 'string' && raw.routing.default ? raw.routing.default : null, preferLocal: bool(raw.routing.preferLocal, false)}
+    : {enabled: bool(raw.routing, true), default: null, preferLocal: false};
   const confidence = typeof raw.confidence === 'number' && raw.confidence >= 0 && raw.confidence <= 1 ? raw.confidence : 0.8;
   return {
     enabled: bool(raw.enabled, false),
@@ -46,7 +49,7 @@ export function normalizeJevSettings(input) {
 // The shape written back to config.json: `routing` stays a plain boolean until a default is set.
 export function persistedJevSettings(settings) {
   const n = normalizeJevSettings(settings);
-  return {enabled: n.enabled, model: n.model, review: n.review, routing: n.routing.default ? {enabled: n.routing.enabled, default: n.routing.default} : n.routing.enabled, confidence: n.confidence};
+  return {enabled: n.enabled, model: n.model, review: n.review, routing: n.routing.default || n.routing.preferLocal ? {enabled: n.routing.enabled, default: n.routing.default, ...(n.routing.preferLocal ? {preferLocal: true} : {})} : n.routing.enabled, confidence: n.confidence};
 }
 
 // Read at use time (the daemon never caches it), so `/jev on` in the TUI applies to the next
@@ -59,7 +62,7 @@ export function readJevSettings(root = dataRoot()) {
 export function jevStatusLine(settings, key) {
   const s = normalizeJevSettings(settings);
   const keyText = key ? `key …${key.key.slice(-4)} (${key.source})` : 'no key';
-  const routing = s.routing.enabled ? `routing on${s.routing.default ? ` (default ${s.routing.default})` : ''}` : 'routing off';
+  const routing = s.routing.enabled ? `routing on${s.routing.default ? ` (default ${s.routing.default})` : ''}${s.routing.preferLocal ? ' (local first)' : ''}` : 'routing off';
   return `Jev (TypeSafe): ${s.enabled ? 'enabled' : 'disabled'} · ${keyText} · model ${s.model} · review ${s.review ? 'on' : 'off'} · ${routing} · confidence ${s.confidence}`;
 }
 
@@ -246,17 +249,71 @@ export const TIER_HINT = {cheapest: 'cheapest: locating files, symbols and call 
 // One criterion per routable profile: what it runs on, what it may do, and — from the profile's
 // own `tier`/`capabilities` or the roster notes bounce wrote for its model (src/roster-notes.js)
 // — what the model is good and bad at, so the choice weighs ability, not just names.
+// The jobs `auto` may choose between: the head of each agent file's derived chain (its hidden
+// `name~n` backends are the AIs that may play it, not separate jobs).
+export const agentHeads = (profiles = {}) => Object.entries(profiles).filter(([name, p]) => p?.derived === true && p.agent?.name === name && p.role !== 'orchestrator');
+
+// `job: true` describes the profile as an AI only — the role and policy are the job's, not its.
+const profileCriteria = (profiles, notes, {job = false} = {}) => Object.fromEntries(Object.entries(profiles).filter(routable).map(([name, p]) => {
+  const tier = p.tier ?? notes[name]?.tier;
+  const capabilities = p.capabilities ?? notes[name]?.capabilities;
+  return [name, [
+    `${p.adapter}${p.model ? `/${p.model}` : ''}`,
+    ...(job ? [] : [`role ${p.role ?? 'builder'}`, `policy ${p.policy ?? 'write'}${p.policy === 'read-only' ? ' (cannot edit files or run commands)' : ''}`]),
+    tier ? `tier ${TIER_HINT[tier] ?? tier}` : '',
+    capabilities ? `capabilities: ${capabilities}` : '',
+  ].filter(Boolean).join(' · ')];
+}));
+
+// TIER FIRST. Jev says which tier the orders need; which profile of that tier runs them is not a
+// question for a model — inside a tier the AIs are near-equal — so bounce takes the first fitting
+// one in the provider order. The question offers only tiers some routable profile has (its own
+// `tier`, else the roster notes'), and is left out entirely for a roster nobody tiered.
+const tierOf = (name, profile, notes) => profile.tier ?? notes?.[name]?.tier;
+const tierQuestion = (profiles, notes, locals = []) => {
+  const present = PROFILE_TIERS.filter(tier => locals.some(item => item.tier === tier) || Object.entries(profiles).some(entry => routable(entry) && tierOf(entry[0], entry[1], notes) === tier));
+  return present.length ? {tier: {
+    type: 'choice',
+    instructions: {question: 'Which tier of AI do these orders need?', guidance: 'Pick the cheapest tier whose contract fits the orders.'},
+    criteria: Object.fromEntries(present.map(tier => [tier, TIER_HINT[tier]])),
+  }} : {};
+};
+// Pure. {name, tier, confidence, probabilities} when the tier is confident and a profile of it
+// passes `fits`; otherwise {name: null, reason}. `reason` is null when no tier was asked at all.
+// `locals` (src/local-models.js localCandidates) join the tier only for an agent's AI: behind the cloud
+// profiles unless `preferLocal`, a loaded model before one that would have to be loaded.
+function tierPick(answers, {profiles, notes, order = [], fits = () => true, unfit = '', locals = [], preferLocal = false}) {
+  if (!isObject(answers?.tier)) return {name: null, reason: null};
+  const tier = PROFILE_TIERS.includes(answers.tier.choice) ? answers.tier.choice : null;
+  const confidence = Number.isFinite(Number(answers.tier.confidence)) ? Number(answers.tier.confidence) : 0;
+  if (!tier) return {name: null, reason: 'no tier chosen'};
+  if (confidence < JEV_TIER_CONFIDENCE) return {name: null, reason: `tier confidence ${confidence.toFixed(2)} below ${JEV_TIER_CONFIDENCE}`};
+  const rank = adapter => { const at = order.indexOf(adapter); return at === -1 ? order.length : at; };
+  const cloud = Object.entries(profiles).filter(entry => routable(entry) && tierOf(entry[0], entry[1], notes) === tier && fits(entry[1]))
+    .sort((a, b) => rank(a[1].adapter) - rank(b[1].adapter)).map(([name]) => ({name}));
+  const local = locals.filter(item => item.tier === tier).sort((a, b) => Number(b.loaded) - Number(a.loaded)).map(item => ({name: item.name, local: {endpoint: item.endpoint, model: item.model}}));
+  const first = (preferLocal ? [...local, ...cloud] : [...cloud, ...local])[0] ?? null;
+  const name = first?.name ?? null;
+  return name ? {name, ...(first.local ? {local: first.local} : {}), tier, confidence, probabilities: isObject(answers.tier.probabilities) ? answers.tier.probabilities : {}} : {name: null, reason: `no ${tier} profile ${unfit || 'is routable'}`};
+}
+
 export function routingQuestions(profiles = {}, notes = {}) {
-  const criteria = Object.fromEntries(Object.entries(profiles).filter(routable).map(([name, p]) => {
-    const tier = p.tier ?? notes[name]?.tier;
-    const capabilities = p.capabilities ?? notes[name]?.capabilities;
-    return [name, [
-      `${p.adapter}${p.model ? `/${p.model}` : ''}`, `role ${p.role ?? 'builder'}`, `policy ${p.policy ?? 'write'}${p.policy === 'read-only' ? ' (cannot edit files or run commands)' : ''}`,
-      tier ? `tier ${TIER_HINT[tier] ?? tier}` : '',
-      capabilities ? `capabilities: ${capabilities}` : '',
-    ].filter(Boolean).join(' · ')];
-  }));
+  const criteria = profileCriteria(profiles, notes);
+  // Which JOB the orders describe, when there are agent files to choose from. `none` is always an
+  // option, so a generic task keeps going to a plain worker profile exactly as before.
+  const jobs = agentHeads(profiles);
+  const agent = jobs.length ? {agent: {
+    type: 'choice',
+    instructions: {
+      question: 'Which job do these orders describe?',
+      guidance: 'Pick a job only when the orders clearly ask for that kind of work; a job\'s policy limits what it may do. Pick none when no listed job fits or the orders are a general implementation task.',
+    },
+    criteria: {...Object.fromEntries(jobs.map(([name, p]) => [name, `${p.agent.description} · policy ${p.policy}${p.policy === 'read-only' ? ' (cannot edit files or run commands)' : ''}`])),
+      none: 'No listed job fits; a general worker should carry out the orders.'},
+  }} : {};
   return {
+    ...agent,
+    ...tierQuestion(profiles, notes),
     profile: {
       type: 'choice',
       instructions: {
@@ -272,23 +329,99 @@ export function routingQuestions(profiles = {}, notes = {}) {
 
 // Pure: the top choice wins only with confidence at or above the threshold and a policy that
 // satisfies the access the Nouls say the orders need; otherwise the fallback, with the reason.
-export function decideRoute(answers, {profiles = {}, confidence = 0.8, fallback = null} = {}) {
+export function decideRoute(answers, {profiles = {}, confidence = 0.8, fallback = null, notes = {}, order = [], locals = [], preferLocal = false} = {}) {
   const answer = isObject(answers?.profile) ? answers.profile : {};
   const chosen = typeof answer.choice === 'string' ? answer.choice : null;
   const conf = Number.isFinite(Number(answer.confidence)) ? Number(answer.confidence) : 0;
   const needs = {write: Number(answers?.needs_write?.noul ?? 0) >= 0.5, shell: Number(answers?.needs_shell?.noul ?? 0) >= 0.5};
+  // The job first. A confident job whose policy fits the access the orders need is the route: the
+  // task goes to that agent, and the agent file's own `models:` order decides the AI — Jev never
+  // overrides a list a person wrote. Anything less is `agent: null` and the profile choice below.
+  let job = {};
+  if (isObject(answers?.agent)) {
+    const name = typeof answers.agent.choice === 'string' ? answers.agent.choice : null;
+    const jobConfidence = Number.isFinite(Number(answers.agent.confidence)) ? Number(answers.agent.confidence) : 0;
+    const head = name && name !== 'none' ? agentHeads(profiles).find(([candidate]) => candidate === name)?.[1] : null;
+    const why = !name || name === 'none' ? 'no job fits' : !head ? 'no such job'
+      : jobConfidence < confidence ? `job confidence ${jobConfidence.toFixed(2)} below ${confidence}`
+      // Only WRITE access is a hard misfit for a job. Measured live: Jev scores "needs a shell" at
+      // 0.6–0.8 for plain searching and reviewing, while picking the read-only analyst/reviewer at
+      // 0.99–1.00 from criteria that already say "cannot edit files or run commands" — so the shell
+      // need is weighed in the job choice itself. A read-only job genuinely cannot produce edits.
+      : needs.write && head.policy !== 'write' ? `${name} is read-only but the orders need write access` : null;
+    // An agent whose `models:` opens with `auto` also takes this ask's AI answer, when it is a
+    // confident one; the scheduler composes the two. Any other agent keeps the list a person wrote.
+    // Local models are candidates for a job's AI only; a plain worker profile is never local.
+    const picked = !why && head.auto ? decideAI(answers, {profiles, confidence, notes, order, locals, preferLocal}) : null;
+    if (!why) return {chosen: name, agent: name, ...(picked?.ai ? {ai: picked.ai, ...(picked.local ? {local: picked.local} : {})} : {}), fallback: false, reason: null, probabilities: isObject(answers.agent.probabilities) ? answers.agent.probabilities : {}, confidence: jobConfidence, needs};
+    job = {agent: null, agentReason: why};
+  }
+  // The tier first; a named profile chosen with confidence is the second chance.
+  const access = needs.write || needs.shell;
+  const tiered = tierPick(answers, {profiles, notes, order, fits: profile => !access || profile.policy === 'write', unfit: access ? `can ${needs.write ? 'write' : 'run commands'}` : ''});
+  if (tiered.name) return {chosen: tiered.name, tier: tiered.tier, fallback: false, reason: null, probabilities: tiered.probabilities, confidence: tiered.confidence, needs, ...job};
   let reason = null;
   if (!chosen || !routable([chosen, profiles[chosen]])) reason = 'no routable choice';
   else if (conf < confidence) reason = `confidence ${conf.toFixed(2)} below ${confidence}`;
   else if ((needs.write || needs.shell) && profiles[chosen].policy !== 'write') reason = `${chosen} is read-only but the orders need ${needs.write ? 'write' : 'shell'} access`;
-  return {chosen: reason ? fallback : chosen, fallback: Boolean(reason), reason, probabilities: isObject(answer.probabilities) ? answer.probabilities : {}, confidence: conf, needs};
+  if (reason && tiered.reason) reason = `${tiered.reason}; ${reason}`;
+  return {chosen: reason ? fallback : chosen, fallback: Boolean(reason), reason, probabilities: isObject(answer.probabilities) ? answer.probabilities : {}, confidence: conf, needs, ...job};
+}
+
+// Which AI plays an agent whose `models:` opens with `auto`. The job is given, so the question is
+// about ability and cost alone: no role, no policy, no access Nouls.
+export function aiQuestions(profiles = {}, notes = {}, head = null, locals = []) {
+  const named = {profile: {
+    type: 'choice',
+    instructions: {
+      question: `Which AI should do this job?${head?.agent ? ` The job: ${head.agent.description} (policy ${head.policy})` : ''}`,
+      guidance: 'Weigh each AI\'s capabilities against what the orders demand, then prefer the cheapest tier that fits: cheapest for locating files and extracting facts, mid for research and routine implementation, strongest for independent review, ambiguous or cross-cutting debugging and security-sensitive work.',
+    },
+    criteria: {...profileCriteria(profiles, notes, {job: true}), ...Object.fromEntries(locals.map(item => [item.name, [
+      `local model ${item.name}`, 'runs on this machine at no cost', ...(item.loaded ? [] : ['not loaded: choosing it costs a model load first']),
+      ...(item.context ? [`context ${Math.round(item.context / 1024)}k`] : []), `tier ${TIER_HINT[item.tier] ?? item.tier}`, `capabilities: ${item.capabilities}`].join(' · ')]))},
+  }};
+  return {...tierQuestion(profiles, notes, locals), ...named};
+}
+
+// Pure: the AI is taken only when it is a routable profile chosen with confidence; the job's policy
+// is its own, so there is no access gate here.
+export function decideAI(answers, {profiles = {}, confidence = 0.8, notes = {}, order = [], locals = [], preferLocal = false} = {}) {
+  const tiered = tierPick(answers, {profiles, notes, order, locals, preferLocal});
+  if (tiered.name) return {ai: tiered.name, ...(tiered.local ? {local: tiered.local} : {}), tier: tiered.tier, reason: null, confidence: tiered.confidence, probabilities: tiered.probabilities};
+  const answer = isObject(answers?.profile) ? answers.profile : {};
+  const chosen = typeof answer.choice === 'string' ? answer.choice : null;
+  const conf = Number.isFinite(Number(answer.confidence)) ? Number(answer.confidence) : 0;
+  const localChoice = locals.find(item => item.name === chosen);
+  const named = !chosen || !(localChoice || routable([chosen, profiles[chosen]])) ? 'no routable choice' : conf < confidence ? `confidence ${conf.toFixed(2)} below ${confidence}` : null;
+  const reason = named && tiered.reason ? `${tiered.reason}; ${named}` : named;
+  return {ai: reason ? null : chosen, ...(!reason && localChoice ? {local: {endpoint: localChoice.endpoint, model: localChoice.model}} : {}), reason, confidence: conf, probabilities: isObject(answer.probabilities) ? answer.probabilities : {}};
+}
+
+// The AI for one task submitted to an `auto` agent. Never throws. `asked: false` means Jev was not
+// consulted at all (off, or nothing to choose between), so the scheduler journals nothing.
+export async function routeAgentAI({orders, profiles, head, settings, ask, notes = {}, order = [], locals = [], signal} = {}) {
+  const s = normalizeJevSettings(settings);
+  if (!s.enabled || !s.routing.enabled || typeof ask !== 'function') return {ai: null, asked: false};
+  let known = {};
+  try { known = (typeof notes === 'function' ? await notes() : notes) ?? {}; } catch { known = {}; }
+  let here = [];
+  try { here = (typeof locals === 'function' ? await locals() : locals) ?? []; } catch { here = []; }
+  const questions = aiQuestions(profiles, known, head, here);
+  if (!Object.keys(questions.profile.criteria).length) return {ai: null, asked: false};
+  try {
+    const result = await ask({state: {orders: String(orders ?? '').slice(0, 24_000)}, questions, model: s.model, signal});
+    return {...decideAI(result.answers, {profiles, confidence: s.confidence, notes: known, order, locals: here, preferLocal: s.routing.preferLocal}), asked: true, model: result.model, latencyMs: result.latencyMs};
+  } catch (error) {
+    return {ai: null, asked: true, reason: error?.code ?? error?.message ?? 'error', confidence: 0, probabilities: {}, model: null};
+  }
 }
 
 // The whole routing decision for one submitted task. Never throws: any Jev failure is a
 // fallback with its reason, so `profile: "auto"` always resolves when a fallback exists.
 // `notes` is the roster's per-profile {tier, capabilities} (or a function returning them);
 // notes that cannot be read only narrow the criteria, never the decision.
-export async function routeTask({orders, profiles, settings, ask, notes = {}, signal} = {}) {
+export async function routeTask({orders, profiles, settings, ask, notes = {}, order = [], locals = [], signal} = {}) {
   const s = normalizeJevSettings(settings);
   const fallback = routingFallback(profiles, s.routing.default);
   const off = reason => ({chosen: fallback, fallback: true, reason, probabilities: {}, confidence: 0, needs: null, model: null});
@@ -301,7 +434,9 @@ export async function routeTask({orders, profiles, settings, ask, notes = {}, si
   if (!Object.keys(questions.profile.criteria).length) return off('no routable profiles');
   try {
     const result = await ask({state: {orders: String(orders ?? '').slice(0, 24_000)}, questions, model: s.model, signal});
-    return {...decideRoute(result.answers, {profiles, confidence: s.confidence, fallback}), model: result.model, latencyMs: result.latencyMs};
+    let here = [];
+    if (agentHeads(profiles).some(([, head]) => head.auto)) { try { here = (typeof locals === 'function' ? await locals() : locals) ?? []; } catch { here = []; } }
+    return {...decideRoute(result.answers, {profiles, confidence: s.confidence, fallback, notes: known, order, locals: here, preferLocal: s.routing.preferLocal}), model: result.model, latencyMs: result.latencyMs};
   } catch (error) {
     return off(error?.code ?? error?.message ?? 'error');
   }
@@ -317,11 +452,12 @@ export function jevReviewerProfile(settings = {}) {
 // bound to the typesafe adapter's client. `notes` (a function, may be async) supplies the
 // roster's {tier, capabilities} per profile at route time — the roster setup of
 // src/roster-notes.js in the daemon; absent, routing sees adapter/model/role/policy only.
-export function createJevDecisions({root = dataRoot(), adapter, readSettings = () => readJevSettings(root), notes = null} = {}) {
+export function createJevDecisions({root = dataRoot(), adapter, readSettings = () => readJevSettings(root), notes = null, order = () => [], locals = null} = {}) {
   return {
     reviewer: JEV_REVIEWER,
     settings: readSettings,
-    route: ({orders, profiles, signal}) => routeTask({orders, profiles, settings: readSettings(), ask: adapter?.ask, ...(notes ? {notes} : {}), signal}),
+    routeAI: ({orders, profiles, head, signal}) => routeAgentAI({orders, profiles, head, order: order(), ...(locals ? {locals} : {}), settings: readSettings(), ask: adapter?.ask, ...(notes ? {notes} : {}), signal}),
+    route: ({orders, profiles, signal}) => routeTask({orders, profiles, order: order(), ...(locals ? {locals} : {}), settings: readSettings(), ask: adapter?.ask, ...(notes ? {notes} : {}), signal}),
   };
 }
 

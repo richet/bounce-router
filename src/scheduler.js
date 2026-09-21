@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import * as reducers from './reducers.js';
 import {takeCheckpoint, sameTree} from './checkpoint.js';
-import {POLICY_RANK, effectivePolicy, LOCAL_ADAPTERS, READ_ONLY_ROLES as READONLY_ROLES} from './profiles.js';
+import {POLICY_RANK, effectivePolicy, LOCAL_ADAPTERS, playedBy, READ_ONLY_ROLES as READONLY_ROLES} from './profiles.js';
 import {defaultStrategy} from './strategy.js';
 import {reportEvent, validateReport} from './reporting.js';
 import {createLocalResolver} from './local-resolve.js';
@@ -80,10 +80,20 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   const rawSubmittedRow = task => session.events.find(e => e.kind === 'task.submitted' && e.task === task);
   const submittedRow = task => {
     const row = rawSubmittedRow(task);
-    if (row?.profile !== AUTO_PROFILE) return row;
+    // ...and so is a task for an agent whose `models:` opens with `auto`: Jev's AI for it is a routed row too.
+    if (row?.profile !== AUTO_PROFILE && profiles[row?.profile]?.auto !== true) return row;
     const routed = session.events.findLast(e => e.kind === 'jev.routed' && e.task === task);
     return routed ? {...row, profile: routed.chosen} : row;
   };
+  // A job on an AI Jev picked (`agent@ai`) is composed when it is first needed and again after a
+  // restart, from the rows that named it — it is never part of the validated table.
+  // `local` ({endpoint, model}) when the AI is a local model, which has no profile of its own.
+  const compose = (agent, ai, local = null) => {
+    const name = `${agent}@${ai}`;
+    if (profiles[agent]?.auto === true && (local || profiles[ai])) profiles[name] = playedBy(profiles[agent], ai, profiles[ai], local);
+    return profiles[name] ? name : null;
+  };
+  for (const e of session.events) if (e.kind === 'jev.routed' && e.agent && e.ai) compose(e.agent, e.ai, e.local ?? null);
   // Jev's diff base (`head` on the first task.started) is recorded only for a task a
   // decision-model (typesafe) reviewer will judge — the `jev` critic prepare() names when Jev
   // review is on. Otherwise the row carries no `head` and no git call is made, so with Jev
@@ -981,9 +991,33 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         append({kind: 'task.failed', task, reason: 'error', text: 'malformed: profile (no worker profile to route auto to)', context});
         return;
       }
-      append({kind: 'jev.routed', task, chosen: decision.chosen, probabilities: decision.probabilities ?? {}, confidence: decision.confidence ?? 0, fallback: decision.fallback === true, reason: decision.reason ?? null, model: decision.model ?? null,
-        text: decision.fallback ? `Routed auto → ${decision.chosen} (fallback: ${decision.reason ?? 'unavailable'})` : `Routed auto → ${decision.chosen} (Jev, confidence ${Number(decision.confidence ?? 0).toFixed(2)})`, context});
+      // A job AND its AI from the one ask: the agent's `models:` opens with `auto` and the AI answer was confident.
+      const played = decision.agent && decision.ai ? compose(decision.agent, decision.ai, decision.local ?? null) : null;
+      if (played) {
+        append({kind: 'jev.routed', task, chosen: played, agent: decision.agent, ai: decision.ai, ...(decision.local ? {local: decision.local} : {}), via: 'auto', probabilities: decision.probabilities ?? {}, confidence: decision.confidence ?? 0, fallback: false, reason: null, model: decision.model ?? null,
+          text: `Routed auto → ${decision.agent} on ${decision.ai} (job and AI chosen by Jev, confidence ${Number(decision.confidence ?? 0).toFixed(2)})`, context});
+      } else
+      append({kind: 'jev.routed', task, chosen: decision.chosen, ...(decision.tier ? {tier: decision.tier} : {}), ...(decision.agent !== undefined ? {agent: decision.agent, ...(decision.agentReason ? {agentReason: decision.agentReason} : {})} : {}), probabilities: decision.probabilities ?? {}, confidence: decision.confidence ?? 0, fallback: decision.fallback === true, reason: decision.reason ?? null, model: decision.model ?? null,
+        text: decision.fallback ? `Routed auto → ${decision.chosen} (fallback: ${decision.reason ?? 'unavailable'})` : `Routed auto → ${decision.chosen} (${decision.agent ? 'job chosen by ' : ''}Jev${decision.tier ? `: tier ${decision.tier}` : ''}, confidence ${Number(decision.confidence ?? 0).toFixed(2)})`, context});
       row = submittedRow(task);
+    } else if (profiles[row.profile]?.auto === true && !row.replaces && jev?.routeAI && !session.events.some(e => e.kind === 'jev.routed' && e.task === task)) {
+      // An agent whose `models:` opens with `auto`: the job is given, Jev picks the AI. A recovery
+      // task (`replaces`) is never routed — it is the job falling to its own chain.
+      if (routing.has(task)) return;
+      routing.add(task);
+      const agent = row.profile;
+      let decision;
+      try { decision = await jev.routeAI({task, orders: row.orders, profiles, head: profiles[agent]}); }
+      finally { routing.delete(task); }
+      if (reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) return;
+      const played = decision?.ai ? compose(agent, decision.ai, decision.local ?? null) : null;
+      // Jev off asks nothing and journals nothing: the journal is what it was without `auto`.
+      if (decision?.asked) {
+        append({kind: 'jev.routed', task, chosen: played ?? agent, agent, ai: played ? decision.ai : null, via: 'agent-auto', probabilities: decision.probabilities ?? {}, confidence: decision.confidence ?? 0, fallback: !played, reason: played ? null : decision.reason ?? 'unavailable', model: decision.model ?? null,
+          ...(played && decision.tier ? {tier: decision.tier} : {}), ...(played && decision.local ? {local: decision.local} : {}),
+          text: played ? `Routed ${agent} → ${decision.ai} (AI chosen by Jev${decision.tier ? `: tier ${decision.tier}` : ''}, confidence ${Number(decision.confidence ?? 0).toFixed(2)})` : `Routed ${agent} → its own models (fallback: ${decision.reason ?? 'unavailable'})`, context});
+        row = submittedRow(task);
+      }
     }
     const profile = profiles[row.profile];
     if (!profile) {
@@ -1384,8 +1418,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       if (Object.values(chain).some(profile => LOCAL_ADAPTERS.has(profile.adapter))) {
         localResolver.configure(local);
       }
+      // `name@ai` entries are this agent played by an AI Jev picked: they follow the new head, or go with `auto`.
+      const played = Object.entries(profiles).filter(([, profile]) => profile.agent?.name === name && profile.ai).map(([, profile]) => [profile.ai, profile.backend ? {endpoint: profile.endpoint, model: profile.model} : null]);
       for (const key of Object.keys(profiles)) if (profiles[key].agent?.name === name && !Object.hasOwn(chain, key)) delete profiles[key];
       Object.assign(profiles, chain);
+      for (const [ai, local] of played) compose(name, ai, local);
     },
     // The submit predicate, exposed so the bus refuses a malformed task.submitted before it is journaled.
     validate: spec => validate(spec, reducers.tasks(session.events)),

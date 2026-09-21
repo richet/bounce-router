@@ -49,6 +49,11 @@ test('switches and settings are parsed, saved under config.jev, and reported bac
   await run('model jev-1.13.0');
   await run('routing default none');
   assert.deepEqual(settings.jev.routing, true);
+  assert.match((await run('routing local on')).text, /routing on \(local first\)/);
+  assert.deepEqual(settings.jev.routing, {enabled: true, default: null, preferLocal: true});
+  await run('routing local off');
+  assert.deepEqual(settings.jev.routing, true);
+  await assert.rejects(run('routing local maybe'), /Use \/jev routing local on\|off/);
   await assert.rejects(run('review maybe'), /Use \/jev review on\|off/);
   await assert.rejects(run('routing default nope'), /Unknown profile nope/);
   await assert.rejects(run('confidence 2'), /between 0 and 1/);
