@@ -135,3 +135,19 @@ test('a write agent in a plan configuration asks for yolo first; a classic confi
   assert.equal(classic.saved().operation, 'orchestrator');
   assert.equal(classic.saved().orchestrator, 'main');
 });
+
+test('`auto` hands an agent\'s AI to Jev: it leads the list, every AI the agent had stays behind it, and no bridge turn is spent', async t => {
+  let bridged = 0;
+  const f = fixture(t, ['skip', 'auto', 'y'], {bridge: async () => { bridged++; return okBridge(); }});
+  assert.deepEqual(await runLocalSetup(f.options), {saved: true, profiles: [], agents: ['reviewer']});
+  assert.deepEqual(f.read('reviewer').models, ['auto', 'codex/gpt-5.6-terra', 'claude/default']);
+  assert.equal(f.output.includes('reviewer → auto (Jev picks the AI; needs `bounce jev on`) · then codex/gpt-5.6-terra, claude/default'), true);
+  assert.equal(bridged, 0);
+
+  // naming a model afterwards takes `auto` away again: a person's pick is never overridden
+  const again = fixture(t, ['skip', '3', 'y']);
+  again.options.roles.set('reviewer', {...again.options.roles.get('reviewer'), models: ['auto', 'codex/gpt-5.6-terra']});
+  await runLocalSetup(again.options);
+  assert.equal(again.questions[1], 'reviewer (read-only) · now auto (Jev) → [1] small · [2] coder-next · [3] big · list · skip (Enter = 3): ');
+  assert.deepEqual(again.read('reviewer').models, ['lmstudio/big', 'codex/gpt-5.6-terra', 'claude/default']);
+});
