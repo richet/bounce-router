@@ -70,6 +70,14 @@ export function createClaudeLive({connect = nodeConnect, fs = nodeFs, kill = pro
         let raw;
         try { raw = JSON.parse(event.text); } catch { yield {kind: 'status', text: event.text}; continue; }
         yield {kind: 'raw', raw}; // the scheduler journals raw rows for quota, before the normalized view
+        // Resuming a session that left background tasks behind, Claude Code reports them and emits an
+        // EMPTY result — zero model turns — BEFORE it runs the prompt it was given (reproduced with
+        // the real CLI, 2.1.278). Whoever consumes this stream ends the turn at the first result, so
+        // that one must not count: the orchestrator's hand-off was being swallowed by it.
+        if (raw?.type === 'result' && raw.num_turns === 0 && raw.is_error !== true && !String(raw.result ?? '').trim()) {
+          yield {kind: 'diagnostic', text: 'claude reported leftover background tasks with an empty result; waiting for the turn itself'};
+          continue;
+        }
         for (const normalized of claude.normalize(raw)) {
           if (normalized.kind === 'peer.native') {
             handle.sessionId = normalized.sessionId;

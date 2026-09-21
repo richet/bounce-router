@@ -271,3 +271,18 @@ test('L12 a usage-limit error result, or a rejected rate_limit_event before a fa
   const exited = {live: {events: (async function* () { yield {kind: 'exit', code: 1, signal: null, limited: true}; })()}};
   assert.deepEqual(await drain(adapter, exited), [{kind: 'result', status: 'limited', text: 'protocol error: claude exited without result'}]);
 });
+
+test('L9 an empty result with zero model turns is not the end of the turn: the real answer still arrives', async t => {
+  // Found live: the orchestrator was woken with two workers' outcomes, and its turn "completed" in
+  // one second with zero tokens. Claude Code, resuming a session that had left background tasks
+  // behind, flushes them with an EMPTY result before it runs the prompt — and bounce hung up on it,
+  // so the hand-off was swallowed and nothing ever acted on the workers' results.
+  const dir = tmp(t);
+  withEnv(t, {FAKE_ORPHAN: '1', FAKE_SOCKET: '', FAKE_SESSION: 'sess-l9', FAKE_HOLD: '', FAKE_TRAP_SIGTERM: '', FAKE_READY: '', FAKE_STDERR_LINES: ''});
+  const adapter = createClaudeLive({});
+  const handle = await adapter.resume({peer: {}, profile: {mode: 'yolo', ...launcher}, native: {sessionId: 'sess-l9'}, message: 'worker outcomes…', cwd: dir, dir});
+  const events = await drain(adapter, handle);
+  assert.deepEqual(events.filter(e => e.kind === 'result'), [{kind: 'result', text: 'ok', success: true, status: 'completed'}]);
+  assert.deepEqual(events.filter(e => e.kind === 'diagnostic').map(e => e.text), ['claude reported leftover background tasks with an empty result; waiting for the turn itself']);
+  assert.equal(events.filter(e => e.kind === 'raw' && e.raw.type === 'result').length, 2, 'both results are still journaled raw');
+});

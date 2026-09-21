@@ -14,6 +14,7 @@
 // FAKE_READY=<path>       touch this file once the SIGTERM disposition above is settled — a test
 //                         that cancels must gate on it, or it races the interpreter's boot
 // FAKE_STDERR_LINES=<n>   write n 1,000-character lines to stderr before finishing
+// FAKE_ORPHAN=1           emit an empty zero-turn result before the real turn (orphaned background tasks)
 // FAKE_USAGE=<json>       usage object on the result line (default '{}' — vendor field names)
 import {execSync} from 'node:child_process';
 import {createServer} from 'node:net';
@@ -50,6 +51,14 @@ const start = async () => {
   }
   const sessionId = process.env.FAKE_SESSION ?? 'sess-fake';
   console.log(JSON.stringify({type: 'system', subtype: 'init', session_id: sessionId, tools: []}));
+  // FAKE_ORPHAN=1: what Claude Code 2.1.278 really does when the resumed session left background
+  // tasks behind — it reports them, emits an EMPTY result (zero model turns) and only then runs the
+  // turn it was asked for (captured live; see test L9).
+  if (process.env.FAKE_ORPHAN === '1') {
+    console.log(JSON.stringify({type: 'system', subtype: 'task_notification', task_id: 'b1', status: 'stopped', summary: 'Orphaned by a previous Claude Code process exit and reported in an aggregate summary.'}));
+    console.log(JSON.stringify({type: 'result', subtype: 'success', is_error: false, num_turns: 0, duration_api_ms: 0, result: '', session_id: sessionId, usage: {input_tokens: 0, output_tokens: 0}}));
+    console.log(JSON.stringify({type: 'system', subtype: 'init', session_id: sessionId, tools: []}));
+  }
   const noisy = Number(process.env.FAKE_STDERR_LINES ?? 0);
   for (let n = 0; n < noisy; n++) process.stderr.write('d'.repeat(1000) + '\n');
   let stdin = '';
