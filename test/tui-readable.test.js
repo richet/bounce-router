@@ -31,11 +31,11 @@ test('central transcript preserves highlighting and folds tools without dumping 
     terminal.unmount();
   }
   const plain = stripAnsi(output);
-  // Claude Code's shape: "● Bash(what for)", a ⎿ block previewing the first lines, "… +N lines".
-  assert.match(plain, /● Bash\(Run focused tests\)/);
-  assert.match(plain, /⎿  Tests passed[\s\S]*RAW_LINE_THREE[\s\S]*… \+2 lines/);
-  assert.doesNotMatch(plain, /RAW_LINE_FOUR|RAW_LINE_FIVE|WORKER_RAW_DUMP/);
-  assert.match(output, /\x1b\[32m●/);
+  // A run of the orchestrator's tool calls is one line; none of their pasted output is in the folded view.
+  assert.match(plain, /⚙ 1 tool call · last: Bash\(Run focused tests\)/);
+  assert.doesNotMatch(plain, /Tests passed|RAW_LINE_|WORKER_RAW_DUMP/);
+  // highlighting: the mechanics are dimmed, the answer keeps its markdown emphasis
+  assert.match(output, /\x1b\[90m  ⚙ 1 tool call/);
   assert.match(output, /\x1b\[1mVerified/);
 });
 
