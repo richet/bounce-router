@@ -63,6 +63,22 @@ test('the MODELS block, when present, sits between the quota panel and AGENTS wi
   assert.equal(withoutModels[withoutModels.findIndex(line => line.startsWith('CLAUDE')) + 3], 'AGENTS · 2');
 });
 
+test('the mode row shows the session as it runs and names a saved switch that only applies next session', () => {
+  const rail = opts => frame(120, false, {metadata: {...metadata, ...opts}}).split('\n').map(line => line.replace(/^.*│ ?/, '').trim());
+  // No pending switch: the running mode alone, and no extra row before the prompt counter.
+  const steady = rail({operation: 'orchestrator', pendingOperation: null});
+  const mode = steady.findIndex(line => line.startsWith('orchestrator ·'));
+  assert.ok(mode >= 0);
+  assert.match(steady[mode + 1], /prompt/);
+  // /operation classic (or Ctrl+O) saved while an orchestrator session runs: the sidebar keeps
+  // saying orchestrator — that is what dispatches — and shows where the saved choice takes effect.
+  const pending = rail({operation: 'orchestrator', pendingOperation: 'classic'});
+  const running = pending.findIndex(line => line.startsWith('orchestrator ·'));
+  assert.ok(running >= 0);
+  assert.equal(pending[running + 1], '→ classic on next session');
+  assert.equal(pending.some(line => line.startsWith('classic ·')), false);
+});
+
 test('config keeps the sidebar on unless told otherwise, and rejects a non-boolean', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-sidebar-config-'));
   try {

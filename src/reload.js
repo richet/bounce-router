@@ -119,6 +119,12 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     'Do not edit the repository yourself and do not read bounce\'s own source to learn the bridge — everything you need is here.',
     'Workers run ONLY through this bridge: never your own subagent/Agent/Task tools (they are switched off for you), and never',
     'do the work yourself when a dispatch fails — a task.failed row names the reason; report it to the user and stop.', '',
+    'Brief from the request and what you already know; do not read the repository first to write a "precise" brief. The worker',
+    'inspects the code itself at full speed and would only reread what you read (measured: 1–2 minutes of orchestrator reading per',
+    'turn, then the same files again in the worker). State the goal, the acceptance, the paths you happen to know and how to verify,',
+    'and submit — usually within a few seconds of the user\'s message. When a decision genuinely depends on a fact you lack, ask one',
+    'read-only scout task for that fact rather than reading around it yourself. Give one builder the whole change (one brief, one',
+    'worker, one review round) instead of splitting one bounded change into several workers that each reread the same files.', '',
     `Skill: ${path.join(root, 'skills', 'agent-orchestrator', 'SKILL.md')}`, '',
     'Bridge (already in your environment):',
     `    BOUNCE_BUS=${bus.path}`,
@@ -180,8 +186,7 @@ export function installControlAuthority({session, scheduler, onStopped}) {
 
 // ---- legacy (no daemon) path: --help, sessions, models, quota, skills, doctor, login, update ----
 
-async function legacySupervise(args, {spawnChild, updateInstall}) {
-  let resume;
+async function legacySupervise(args, {spawnChild, updateInstall, resume = null}) {
   for (;;) {
     const outcome = await new Promise(resolve => {
       let request, update;
@@ -202,6 +207,10 @@ async function legacySupervise(args, {spawnChild, updateInstall}) {
     });
     if (outcome.code !== 75 || !outcome.request) {process.exitCode=outcome.code;return;}
     resume=outcome.request;
+    // /operation orchestrator: the child saved the config and asked to be restarted into the
+    // other mode. That needs the daemon apparatus, which only supervise() can start — hand the
+    // state back up rather than respawning a classic TUI that would still show workers as "off".
+    if (resume.operation === 'orchestrator') return {reoperate: resume};
     if (outcome.update) {
       try {resume.updateNotice = await updateInstall();}
       catch (error) {resume.updateNotice = `Update failed: ${error.message}. Retry with /update.`;}
@@ -508,6 +517,13 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
       await finish(0);
       return {switchTo: outcome.switchTo};
     }
+    // /operation classic: this daemon is the orchestrator apparatus, so leaving that mode means
+    // finishing here (the TUI refused the switch while workers still ran) and letting supervise()
+    // respawn the same session under the classic loop.
+    if (outcome.code === 75 && outcome.request?.operation === 'classic') {
+      await finish(0);
+      return {reoperate: outcome.request};
+    }
     if (outcome.code !== 75 || !outcome.request) {
       if (detachedDaemon) {
         await waitForDrain();
@@ -615,6 +631,9 @@ async function interactiveView(args, {existing, restart} = {}) {
   }
   channel.close();
   if (code === 75 && requestedRestart) {
+    // The daemon is stopped and has released the session above; a switch to classic hands the
+    // state to supervise(), which resumes the same session id under legacySupervise.
+    if (requestedRestart.state?.operation === 'classic') return {reoperate: requestedRestart.state};
     return interactiveView(args, {existing: {id: session.id}, restart: requestedRestart.state});
   }
   if (code === 76 && switchTo) {
@@ -727,24 +746,50 @@ export async function supervise(args = process.argv.slice(2), {spawnChild = spaw
     image: {type: 'string', multiple: true}, scope: {type: 'string'}, help: {type: 'boolean', short: 'h'}, version: {type: 'boolean', short: 'v'},
   }});
   const interactive = !info.help && !info.version && (positionals.length === 0 || (positionals.length === 1 && positionals[0] === 'dev'));
+  // The TUI needs a terminal; only the view daemon (spawned by interactiveView, BOUNCE_VIEW_DAEMON=1)
+  // legitimately takes the interactive args without one. Any other headless `bounce` — typically a
+  // worker or the orchestrator's CLI probing for usage from its shell — is refused here, before a
+  // session, bus, roster setup or daemon exists for nobody to attach to. Same message as cli.js's
+  // own check so the classic path reads identically. A test's injected spawnChild is exempt, as
+  // it is for interactiveView below: it drives this path without a terminal by design.
+  if (interactive && spawnChild === spawn && process.env.BOUNCE_VIEW_DAEMON !== '1' && (!process.stdin.isTTY || !process.stdout.isTTY)) {
+    throw new Error('TUI requires a terminal. Use bounce run "prompt" for headless execution, or bounce report/publish/wait from a worker shell.');
+  }
   let operation = 'classic';
   if (interactive) { try { operation = config(dataRoot()).operation ?? 'classic'; } catch { /* a broken config surfaces in the classic TUI below */ } }
-  if (operation === 'orchestrator') {
-    if (process.env.BOUNCE_VIEW_DAEMON !== '1' && spawnChild === spawn && process.stdin.isTTY) return interactiveView(args);
-    // A session switch (/resume, /new) ends one daemon and starts the next for the chosen
-    // session — same args, only `--resume` replaced ('new' drops it).
-    let current = args;
-    for (;;) {
-      const result = await daemonSupervise(current, {spawnChild, updateInstall, adapters, profiles, strategy, onReady});
-      if (!result?.switchTo) return result;
-      const stripped = [];
-      for (let i = 0; i < current.length; i++) {
-        if (current[i] === '--resume') { i++; continue; }
-        if (current[i].startsWith('--resume=')) continue;
-        stripped.push(current[i]);
+  // The mode is fixed per spawn (the daemon and its workers exist or they don't), so /operation
+  // and Ctrl+O save the config and restart the session into the other mode: the TUI exits 75
+  // with a state that names the mode, the hosting path returns `reoperate`, and the loop below
+  // resumes the same session id under the other path. Both directions keep the transcript.
+  let restart = null;
+  for (;;) {
+    let result;
+    if (operation === 'orchestrator') {
+      if (process.env.BOUNCE_VIEW_DAEMON !== '1' && spawnChild === spawn && process.stdin.isTTY) {
+        result = await interactiveView(args, restart ? {existing: {id: restart.id}, restart} : {});
+      } else {
+        // A session switch (/resume, /new) ends one daemon and starts the next for the chosen
+        // session — same args, only `--resume` replaced ('new' drops it).
+        let current = restart?.id ? [...stripResume(args), '--resume', restart.id] : args;
+        for (;;) {
+          result = await daemonSupervise(current, {spawnChild, updateInstall, adapters, profiles, strategy, onReady});
+          if (!result?.switchTo) break;
+          current = result.switchTo === 'new' ? stripResume(current) : [...stripResume(current), '--resume', result.switchTo];
+        }
       }
-      current = result.switchTo === 'new' ? stripped : [...stripped, '--resume', result.switchTo];
-    }
+    } else result = await legacySupervise(args, {spawnChild, updateInstall, resume: restart});
+    if (!result?.reoperate) return result;
+    restart = result.reoperate;
+    operation = restart.operation;
   }
-  return legacySupervise(args, {spawnChild, updateInstall});
+}
+
+function stripResume(args) {
+  const stripped = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--resume') { i++; continue; }
+    if (args[i].startsWith('--resume=')) continue;
+    stripped.push(args[i]);
+  }
+  return stripped;
 }

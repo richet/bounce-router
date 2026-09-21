@@ -144,6 +144,28 @@ test('L4 resume: pending texts then the new message go on stdin, --resume carrie
   assert.equal(fs.readFileSync(path.join(dir, 'pending.jsonl'), 'utf8'), '');
 });
 
+test('L4b resume: a zero-turn result (the CLI spent the resume on a stopped background task) relaunches the resume once', async t => {
+  const dir = tmp(t), stdinFile = path.join(dir, 'stdin.txt'), marker = path.join(dir, 'dropped');
+  withEnv(t, {FAKE_SOCKET: '', FAKE_SESSION: 'sess-l4b', FAKE_STDIN: stdinFile, FAKE_HOLD: '', FAKE_READY: '', FAKE_STDERR_LINES: '', FAKE_EMPTY_TURN_ONCE: marker});
+  const adapter = createClaudeLive({});
+  const handle = await adapter.resume({peer: {}, profile: {mode: 'yolo', ...launcher}, native: {sessionId: 's1'}, message: 'report now', cwd: dir, dir});
+  const firstPid = handle.pid;
+  const events = await drain(adapter, handle);
+  // One relaunch, announced as status, and the only result is the second run's real answer.
+  assert.equal(events.filter(e => e.kind === 'result').length, 1);
+  assert.deepEqual(events.find(e => e.kind === 'result'), {kind: 'result', text: 'ok', success: true, status: 'completed'});
+  assert.equal(events.some(e => e.kind === 'status' && /relaunching the resume once/.test(e.text)), true);
+  assert.equal(fs.existsSync(marker), true);
+  assert.notEqual(handle.pid, firstPid, 'the handle now points at the relaunched process');
+  assert.equal(fs.readFileSync(stdinFile, 'utf8'), 'report now', 'the relaunch carries the same prompt');
+  // A launch (not a resume) never relaunches: a zero-turn result there is the outcome.
+  fs.rmSync(marker);
+  const launched = await adapter.launch({peer: {}, profile: {mode: 'yolo', ...launcher}, orders: 'go', cwd: dir, dir});
+  const once = await drain(adapter, launched);
+  assert.equal(once.filter(e => e.kind === 'result').length, 1);
+  assert.equal(once.some(e => e.kind === 'status' && /relaunching/.test(e.text)), false);
+});
+
 test('L5 cancel: SIGTERM then SIGKILL only when needed, verified by ESRCH', async t => {
   const run = async (trap, marker) => {
     const dir = tmp(t), ready = path.join(dir, 'holding');

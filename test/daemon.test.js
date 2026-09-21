@@ -156,6 +156,83 @@ test('legacy no-regression: --help and sessions never create a daemon or bus', a
   assert.equal(anyDaemonFiles, false);
 });
 
+// A worker probing `bounce` from its shell (observed while hunting the report schema) must not
+// become a second, headless daemon: no session directory, no bus, a one-line refusal instead —
+// even when the daemon's own process flags leak in, which vendorEnv/runProcess now also prevent.
+test('a headless bare `bounce` in orchestrator config refuses before creating any session', async t => {
+  const root = tmpRoot('bounce-headless-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify({
+    order: ['codex'], mode: 'yolo', models: {}, cooldownMinutes: 30, contextChars: 48000, executables: {codex: fakeCli},
+    skills: {scope: 'user', autoSync: false}, operation: 'orchestrator', orchestrator: 'main',
+    profiles: {main: {adapter: 'codex'}, build: {adapter: 'codex'}},
+  }));
+  for (const flags of [{}, {BOUNCE_DETACHED: '1', BOUNCE_SUPERVISED: '1'}]) {
+    const {code, stderr} = await run([], bounceEnv(root, flags), {timeout: 8000});
+    assert.equal(code, 1, stderr);
+    assert.match(stderr, /TUI requires a terminal/);
+    assert.equal(fs.existsSync(path.join(root, 'sessions')) && fs.readdirSync(path.join(root, 'sessions')).length > 0, false, 'no session was created');
+  }
+});
+
+// /operation switches the mode by restarting the session: the TUI saves the config and exits 75
+// with a state naming the mode; supervise() then re-hosts the SAME session id under the other
+// path — classic (no daemon, no BOUNCE_ROLE) ↔ orchestrator (daemon, BOUNCE_ROLE set) — and back.
+test('a mode switch restarts the same session under the other supervisor path, in both directions', async t => {
+  const root = tmpRoot('bounce-reoperate-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const {EventEmitter} = await import('node:events');
+  const {Session} = await import('../src/core.js');
+  const classicConfig = {order: ['codex'], mode: 'yolo', models: {}, cooldownMinutes: 30, contextChars: 48000, executables: {codex: fakeCli}, skills: {scope: 'user', autoSync: false}};
+  const orchestratorConfig = {...classicConfig, operation: 'orchestrator', orchestrator: 'main', profiles: {main: {adapter: 'codex'}, build: {adapter: 'codex'}}};
+  const saveConfig = config => fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify(config));
+  saveConfig(classicConfig);
+  const adapter = {async launch() { return {}; }, async *events() { await new Promise(() => {}); }, async cancel() { return {verified: true}; }};
+  const spawns = [];
+  const spawnChild = (_exe, args, options) => {
+    const child = new EventEmitter();
+    child.send = () => {}; child.kill = () => {};
+    spawns.push({child, args, env: options.env});
+    return child;
+  };
+  await withEnv({BOUNCE_HOME: root}, async () => {
+    const seed = new Session(process.cwd(), {root});
+    const id = seed.id;
+    const state = operation => ({id, settings: {}, provider: 'codex', dev: false, operation});
+    const done = supervise([], {spawnChild, adapters: {fake: adapter}, profiles: {main: {adapter: 'fake', mode: 'yolo', fallback: []}}});
+
+    // 1. Classic TUI: no daemon apparatus in its env. It "runs" /operation orchestrator.
+    await waitFor(() => spawns.length === 1);
+    assert.equal(spawns[0].env.BOUNCE_ROLE, undefined);
+    assert.equal(spawns[0].env.BOUNCE_SUPERVISED, '1');
+    saveConfig(orchestratorConfig);
+    spawns[0].child.emit('message', {type: 'restart', state: state('orchestrator')});
+    spawns[0].child.emit('close', 75, null);
+
+    // 2. The orchestrator TUI for the same session, under the daemon: BOUNCE_ROLE set, session resumed.
+    await waitFor(() => spawns.length === 2);
+    assert.equal(spawns[1].env.BOUNCE_ROLE, 'orchestrator');
+    assert.equal(spawns[1].env.BOUNCE_REMOTE_SESSION, '1');
+    assert.deepEqual(spawns[1].args.slice(-2), ['--resume', id]);
+    assert.equal(JSON.parse(spawns[1].env.BOUNCE_RESTART).id, id);
+    assert.equal(fs.existsSync(path.join(root, 'sessions', id, 'daemon.json')), true, 'the daemon hosts the session');
+    // It "runs" /operation classic.
+    saveConfig(classicConfig);
+    spawns[1].child.emit('message', {type: 'restart', state: state('classic')});
+    spawns[1].child.emit('close', 75, null);
+
+    // 3. Back to a classic TUI for the same session: the daemon is gone, the state carries the id.
+    await waitFor(() => spawns.length === 3);
+    assert.equal(spawns[2].env.BOUNCE_ROLE, undefined);
+    assert.equal(spawns[2].env.BOUNCE_SUPERVISED, '1');
+    assert.deepEqual(JSON.parse(spawns[2].env.BOUNCE_RESTART), state('classic'));
+    await waitFor(() => !fs.existsSync(path.join(root, 'sessions', id, 'daemon.json')));
+    spawns[2].child.emit('close', 0, null);
+    await done;
+    assert.equal(spawns.length, 3);
+  });
+});
+
 test('D2 restart keeps workers: a task submitted before a /restart (exit 75) stays running and receives a milestone after', async t => {
   const root = tmpRoot('bounce-d2-');
   t.after(() => fs.rmSync(root, {recursive: true, force: true}));
