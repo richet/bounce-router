@@ -29,19 +29,19 @@ const roster = () => ({
   build: {adapter: 'codex', model: 'gpt-7-nova', role: 'builder', policy: 'write', mode: 'yolo', fallback: [], tier: 'mid'},
   build2: {adapter: 'codex', model: 'gpt-7-nova', role: 'builder', policy: 'write', mode: 'yolo', fallback: []},
   own: {adapter: 'claude', model: 'sonnet', role: 'builder', policy: 'write', mode: 'yolo', fallback: [], tier: 'strongest', capabilities: 'Configured by hand.'},
-  local: {adapter: 'local', model: '', endpoint: 'http://localhost:1234', role: 'builder', policy: 'write', mode: 'yolo', fallback: []},
+  local: {adapter: 'opencode', model: '', endpoint: 'lmstudio', derived: false, role: 'builder', policy: 'write', mode: 'yolo', fallback: []},
   jev: {adapter: 'typesafe', model: '', role: 'critic', policy: 'read-only', mode: 'yolo', fallback: []},
 });
 // A runner that answers like a vendor CLI would: assistant text, then a successful result.
 const answering = (text, calls = []) => async args => { calls.push(args); args.emit({kind: 'assistant', text}); args.emit({kind: 'result', text, success: true}); return {status: 'completed', code: 0}; };
-const ANSWER = JSON.stringify({'claude/haiku-next': {tier: 'cheapest', capabilities: 'Fast and cheap;  weak at long multi-step edits.'}, 'codex/gpt-7-nova': {tier: 'mid', capabilities: 'Solid implementation.'}, 'local/auto': {tier: 'nonsense', capabilities: 'Unknown local model.'}});
+const ANSWER = JSON.stringify({'claude/haiku-next': {tier: 'cheapest', capabilities: 'Fast and cheap;  weak at long multi-step edits.'}, 'codex/gpt-7-nova': {tier: 'mid', capabilities: 'Solid implementation.'}, 'lmstudio/auto': {tier: 'nonsense', capabilities: 'Unknown local model.'}});
 
 test('config wins over the cache, the cache fills the rest, and only models nobody described are pending', t => {
   const root = tmpRoot(t);
   assert.deepEqual(readRosterNotes(root), {});
-  assert.equal(modelKey(roster().local), 'local/auto');
+  assert.equal(modelKey(roster().local), 'lmstudio/auto');
   assert.equal(modelKey({adapter: 'claude', model: ''}), 'claude/default');
-  assert.deepEqual(undescribedModels(roster()).map(m => m.key), ['claude/haiku-next', 'codex/gpt-7-nova', 'local/auto'], 'unique, in roster order, never the orchestrator or the reviewer');
+  assert.deepEqual(undescribedModels(roster()).map(m => m.key), ['claude/haiku-next', 'codex/gpt-7-nova', 'lmstudio/auto'], 'unique, in roster order, never the orchestrator or the reviewer');
   writeRosterNotes({'codex/gpt-7-nova': {tier: 'strongest', capabilities: 'From the cache.', by: 'claude/opus', at: '2026-09-18T00:00:00.000Z'}, junk: 'x'}, root);
   assert.equal(fs.statSync(path.join(root, NOTES_FILE)).mode & 0o777, 0o600);
   const cache = readRosterNotes(root);
@@ -52,7 +52,7 @@ test('config wins over the cache, the cache fills the rest, and only models nobo
   assert.deepEqual(notes.build2, {model: 'codex/gpt-7-nova', tier: 'strongest', capabilities: 'From the cache.', source: 'claude/opus'});
   assert.deepEqual(notes.own, {model: 'claude/sonnet', tier: 'strongest', capabilities: 'Configured by hand.', source: 'config'});
   assert.deepEqual(notes.scout, {model: 'claude/haiku-next', tier: null, capabilities: null, source: null});
-  assert.deepEqual(undescribedModels(roster(), cache).map(m => m.key), ['claude/haiku-next', 'local/auto']);
+  assert.deepEqual(undescribedModels(roster(), cache).map(m => m.key), ['claude/haiku-next', 'lmstudio/auto']);
   assert.match(routingQuestions(roster(), notes).profile.criteria.build2, /tier strongest: .* · capabilities: From the cache\.$/);
   fs.writeFileSync(path.join(root, NOTES_FILE), '{broken');
   assert.deepEqual(readRosterNotes(root), {});
@@ -60,10 +60,10 @@ test('config wins over the cache, the cache fills the rest, and only models nobo
 
 test('the describing agent is the orchestrator when it is a cloud agent, else the first cloud profile, else the provider order', () => {
   assert.deepEqual(setupAgent({profiles: roster(), orchestrator: 'main'}), {adapter: 'claude', model: 'opus'});
-  const localMain = {...roster(), main: {...roster().main, adapter: 'local', model: 'auto'}};
+  const localMain = {...roster(), main: {...roster().main, adapter: 'opencode', model: 'auto'}};
   assert.deepEqual(setupAgent({profiles: localMain, orchestrator: 'main'}), {adapter: 'claude', model: 'haiku-next'});
-  assert.deepEqual(setupAgent({profiles: {a: {adapter: 'local'}}, order: ['codex', 'claude'], models: {codex: 'gpt-7-nova'}}), {adapter: 'codex', model: 'gpt-7-nova'});
-  assert.equal(setupAgent({profiles: {a: {adapter: 'local'}}, order: ['local']}), null);
+  assert.deepEqual(setupAgent({profiles: {a: {adapter: 'opencode'}}, order: ['codex', 'claude'], models: {codex: 'gpt-7-nova'}}), {adapter: 'codex', model: 'gpt-7-nova'});
+  assert.equal(setupAgent({profiles: {a: {adapter: 'opencode'}}, order: ['local']}), null);
 });
 
 test('the prompt lists every model with what the vendor says, asks for JSON only, and the answer is parsed tolerantly', () => {
@@ -71,7 +71,7 @@ test('the prompt lists every model with what the vendor says, asks for JSON only
   const prompt = setupPrompt(models, [{provider: 'claude', models: [{id: 'haiku-next', description: 'Fastest, for simple tasks'}]}]);
   assert.match(prompt, /- claude\/haiku-next: the claude CLI, model "haiku-next" — the vendor describes it as: "Fastest, for simple tasks"/);
   assert.match(prompt, /- codex\/gpt-7-nova: the codex CLI, model "gpt-7-nova"\n/);
-  assert.match(prompt, /- local\/auto: a local model served through LM Studio at http:\/\/localhost:1234, the model loaded at the time/);
+  assert.match(prompt, /- lmstudio\/auto: a local model served through LM Studio \(endpoint lmstudio\), the model loaded at the time/);
   assert.match(prompt, /"cheapest" — locating files/);
   assert.match(prompt, /never at "cheapest" just because it is unfamiliar/);
   assert.match(prompt, /Do not use any tools/);
@@ -80,7 +80,7 @@ test('the prompt lists every model with what the vendor says, asks for JSON only
   assert.deepEqual(parsed, {
     'claude/haiku-next': {tier: 'cheapest', capabilities: 'Fast and cheap; weak at long multi-step edits.'},
     'codex/gpt-7-nova': {tier: 'mid', capabilities: 'Solid implementation.'},
-    'local/auto': {tier: 'mid', capabilities: 'Unknown local model.'},
+    'lmstudio/auto': {tier: 'mid', capabilities: 'Unknown local model.'},
   }, 'whitespace collapsed, an unknown tier reads as mid');
   assert.equal(parseSetupAnswer(JSON.stringify({'claude/haiku-next': {tier: 'mid', capabilities: 'x'.repeat(600)}, other: {tier: 'mid', capabilities: 'not asked'}}), models)['claude/haiku-next'].capabilities.length, 400);
   assert.throws(() => parseSetupAnswer('no json here', models), /no JSON object/);
@@ -122,11 +122,11 @@ test('the daemon setup describes only what is missing, once, journals jev.roster
   const [first, second] = await Promise.all([setup.ensure(), setup.ensure()]);
   assert.equal(calls.length, 1, 'concurrent ensures share one run');
   assert.deepEqual(first, second);
-  assert.deepEqual(Object.keys(first), ['claude/haiku-next', 'codex/gpt-7-nova', 'local/auto']);
+  assert.deepEqual(Object.keys(first), ['claude/haiku-next', 'codex/gpt-7-nova', 'lmstudio/auto']);
   assert.equal(changes, 1);
   const row = session.events.find(e => e.kind === 'jev.roster');
   assert.equal(row.by, 'claude/opus');
-  assert.match(row.text, /^Jev roster: claude\/opus described claude\/haiku-next, codex\/gpt-7-nova, local\/auto · scout → cheapest, build → mid, build2 → mid, own → strongest, local → mid$/);
+  assert.match(row.text, /^Jev roster: claude\/opus described claude\/haiku-next, codex\/gpt-7-nova, lmstudio\/auto · scout → cheapest, build → mid, build2 → mid, own → strongest, local → mid$/);
   assert.deepEqual(setup.notes().scout, {model: 'claude/haiku-next', tier: 'cheapest', capabilities: 'Fast and cheap; weak at long multi-step edits.', source: 'claude/opus'});
   assert.deepEqual(setup.notes().build, {model: 'codex/gpt-7-nova', tier: 'mid', capabilities: 'Solid implementation.', source: 'claude/opus'});
   assert.equal(await setup.ensure(), null, 'nothing left to describe');

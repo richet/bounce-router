@@ -132,9 +132,9 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
       const ref = p => `${LOCAL_ADAPTERS.has(p.adapter) ? `${p.endpoint ?? 'lmstudio'}/${p.model || 'auto'} (via opencode)` : [p.adapter, p.model].filter(Boolean).join('/')}`;
       const seen = new Set(); const lines = [];
       for (const [name, p] of Object.entries(profiles)) {
-        if (name === orchestrator || name === JEV_REVIEWER || seen.has(name) || !p.agent) continue;
+        if (name === orchestrator || name === JEV_REVIEWER || seen.has(name) || !p.derived) continue;
         const chain = []; let current = name;
-        while (current && !seen.has(current)) { seen.add(current); chain.push(profiles[current]); current = profiles[current].agent ? profiles[current].fallback[0] : null; }
+        while (current && !seen.has(current)) { seen.add(current); chain.push(profiles[current]); current = profiles[current].derived ? profiles[current].fallback[0] : null; }
         const head = chain[0];
         lines.push(`    ${name} → ${chain.map(ref).join(', ')}${head.agent ? ` · ${head.agent.policy} · ${head.agent.description}` : head.role ? ` (${head.role})` : ''}`);
       }
@@ -155,13 +155,13 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
         'Team setup: the shipped agents are generic. On your first task in a project, define the agents this repository actually needs',
         '(one per job; the same job on another AI is a `models:` entry, not another agent) with',
         '    bounce agents set NAME --scope project   # the agent file on stdin; format and fields in',
-        `    ${path.join(root, 'skills', 'agent-orchestrator', 'references', 'agents.md')}`,
+        `    ${path.join(root, 'skills', 'agent-orchestrator', 'references', 'team.md')}`,
         'It is validated against this machine before it lands. It applies to the NEXT session: say so to the user and continue on the current roster.',
         '`bounce agents` lists the team in force; `bounce agents show NAME` prints one.', '',
       ];
     })(),
     'Worker profiles you can submit to (one AI each: name → adapter/model):',
-    ...Object.entries(profiles).filter(([name, p]) => name !== orchestrator && name !== JEV_REVIEWER && !p.agent).map(([name, p]) => `    ${name} → ${[p.adapter, p.model].filter(Boolean).join('/')}${p.role ? ` (${p.role})` : ''}${about(name).tier ?? p.tier ? ` [tier ${about(name).tier ?? p.tier}]` : ''}${about(name).capabilities ?? p.capabilities ? ` — ${about(name).capabilities ?? p.capabilities}` : ''}`),
+    ...Object.entries(profiles).filter(([name, p]) => name !== orchestrator && name !== JEV_REVIEWER && !p.derived).map(([name, p]) => `    ${name} → ${[p.adapter, p.model].filter(Boolean).join('/')}${p.role ? ` (${p.role})` : ''}${about(name).tier ?? p.tier ? ` [tier ${about(name).tier ?? p.tier}]` : ''}${about(name).capabilities ?? p.capabilities ? ` — ${about(name).capabilities ?? p.capabilities}` : ''}`),
     ...(jev && autoFallback ? [`    auto → ${routingOn ? 'Jev (TypeSafe) routes each task to the profile above that fits its orders; unconfident picks go to' : 'Jev routing is off (/jev routing on): resolves to'} ${autoFallback}`] : []),
     'Local discovery checks eligibility at dispatch. A downloaded model is not necessarily loaded or tool-capable.',
     'When the user requests local/LM Studio workers, use a local profile from this roster. If none is available, report that and request /local setup or /local activate; never substitute a cloud worker.',

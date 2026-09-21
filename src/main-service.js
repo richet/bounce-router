@@ -1,3 +1,4 @@
+import {LOCAL_ADAPTERS} from './profiles.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
@@ -51,13 +52,13 @@ export function createMainService({session, adapters, profile, settings, profile
       if (seen.has(name)) return;
       seen.add(name);
       const candidate = profiles[name];
-      if (!candidate || candidate.adapter === 'local') return;
+      if (!candidate || LOCAL_ADAPTERS.has(candidate.adapter)) return;
       routes.push({...candidate, model: candidate.model || routing.models?.[candidate.adapter] || ''});
       for (const next of candidate.fallback ?? []) add(next);
     }
     if (explicit) for (const name of profile.fallback ?? []) add(name);
     else for (const provider of routing.order ?? []) {
-      if (provider !== 'local') routes.push({...profile, adapter: provider, model: routing.models?.[provider] ?? ''});
+      if (!LOCAL_ADAPTERS.has(provider)) routes.push({...profile, adapter: provider, model: routing.models?.[provider] ?? ''});
     }
     return routes;
   }
@@ -230,7 +231,7 @@ export function createMainService({session, adapters, profile, settings, profile
       || !params.routing.models || typeof params.routing.models !== 'object'
       || Object.values(params.routing.models).some(m => typeof m !== 'string'))) return {accepted: false, reason: 'invalid_routing'};
     const provider = params.provider ?? selection.provider;
-    if (provider === 'local' || !adapters[provider]) return {accepted: false, reason: 'unknown_provider'};
+    if (LOCAL_ADAPTERS.has(provider) || !adapters[provider]) return {accepted: false, reason: 'unknown_provider'};
     let images;
     try { images = saveImages([...new Set([...(params.files ?? []), ...imagePaths(params.text, session.cwd)])], session); }
     catch (error) { return {accepted: false, reason: error.message}; }

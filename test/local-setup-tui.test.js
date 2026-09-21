@@ -88,8 +88,9 @@ test('TUI setup loaded stays interactive during a held main turn, saves on conse
 // worker rather than TypeError on the absent block, the saved block holds only the worker (the
 // shipped roster stays underneath it in the validated view), and a later `/model worker … --save`
 // persists into the same block.
-test('TUI setup on a config with no profiles block saves only the worker over the shipped roster; /model worker --save keeps it', {timeout:20000}, async t => {
+test('TUI setup on a config with no profiles block writes an agent file and never copies the shipped roster into the config', {timeout:20000}, async t => {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'bounce-setup-tui-roster-'));
+  const bin=fakeOpencodeBin(t,{model:'loaded'});
   const payload=JSON.stringify({models:[{key:'loaded-choice',type:'llm',capabilities:{trained_for_tool_use:true},loaded_instances:[{id:'loaded',config:{context_length:8192}}]}]});
   const server=http.createServer((req,res)=>{res.setHeader('content-type','application/json');res.end(payload);});
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
@@ -102,36 +103,27 @@ test('TUI setup on a config with no profiles block saves only the worker over th
   const profiles = validateOrchestration(settings).profiles;
   const scheduler = createScheduler({session, profiles, adapters: {}, localSettings: settings.local});
   const closeActivation = createLocalActivation({session, scheduler, profiles, settings,
-    readSettings: () => JSON.parse(fs.readFileSync(file)), refresh: () => {}});
+    readSettings: () => JSON.parse(fs.readFileSync(file)), readRoles: () => rolesFor(root, {cwd: root}), refresh: () => {}});
   t.after(() => {closeActivation(); scheduler.close();});
   const main={state:()=>({state:'idle',currentTurnId:null}),subscribe(){return()=>{};},
     async run(params){return{accepted:true,requestId:params.id};},async cancel(){return{accepted:true};}};
-  const child=fork(fileURLToPath(new URL('./helpers/tui-process.js',import.meta.url)),[],{env:{...process.env,BOUNCE_HOME:root,BOUNCE_SUPERVISED:'1',BOUNCE_REMOTE_SESSION:'1',BOUNCE_ROLE:'orchestrator',BOUNCE_ORCHESTRATOR_PROFILE:JSON.stringify({adapter:'codex',model:'',mode:'plan'}),BOUNCE_NO_UPDATE_CHECK:'1'},stdio:['pipe','pipe','pipe','ipc']});
+  const child=fork(fileURLToPath(new URL('./helpers/tui-process.js',import.meta.url)),[],{env:{...process.env,...bin.env,BOUNCE_HOME:root,BOUNCE_SUPERVISED:'1',BOUNCE_REMOTE_SESSION:'1',BOUNCE_ROLE:'orchestrator',BOUNCE_ORCHESTRATOR_PROFILE:JSON.stringify({adapter:'codex',model:'',mode:'plan'}),BOUNCE_NO_UPDATE_CHECK:'1'},stdio:['pipe','pipe','pipe','ipc']});
   let output='';child.stdout.on('data',d=>output+=d);child.stderr.on('data',d=>output+=d);
   const hosted=hostSession({session,child,main});
   t.after(async()=>{hosted.detach();if(child.exitCode===null){child.kill('SIGKILL');await new Promise(r=>child.once('close',r));}fs.rmSync(root,{recursive:true,force:true});});
   const wait=async(check)=>{const start=Date.now();while(!check()){if(Date.now()-start>4000)throw Error(output.slice(-4000));await new Promise(r=>setTimeout(r,10));}};
   const answer=async(text,next)=>{const offset=output.length;child.stdin.write(text+'\r');await wait(()=>output.slice(offset).includes(next));};
   await wait(()=>output.includes('Ready.'));
-  await answer('/local setup loaded','Workers for');
-  await answer('research','Priority:');await answer('balanced','Compare 1 loaded models');
-  await answer('n','Model endpoint/key');await answer('','Worker profile name:');
-  await answer('local_read','Adjust worker');await answer('n','Save this configuration?');
-  child.stdin.write('y\r');await wait(()=>output.includes('workers active in this session'));
+  await answer('/local setup loaded','analyst (');
+  await answer('1','builder (');await answer('skip','integrator (');await answer('skip','reviewer (');await answer('skip','Save this configuration?');
+  child.stdin.write('y\r');await wait(()=>output.includes('agents analyst active in this session'));
   const saved=JSON.parse(fs.readFileSync(file));
   assert.equal(saved.orchestrator,'main');
-  assert.equal(saved.profiles.local_read.model,'loaded-choice');
-  assert.deepEqual(Object.keys(saved.profiles),['local_read'],'the overlay only, never a copy of the roster');
-  const view=validateOrchestration(saved);
-  assert.deepEqual(Object.keys(view.profiles),[...Object.keys(starterProfiles(settings)),'local_read']);
+  assert.deepEqual(saved.profiles,{},'the overlay only, never a copy of the roster — and an agent is a file, not a profile');
+  assert.deepEqual(agentMetadata(fs.readFileSync(path.join(root,'agents','analyst.md'),'utf8')).models,['lmstudio/loaded','codex/default']);
+  const view=validateOrchestration(saved,undefined,{roles:rolesFor(root,{cwd:root})});
+  assert.deepEqual(Object.keys(view.profiles).filter(name=>!view.profiles[name].derived),Object.keys(starterProfiles(settings)));
   assert.equal(view.profiles.build.adapter,'codex');
-  assert.equal(view.profiles.local_read.adapter,'local');
-  assert.equal(profiles.local_read.model,'loaded-choice');
-  child.stdin.write('/model worker local_read prefer lmstudio/loaded-choice --save\r');
-  await wait(()=>session.events.some(row=>row.kind==='control.local_preferences'));
-  await wait(()=>JSON.parse(fs.readFileSync(file)).profiles.local_read.prefer);
-  const again=JSON.parse(fs.readFileSync(file));
-  assert.deepEqual(again.profiles.local_read.prefer,['lmstudio/loaded-choice']);
-  assert.deepEqual(Object.keys(again.profiles),Object.keys(saved.profiles),'a later worker save still writes only the overlay');
-  assert.equal(again.orchestrator,'main');
+  assert.deepEqual([view.profiles.analyst.adapter,view.profiles.analyst.model],['opencode','loaded']);
+  assert.equal(profiles.analyst.model,'loaded','and the running session has it');
 });

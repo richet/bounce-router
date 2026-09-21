@@ -190,7 +190,7 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
       const name = chain[index];
       const mode = settings.mode;
       const policy = agent.policy ?? 'write';
-      const base = {adapter: isLocal(provider) ? 'opencode' : provider, model: isLocal(provider) ? model : model, mode, policy,
+      const base = {derived: true, adapter: isLocal(provider) ? 'opencode' : provider, model: isLocal(provider) ? model : model, mode, policy,
         fallback: chain.slice(index + 1, index + 2), role: agent.name, executables: {...(settings.executables ?? {})},
         agent: {name: agent.name, description: agent.description, policy, prompt: agent.prompt, ...(agent.maxSteps ? {maxSteps: agent.maxSteps} : {})}};
       if (isLocal(provider)) {

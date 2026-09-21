@@ -226,8 +226,10 @@ export function decideVerdict(answers, {confidence = 0.8} = {}) {
 
 // ---- model routing: a Choice over the roster plus Nouls for the access the orders need ----
 
-// Every worker profile is a routing target except the orchestrator and a decision model.
-export const routable = ([, profile]) => Boolean(profile) && profile.role !== 'orchestrator' && profile.adapter !== 'typesafe';
+// Every worker profile is a routing target except the orchestrator, a decision model, and the
+// backends derived from an agent file: `auto` chooses between AIs, while an agent is a job the
+// orchestrator names, with its own ordered list of AIs.
+export const routable = ([, profile]) => Boolean(profile) && profile.role !== 'orchestrator' && profile.adapter !== 'typesafe' && profile.derived !== true;
 
 // The profile `auto` resolves to when routing is off, unavailable or unconfident: the configured
 // default if it names a routable profile, else the first writing builder that is not the

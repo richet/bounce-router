@@ -554,7 +554,7 @@ test('O2 orchestrator single-provider: the orchestrator submits over the bridge,
   assert.match(orders, /^Team: analyst, builder, integrator, reviewer ← skill agent-orchestrator$/m);
   assert.match(orders, /^AIs on this machine: codex, lmstudio\/<loaded model> \(via opencode\)$/m);
   assert.match(orders, /bounce agents set NAME --scope project/);
-  assert.match(orders, /references\/agents\.md/);
+  assert.match(orders, /references\/team\.md/);
   assert.match(orders, /^`bounce agents set` journals agents\.defined for you\.$/m);
 });
 

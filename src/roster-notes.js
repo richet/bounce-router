@@ -11,6 +11,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {dataRoot, saveJSON} from './core.js';
 import {PROFILE_TIERS, TIER_HINT, routable} from './jev.js';
+import {LOCAL_ADAPTERS} from './profiles.js';
 import {invocation, runProcess} from './providers.js';
 import {resolveExecutable} from './executable.js';
 import {CATALOG_SOURCE, catalogNote} from './model-catalog.js';
@@ -23,7 +24,11 @@ export const CAPABILITIES_MAX = 400;
 const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
 // The cache key: one note per model, shared by every profile that runs it.
-export const modelKey = profile => `${profile.adapter}/${profile.model || (profile.adapter === 'local' ? 'auto' : 'default')}`;
+// A local model is named by its provider (`lmstudio/<model>`), like everywhere else — never by the
+// runtime it runs through.
+export const modelKey = profile => LOCAL_ADAPTERS.has(profile.adapter)
+  ? `${profile.endpoint ?? 'lmstudio'}/${profile.model || 'auto'}`
+  : `${profile.adapter}/${profile.model || 'default'}`;
 
 // ---- the store ---------------------------------------------------------------------------
 
@@ -68,7 +73,7 @@ export function undescribedModels(profiles = {}, cache = {}) {
   for (const [, p] of rosterEntries(profiles)) {
     const key = modelKey(p);
     if (p.capabilities || noteFor(key, cache)?.capabilities || seen.has(key)) continue;
-    seen.set(key, {key, adapter: p.adapter, model: p.model || '', ...(p.adapter === 'local' && p.endpoint ? {endpoint: p.endpoint} : {})});
+    seen.set(key, {key, adapter: p.adapter, model: p.model || '', ...(LOCAL_ADAPTERS.has(p.adapter) && p.endpoint ? {endpoint: p.endpoint} : {})});
   }
   return [...seen.values()];
 }
@@ -90,7 +95,7 @@ export function setupAgent({profiles = {}, orchestrator = null, order = [], mode
 export function setupPrompt(models, catalogs = []) {
   const vendorSays = ({adapter, model}) => catalogs.find(c => c?.provider === adapter)?.models?.find(m => m.id === model)?.description || '';
   const line = m => {
-    const where = m.adapter === 'local' ? `a local model served through LM Studio${m.endpoint ? ` at ${m.endpoint}` : ''}${m.model && m.model !== 'auto' ? `, model "${m.model}"` : ', the model loaded at the time'}`
+    const where = LOCAL_ADAPTERS.has(m.adapter) ? `a local model served through LM Studio${m.endpoint ? ` (endpoint ${m.endpoint})` : ''}${m.model && m.model !== 'auto' ? `, model "${m.model}"` : ', the model loaded at the time'}`
       : `the ${m.adapter} CLI${m.model ? `, model "${m.model}"` : ', its default model'}`;
     const vendor = vendorSays(m);
     return `- ${m.key}: ${where}${vendor ? ` — the vendor describes it as: ${JSON.stringify(vendor)}` : ''}`;

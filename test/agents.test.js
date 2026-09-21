@@ -163,7 +163,7 @@ test('the orchestrator profile is never derived from an agent, and a plan sessio
   assert.equal(view.profiles.main.adapter, 'claude', 'the config orchestrator stays; main.md is ignored for it');
   assert.equal(view.profiles['main~2'], undefined);
   const plan = validateOrchestration(orchestration({}, {mode: 'plan'}), undefined, {roles: loadAgents(root(t))});
-  assert.deepEqual(Object.keys(plan.profiles).filter(name => !name.includes('~')).sort(), ['analyst', 'main', 'reviewer'], 'builder and integrator are not offered in a plan session');
+  assert.deepEqual([...new Set(Object.values(plan.profiles).filter(p => p.derived).map(p => p.role))].sort(), ['analyst', 'reviewer'], 'builder and integrator are not offered in a plan session');
   assert.equal(plan.skipped.filter(item => item.agent === 'builder').length, 4, 'one skip per backend the write agent would have had');
   assert.equal(plan.skipped.find(item => item.agent === 'builder').reason, 'a plan session runs read-only agents only');
 });

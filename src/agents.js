@@ -19,8 +19,10 @@ import {normalizeLocalSettings} from './local-models.js';
 export const SKILL = 'agent-orchestrator';
 export const agentStore = root => path.join(root, 'agents');
 export const projectAgentStore = cwd => path.join(cwd, '.bounce', 'agents');
-export const installedSkillAgents = root => path.join(root, 'skills', SKILL, 'agents');
-const SHIPPED = fileURLToPath(new URL(`../skills/${SKILL}/agents/`, import.meta.url));
+export const installedSkillAgents = root => path.join(root, 'skills', SKILL, 'team');
+// `team/`, not `agents/`: the skill's `agents/` directory holds the vendor subagent role files
+// (orch-*.md for Claude Code, orch-*.toml for Codex), which are a different thing.
+const SHIPPED = fileURLToPath(new URL(`../skills/${SKILL}/team/`, import.meta.url));
 const LISTS = ['models', 'readPaths', 'writePaths', 'commands'];
 const MODEL_REF = /^[a-z0-9][a-z0-9_-]*\/\S+$/;
 const list = value => value.trim().replace(/^\[([\s\S]*)\]$/, '$1').split(',').map(item => item.trim().replace(/^(["'])([\s\S]*)\1$/, '$2')).filter(Boolean);
