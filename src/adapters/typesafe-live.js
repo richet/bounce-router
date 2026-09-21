@@ -102,6 +102,10 @@ export function createTypesafeLive({fetchImpl, readKey, readSettings = () => rea
     if (review.stage !== 'completion') return skipped(stream, 'stage', `${review.stage} review is not a Jev decision`);
     if (!settings.enabled) return skipped(stream, 'disabled', 'Jev is disabled (/jev on)');
     if (!settings.review) return skipped(stream, 'review_off', 'Jev completion review is off (/jev review on)');
+    // Every verdict question is about the diff. Outside a repository there is none: an empty diff
+    // reads as "nothing was done" and sends correct work back for rework round after round (observed
+    // live), so Jev is not asked at all.
+    if ((await git(['rev-parse', '--is-inside-work-tree'], cwd, controller.signal)).trim() !== 'true') return skipped(stream, 'no_repository', 'the working folder is not a git repository, so there is no diff to judge');
     stream.push({kind: 'activity', text: 'Jev verdict · collecting the report and diff'});
     const state = await buildReviewState({review, cwd, git, signal: controller.signal});
     if (controller.signal.aborted) return skipped(stream, 'aborted', 'cancelled');

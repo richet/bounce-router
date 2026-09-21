@@ -7,6 +7,7 @@ import {createTypesafeLive} from './adapters/typesafe-live.js';
 import {JEV_REVIEWER, createJevActivation, createJevDecisions, jevReviewerProfile, readJevSettings, routingFallback} from './jev.js';
 import {createRosterSetup, effectiveNotes, readRosterNotes, setupAgent} from './roster-notes.js';
 import {modelCatalog} from './models.js';
+import os from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {createHash} from 'node:crypto';
@@ -94,6 +95,13 @@ function formatRow(row, json) {
 
 // Derives Phase 2's single orchestration profile from legacy settings — real adapters
 // arrive in Phase 3; see docs/local-orchestration.md "Process model".
+// A session opened in the home folder: every worker — a local model with a shell included — runs
+// from there. Said once, at the top of the session; null anywhere else.
+export function homeSessionWarning(cwd, home = os.homedir()) {
+  if (typeof cwd !== 'string' || path.resolve(cwd) !== path.resolve(home)) return null;
+  return `This session is in your home folder (${path.resolve(home)}): every worker runs, reads and edits from here, not inside a project. Quit and start bounce from the project folder.`;
+}
+
 export function buildProfiles(settings) {
   return {main: {adapter: settings.order[0], mode: settings.mode, fallback: settings.order.slice(1)}};
 }
@@ -350,6 +358,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // Routing on: describe the roster's models now so the first `auto` need not wait; the outcome
   // is journaled either way.
   if (orchestrating) { const jevNow = readJevSettings(root); if (jevNow.enabled && jevNow.routing.enabled) rosterSetup.ensure().catch(() => {}); }
+  if (homeSessionWarning(session.cwd)) session.append({kind: 'status', text: homeSessionWarning(session.cwd)});
   if (orchestrating) session.append({kind: 'operation', operation: 'orchestrator', orchestrator: orchestration.orchestrator, shape: orchestration.shape, text: `Operation: orchestrator on ${orchestration.orchestrator} (${orchestration.shape})`});
   const main = orchestrating && positionals[0] !== 'run' ? createMainService({session, adapters, profile: orchestratorProfile, settings, profiles: orchestration.profiles, readRouting: () => config(root),
     orchestratorEnv: {BOUNCE_BUS: bus.path, BOUNCE_BUS_TOKEN_FILE: orchestratorGrant.file, BOUNCE_ROLE: 'orchestrator', BOUNCE_ORCHESTRATOR_PROFILE: JSON.stringify(orchestratorProfile)},

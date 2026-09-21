@@ -39,7 +39,7 @@ test('a local agent\'s answer is what Jev judges; a confident rework resumes the
 
   const settings = {enabled: true, model: 'jev-1.13.0', review: true, routing: {enabled: false, default: null}, confidence: 0.8};
   const calls = []; let round = 0;
-  const typesafe = createTypesafeLive({readKey: () => ({key: 'ts-test-key', source: 'file'}), readSettings: () => settings, git: async () => '',
+  const typesafe = createTypesafeLive({readKey: () => ({key: 'ts-test-key', source: 'file'}), readSettings: () => settings, git: async args => args[0] === 'rev-parse' ? 'true\n' : '',
     fetchImpl: async (url, options) => { calls.push(JSON.parse(options.body)); return okResponse(++round === 1 ? verdict('rework', 0.93, {remaining_work: 0.9}) : verdict('accept', 0.96)); }});
   const jev = createJevDecisions({adapter: typesafe, readSettings: () => settings});
   const scheduler = createScheduler({session, adapters: {opencode: createOpencodeLive({}), typesafe}, profiles, jev, localResolver, requireFinalReport: true, gitHead: () => null});

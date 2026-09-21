@@ -709,7 +709,8 @@ test('O-jev orchestrator with Jev review on: the root task is Jev-reviewed befor
     bodies.push(JSON.parse(options.body));
     return {ok: true, status: 200, headers: {get: () => null}, json: async () => ({model: 'jev-1.13.0', answers: {decision: {type: 'choice', choice: 'accept', probabilities: {accept: 0.96, rework: 0.04}, confidence: 0.93}}, usage: {input_tokens: 40, output_tokens: 2}})};
   };
-  const typesafe = createTypesafeLive({fetchImpl, readKey: () => ({key: 'daemon-test-key-4242', source: 'env'}), readSettings: () => ({enabled: true, model: 'jev-1.13.0', review: true, routing: {enabled: false, default: null}, confidence: 0.8}), git: async () => ''});
+  // the session's folder is a temp dir, not a repository: answer the repository probe so the verdict is asked
+  const typesafe = createTypesafeLive({fetchImpl, readKey: () => ({key: 'daemon-test-key-4242', source: 'env'}), readSettings: () => ({enabled: true, model: 'jev-1.13.0', review: true, routing: {enabled: false, default: null}, confidence: 0.8}), git: async args => args[0] === 'rev-parse' ? 'true\n' : ''});
   const session = await runOrchestratorSession(root, {adapters: {codex: completingAdapter(), typesafe}});
 
   const submitted = session.events.find(e => e.kind === 'task.submitted');

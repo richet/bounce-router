@@ -32,7 +32,7 @@ const waitFor = async (fn, {timeout = 3000, interval = 5} = {}) => {
 const okResponse = body => ({ok: true, status: 200, headers: {get: () => null}, json: async () => body, text: async () => JSON.stringify(body)});
 const answers = (choice, confidence, nouls = {}) => ({decision: {type: 'choice', choice, probabilities: {accept: choice === 'accept' ? confidence : 1 - confidence, rework: choice === 'rework' ? confidence : 1 - confidence}, confidence}, ...Object.fromEntries(Object.entries(nouls).map(([name, noul]) => [name, {type: 'noul', noul}]))});
 const KEY = 'ts-live-key-9f3a';
-const gitStub = async args => args[0] === 'diff' ? 'diff --git a/x b/x\n+x' : '';
+const gitStub = async args => args[0] === 'diff' ? 'diff --git a/x b/x\n+x' : args[0] === 'rev-parse' ? 'true\n' : '';
 
 // A scheduler with the Jev seam wired the way reload.js wires it: the `jev` critic profile,
 // the typesafe adapter on a stubbed fetch, settings supplied by the test.
@@ -299,4 +299,25 @@ test('a reconcile() while an auto route is in flight does not dispatch the task 
   assert.equal(session.events.filter(e => e.kind === 'jev.routed').length, 1);
   assert.deepEqual(launches, ['b']);
   assert.deepEqual(session.events.filter(e => e.task === row.task).map(e => e.kind), ['task.submitted', 'jev.routed', 'budget.reserved', 'task.started', 'task.completed']);
+});
+
+test('outside a git repository there is no diff to judge, so Jev is not asked and the task is accepted as it was before Jev', async t => {
+  // Found live: a session in a folder that is not a repository. Every diff was empty, `empty_diff`
+  // fired on correct work, and the task was sent back for rework round after round.
+  const {session} = setup(t);
+  const worker = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'copied both files; hashes match'}]);
+  let asked = 0;
+  const fetchImpl = async () => { asked++; return okResponse({answers: answers('rework', 0.99)}); };
+  const settings = {enabled: true, model: 'jev-1.13.0', review: true, routing: {enabled: false, default: null}, confidence: 0.8};
+  const typesafe = createTypesafeLive({fetchImpl, readKey: () => ({key: KEY, source: 'file'}), readSettings: () => settings, git: async () => ''});
+  const profiles = {A: {adapter: 'worker', model: 'w', mode: 'yolo', fallback: [], role: 'builder', policy: 'write'}, jev: jevReviewerProfile({})};
+  const scheduler = createScheduler({session, adapters: {worker, typesafe}, profiles, jev: createJevDecisions({adapter: typesafe, readSettings: () => settings}), gitHead: () => null});
+  t.after(() => scheduler.close());
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'copy two files', deadline: null});
+  await waitFor(() => reducers.TERMINAL.has(scheduler.tasks()[row.task]?.state));
+  assert.equal(scheduler.tasks()[row.task].state, 'accepted');
+  assert.equal(asked, 0);
+  const skipped = session.events.find(e => e.kind === 'jev.skipped');
+  assert.deepEqual([skipped.reason, skipped.text], ['no_repository', 'Jev verdict skipped · the working folder is not a git repository, so there is no diff to judge · accepting as today']);
+  assert.equal(session.events.some(e => e.kind === 'task.rework'), false);
 });
