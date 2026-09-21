@@ -212,3 +212,27 @@ test('capabilities: the same ladder as before, live and resumable', () => {
   assert.deepEqual(createOpencodeLive().capabilities(), {live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'],
     executionPolicies: ['read-only', 'plan', 'write', 'yolo'], quota: 'stream'});
 });
+
+test('the answer is the last text that says something: a stray closing fence after the report is not the result', async t => {
+  const {cwd, dir} = setup(t, {FAKE_OC_SCENARIO: 'fence'});
+  const adapter = createOpencodeLive({});
+  const handle = await adapter.launch({peer: 'worker:f', profile: profileFor({policy: 'read-only'}), cwd, dir, orders: 'report please'});
+  const events = await drain(adapter, handle);
+  assert.deepEqual(events.at(-1), {kind: 'result', status: 'completed', text: 'echo: report please'});
+  assert.deepEqual(events.filter(event => event.kind === 'assistant').map(event => event.text), ['echo: report please', '```'], 'the fence is still shown in the pane');
+});
+
+test('a write worker in a yolo session may work outside the project folder, as a cloud yolo worker may; a read-only one may not', async t => {
+  // Found live: the orchestrator put a gate script and an evidence folder under /private/tmp, and
+  // opencode auto-rejected the first path outside --dir, which ends the whole turn.
+  const {cwd, dir, logged} = setup(t);
+  const adapter = createOpencodeLive({});
+  await drain(adapter, await adapter.launch({peer: 'worker:w', profile: profileFor({policy: 'write'}), cwd, dir, orders: 'go'}));
+  assert.deepEqual(logged('CONFIG').permission, {external_directory: 'allow'});
+  fs.rmSync(path.join(dir, 'fake.log'));
+  await drain(adapter, await adapter.launch({peer: 'worker:r', profile: profileFor({policy: 'read-only'}), cwd, dir, orders: 'go'}));
+  assert.equal(Object.hasOwn(logged('CONFIG'), 'permission'), false);
+  fs.rmSync(path.join(dir, 'fake.log'));
+  await drain(adapter, await adapter.launch({peer: 'worker:p', profile: profileFor({policy: 'write', mode: 'plan'}), cwd, dir, orders: 'go'}));
+  assert.equal(Object.hasOwn(logged('CONFIG'), 'permission'), false, 'a plan session changes nothing, inside or outside');
+});

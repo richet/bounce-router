@@ -35,11 +35,10 @@ test('E1 effectivePolicy: read-only absolute, otherwise mode narrows write/unset
   assert.equal(effectivePolicy({policy: 'write', mode: 'plan'}), 'plan');
   assert.equal(effectivePolicy({mode: 'yolo'}), 'yolo');
   assert.equal(effectivePolicy({}), 'yolo');
-  // The write tier belongs to the adapters that can actually confine a write to a scope — since
-  // Phase 4 that is `opencode` alone, via the task-local copy and the publish gate
-  // (docs/plans/opencode-adapter.md, Q1(a)). Every other adapter's `write` is yolo, including the
-  // removed `local`, so a stale config naming it cannot quietly claim a confined write tier.
-  assert.equal(effectivePolicy({adapter: 'opencode', policy: 'write'}), 'write');
+  // A local write worker edits the real tree and runs commands exactly as a cloud one does (the
+  // task-local copy and the publish gate are gone), so it is a yolo worker like any other. While it
+  // ranked one tier below, the scheduler refused its own cloud fallback as "more privileged".
+  assert.equal(effectivePolicy({adapter: 'opencode', policy: 'write'}), 'yolo');
   assert.equal(effectivePolicy({adapter: 'claude', policy: 'write'}), 'yolo');
   assert.equal(effectivePolicy({adapter: 'local', policy: 'write'}), 'yolo');
 });

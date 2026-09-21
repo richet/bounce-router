@@ -68,6 +68,9 @@ process.stdin.on('end', () => {
     if (scenario === 'denied') emit('tool_use', {type: 'tool', tool: 'read', state: {status: 'error', input: {filePath: '/etc/hosts'}, error: 'The user rejected permission to use this specific tool call.'}});
     else emit('tool_use', {type: 'tool', tool: 'read', state: {status: 'completed', input: {filePath: 'note.txt'}, output: 'ok'}});
     if (scenario !== 'notext') emit('text', {type: 'text', text: `echo: ${prompt}`});
+    // Observed live (qwen3-coder-30b): the whole report, then one more step whose only text is a
+    // stray closing code fence.
+    if (scenario === 'fence') { emit('step_finish', {type: 'step-finish', reason: 'tool-calls', tokens: usage}); emit('step_start', {type: 'step-start'}); emit('text', {type: 'text', text: '```'}); }
     emit('step_finish', {type: 'step-finish', reason: 'stop', tokens: usage});
     process.exit(0);
   }, Number(process.env.FAKE_OC_TURN_MS ?? 5));

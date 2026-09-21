@@ -69,3 +69,18 @@ test('a cloud worker that hits its limit falls back to a local worker, task pres
   await waitFor(() => scheduler.tasks()[retry.task].state === 'completed');
   assert.match(session.events.find(e => e.kind === 'task.completed' && e.task === retry.task).summary, /^echo: implement it/);
 });
+
+test('a local WRITE agent that fails falls back to its cloud AI too: a local write worker is a yolo worker, not a tier below one', async t => {
+  // Found live: integrator → lmstudio failed recoverably and its claude fallback was refused as
+  // "no_compatible_profile", because a local write worker ranked below a cloud write worker.
+  const {session} = setup(t, {FAKE_OC_SCENARIO: 'fail'});
+  const cloud = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done via cloud'}]);
+  const profiles = {integrator: local({policy: 'write', fallback: ['integrator~2']}), 'integrator~2': {adapter: 'claude', model: 'sonnet', mode: 'yolo', policy: 'write', fallback: []}};
+  const scheduler = createScheduler({session, adapters: {opencode: createOpencodeLive({}), claude: cloud}, profiles});
+  t.after(() => scheduler.close());
+  scheduler.submit({parent: null, profile: 'integrator', orders: 'run the gate'});
+  const fallback = await waitFor(() => session.events.find(e => e.kind === 'policy.fallback' || e.kind === 'policy.fallback.skipped'));
+  assert.deepEqual([fallback.kind, fallback.from_profile, fallback.to_profile, fallback.reason], ['policy.fallback', 'integrator', 'integrator~2', 'worker_runtime']);
+  const retry = await waitFor(() => session.events.find(e => e.kind === 'task.submitted' && e.profile === 'integrator~2'));
+  await waitFor(() => scheduler.tasks()[retry.task].state === 'completed');
+});

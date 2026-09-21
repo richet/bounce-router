@@ -81,20 +81,17 @@ function mergeProfiles(settings) {
   return {input, userWritten};
 }
 
-// The adapters that can actually confine a write to a declared scope, and so are the only ones for
-// which `write` is a real tier rather than an alias for yolo: `opencode` gives the worker its
-// tools from the tier (src/adapters/opencode-live.js toolsFor).
-const WRITE_TIER_ADAPTERS = new Set(['opencode']);
-
 // The adapters that run a LOCAL model. A local worker is an agent's backend, never a config profile.
 export const LOCAL_ADAPTERS = new Set(['opencode']);
 
 // A profile's effective policy (pure): read-only is absolute; otherwise mode narrows write/unset
-// down to plan or yolo.
+// down to plan or yolo. A local write worker is a yolo worker like any other: it edits the real
+// tree and runs commands exactly as a cloud one does. It used to rank one tier below (`write`, from
+// the sandboxed design that is gone), which made the scheduler refuse the cloud AI of a local write
+// agent as "more privileged" — observed live as a failed local task with no fallback.
 export function effectivePolicy(profile) {
   if (profile.policy === 'read-only') return 'read-only';
   if (profile.mode === 'plan') return 'plan';
-  if (WRITE_TIER_ADAPTERS.has(profile.adapter) && profile.policy === 'write') return 'write';
   return 'yolo';
 }
 

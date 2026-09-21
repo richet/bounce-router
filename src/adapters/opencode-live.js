@@ -76,7 +76,11 @@ export function createOpencodeLive({kill = process.kill, spawn} = {}) {
     const name = agent.name ?? DEFAULT_AGENT;
     // The worker IS its agent: the agent file's prompt and step cap, and the tier's tools. Defined
     // for every worker, because `run` takes its tools from the agent, not from the prompt.
-    const config = {...(profile.opencodeConfig ?? {}), agent: {...(profile.opencodeConfig?.agent ?? {}), [name]: {
+    // A write worker in a yolo session may work outside --dir, as a cloud yolo worker may. Without
+    // this opencode auto-rejects the first path outside the project and ENDS the turn — observed
+    // live when orders pointed at a script and an evidence folder under /private/tmp.
+    const outside = effectiveTier(profile) === 'write' ? {permission: {...(profile.opencodeConfig?.permission ?? {}), external_directory: 'allow'}} : {};
+    const config = {...(profile.opencodeConfig ?? {}), ...outside, agent: {...(profile.opencodeConfig?.agent ?? {}), [name]: {
       description: agent.description ?? 'A bounce worker.', mode: 'primary',
       ...(agent.prompt ? {prompt: agent.prompt} : {}), maxSteps: agent.maxSteps ?? DEFAULT_STEPS, tools: toolsFor(effectiveTier(profile))}}};
     const model = profile.providerID && profile.model ? ['-m', `${profile.providerID}/${profile.model}`] : [];
@@ -140,7 +144,10 @@ export function createOpencodeLive({kill = process.kill, spawn} = {}) {
         }
         const part = raw.part ?? {};
         if (raw.type === 'text' && typeof part.text === 'string') {
-          if (part.text.trim()) { lastText = part.text.trim(); stepActed = true; yield {kind: 'assistant', text: lastText}; }
+          // The answer is the last text that SAYS something. Observed live: a model wrote its whole
+          // report and then one more step holding only a closing code fence, and that fence became
+          // the task's result. Text with no letter or digit is shown, never taken as the answer.
+          if (part.text.trim()) { const said = part.text.trim(); if (/[\p{L}\p{N}]/u.test(said)) lastText = said; stepActed = true; yield {kind: 'assistant', text: said}; }
         } else if (raw.type === 'tool_use') {
           const status = part.state?.status ?? '';
           stepActed = true;
