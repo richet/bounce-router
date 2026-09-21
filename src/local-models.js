@@ -236,6 +236,14 @@ function splitRef(ref) {
 
 function endpointAllowed(id, endpoint) { return endpoint && (isLoopback(new URL(endpoint.url)) || endpoint.trusted); }
 
+// `local on|off`, the same switch `jev on|off` is. On is the default, so it is saved as the absence
+// of the flag; the text is what both the CLI and the TUI answer with.
+export function switchLocal(settings, on) {
+  settings.local = {...(isObject(settings.local) ? settings.local : {})};
+  if (on) delete settings.local.enabled; else settings.local.enabled = false;
+  return on ? 'Local models: on · agents may run on the models LM Studio serves' : 'Local models: off · agents skip their local AIs and run on the rest of their list';
+}
+
 // The local models Jev may pick as the AI of an `auto` agent. Loaded, tool-capable models; only
 // when nothing is loaded are downloaded ones offered (choosing one costs a load). Each is described
 // by its roster note (`<endpoint>/<model>` in roster-notes.json) or, with none, conservatively.

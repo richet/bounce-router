@@ -16,7 +16,7 @@ const setup = t => {
   const settings = {operation: 'orchestrator', order: ['claude'], mode: 'yolo', profiles: {main: {adapter: 'claude'}, build: {adapter: 'codex'}}};
   const saves = [];
   const save = () => { saves.push(structuredClone(settings)); fs.writeFileSync(file, JSON.stringify(settings)); };
-  const run = (line, extra = {}) => jevCommand(line.split(/\s+/).filter(Boolean), {root, settings, save, env: {}, ...extra});
+  const run = (line, extra = {}) => jevCommand(line.split(/\s+/).filter(Boolean), {root, settings, save, env: {}, discover: async () => [], ...extra});
   return {root, file, settings, saves, run};
 };
 const okResponse = body => ({ok: true, status: 200, headers: {get: () => null}, json: async () => body, text: async () => JSON.stringify(body)});
@@ -49,11 +49,8 @@ test('switches and settings are parsed, saved under config.jev, and reported bac
   await run('model jev-1.13.0');
   await run('routing default none');
   assert.deepEqual(settings.jev.routing, true);
-  assert.match((await run('routing local on')).text, /routing on \(local first\)/);
-  assert.deepEqual(settings.jev.routing, {enabled: true, default: null, preferLocal: true});
-  await run('routing local off');
-  assert.deepEqual(settings.jev.routing, true);
-  await assert.rejects(run('routing local maybe'), /Use \/jev routing local on\|off/);
+  // there is no local switch here: `/local on|off` is the one switch for local models
+  await assert.rejects(run('routing local on'), /Use \/jev routing on\|off, or \/jev routing default PROFILE\|none/);
   await assert.rejects(run('review maybe'), /Use \/jev review on\|off/);
   await assert.rejects(run('routing default nope'), /Unknown profile nope/);
   await assert.rejects(run('confidence 2'), /between 0 and 1/);

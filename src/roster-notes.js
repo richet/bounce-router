@@ -95,7 +95,9 @@ export function setupAgent({profiles = {}, orchestrator = null, order = [], mode
 
 // ---- the one-shot description ------------------------------------------------------------
 
-export function setupPrompt(models, catalogs = []) {
+// `reference` ([key, tier] pairs) is what the roster already rates: shown so a new model — a local
+// one above all — lands on the same scale instead of being ranked only against its neighbours.
+export function setupPrompt(models, catalogs = [], reference = []) {
   const vendorSays = ({adapter, model}) => catalogs.find(c => c?.provider === adapter)?.models?.find(m => m.id === model)?.description || '';
   const line = m => {
     const where = LOCAL_ADAPTERS.has(m.adapter) ? `a local model served through LM Studio${m.endpoint ? ` (endpoint ${m.endpoint})` : ''}${m.model && m.model !== 'auto' ? `, model "${m.model}"` : ', the model loaded at the time'}`
@@ -113,6 +115,7 @@ export function setupPrompt(models, catalogs = []) {
     'Do not use any tools, do not read files, and do not ask questions.',
     'Reply with ONLY a JSON object — no prose, no code fence — keyed by the model key exactly as listed:',
     `{${models.map(m => `${JSON.stringify(m.key)}: {"tier": "cheapest|mid|strongest", "capabilities": "…"}`).join(', ')}}`,
+    ...(reference.length ? ['', 'Already rated, for scale — place the models below on this same scale:', ...reference.map(([key, tier]) => `  ${key} → ${tier}`)] : []),
     '', 'Models:', ...models.map(line),
   ].join('\n');
 }
@@ -138,10 +141,10 @@ export function parseSetupAnswer(text, models) {
 // One read-only, tool-free turn of `agent` answering setupPrompt. Resolves the parsed notes
 // (each stamped with who wrote them and when); rejects with the agent's failure. `run` is the
 // classic runner (providers.js runProcess): the vendor child sees no bus and no grant.
-export async function describeModels({models, agent, catalogs = [], root = dataRoot(), executables = {}, run = runProcess, timeoutMs = SETUP_TIMEOUT_MS, clock = () => Date.now(), signal} = {}) {
+export async function describeModels({models, agent, catalogs = [], reference = [], root = dataRoot(), executables = {}, run = runProcess, timeoutMs = SETUP_TIMEOUT_MS, clock = () => Date.now(), signal} = {}) {
   if (!models.length) return {};
   if (!agent) throw new Error('no signed-in cloud agent to describe the roster with');
-  const prompt = setupPrompt(models, catalogs);
+  const prompt = setupPrompt(models, catalogs, reference);
   const dir = path.join(root, 'roster-setup');
   fs.mkdirSync(dir, {recursive: true, mode: 0o700});
   const promptFile = path.join(dir, 'prompt.txt');
@@ -197,7 +200,8 @@ export function createRosterSetup({root = dataRoot(), profiles = {}, agent = nul
         if (!agent) throw new Error('no cloud agent in the roster or the provider order to describe the models with');
         let known = [];
         try { known = await catalogs(); } catch {}
-        const written = await describeModels({models, agent, catalogs: Array.isArray(known) ? known : [], root, executables, run, timeoutMs, clock});
+        const reference = [...new Map(Object.values(effectiveNotes(profiles, cache)).filter(note => note.tier).map(note => [note.model, note.tier]))];
+        const written = await describeModels({models, agent, catalogs: Array.isArray(known) ? known : [], reference, root, executables, run, timeoutMs, clock});
         writeRosterNotes({...readRosterNotes(root), ...written}, root);
         failed = false;
         const roster = effectiveNotes(profiles, readRosterNotes(root));

@@ -18,7 +18,7 @@ test('real CLI: bounce local profile is gone and points at bounce agents; nothin
   const result = await new Promise(resolve => execFile(process.execPath, [cli, 'local', 'profile', 'local_build', '{}', '--save'],
     {env: {...process.env, BOUNCE_HOME: root, BOUNCE_NO_UPDATE_CHECK: '1'}, timeout: 10000}, (error, stdout, stderr) => resolve({code: error?.code ?? 0, stdout, stderr})));
   assert.equal(result.code, 1);
-  assert.match(result.stderr, /Use bounce local \[--verify\] or bounce local setup; agents are managed with bounce agents/);
+  assert.match(result.stderr, /Use bounce local \[--verify\], bounce local on\|off, or bounce local setup; agents are managed with bounce agents/);
   assert.deepEqual(JSON.parse(await fs.readFile(path.join(root, 'config.json'), 'utf8')), settings);
   assert.deepEqual((await fs.readdir(root)).sort(), ['config.json']);
 });

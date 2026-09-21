@@ -8,13 +8,13 @@ import {backspace, clampCursor, deleteForward, deleteWordBackward, deleteWordFor
 import {inputDisposition} from './commands.js';
 import {commands as ownCommands, completions, typedCommand, inputLayout, windowAround, modelRows, checklistRows} from './terminal.js';
 import {modelCatalog, modelEntries, catalogNotes} from './models.js';
-import {discoverLocalModels} from './local-models.js';
+import {discoverLocalModels, switchLocal} from './local-models.js';
 import {runLocalSetup} from './local-wizard.js';
 import {createLocalSetupView} from './local-setup-view.js';
 import {activateLocalProfiles} from './local-activation.js';
 import {jevCommand} from './jev-command.js';
 import {jevSidebarLabel} from './jev.js';
-import {rolesFor, agentStore, agentsCommand} from './agents.js';
+import {rolesFor, agentStore, agentsCommand, agentTable, handAIsToJev} from './agents.js';
 import {createInterface} from 'node:readline';
 import stringWidth from 'string-width';
 import {clean, createFormatter, createWorkSummary, workReview, withAsides, continueMain} from './format.js';
@@ -35,6 +35,7 @@ import {listSessions, resolveSessionRef, sessionsTable, sessionAge} from './sess
 import {createRemoteSession} from './remote.js';
 import {version, checkUpdate, globalInstall, installUpdate} from './update.js';
 import {helpText, helpRows} from './help.js';
+const handedText = names => `${names.join(', ')} now let Jev pick their AI per task (models: [auto, …]); the models you chose stay behind it as the fallback. Needs \`bounce jev on\`.`;
 
 // The `profiles` block is an overlay on the shipped roster (validateOrchestration), so a
 // profile write only needs the block to exist: the saved config holds the user's additions and
@@ -92,6 +93,16 @@ async function main() {
       } finally { lines.close(); }
       return;
     }
+    // `bounce local on|off`: the switch, in the words `bounce jev on|off` uses.
+    if (positionals[1] === 'on' || positionals[1] === 'off') {
+      const saved = config(root); // the saved config, written back whole, as `bounce jev` does
+      const text = switchLocal(saved, positionals[1] === 'on');
+      saveJSON(path.join(root, 'config.json'), saved);
+      const handed = positionals[1] === 'on' ? handAIsToJev(roles, {orchestrator: saved.orchestrator}) : [];
+      console.log(`${text} · saved; applies to the next session (/local on|off applies it to a running one)`);
+      if (handed.length) console.log(handedText(handed));
+      return;
+    }
     // Bare `bounce local` is the status view: what the endpoint has, whether the OpenCode bridge is
     // installed, and which local workers are configured. It replaces the separate `models` and
     // `check` subcommands. --verify adds the live one-line turn, which costs a real (small)
@@ -107,7 +118,7 @@ async function main() {
       if (status.problem) process.exitCode = 1;
       return;
     }
-    throw new Error('Use bounce local [--verify] or bounce local setup; agents are managed with bounce agents');
+    throw new Error('Use bounce local [--verify], bounce local on|off, or bounce local setup; agents are managed with bounce agents');
   }
   if (positionals[0] === 'jev' || positionals[0] === 'typesafe') {
     // Headless twin of /jev: the same command over the saved config, written back whole.
@@ -695,6 +706,19 @@ async function main() {
         }
         if (command === 'local') {
           if (arg === 'cancel') {cancelLocalSetup(); return;}
+          if (arg === 'on' || arg === 'off') {
+            // The switch, in `/jev on|off`'s words. Saved, then the agents that can still be played are
+            // re-read into this session, so it applies to the next task without a restart.
+            const handed = arg === 'on' ? handAIsToJev(rolesFor(root, {cwd: session.cwd}), {orchestrator: settings.orchestrator}) : [];
+            const text = [switchLocal(settings, arg === 'on'), ...(handed.length ? [handedText(handed)] : [])].join('\n');
+            save();
+            const saved = config(root);
+            const names = agentTable(rolesFor(root, {cwd: session.cwd}), saved).filter(row => !row.error && row.backends.length && row.name !== saved.orchestrator).map(row => row.name);
+            session.append({kind: 'status', text});
+            notice = orchestrating && names.length ? (await activateLocalProfiles(session, names)).text : text;
+            render();
+            return;
+          }
           if (arg === 'activate' || arg.startsWith('activate ')) {
             const saved = config(root);
             const requested = arg.slice('activate'.length).trim();
@@ -722,7 +746,7 @@ async function main() {
             render();
             return;
           }
-          if (!['setup', 'setup loaded', 'setup --loaded', 'loaded'].includes(arg)) throw new Error('Use /local [verify], /local setup [loaded], /local activate [NAME], or /local cancel');
+          if (!['setup', 'setup loaded', 'setup --loaded', 'loaded'].includes(arg)) throw new Error('Use /local [verify], /local on|off, /local setup [loaded], /local activate [NAME], or /local cancel');
           openLocalSetup(arg.includes('loaded')); return;
         }
         if (command === 'jev') {

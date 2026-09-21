@@ -21,6 +21,7 @@ export const CLI_USAGE = [
   ['bounce models', '[--json]', 'List the models each agent reports, cloud and local'],
   ['bounce agents', '[list|show NAME|set NAME [--force]|remove NAME] [--scope user|project]', 'Agent files (the team); set reads markdown from stdin'],
   ['bounce local', '[--verify] [--json]', 'Local status: models, the OpenCode bridge, agents a local model may play'],
+  ['bounce local on|off', '', 'Let agents run on local models, or make them skip their local AIs'],
   ['bounce local setup', '', 'Choose which local model plays each agent'],
   ['bounce quota', '[--json]', 'Show the subscription usage each agent reports'],
   ['bounce jev', '[key KEY|key clear|on|off|review on|off|routing on|off|roster [refresh]|model ID|confidence N|test]', 'Jev (TypeSafe) decision model; no arg shows status'],
@@ -45,6 +46,7 @@ export const TUI_SECTIONS = [
   ]},
   {title: 'Local workers', rows: [
     ['/local', '[verify]', 'Local status: models, the OpenCode bridge, agents a local model may play'],
+    ['/local on|off', '', 'Let agents run on local models, or make them skip their local AIs; applies to this session'],
     ['/local setup', '[loaded]', 'Choose which local model plays each agent; loaded limits choices to loaded models'],
     ['/local cancel', '', 'Cancel setup without interrupting agents'],
     ['/local activate', '[AGENT]', 'Re-read agent files into this session without restarting'],

@@ -1,7 +1,8 @@
 // Local models as candidates for an `auto` agent's AI (docs/plans/jev-agents-routing.md, Phase 3).
 // A local model only ever exists as an agent's backend, so it is a candidate for the AI of a JOB —
 // never for a plain `auto` task. Loaded models are preferred; downloaded ones are offered only when
-// nothing is loaded (D3). `jev.routing.preferLocal` (default off) puts them ahead of cloud AIs.
+// nothing is loaded (D3). They are only supplied while `/local` is on, and then a local model of the
+// needed tier runs first: it costs nothing. Tiers do the mixing — cheap work local, the rest cloud.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -9,7 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {Session} from '../src/core.js';
 import {createScheduler} from '../src/scheduler.js';
-import {createJevDecisions, aiQuestions, decideAI, routingQuestions, normalizeJevSettings, persistedJevSettings, TIER_HINT} from '../src/jev.js';
+import {createJevDecisions, aiQuestions, decideAI, decideRoute, routingQuestions, normalizeJevSettings, persistedJevSettings, TIER_HINT} from '../src/jev.js';
 import {localCandidates} from '../src/local-models.js';
 import {validateOrchestration, playedBy} from '../src/profiles.js';
 import {agentMetadata} from '../src/agents.js';
@@ -48,24 +49,20 @@ test('the AI question offers the local models beside the profiles; a plain `auto
   assert.equal(Object.keys(routingQuestions(profiles).profile.criteria).some(name => name.startsWith('lmstudio/')), false);
 });
 
-test('decideAI: cloud first by default, local first with preferLocal, loaded before downloaded, and a named local answer counts', () => {
+test('decideAI: a local model of the needed tier runs first, a tier no local model has goes cloud, loaded before downloaded, and a named local answer counts', () => {
   const options = {profiles: table(), order: ['claude'], locals, confidence: 0.8};
-  assert.equal(decideAI(tier('strongest', 0.9), options).ai, 'sonnet');
-  assert.deepEqual(decideAI(tier('strongest', 0.9), {...options, preferLocal: true}), {ai: 'lmstudio/dense-27b', local: {endpoint: 'lmstudio', model: 'dense-27b'}, tier: 'strongest', reason: null, confidence: 0.9, probabilities: {strongest: 0.9}});
-  // no cloud profile of the tier: the local model is the tier's only AI, preferLocal or not
-  const {sonnet, ...noStrongCloud} = table();
-  assert.equal(decideAI(tier('strongest', 0.9), {...options, profiles: noStrongCloud}).ai, 'lmstudio/dense-27b');
+  assert.equal(decideAI(tier('cheapest', 0.9), {...options, locals: []}).ai, 'haiku', 'with /local off no local model is supplied');
+  assert.equal(decideAI(tier('mid', 0.9), {...options, profiles: {...options.profiles, terra: {adapter: 'codex', model: 't', role: 'builder', policy: 'write', tier: 'mid'}}}).ai, 'terra', 'no local model is rated mid: cloud');
+  assert.deepEqual(decideAI(tier('strongest', 0.9), options), {ai: 'lmstudio/dense-27b', local: {endpoint: 'lmstudio', model: 'dense-27b'}, tier: 'strongest', reason: null, confidence: 0.9, probabilities: {strongest: 0.9}});
   const mixed = [{...locals[0], name: 'lmstudio/cold', model: 'cold', loaded: false}, locals[0]];
-  assert.equal(decideAI(tier('cheapest', 0.9), {...options, locals: mixed, preferLocal: true}).ai, 'lmstudio/coder-30b');
+  assert.equal(decideAI(tier('cheapest', 0.9), {...options, locals: mixed}).ai, 'lmstudio/coder-30b');
   const named = decideAI({...tier('mid', 0.3), profile: {choice: 'lmstudio/dense-27b', confidence: 0.85}}, options);
   assert.deepEqual([named.ai, named.local], ['lmstudio/dense-27b', {endpoint: 'lmstudio', model: 'dense-27b'}]);
 });
 
-test('preferLocal is a routing setting, off by default and written only when on', () => {
-  assert.equal(normalizeJevSettings({enabled: true}).routing.preferLocal, false);
-  assert.equal(normalizeJevSettings({routing: {enabled: true, preferLocal: true}}).routing.preferLocal, true);
-  assert.deepEqual(persistedJevSettings({enabled: true}).routing, true);
-  assert.deepEqual(persistedJevSettings({enabled: true, routing: {enabled: true, preferLocal: true}}).routing, {enabled: true, default: null, preferLocal: true});
+test('there is no separate local-first setting: a stale one in config.json is dropped', () => {
+  assert.deepEqual(normalizeJevSettings({enabled: true, routing: {enabled: true, preferLocal: true}}).routing, {enabled: true, default: null});
+  assert.deepEqual(persistedJevSettings({enabled: true, routing: {enabled: true, preferLocal: true}}).routing, true);
 });
 
 test('a job played by a local model is an ordinary local backend of that job', () => {
@@ -87,7 +84,7 @@ test('scheduler: Jev\'s local pick runs the job through opencode on that model, 
   const session = new Session(root, {root});
   const launched = [];
   const worker = (name, script) => { const inner = fakeAdapter(script); return {...inner, launch: async args => { launched.push([name, args.profile.model, args.profile.role, args.profile.policy]); return inner.launch(args); }}; };
-  const jev = createJevDecisions({readSettings: () => ({enabled: true, routing: {enabled: true, preferLocal: true}}), order: () => ['claude'], locals: async () => locals,
+  const jev = createJevDecisions({readSettings: () => ({enabled: true, routing: true}), order: () => ['claude'], locals: async () => locals,
     adapter: {ask: async () => ({answers: tier('strongest', 0.9), model: 'jev-1.13.0', latencyMs: 4})}});
   const localResolver = {resolve: async ({profile}) => ({...profile, providerID: 'lmstudio', opencodeConfig: {}}), configure() {}};
   const scheduler = createScheduler({session, profiles: table(), jev, localResolver, gitHead: () => null, adapters: {
@@ -103,4 +100,16 @@ test('scheduler: Jev\'s local pick runs the job through opencode on that model, 
   const routed = session.events.find(e => e.kind === 'jev.routed');
   assert.deepEqual([routed.chosen, routed.ai, routed.local, routed.tier], ['reviewer@lmstudio/dense-27b', 'lmstudio/dense-27b', {endpoint: 'lmstudio', model: 'dense-27b'}, 'strongest']);
   assert.equal(routed.text, 'Routed reviewer → lmstudio/dense-27b (AI chosen by Jev: tier strongest, confidence 0.90)');
+});
+
+test('between local models of one tier, the one the agent\'s own list names plays it — a reviewer keeps its reviewer model', () => {
+  const two = [{...locals[0], tier: 'mid'}, {...locals[1], tier: 'mid'}]; // coder-30b, dense-27b: both mid
+  const pinned = new Map([['reviewer', {...agentMetadata('---\nname: reviewer\ndescription: Reads for defects.\npolicy: read-only\nmodels: [auto, lmstudio/dense-27b, claude/sonnet]\n---\nYou are the reviewer.\n'), source: 'user', file: '/x/reviewer.md'}]]);
+  const profiles = validateOrchestration(settings, undefined, {roles: pinned}).profiles;
+  const options = {profiles, order: ['claude'], locals: two, confidence: 0.8};
+  assert.equal(decideAI(tier('mid', 0.9), options).ai, 'lmstudio/coder-30b', 'with no job in hand, the order LM Studio lists them');
+  assert.equal(decideAI(tier('mid', 0.9), {...options, head: profiles.reviewer}).ai, 'lmstudio/dense-27b');
+  // the same through a plain `auto` task that lands on the job
+  const routed = decideRoute({agent: {choice: 'reviewer', confidence: 0.95}, ...tier('mid', 0.9), needs_write: {noul: 0.02}}, {...options, fallback: null});
+  assert.deepEqual([routed.agent, routed.ai], ['reviewer', 'lmstudio/dense-27b']);
 });

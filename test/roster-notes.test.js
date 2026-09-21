@@ -170,7 +170,7 @@ test('/jev roster lists what routing knows and who said it; refresh clears this 
   const dropped = Object.fromEntries(Object.keys(starterProfiles()).filter(name => !['main', 'build'].includes(name)).map(name => [name, null]));
   const settings = {order: ['claude'], mode: 'yolo', operation: 'orchestrator', orchestrator: 'main', executables: {},
     profiles: {...dropped, main: {adapter: 'claude', model: 'opus'}, build: {adapter: 'codex', model: 'gpt-7-nova'}, scout: {adapter: 'claude', model: 'haiku-next', role: 'analyst', tier: 'cheapest', capabilities: 'By hand.'}}};
-  const run = (line, extra = {}) => jevCommand(line.split(/\s+/).filter(Boolean), {root, settings, save: () => {}, env: {}, ...extra});
+  const run = (line, extra = {}) => jevCommand(line.split(/\s+/).filter(Boolean), {root, settings, save: () => {}, env: {}, discover: async () => [], ...extra});
   const before = await run('roster');
   assert.equal(before.text, ['Jev roster · routing on', '  build → codex/gpt-7-nova · not described yet', '  scout → claude/haiku-next · tier cheapest · By hand. (config)', '1 model not described yet: bounce describes them when routing is on and the daemon starts, or on /jev roster refresh'].join('\n'));
   writeRosterNotes({'codex/gpt-7-nova': {tier: 'mid', capabilities: 'Cached.', by: 'claude/opus'}, 'claude/other': {tier: 'mid', capabilities: 'Another roster\'s.'}}, root);

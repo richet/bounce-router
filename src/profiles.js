@@ -185,6 +185,7 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
         // A plan session is read-only end to end: a write agent is not offered rather than refused,
         // so a fresh install (whose shipped team has write agents) still plans.
         if (settings.mode === 'plan' && (agent.policy ?? 'write') === 'write') { skipped.push({agent: agent.name, ref, reason: 'a plan session runs read-only agents only'}); return false; }
+        if (isLocal(provider) && !local.enabled) { skipped.push({agent: agent.name, ref, reason: 'local models are off (/local on)'}); return false; }
         if (isLocal(provider) ? !adapterNames.includes('opencode') : !adapterNames.includes(provider)) { skipped.push({agent: agent.name, ref, reason: `no ${provider} adapter on this machine`}); return false; }
         return true;
       });

@@ -34,8 +34,8 @@ const bool = (value, fallback) => typeof value === 'boolean' ? value : fallback;
 export function normalizeJevSettings(input) {
   const raw = isObject(input) ? input : {};
   const routing = isObject(raw.routing)
-    ? {enabled: bool(raw.routing.enabled, true), default: typeof raw.routing.default === 'string' && raw.routing.default ? raw.routing.default : null, preferLocal: bool(raw.routing.preferLocal, false)}
-    : {enabled: bool(raw.routing, true), default: null, preferLocal: false};
+    ? {enabled: bool(raw.routing.enabled, true), default: typeof raw.routing.default === 'string' && raw.routing.default ? raw.routing.default : null}
+    : {enabled: bool(raw.routing, true), default: null};
   const confidence = typeof raw.confidence === 'number' && raw.confidence >= 0 && raw.confidence <= 1 ? raw.confidence : 0.8;
   return {
     enabled: bool(raw.enabled, false),
@@ -49,7 +49,7 @@ export function normalizeJevSettings(input) {
 // The shape written back to config.json: `routing` stays a plain boolean until a default is set.
 export function persistedJevSettings(settings) {
   const n = normalizeJevSettings(settings);
-  return {enabled: n.enabled, model: n.model, review: n.review, routing: n.routing.default || n.routing.preferLocal ? {enabled: n.routing.enabled, default: n.routing.default, ...(n.routing.preferLocal ? {preferLocal: true} : {})} : n.routing.enabled, confidence: n.confidence};
+  return {enabled: n.enabled, model: n.model, review: n.review, routing: n.routing.default ? {enabled: n.routing.enabled, default: n.routing.default} : n.routing.enabled, confidence: n.confidence};
 }
 
 // Read at use time (the daemon never caches it), so `/jev on` in the TUI applies to the next
@@ -62,7 +62,7 @@ export function readJevSettings(root = dataRoot()) {
 export function jevStatusLine(settings, key) {
   const s = normalizeJevSettings(settings);
   const keyText = key ? `key …${key.key.slice(-4)} (${key.source})` : 'no key';
-  const routing = s.routing.enabled ? `routing on${s.routing.default ? ` (default ${s.routing.default})` : ''}${s.routing.preferLocal ? ' (local first)' : ''}` : 'routing off';
+  const routing = s.routing.enabled ? `routing on${s.routing.default ? ` (default ${s.routing.default})` : ''}` : 'routing off';
   return `Jev (TypeSafe): ${s.enabled ? 'enabled' : 'disabled'} · ${keyText} · model ${s.model} · review ${s.review ? 'on' : 'off'} · ${routing} · confidence ${s.confidence}`;
 }
 
@@ -280,9 +280,16 @@ const tierQuestion = (profiles, notes, locals = []) => {
 };
 // Pure. {name, tier, confidence, probabilities} when the tier is confident and a profile of it
 // passes `fits`; otherwise {name: null, reason}. `reason` is null when no tier was asked at all.
-// `locals` (src/local-models.js localCandidates) join the tier only for an agent's AI: behind the cloud
-// profiles unless `preferLocal`, a loaded model before one that would have to be loaded.
-function tierPick(answers, {profiles, notes, order = [], fits = () => true, unfit = '', locals = [], preferLocal = false}) {
+// `locals` (src/local-models.js localCandidates) join the tier only for an agent's AI, and only while
+// `/local` is on. A local model of the needed tier runs first — it costs nothing — a loaded one before
+// one that would have to be loaded; the tiers do the mixing: cheap work local, the rest cloud.
+// The local models an agent's own list names, by walking its derived chain from the head.
+const namedLocals = (profiles, head) => {
+  const names = []; const seen = new Set();
+  for (let current = head; current && !seen.has(current); current = profiles[current.fallback?.[0]]) { seen.add(current); if (current.backend) names.push(`${current.endpoint}/${current.model}`); }
+  return names;
+};
+function tierPick(answers, {profiles, notes, order = [], fits = () => true, unfit = '', locals = [], head = null}) {
   if (!isObject(answers?.tier)) return {name: null, reason: null};
   const tier = PROFILE_TIERS.includes(answers.tier.choice) ? answers.tier.choice : null;
   const confidence = Number.isFinite(Number(answers.tier.confidence)) ? Number(answers.tier.confidence) : 0;
@@ -291,8 +298,11 @@ function tierPick(answers, {profiles, notes, order = [], fits = () => true, unfi
   const rank = adapter => { const at = order.indexOf(adapter); return at === -1 ? order.length : at; };
   const cloud = Object.entries(profiles).filter(entry => routable(entry) && tierOf(entry[0], entry[1], notes) === tier && fits(entry[1]))
     .sort((a, b) => rank(a[1].adapter) - rank(b[1].adapter)).map(([name]) => ({name}));
-  const local = locals.filter(item => item.tier === tier).sort((a, b) => Number(b.loaded) - Number(a.loaded)).map(item => ({name: item.name, local: {endpoint: item.endpoint, model: item.model}}));
-  const first = (preferLocal ? [...local, ...cloud] : [...cloud, ...local])[0] ?? null;
+  // Between local models of the tier: the one the agent's own list names (a reviewer keeps its
+  // reviewer model), then a loaded one before one that would have to be loaded.
+  const named = head ? namedLocals(profiles, head) : [];
+  const local = locals.filter(item => item.tier === tier).sort((a, b) => Number(named.includes(b.name)) - Number(named.includes(a.name)) || Number(b.loaded) - Number(a.loaded)).map(item => ({name: item.name, local: {endpoint: item.endpoint, model: item.model}}));
+  const first = [...local, ...cloud][0] ?? null;
   const name = first?.name ?? null;
   return name ? {name, ...(first.local ? {local: first.local} : {}), tier, confidence, probabilities: isObject(answers.tier.probabilities) ? answers.tier.probabilities : {}} : {name: null, reason: `no ${tier} profile ${unfit || 'is routable'}`};
 }
@@ -329,7 +339,7 @@ export function routingQuestions(profiles = {}, notes = {}) {
 
 // Pure: the top choice wins only with confidence at or above the threshold and a policy that
 // satisfies the access the Nouls say the orders need; otherwise the fallback, with the reason.
-export function decideRoute(answers, {profiles = {}, confidence = 0.8, fallback = null, notes = {}, order = [], locals = [], preferLocal = false} = {}) {
+export function decideRoute(answers, {profiles = {}, confidence = 0.8, fallback = null, notes = {}, order = [], locals = []} = {}) {
   const answer = isObject(answers?.profile) ? answers.profile : {};
   const chosen = typeof answer.choice === 'string' ? answer.choice : null;
   const conf = Number.isFinite(Number(answer.confidence)) ? Number(answer.confidence) : 0;
@@ -352,7 +362,7 @@ export function decideRoute(answers, {profiles = {}, confidence = 0.8, fallback 
     // An agent whose `models:` opens with `auto` also takes this ask's AI answer, when it is a
     // confident one; the scheduler composes the two. Any other agent keeps the list a person wrote.
     // Local models are candidates for a job's AI only; a plain worker profile is never local.
-    const picked = !why && head.auto ? decideAI(answers, {profiles, confidence, notes, order, locals, preferLocal}) : null;
+    const picked = !why && head.auto ? decideAI(answers, {profiles, confidence, notes, order, locals, head}) : null;
     if (!why) return {chosen: name, agent: name, ...(picked?.ai ? {ai: picked.ai, ...(picked.local ? {local: picked.local} : {})} : {}), fallback: false, reason: null, probabilities: isObject(answers.agent.probabilities) ? answers.agent.probabilities : {}, confidence: jobConfidence, needs};
     job = {agent: null, agentReason: why};
   }
@@ -386,8 +396,8 @@ export function aiQuestions(profiles = {}, notes = {}, head = null, locals = [])
 
 // Pure: the AI is taken only when it is a routable profile chosen with confidence; the job's policy
 // is its own, so there is no access gate here.
-export function decideAI(answers, {profiles = {}, confidence = 0.8, notes = {}, order = [], locals = [], preferLocal = false} = {}) {
-  const tiered = tierPick(answers, {profiles, notes, order, locals, preferLocal});
+export function decideAI(answers, {profiles = {}, confidence = 0.8, notes = {}, order = [], locals = [], head = null} = {}) {
+  const tiered = tierPick(answers, {profiles, notes, order, locals, head});
   if (tiered.name) return {ai: tiered.name, ...(tiered.local ? {local: tiered.local} : {}), tier: tiered.tier, reason: null, confidence: tiered.confidence, probabilities: tiered.probabilities};
   const answer = isObject(answers?.profile) ? answers.profile : {};
   const chosen = typeof answer.choice === 'string' ? answer.choice : null;
@@ -411,7 +421,7 @@ export async function routeAgentAI({orders, profiles, head, settings, ask, notes
   if (!Object.keys(questions.profile.criteria).length) return {ai: null, asked: false};
   try {
     const result = await ask({state: {orders: String(orders ?? '').slice(0, 24_000)}, questions, model: s.model, signal});
-    return {...decideAI(result.answers, {profiles, confidence: s.confidence, notes: known, order, locals: here, preferLocal: s.routing.preferLocal}), asked: true, model: result.model, latencyMs: result.latencyMs};
+    return {...decideAI(result.answers, {profiles, confidence: s.confidence, notes: known, order, locals: here, head}), asked: true, model: result.model, latencyMs: result.latencyMs};
   } catch (error) {
     return {ai: null, asked: true, reason: error?.code ?? error?.message ?? 'error', confidence: 0, probabilities: {}, model: null};
   }
@@ -436,7 +446,7 @@ export async function routeTask({orders, profiles, settings, ask, notes = {}, or
     const result = await ask({state: {orders: String(orders ?? '').slice(0, 24_000)}, questions, model: s.model, signal});
     let here = [];
     if (agentHeads(profiles).some(([, head]) => head.auto)) { try { here = (typeof locals === 'function' ? await locals() : locals) ?? []; } catch { here = []; } }
-    return {...decideRoute(result.answers, {profiles, confidence: s.confidence, fallback, notes: known, order, locals: here, preferLocal: s.routing.preferLocal}), model: result.model, latencyMs: result.latencyMs};
+    return {...decideRoute(result.answers, {profiles, confidence: s.confidence, fallback, notes: known, order, locals: here}), model: result.model, latencyMs: result.latencyMs};
   } catch (error) {
     return off(error?.code ?? error?.message ?? 'error');
   }

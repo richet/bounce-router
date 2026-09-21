@@ -120,6 +120,21 @@ export function loadAgents(root, {cwd} = {}) {
   return roles;
 }
 
+// `/local on`: a mix of local and cloud AIs is Jev's to make, and it only picks the AI of an agent
+// whose `models:` opens with `auto`. So every agent file a person wrote gets `auto` put first; the
+// models they chose stay behind it, as what the agent runs on when Jev is off or unsure. Shipped
+// agents are already `auto` and are never written to. Returns the names changed.
+export function handAIsToJev(roles, {orchestrator = 'main'} = {}) {
+  const changed = [];
+  for (const role of roles.values()) {
+    if (role.error || role.name === orchestrator || !['user', 'project'].includes(role.source) || role.models?.[0] === AUTO_MODEL) continue;
+    const {file, source, error, ...agent} = role;
+    writeAgent(path.dirname(file), {...agent, models: [AUTO_MODEL, ...(role.models ?? [])]}, {force: true});
+    changed.push(role.name);
+  }
+  return changed;
+}
+
 export const readOnlyRoles = roles => new Set([...roles.values()].filter(role => !role.error && role.policy === 'read-only').map(role => role.name));
 
 // What every entry point calls. It never writes: the shipped agents are layered in from the skill.
