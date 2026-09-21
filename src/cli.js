@@ -361,7 +361,7 @@ async function main() {
   // The usage panel covers every vendor the session can spend on: in orchestrator mode the
   // workers' vendors too, not just the orchestrator's own (settings.order is narrowed to it).
   const quotaOrder = () => usageOrder(settings.order, orchestration.operation === 'orchestrator' ? orchestration.profiles : {});
-  let activityTimer, activityStarted = 0, progress = '';
+  let activityTimer, activityStarted = 0, progress = '', busySince = null;
   const activity = () => `${['◐', '◓', '◑', '◒'][Math.floor((Date.now() - activityStarted) / 150) % 4]} Working · ${Math.floor((Date.now() - activityStarted) / 1000)}s`;
   let loadedFingerprint = fingerprint();
   let completionIndex = 0, menuDismissed = false, copyPaused = false;
@@ -596,7 +596,9 @@ async function main() {
     terminal.update({
       agentsOpen, details, sidebar: settings.sidebar, selectedId: selectedAgentPane, input: textPrompt?.mask ? '•'.repeat(input.length) : input, inputCursor: clampCursor(input, inputCursor), inputTarget: textPrompt ? textPrompt.label : localSetup ? 'setup' : inputTarget(), scroll, busy, progress,
       paneScrolls: {...Object.fromEntries([...paneInputs].map(([id, value]) => [id, value.scroll])), [selectedAgentPane]: scroll},
-      main: {...session.main, text: progress || notice, operation: orchestration.operation},
+      // When this turn began, so the header and the rail can say how long the main worker has been at it.
+      main: {...session.main, text: progress || notice, operation: orchestration.operation, startedAt: (busySince = busy ? busySince || new Date().toISOString() : null)},
+      now: Date.now(),
       notice: localSetup?.state.question || notice, paused: copyPaused, mouseScroll,
       menu: menu.map(([text, paint]) => paint(clean(text))),
       metadata: {
@@ -1092,9 +1094,14 @@ async function main() {
   await terminal.mount({mouseScroll});
 
   session.onEvent = scheduleRender;
-  // Orchestrator sessions tick once a second so the AGENTS pane's elapsed times advance between
-  // events; unref'd so it never keeps the process alive, and render() is a no-op while suspended.
-  if (orchestration.operation === 'orchestrator') { const t = setInterval(() => render(), 1000); t.unref?.(); }
+  // Orchestrator sessions tick so the status glyphs move and the quiet times advance between events:
+  // four times a second while the main worker or any agent is working, once a second at rest.
+  // unref'd so it never keeps the process alive, and render() is a no-op while suspended.
+  if (orchestration.operation === 'orchestrator') {
+    let beat = 0;
+    const t = setInterval(() => { const working = busy || (terminal?.snapshot().panes ?? []).some(pane => pane.state === 'running'); if (working || ++beat % 4 === 0) render(); }, 250);
+    t.unref?.();
+  }
   void refreshQuota(settings, {root, store: quotas, cwd: session.cwd}).then(render, () => {});
 
   process.on('SIGTERM', () => { if (busy) {router.cancel(); const timer = setInterval(() => {if (!busy) {clearInterval(timer); quit();}}, 100);} else quit(); });
