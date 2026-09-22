@@ -9,8 +9,8 @@ const cache = new Map();
 // A loaded model is still preferred when one exists (see the ranking in resolveLocalModel); this only
 // stops "nothing is loaded right now" from being a dead end. `loaded-only` remains available for
 // setups that must never trigger a load.
-// maxConcurrent is still accepted so existing configs load; nothing reads it (LM Studio queues
-// concurrent requests itself).
+// maxConcurrent: how many local workers the scheduler runs on the endpoint at once — set it to the
+// number of parallel slots the model is loaded with. The rest wait in the queue (src/scheduler.js).
 const DEFAULT_ENDPOINT = {backend: 'lmstudio', url: 'http://127.0.0.1:1234', loadPolicy: 'on-demand', maxConcurrent: 1};
 const endpointIdPattern = /^[A-Za-z0-9_-]+$/;
 const maxBodyBytes = 1024 * 1024;

@@ -244,6 +244,8 @@ A grant can publish only what its role allows: the orchestrator submits tasks an
 
 However large the request, the orchestrator does not hand one worker the whole job. Its standing orders tell it to plan **phases in sequence, each made of chunks that run in parallel** where their owned paths are disjoint, to chain phases with `depends_on`, and to review each phase before the next starts. The scheduler holds it to that: no task may be given more than `taskMinutes` (config.json, default 15, 1–240). A deadline over the cap is refused before anything runs (`task.failed`, reason `size`), and the refusal says how to split. A task with no deadline gets the cap as its deadline.
 
+`local.endpoints.<name>.maxConcurrent` (default 1) is how many local workers run on that endpoint at once; set it to the parallel slots the model is loaded with. A task past the limit stays queued, says so once, and starts when a local turn ends. Cloud workers are never held by it.
+
 While a worker runs, the status rail shows under its row the phase it last reported and how long ago that milestone was, and its block in the conversation names the phase. The stall alarm treats five minutes without any output as silence and ten minutes without a milestone as a stall; at two minutes it used to fire on every test run.
 
 ## Agents and local models

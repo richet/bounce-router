@@ -6,6 +6,7 @@ import {takeCheckpoint, sameTree} from './checkpoint.js';
 import {POLICY_RANK, effectivePolicy, LOCAL_ADAPTERS, playedBy, READ_ONLY_ROLES as READONLY_ROLES} from './profiles.js';
 import {defaultStrategy} from './strategy.js';
 import {reportEvent, validateReport} from './reporting.js';
+import {normalizeLocalSettings} from './local-models.js';
 import {createLocalResolver} from './local-resolve.js';
 import {routingFallback} from './jev.js';
 import {execFileSync} from 'node:child_process';
@@ -72,6 +73,16 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   const handles = new Map(); // task -> {adapter, handle}
   const reviews = new Map(); // task -> {adapter, handle}, one review in flight per task (A3)
   const heldTasks = new Set(); // tasks queued behind an unaccepted depends_on, re-evaluated on terminal rows
+  // Local workers waiting for a slot: `local.endpoints.<name>.maxConcurrent` is how many the endpoint
+  // runs at once (LM Studio is loaded with that many parallel slots; more would queue inside it and
+  // look stalled, and each running model turn holds memory — observed live as a swapping machine).
+  // A task past the limit stays queued, says so once, and dispatches when a local turn ends.
+  const slotWaiters = new Set();
+  const localSlots = endpoint => { try { return normalizeLocalSettings(localSettings).endpoints[endpoint]?.maxConcurrent ?? 1; } catch { return 1; } };
+  // Running = a live handle, or a launch still in flight (the handle exists only after launch()
+  // resolves, and several dispatches can pass the check before the first one does).
+  const localEndpointOf = task => { const p = profiles[reducers.tasks(session.events)[task]?.profile]; return p && LOCAL_ADAPTERS.has(p.adapter) ? p.endpoint ?? 'lmstudio' : null; };
+  const localRunning = endpoint => new Set([...[...handles.entries()].filter(([, h]) => h.local === endpoint).map(([t]) => t), ...[...launchingAttempts.keys()].filter(t => localEndpointOf(t) === endpoint)]).size;
   const launchingAttempts = new Map(); // task -> {attempt, reports}; grants exist before task.started
   const resolvedLocalProfiles = new Map();
   // Live activity, never journaled (task.activity is a LIVE_KIND): task -> {at, expectUntil}.
@@ -378,6 +389,13 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       if (row) dispatch(row).catch(error => append({kind: 'task.failed', task, reason: 'error', text: error.message, context: row.context}));
     }
   }
+  function wakeSlotWaiters() {
+    for (const task of [...slotWaiters]) {
+      if (!reducers.tasks(session.events)[task] || reducers.tasks(session.events)[task].state !== 'queued') { slotWaiters.delete(task); continue; }
+      const row = submittedRow(task);
+      if (row) dispatch(row).catch(error => append({kind: 'task.failed', task, reason: 'error', text: error.message, context: row.context}));
+    }
+  }
   function reevaluateHeld() {
     for (const task of [...heldTasks]) {
       heldTasks.delete(task);
@@ -508,6 +526,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       else append({kind: 'task.blocked', task, text: 'termination unverified', from, context});
     } finally {
       if (handles.get(task)?.handle === handle && reducers.tasks(session.events)[task]?.blocker !== 'termination unverified') handles.delete(task);
+      if (slotWaiters.size) queueMicrotask(wakeSlotWaiters); // a local slot may have freed: the handle is gone only now
     }
   }
 
@@ -583,13 +602,13 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // The task may have been cancelled (or otherwise gone terminal) while launch() was
     // pending: don't adopt it as live, just shut down the now-unwanted process.
     if (launchingAttempts.get(task)?.cancelReason || reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) {
-      handles.set(task, {adapter, handle});
+      handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : {})});
       const reason = launchingAttempts.get(task)?.cancelReason ?? 'user';
       launchingAttempts.delete(task);
       await cancelOne(task, reducers.tasks(session.events), reason);
       return;
     }
-    handles.set(task, {adapter, handle});
+    handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : {})});
     append({kind: 'peer.joined', name: workerFrom(task), role: 'worker', adapter: profile.adapter, profile: row.profile, from: workerFrom(task), context});
       append({kind: 'task.started', task, attempt, requested: profile.model ?? '', ...(attempt === 1 && jevReviewed(row) ? {head: gitHead(session.cwd)} : {}), from: workerFrom(task), context});
     for (const staged of launchingAttempts.get(task)?.reports ?? []) report({task, attempt, report: staged.payload, from: staged.from, context: staged.context});
@@ -660,13 +679,13 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // A throwing resume (the branch above) journals none of this — nothing was delivered.
     for (const m of pending) append({kind: 'task.delivered', task, tier: 'next-turn', message: m.id, text: `rework round ${round}`, from: 'bounce', context});
     if (launchingAttempts.get(task)?.cancelReason || reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) {
-      handles.set(task, {adapter, handle});
+      handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : {})});
       const reason = launchingAttempts.get(task)?.cancelReason ?? 'user';
       launchingAttempts.delete(task);
       await cancelOne(task, reducers.tasks(session.events), reason);
       return;
     }
-    handles.set(task, {adapter, handle});
+    handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : {})});
     append({kind: 'task.started', task, attempt, resumed: true, requested: profile.model ?? '', from: workerFrom(task), context});
     for (const staged of launchingAttempts.get(task)?.reports ?? []) report({task, attempt, report: staged.payload, from: staged.from, context: staged.context});
     launchingAttempts.delete(task);
@@ -1053,6 +1072,16 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         append({kind: 'task.failed', task, reason: refusal.reason, text: refusal.text, context});
         return;
       }
+    }
+    if (LOCAL_ADAPTERS.has(profile.adapter)) {
+      const endpoint = profile.endpoint ?? 'lmstudio';
+      const running = localRunning(endpoint), slots = localSlots(endpoint);
+      if (running >= slots) {
+        if (!slotWaiters.has(task)) append({kind: 'task.milestone', task, phase: 'queued', text: `Waiting for a local slot on ${endpoint}: ${running} of ${slots} in use`, next: 'dispatch when a local turn ends', context});
+        slotWaiters.add(task);
+        return;
+      }
+      slotWaiters.delete(task);
     }
     // STRATEGY (CONTRACT.md §0/§1): the depends_on hold/fail decision and the prelaunch-review
     // decision both come from onSubmitted now — the CORE only executes the returned intent, it
