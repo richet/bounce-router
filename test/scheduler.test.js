@@ -937,6 +937,8 @@ test('S-role: a non-opencode worker receives its role prompt ahead of the orders
   const b = scheduler.submit({parent: null, profile: 'local', orders: 'review the tree'});
   await waitFor(() => seen.fake !== undefined && seen.opencode !== undefined, {timeout: 4000});
   assert.equal(seen.fake, 'You are the reviewer.\n\n---\n\nreview the tree');
-  assert.equal(seen.opencode, 'review the tree', 'opencode gets the agent natively, so its orders stay bare');
+  // opencode gets the agent natively, so no role prompt; a local worker is told its answer is its report.
+  assert.equal(seen.opencode.startsWith('review the tree\n\nYour final answer is your report:'), true, seen.opencode);
+  assert.equal(seen.opencode.includes('You are'), false);
   await scheduler.cancel(a.task); await scheduler.cancel(b.task);
 });

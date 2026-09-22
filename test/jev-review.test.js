@@ -354,3 +354,26 @@ test('a rework whose worker cannot be resumed falls back to the next AI, exactly
     sch.close();
   }
 });
+
+// Found live (ACE): a repository that has no commit yet — `git init` and nothing tracked — is inside a
+// work tree, so the no-repository skip did not fire, and every diff Jev was shown was empty. A worker
+// that made the change and passed every gate was sent back for rework three times on `empty_diff`.
+test('a repository with no commit is judged the way no repository is: Jev is not asked, the task is accepted', async t => {
+  const {session} = setup(t);
+  const worker = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'one-line change made; 78 passed, 0 failed'}]);
+  let asked = 0;
+  const fetchImpl = async () => { asked++; return okResponse({answers: answers('rework', 0.99)}); };
+  const settings = {enabled: true, model: 'jev-1.13.0', review: true, routing: {enabled: false, default: null}, confidence: 0.8};
+  // inside a work tree, but HEAD does not resolve and nothing is tracked
+  const git = async args => args[0] === 'rev-parse' && args[1] === '--is-inside-work-tree' ? 'true\n' : args[0] === 'rev-parse' && args.includes('HEAD') ? '' : '';
+  const typesafe = createTypesafeLive({fetchImpl, readKey: () => ({key: KEY, source: 'file'}), readSettings: () => settings, git});
+  const profiles = {A: {adapter: 'worker', model: 'w', mode: 'yolo', fallback: [], role: 'builder', policy: 'write'}, jev: jevReviewerProfile({})};
+  const scheduler = createScheduler({session, adapters: {worker, typesafe}, profiles, jev: createJevDecisions({adapter: typesafe, readSettings: () => settings}), gitHead: () => null});
+  t.after(() => scheduler.close());
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'make the one-line change', deadline: null});
+  await waitFor(() => reducers.TERMINAL.has(scheduler.tasks()[row.task]?.state));
+  assert.equal(scheduler.tasks()[row.task].state, 'accepted');
+  assert.equal(asked, 0);
+  const skipped = session.events.find(e => e.kind === 'jev.skipped');
+  assert.deepEqual([skipped.reason, skipped.text], ['no_repository', 'Jev verdict skipped · the working folder has no commit to diff against, so there is no diff to judge · accepting as today']);
+});

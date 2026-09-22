@@ -127,6 +127,7 @@ export function choosingOrders({agents = false, routingOn = false, localOn = fal
     `    ${[agents, routingOn].filter(Boolean).length + 1}. A worker profile by name ONLY when the user asks for that specific AI, or an agent's own list has been exhausted.`,
     routingOn ? 'Do not pick a tier or a model yourself: for an agent or `auto`, Jev weighs the orders and picks the AI per task.'
       : 'An agent runs on the AIs in the order its file lists them; naming a profile skips that list.',
+    'Once you have dispatched a task, wait for it (`bounce wait`) or end your turn: do not investigate the same question yourself in parallel — that spends the worker\'s whole slot for nothing. If you must take the work back, cancel the task first.',
     ...(localOn ? ['Local models are part of the normal path, not a special request: an agent runs on a local model when one fits the task, at no cost — do not wait for the user to ask for them, and do not route around them by naming a cloud profile.'] : []),
     ''];
 }

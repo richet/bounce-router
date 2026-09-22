@@ -84,3 +84,20 @@ test('a local WRITE agent that fails falls back to its cloud AI too: a local wri
   const retry = await waitFor(() => session.events.find(e => e.kind === 'task.submitted' && e.profile === 'integrator~2'));
   await waitFor(() => scheduler.tasks()[retry.task].state === 'completed');
 });
+
+// Found live: three local workers' reports opened with "the bounce API endpoint is not reachable in
+// this environment" — they had been told to report through `bounce report` and spent their turn on
+// it. A local worker's answer IS its report; it is told so, and nothing about a report endpoint.
+test('a local worker is told that its final answer is its report, never to use a report endpoint', async t => {
+  const {root, session} = setup(t);
+  const log = path.join(root, 'fake.log'); process.env.FAKE_OC_LOG = log; t.after(() => delete process.env.FAKE_OC_LOG);
+  const grant = () => ({BOUNCE_REPORT_BUS: '/tmp/r.sock', BOUNCE_REPORT_TOKEN_FILE: '/tmp/r.tok'});
+  const scheduler = createScheduler({session, adapters: {opencode: createOpencodeLive({})}, profiles: {coder: local({policy: 'write', agent: {name: 'builder', prompt: 'Build.'}})}, requireFinalReport: true, reportGrant: grant});
+  t.after(() => scheduler.close());
+  const row = scheduler.submit({parent: null, profile: 'coder', orders: 'Fix src/a.js and run the tests.'});
+  await waitFor(() => ['completed', 'accepted', 'failed'].includes(scheduler.tasks()[row.task]?.state));
+  const prompt = JSON.parse(fs.readFileSync(log, 'utf8').split('\n').find(l => l.startsWith('PROMPT ')).slice(7));
+  assert.equal(prompt.includes('bounce report'), false, prompt);
+  assert.equal(prompt.includes('report endpoint'), false);
+  assert.equal(prompt.endsWith('Your final answer is your report: when you are done, state the outcome, what you changed, how you verified it (paste the test output line), and what remains. There is no report tool or endpoint to reach.'), true, prompt);
+});

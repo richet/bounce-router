@@ -19,7 +19,8 @@ test('no more local workers run at once than the endpoint allows; the rest wait 
   t.after(() => fs.rmSync(root, {recursive: true, force: true}));
   const session = new Session(root, {root});
   const gates = new Map(); let launched = [];
-  const opencode = fakeAdapter(({orders}) => { const gate = Promise.withResolvers(); gates.set(orders, gate); launched.push(orders); return gate.promise; });
+  const first = orders => orders.split('\n')[0]; // a local worker's orders carry a report line after them
+  const opencode = fakeAdapter(({orders}) => { const gate = Promise.withResolvers(); gates.set(first(orders), gate); launched.push(first(orders)); return gate.promise; });
   const claude = fakeAdapter(({orders}) => { launched.push(orders); return [{kind: 'result', status: 'completed', text: 'cloud done'}]; });
   const localResolver = {resolve: async ({profile}) => ({...profile, providerID: 'lmstudio', opencodeConfig: {}}), configure() {}};
   const profiles = {a: local('a'), b: local('b'), c: local('c'), cloud: {adapter: 'claude', model: 's', mode: 'yolo', policy: 'write', fallback: [], role: 'builder'}};

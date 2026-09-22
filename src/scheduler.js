@@ -37,6 +37,7 @@ const isNonNegativeInt = n => Number.isInteger(n) && n >= 0;
 const isPositiveInt = n => Number.isInteger(n) && n > 0;
 // `opencode` workers report by answering (or `bounce report` when they can run commands); it must be
 // told to CALL it, not to run `bounce report`, because the opencode tier has no shell (Q3).
+const LOCAL_REPORT_LINE = 'Your final answer is your report: when you are done, state the outcome, what you changed, how you verified it (paste the test output line), and what remains. There is no report tool or endpoint to reach.';
 const reportInstruction = profile => profile?.adapter === 'codex'
   ? 'call the bounce_report tool with the report object'
   : 'use bounce report --report <json>';
@@ -596,9 +597,13 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // gets the role's prompt ahead of the orders instead, so the role means the same thing whoever
       // answers the dispatch.
       const roleLead = profile.agent?.prompt && profile.adapter !== 'opencode' ? `${profile.agent.prompt}\n\n---\n\n` : '';
-      // A local worker reports by answering; one that can run commands may also use `bounce report`.
-      const canReport = reportEnv && (!LOCAL_ADAPTERS.has(profile.adapter) || effectivePolicy(profile) !== 'read-only' && effectivePolicy(profile) !== 'plan');
-      let workerOrders = canReport ? `${roleLead}${row.orders}\n\nTo report progress, ${reportInstruction(profile)} using your scoped report endpoint. Final reports require op:\"final\", outcome, summary, phase, text and next; do not publish task completion directly.` : `${roleLead}${row.orders}`;
+      // A local worker reports by answering, and is told so. Observed live: told to use `bounce report`,
+      // three local workers opened their reports with "the bounce API endpoint is not reachable" and
+      // had spent their turn on it. A cloud worker keeps the report protocol.
+      const canReport = reportEnv && !LOCAL_ADAPTERS.has(profile.adapter);
+      let workerOrders = canReport ? `${roleLead}${row.orders}\n\nTo report progress, ${reportInstruction(profile)} using your scoped report endpoint. Final reports require op:\"final\", outcome, summary, phase, text and next; do not publish task completion directly.`
+        : LOCAL_ADAPTERS.has(profile.adapter) ? `${roleLead}${row.orders}\n\n${LOCAL_REPORT_LINE}` : `${roleLead}${row.orders}`;
+      owned = ownedSnapshot(task, profile);
       handle = await adapter.launch({peer: workerFrom(task), profile, orders: workerOrders, cwd: session.cwd, dir,
         task, attempt, context, signal: admission?.signal,
         onActivity: LOCAL_ADAPTERS.has(profile.adapter) ? localActivity(task, attempt, context) : undefined,
@@ -662,13 +667,14 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       : [`Rework round ${round}:`, ...findings.map(f => `- ${f}`), ...pending.map(m => m.text)].join('\n');
     let adapter = adapters[profile.adapter];
     let admission;
-    let handle;
+    let handle, owned = null;
     try {
       if (LOCAL_ADAPTERS.has(profile.adapter) && profile.backend === 'lmstudio') {
         admission = await admitLocal(profile, task, attempt, context);
         ({profile, adapter} = admission);
       }
-      handle = await adapter.resume({peer: workerFrom(task), profile, native, message: reportEnv ? `${message}\n\nTo report, ${reportInstruction(profile)}; finals require outcome, summary, phase, text and next.` : message, cwd: session.cwd, dir, checkpoint: row.checkpoint,
+      owned = ownedSnapshot(task, profile);
+      handle = await adapter.resume({peer: workerFrom(task), profile, native, message: reportEnv && !LOCAL_ADAPTERS.has(profile.adapter) ? `${message}\n\nTo report, ${reportInstruction(profile)}; finals require outcome, summary, phase, text and next.` : LOCAL_ADAPTERS.has(profile.adapter) ? `${message}\n\n${LOCAL_REPORT_LINE}` : message, cwd: session.cwd, dir, checkpoint: row.checkpoint,
         task, attempt, context, signal: admission?.signal,
         onActivity: LOCAL_ADAPTERS.has(profile.adapter) ? localActivity(task, attempt, context) : undefined,
         report: requireFinalReport ? ({report: payload}) => report({task, attempt, context, report: payload}) : undefined});

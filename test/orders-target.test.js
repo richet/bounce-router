@@ -42,3 +42,13 @@ test('the orders say who to submit to: the job first, auto next, a named AI only
   assert.equal(cloudOnly.includes('Local models'), false);
   assert.deepEqual(choosingOrders({agents: false, routingOn: false, localOn: false}), [], 'no agents and no routing: there is nothing to choose between but profiles');
 });
+
+// Found live (ACE session): the orchestrator dispatched an analyst, then spent 19 tool calls of its own
+// answering the same question and wrote the next task from its own findings; the analyst's whole
+// 15-minute slot was wasted.
+test('the orders tell the orchestrator to wait on what it dispatched instead of doing it itself', () => {
+  const text = choosingOrders({agents: true, routingOn: true, localOn: true}).join('\n');
+  assert.equal(text.includes('Once you have dispatched a task, wait for it'), true);
+  assert.equal(text.includes('do not investigate the same question yourself'), true);
+  assert.equal(text.includes('cancel the task first'), true);
+});
