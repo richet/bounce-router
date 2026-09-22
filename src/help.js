@@ -52,7 +52,7 @@ export const TUI_SECTIONS = [
     ['/local activate', '[AGENT]', 'Re-read agent files into this session without restarting'],
   ]},
   {title: 'Orchestration', rows: [
-    ['/operation', '[NAME]', 'Switch/pick classic|orchestrator; no arg opens a menu, Ctrl+O toggles'],
+    ['/operation', '[NAME]', 'Switch classic|orchestrator (restarts this session into it); no arg or Ctrl+O opens a menu'],
     ['/continue', 'PROFILE', 'Start an orchestrator turn on that profile'],
     ['/stop', '[TASK]', 'Cancel one task, or every running task with no arg'],
     ['/msg', 'TASK TEXT', 'Send a message to a running worker'],
@@ -104,7 +104,7 @@ export const KEYS = [
   ['PgUp/PgDn', '', 'Scroll the transcript (the mouse wheel does too)'],
   ['F2', '', 'Pause the view for copying'],
   ['F3', '', 'Mouse scroll off, so click-drag selects text'],
-  ['Ctrl+O', '', 'Toggle classic/orchestrator'],
+  ['Ctrl+O', '', 'Choose classic/orchestrator (restarts the session)'],
   ['Ctrl+U', '', 'Clear the input'],
   ['Ctrl+C', '', 'Cancel the turn; exit when idle'],
   ['Esc', '', 'Cancel an active turn or close a picker'],

@@ -16,6 +16,9 @@
 // FAKE_STDERR_LINES=<n>   write n 1,000-character lines to stderr before finishing
 // FAKE_ORPHAN=1           emit an empty zero-turn result before the real turn (orphaned background tasks)
 // FAKE_USAGE=<json>       usage object on the result line (default '{}' — vendor field names)
+// FAKE_EMPTY_TURN_ONCE=<path>  the first run (no marker file yet) answers like a resume whose
+//                         turn the CLI dropped — a result with num_turns 0 and no API time —
+//                         and writes the marker; later runs behave normally
 import {execSync} from 'node:child_process';
 import {createServer} from 'node:net';
 import fs from 'node:fs';
@@ -50,6 +53,15 @@ const start = async () => {
     } catch {}
   }
   const sessionId = process.env.FAKE_SESSION ?? 'sess-fake';
+  const marker = process.env.FAKE_EMPTY_TURN_ONCE;
+  if (marker && !fs.existsSync(marker)) {
+    fs.writeFileSync(marker, 'dropped');
+    console.log(JSON.stringify({type: 'system', subtype: 'task_notification', task_id: 'bg1', status: 'stopped', summary: "Background shell command didn't finish before the previous session ended", session_id: sessionId}));
+    console.log(JSON.stringify({type: 'system', subtype: 'init', session_id: sessionId, tools: []}));
+    console.log(JSON.stringify({type: 'result', subtype: 'success', is_error: false, result: '', num_turns: 0, duration_api_ms: 0, stop_reason: null, session_id: sessionId, usage: {}}));
+    process.exitCode = 0;
+    return;
+  }
   console.log(JSON.stringify({type: 'system', subtype: 'init', session_id: sessionId, tools: []}));
   // FAKE_ORPHAN=1: what Claude Code 2.1.278 really does when the resumed session left background
   // tasks behind — it reports them, emits an EMPTY result (zero model turns) and only then runs the

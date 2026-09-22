@@ -250,6 +250,68 @@ export function cooldowns(events, now) {
   return result;
 }
 
+// Every vendor's usage field name, mapped to the four canonical categories the rest of this file
+// sums over — raw adapters (src/adapters/claude.js, codex.js) pass the vendor's own field names
+// through unmapped, live adapters and workers (src/scheduler.js task.usage) already normalize, so
+// this map carries both: an already-canonical key maps to itself, a vendor key maps across.
+const USAGE_KEY_MAP = {
+  input_tokens: 'input', cache_read_input_tokens: 'cache_read', cache_creation_input_tokens: 'cache_write',
+  cached_input_tokens: 'cache_read', cache_write_input_tokens: 'cache_write', output_tokens: 'output',
+  input: 'input', cache_read: 'cache_read', cache_write: 'cache_write', output: 'output',
+};
+export function normalizeUsage(raw) {
+  const usage = {};
+  if (!raw || typeof raw !== 'object') return usage;
+  for (const [key, canon] of Object.entries(USAGE_KEY_MAP)) {
+    const value = raw[key];
+    if (Number.isFinite(value)) usage[canon] = (usage[canon] || 0) + value;
+  }
+  return usage;
+}
+const TOKEN_KEYS = ['input', 'cache_read', 'cache_write', 'output'];
+const tokenSum = usage => TOKEN_KEYS.reduce((sum, key) => sum + (usage[key] || 0), 0);
+
+// Which model a usage row belongs to: the most recent `model` row seen for the same (from, task)
+// pair, else — since a worker always gets a task.started before it ever reports usage — the
+// model it was launched with, else the main session's latest `route.model`, else unattributed.
+// A row with no usable numbers carries no information and is dropped outright, never a zero entry.
+export function modelUsage(events) {
+  const lastModel = new Map(); // `${from}|${task ?? ''}` -> {model, provider}
+  const lastRoute = new Map(); // from -> {model, provider}
+  const requested = new Map(); // task -> requested model string
+  const entries = new Map(); // `${provider}::${model}` -> row
+  const ensure = (model, provider) => {
+    const key = `${provider}::${model}`;
+    let row = entries.get(key);
+    if (!row) { row = {model, provider, usage: {input: 0, cache_read: 0, cache_write: 0, output: 0}, tokens: 0, turns: 0}; entries.set(key, row); }
+    return row;
+  };
+  for (const e of events) {
+    const attrKey = `${e.from}|${e.task ?? ''}`;
+    if (e.kind === 'model' && typeof e.model === 'string') { lastModel.set(attrKey, {model: e.model, provider: e.provider}); continue; }
+    if (e.kind === 'route' && typeof e.model === 'string') {
+      // "default" is the router saying no model was pinned, not a model name: falling through
+      // leaves attribution to land on `${provider} default` instead of a literal "default" row.
+      if (e.model.trim() && e.model.trim().toLowerCase() !== 'default') lastRoute.set(e.from, {model: e.model, provider: e.provider});
+      continue;
+    }
+    if (e.kind === 'task.started' && typeof e.task === 'string' && typeof e.requested === 'string' && e.requested) { requested.set(e.task, e.requested); continue; }
+    if (e.kind !== 'usage' && e.kind !== 'task.usage') continue;
+    const usage = normalizeUsage(e.usage);
+    if (!Object.keys(usage).length) continue;
+    const attribution = lastModel.get(attrKey)
+      ?? (typeof e.task === 'string' && requested.has(e.task) ? {model: requested.get(e.task), provider: e.provider} : undefined)
+      ?? lastRoute.get(e.from);
+    const provider = attribution?.provider ?? e.provider ?? null;
+    const model = attribution?.model ?? (provider ? `${provider} default` : 'default');
+    const row = ensure(model, provider);
+    sumInto(row.usage, usage);
+    row.tokens += tokenSum(usage);
+    row.turns++;
+  }
+  return [...entries.values()].sort((a, b) => b.tokens - a.tokens || a.model.localeCompare(b.model));
+}
+
 // A session's name: the last `session.renamed` row wins; otherwise the first line of its first
 // prompt (the orchestrator brief line stripped), cut to 48 characters; null for an empty log.
 export function sessionName(events) {

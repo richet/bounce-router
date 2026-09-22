@@ -35,12 +35,31 @@ const AUTO_PROFILE = 'auto';
 
 const isNonNegativeInt = n => Number.isInteger(n) && n >= 0;
 const isPositiveInt = n => Number.isInteger(n) && n > 0;
+// How long a report-only continuation (a resumed worker asked only for its missing final report)
+// may take. It was 10 s, less than a resumed CLI's own startup plus one tool call: observed on
+// fb9181d5, every such continuation timed out and finished work was journaled as failed.
+const REPORT_ONLY_WINDOW_MS = 120000;
 // `opencode` workers report by answering (or `bounce report` when they can run commands); it must be
 // told to CALL it, not to run `bounce report`, because the opencode tier has no shell (Q3).
 const LOCAL_REPORT_LINE = 'Your final answer is your report: when you are done, state the outcome, what you changed, how you verified it (paste the test output line), and what remains. There is no report tool or endpoint to reach.';
 const reportInstruction = profile => profile?.adapter === 'codex'
   ? 'call the bounce_report tool with the report object'
   : 'use bounce report --report <json>';
+// The whole report schema rides with the orders. A worker that is only told "final reports
+// require …" guesses the progress shape, gets a refusal, and goes looking for the schema in
+// the CLI (observed: `bounce`/`bounce --help` probes costing minutes per task). Every field a
+// report can carry is named here once, so the first report is the right one.
+const reportContract = profile => [
+  `To report progress, ${reportInstruction(profile)} using your scoped report endpoint (it is the only bounce command you need; \`bounce\` alone starts nothing useful here).`,
+  'Every report is a JSON object with op ("milestone" | "blocked" | "input_required" | "final"), phase ("inspect" | "plan" | "implement" | "test" | "verify" | "review" | "document" | "done"),',
+  'text (what changed), next (what happens next) — all strings, all required — and optional evidence (an array of up to 32 strings naming files, commands or results).',
+  'A final report additionally requires outcome ("completed" | "failed" | "blocked" | "input_required") and summary, and may carry remaining (a string).',
+  'Report a milestone after initial inspection and at each phase change; report blocked the moment progress stops; end with one final report. Do not publish task completion directly.',
+  'You run headless, as one turn: ending your turn ends your process, and nothing re-invokes you. Never background a command, set a',
+  'monitor, or stop to "pick up when it finishes" — run long commands (deploys, test suites) in the foreground with a generous timeout,',
+  'then send the final report in this same turn. Work you leave running when you stop is orphaned and the task is failed as unreported.',
+  `Example: ${reportsByTool(profile) ? 'bounce_report ' : "bounce report --report '"}{"op":"milestone","phase":"inspect","text":"Read the three files the orders name","next":"Implement the helper","evidence":["src/a.js"]}${reportsByTool(profile) ? '' : "'"}`,
+].join('\n');
 
 // The verdict protocol (CONTRACT.md §4): the LAST line of a completed review's text that
 // parses as JSON with a string `verdict` field is the verdict. A missing/failed result, or
@@ -724,7 +743,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       append(stopped?.verified === true
         ? {kind: 'task.failed', task, reason: 'incomplete_report', text: 'Final report request timed out', context}
         : {kind: 'task.blocked', task, text: 'termination unverified', context});
-    }, Math.max(1, Math.min(10000, (deadlineAtFor(task) ?? (clock() + 10000)) - clock()))) : null;
+    }, Math.max(1, Math.min(REPORT_ONLY_WINDOW_MS, (deadlineAtFor(task) ?? (clock() + REPORT_ONLY_WINDOW_MS)) - clock()))) : null;
     try { await consumeWorkerEvents({adapter, handle, task, context, profile, owned}); }
     finally { clearTimeout(reportTimer); }
   }

@@ -46,11 +46,13 @@ export function createWorkspace(React, Ink) {
       {text: [metadata.provider ?? 'agent', metadata.mode ?? 'plan', metadata.jev].filter(Boolean).join(' · ')},
       {text: `Model: ${metadata.model || 'provider default'}`, color: 'gray'},
       {text: `${metadata.operation ?? 'classic'} · ${status}`, color: 'yellow'},
+      ...(metadata.pendingOperation ? [{text: `→ ${metadata.pendingOperation} on next session`, color: 'yellow'}] : []),
       {text: `${metadata.pendingTurns ?? 0} prompt${metadata.pendingTurns === 1 ? '' : 's'} queued`, color: 'gray'},
       {text: metadata.cwd ?? '', color: 'gray'},
       {text: `Session ${(metadata.sessionId ?? '').slice(0, 8)}`, color: 'gray'},
       {text: ''},
       ...(metadata.quotaLines ?? []).map(text => ({text})),
+      ...(metadata.modelLines?.length ? [{text: ''}, ...metadata.modelLines.map(text => ({text}))] : []),
       {text: ''},
       {text: `AGENTS · ${panes.length + 1}`, color: 'cyan', bold: true},
       // Each row moves while that worker works, names its model, and says how long it has been quiet.

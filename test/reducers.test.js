@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {peers, tasks, budgets, cooldowns, watchdog, sessionName} from '../src/reducers.js';
+import {peers, tasks, budgets, cooldowns, watchdog, sessionName, modelUsage} from '../src/reducers.js';
 
 // F4/A7: the reducer's own row fields hold absolute timestamps (a moment), not durations —
 // named lastActivityAt/lastProgressAt so nothing reads them as elapsed ms by mistake. The
@@ -205,4 +205,93 @@ test('sessionName: the last rename wins, else the first prompt line with the orc
   assert.equal(sessionName([{kind: 'user', text: 'a'.repeat(60)}]), `${'a'.repeat(47)}…`);
   assert.equal(sessionName([{kind: 'user', text: 'first'}, {kind: 'session.renamed', name: ' billing v2 '}, {kind: 'session.renamed', name: '   '}]), 'billing v2');
   assert.equal(sessionName([{kind: 'user', text: 'You are the orchestrator peer of session abc; see x.'}]), null);
+});
+
+test('modelUsage: a usage row is credited to the latest model row for its (from, task), raw vendor keys normalized, ranked by tokens desc', () => {
+  const events = [
+    {kind: 'model', from: 'main', model: 'claude-opus-5[1m]', provider: 'claude'},
+    // Raw claude shape (src/adapters/claude.js passes raw.usage through unnormalized).
+    {kind: 'usage', from: 'main', provider: 'claude', usage: {input_tokens: 500000, cache_read_input_tokens: 200000, cache_creation_input_tokens: 50000, output_tokens: 12000}},
+    {kind: 'model', from: 'main', model: 'claude-sonnet-5', provider: 'claude'},
+    {kind: 'usage', from: 'main', provider: 'claude', usage: {input_tokens: 80000, output_tokens: 4000}},
+  ];
+  assert.deepEqual(modelUsage(events), [
+    {model: 'claude-opus-5[1m]', provider: 'claude', usage: {input: 500000, cache_read: 200000, cache_write: 50000, output: 12000}, tokens: 762000, turns: 1},
+    {model: 'claude-sonnet-5', provider: 'claude', usage: {input: 80000, cache_read: 0, cache_write: 0, output: 4000}, tokens: 84000, turns: 1},
+  ]);
+});
+
+test('modelUsage: raw codex usage keys normalize, and repeat turns on the same model accumulate', () => {
+  const events = [
+    {kind: 'model', from: 'main', model: 'gpt-5-codex', provider: 'codex'},
+    {kind: 'usage', from: 'main', provider: 'codex', usage: {input_tokens: 1000, cached_input_tokens: 200, output_tokens: 300}},
+    {kind: 'usage', from: 'main', provider: 'codex', usage: {input_tokens: 2000, cached_input_tokens: 0, output_tokens: 700}},
+  ];
+  const [row] = modelUsage(events);
+  assert.deepEqual(row, {model: 'gpt-5-codex', provider: 'codex', usage: {input: 3000, cache_read: 200, cache_write: 0, output: 1000}, tokens: 4200, turns: 2});
+});
+
+test('modelUsage: a worker task.usage row (already-normalized) attributes via its own model row, keyed by task, never crossing tasks', () => {
+  const events = [
+    {kind: 'task.submitted', task: 't1', from: 'orchestrator'},
+    {kind: 'task.started', task: 't1', requested: 'sonnet', from: 'worker:t1'},
+    {kind: 'model', task: 't1', model: 'claude-sonnet-5', provider: 'claude', from: 'worker:t1'},
+    {kind: 'task.usage', task: 't1', from: 'worker:t1', usage: {input: 9000, cache_read: 1000, output: 500}},
+    {kind: 'task.submitted', task: 't2', from: 'orchestrator'},
+    {kind: 'task.started', task: 't2', requested: 'gpt-5-codex', from: 'worker:t2'},
+    {kind: 'model', task: 't2', model: 'gpt-5-codex', provider: 'codex', from: 'worker:t2'},
+    {kind: 'task.usage', task: 't2', from: 'worker:t2', usage: {input: 500, output: 100}},
+  ];
+  assert.deepEqual(modelUsage(events).map(e => [e.model, e.tokens]), [['claude-sonnet-5', 10500], ['gpt-5-codex', 600]]);
+});
+
+test('modelUsage: attribution falls back to task.started.requested, then route.model, then "<provider> default"', () => {
+  // No model row at all for this worker: falls back to what it was launched with.
+  const viaRequested = modelUsage([
+    {kind: 'task.submitted', task: 't1', from: 'orchestrator'},
+    {kind: 'task.started', task: 't1', requested: 'sonnet', from: 'worker:t1'},
+    {kind: 'task.usage', task: 't1', from: 'worker:t1', usage: {input: 100, output: 10}},
+  ]);
+  assert.deepEqual(viaRequested, [{model: 'sonnet', provider: null, usage: {input: 100, cache_read: 0, cache_write: 0, output: 10}, tokens: 110, turns: 1}]);
+  // Main session with no model row yet: falls back to the route selected at turn start.
+  // route.model "default" means no model was pinned, not a model name: falls through to
+  // "<provider> default" the same as no route at all.
+  const viaRoute = modelUsage([
+    {kind: 'route', from: 'main', provider: 'claude', model: 'default'},
+    {kind: 'usage', from: 'main', provider: 'claude', usage: {input_tokens: 100, output_tokens: 10}},
+  ]);
+  assert.deepEqual(viaRoute, [{model: 'claude default', provider: 'claude', usage: {input: 100, cache_read: 0, cache_write: 0, output: 10}, tokens: 110, turns: 1}]);
+  // Nothing at all to attribute from, but the row still carries its own provider.
+  const lastResort = modelUsage([{kind: 'usage', from: 'main', provider: 'muse', usage: {input_tokens: 100, output_tokens: 10}}]);
+  assert.deepEqual(lastResort, [{model: 'muse default', provider: 'muse', usage: {input: 100, cache_read: 0, cache_write: 0, output: 10}, tokens: 110, turns: 1}]);
+});
+
+test('modelUsage: real codex main-session usage carries cache_write_input_tokens, and reasoning_output_tokens is never double-counted', () => {
+  const events = [
+    {kind: 'model', from: 'main', model: 'gpt-5-codex', provider: 'codex'},
+    {kind: 'usage', from: 'main', provider: 'codex', usage: {input_tokens: 102543, cached_input_tokens: 85760, cache_write_input_tokens: 5000, output_tokens: 567, reasoning_output_tokens: 22}},
+  ];
+  const [row] = modelUsage(events);
+  assert.deepEqual(row.usage, {input: 102543, cache_read: 85760, cache_write: 5000, output: 567});
+  assert.equal(row.tokens, 102543 + 85760 + 5000 + 567);
+});
+
+test('modelUsage: a route.model of "default" is not a pinned model, so usage lands on "<provider> default"', () => {
+  const events = [
+    {kind: 'route', from: 'main', provider: 'codex', model: 'default'},
+    {kind: 'usage', from: 'main', provider: 'codex', usage: {input_tokens: 10}},
+  ];
+  assert.deepEqual(modelUsage(events), [{model: 'codex default', provider: 'codex', usage: {input: 10, cache_read: 0, cache_write: 0, output: 0}, tokens: 10, turns: 1}]);
+});
+
+test('modelUsage: unusable or empty usage rows are dropped, never crash, never rank ahead of real usage', () => {
+  const events = [
+    {kind: 'model', from: 'main', model: 'claude-opus-5', provider: 'claude'},
+    {kind: 'usage', from: 'main', provider: 'claude', usage: null},
+    {kind: 'usage', from: 'main', provider: 'claude', usage: {}},
+    {kind: 'usage', from: 'main', provider: 'claude', usage: {some_unknown_field: 5}},
+    {kind: 'usage', from: 'main'},
+  ];
+  assert.deepEqual(modelUsage(events), []);
+  assert.deepEqual(modelUsage([]), []);
 });

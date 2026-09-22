@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {Session} from '../src/core.js';
 import {createScheduler} from '../src/scheduler.js';
+import {validateReport} from '../src/reporting.js';
 import {fakeAdapter} from './helpers/fake-adapter.js';
 
 const setup = t => {
@@ -165,6 +166,16 @@ test('S6 depth: grandchild exceeds depth cap of 1', async t => {
   await waitFor(() => scheduler.tasks()[grandchild.task]?.state === 'failed');
 
   assert.equal(scheduler.tasks()[grandchild.task].reason, 'depth');
+});
+
+// The refusal names the field: a worker reads it off `bounce report`'s one line and corrects
+// the next call, rather than going looking for the schema (see reporting.js).
+test('a report missing a required field is refused by field name', () => {
+  assert.equal(validateReport({op: 'milestone', phase: 'inspect', text: 'read the files'}), 'next (required string)');
+  assert.equal(validateReport({op: 'milestone', text: 'x', next: 'y'}), 'phase (required string)');
+  assert.equal(validateReport({op: 'milestone', phase: 'inspect', text: 42, next: 'y'}), 'text (required string)');
+  assert.equal(validateReport({op: 'milestone', phase: 'inspect', text: 'x', next: 'y'}), null);
+  assert.equal(validateReport({op: 'nope', phase: 'inspect', text: 'x', next: 'y'}), 'op');
 });
 
 test('S7 malformed submissions throw and publish nothing', async t => {
