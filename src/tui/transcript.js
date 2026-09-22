@@ -124,7 +124,8 @@ export function conversationEvents(events, {details = false} = {}) {
       const summary = String(event.summary ?? event.text ?? event.reason ?? '').replace(/\s+/g, ' ').trim();
       // An acceptance carries no summary of its own: the block keeps what the worker said.
       const row = {...event, kind: 'task.fold', profile, state, model, started, preview: summary || previous?.preview || '',
-        text: [profile, state, model, duration].filter(Boolean).join(' · ')};
+        text: [profile, state, model, duration, state === 'running' && (event.phase ?? previous?.phase) ? `phase: ${event.phase ?? previous.phase}` : null].filter(Boolean).join(' · '),
+        phase: event.phase ?? previous?.phase};
       // Keep the latest update in chronological position, rather than repeated lifecycle dumps.
       if (previous) rows[previous.index] = null;
       row.index = rows.length;

@@ -13,6 +13,10 @@ import {execFileSync} from 'node:child_process';
 const FALLBACK_REASONS = new Set(['limited', 'missing', 'backend_unavailable', 'watchdog', 'local_unavailable', 'worker_runtime', 'incomplete_report']);
 const RISKS = new Set(['boundary', 'process-model', 'logic', 'extraction']);
 const SIZE_FIELDS = ['lines', 'probes', 'minutes'];
+// Silence is five minutes, not two: at two the alarm fired on every test run and corrected itself
+// five seconds later (observed live, four times in one task), which only teaches you to ignore it.
+// No MILESTONE for ten minutes is still a stall, whatever the worker prints.
+export const WATCHDOG_DEFAULTS = {interval: 5000, silence: 300_000, stall: 600_000, grace: 120_000};
 const DEFAULT_DEADLINE_MINUTES = 60; // a worker with no declared deadline; the watchdog ladder still catches silence
 const TIERS = new Set(['live', 'next-turn', 'queued']);
 // The depends_on hold/fail decision (which dependency states fail a dependent outright vs.
@@ -62,7 +66,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // real orchestrations (a 400-line brief) with no way to see why — a shallow rule, removed.
   const limits = {rounds: 2, ...suppliedLimits};
   if (!isPositiveInt(limits.rounds) || SIZE_FIELDS.some(field => limits[field] !== undefined && !isPositiveInt(limits[field]))) throw new Error('malformed: limits');
-  const watchdogConfig = {interval: 5000, silence: 120000, stall: 600000, grace: 120000, ...suppliedWatchdog};
+  const watchdogConfig = {...WATCHDOG_DEFAULTS, ...suppliedWatchdog};
   const intervalOk = watchdogConfig.interval === null || isPositiveInt(watchdogConfig.interval);
   if (!intervalOk || !isPositiveInt(watchdogConfig.silence) || !isPositiveInt(watchdogConfig.stall) || !isPositiveInt(watchdogConfig.grace)) throw new Error('malformed: watchdog');
   const handles = new Map(); // task -> {adapter, handle}
@@ -298,6 +302,15 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return view[id]?.replaces && view[view[id].replaces] ? lineageRootOf(view[id].replaces, view, seen) : id;
   };
   const lineageProfiles = (rootId, view) => Object.keys(view).filter(id => lineageRootOf(id, view) === rootId).map(id => view[id].profile);
+
+  // Why a worker could not be started — launched or resumed — as the reason the fallback walk reads.
+  // A local model that cannot be resolved, a missing or unanswering vendor process, and a vendor
+  // that refuses because the account is exhausted (codex-live tags that `limited`; its own text,
+  // the reset time, rides along) all move the task to its next AI; anything else is an `error`.
+  const startFailure = error => error.code?.startsWith('LOCAL_') ? {reason: 'local_unavailable', text: error.message}
+    : error.code === 'missing' || error.code === 'backend_unavailable' ? {reason: error.code, ...(error.message && error.message !== error.code ? {text: error.message} : {})}
+    : error.code === 'limited' ? {reason: 'limited', text: error.message}
+    : {reason: 'error', text: error.message};
 
   function maybeFallback(row) {
     if (!FALLBACK_REASONS.has(row.reason)) return;
@@ -564,13 +577,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         append({kind: verified ? 'task.cancelled' : 'task.blocked', task, reason: verified ? cancelled : 'termination_unverified', text: verified ? 'Pending launch cancelled' : 'termination unverified after cancelled launch', from: workerFrom(task), context});
         return;
       }
-      if (error.code?.startsWith('LOCAL_')) append({kind: 'task.failed', task, reason: 'local_unavailable', text: error.message, from: workerFrom(task), context});
-      else if (error.code === 'missing' || error.code === 'backend_unavailable') append({kind: 'task.failed', task, reason: error.code, from: workerFrom(task), context});
-      // A vendor that refuses the launch itself because the account is exhausted (codex-live tags
-      // the rejection `limited`) falls back exactly like a limited result would; the vendor's
-      // own text (its reset time) rides along for the orchestrator.
-      else if (error.code === 'limited') append({kind: 'task.failed', task, reason: 'limited', text: error.message, from: workerFrom(task), context});
-      else append({kind: 'task.failed', task, reason: 'error', text: error.message, from: workerFrom(task), context});
+      append({kind: 'task.failed', task, ...startFailure(error), from: workerFrom(task), context});
       return;
     }
     // The task may have been cancelled (or otherwise gone terminal) while launch() was
@@ -641,7 +648,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         append({kind: verified ? 'task.cancelled' : 'task.blocked', task, reason: verified ? cancelled : 'termination_unverified', text: verified ? 'Pending resume cancelled' : 'termination unverified after cancelled resume', from: workerFrom(task), context});
         return;
       }
-      append({kind: 'task.failed', task, reason: reportOnly ? 'incomplete_report' : 'error', text: error.message, from: workerFrom(task), context});
+      // A worker that cannot be RESUMED is classified exactly as one that cannot be launched, so the
+      // task's next AI is tried. It used to be a bare `error`, which no fallback follows (found live:
+      // a codex thread/resume timed out after a Jev rework and the session stopped).
+      append({kind: 'task.failed', task, ...(reportOnly ? {reason: 'incomplete_report', text: error.message} : startFailure(error)), from: workerFrom(task), context});
       return;
     }
     // A resume that resolves is deemed to have delivered every message it folded in: journal
@@ -964,6 +974,14 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       append({kind: 'task.failed', task, reason: 'size', text: `${oversizedField} ${size[oversizedField]} exceeds limit ${limits[oversizedField]}`, context});
       return;
     }
+    // The cap on how long ONE task may be given. A declared size is the orchestrator's own estimate;
+    // the deadline is what it actually grants, so that is what is held to the cap. Found live: one
+    // worker given 40 minutes for "finish P2", never reviewed on the way, nothing accepted at the end.
+    // The refusal says how to split, because a bare refusal was the flaw of the old size defaults.
+    if (limits.minutes !== undefined && Number.isFinite(row.deadline) && row.deadline > limits.minutes * 60000) {
+      append({kind: 'task.failed', task, reason: 'size', text: `a ${Math.ceil(row.deadline / 60000)}-minute task exceeds the ${limits.minutes}-minute cap: split it into phases in sequence (depends_on), each phase made of chunks that run in parallel on disjoint paths, none longer than ${limits.minutes} minutes`, context});
+      return;
+    }
     const view = reducers.tasks(session.events);
     // Cycle-guarded: only a directly-journaled row (never submit(), which requires a
     // pre-existing parent) can make a task its own ancestor.
@@ -1280,7 +1298,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // task as its own failure — never disappear, leaving the task queued forever.
       dispatch(row).catch(error => append({kind: 'task.failed', task: row.task, reason: 'error', text: error.message, context: row.context}));
     }
-    else if (row.kind === 'task.completed') {
+    if (row.kind === 'task.completed') {
       // STRATEGY (CONTRACT.md §2 onCompleted): a second (and later) task.completed on the same
       // task re-enters review exactly the same way — the hook and runCompletionReview both
       // read state fresh off the log every time.

@@ -1,6 +1,6 @@
 import {clean, createFormatter, paneGrid} from '../format.js';
 import {promptLayout} from './prompt-layout.js';
-import {agentRow, glyph, quietFor, rowColor, shortModel} from './status.js';
+import {agentRow, glyph, progressRow, quietFor, rowColor, shortModel} from './status.js';
 
 // The status rail is on unless switched off (`/sidebar off`), and even then only fits a terminal
 // wide enough to leave a readable conversation beside it.
@@ -55,7 +55,7 @@ export function createWorkspace(React, Ink) {
       {text: `AGENTS · ${panes.length + 1}`, color: 'cyan', bold: true},
       // Each row moves while that worker works, names its model, and says how long it has been quiet.
       {text: agentRow({profile: metadata.orchestrator ?? 'main', state: status, model: main.model, startedAt: main.startedAt}, now), color: rowColor({state: status}, now)},
-      ...panes.map(pane => ({text: agentRow(pane, now), color: rowColor(pane, now)})),
+      ...panes.flatMap(pane => [{text: agentRow(pane, now), color: rowColor(pane, now)}, ...(progressRow(pane, now) ? [{text: progressRow(pane, now), color: 'gray'}] : [])]),
     ];
     return React.createElement(Box, {
       width: 32, height, flexShrink: 0, borderStyle: 'single', borderLeft: true,

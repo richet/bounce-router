@@ -548,7 +548,9 @@ test('O2 orchestrator single-provider: the orchestrator submits over the bridge,
   // sentence, and the synthetic reviewer is neither a submit target nor the example's profile.
   assert.equal(orders.includes('auto →'), false);
   assert.equal(/jev/i.test(orders), false);
-  assert.equal(orders.includes('"profile":"build"'), true);
+  // the example submits to a JOB (the first agent), never to a cloud profile by name
+  assert.equal(orders.includes('"profile":"analyst"'), true);
+  assert.match(orders, /^Who to submit to — the job, not the AI:$/m);
   // The team block: where the roster comes from, which AIs exist here, and how to change it —
   // the orchestrator specialises the shipped defaults through the bridge, never by hand.
   assert.match(orders, /^Team: analyst, builder, integrator, reviewer ← skill agent-orchestrator$/m);
@@ -734,6 +736,6 @@ test('O-jev orchestrator with Jev review on: the root task is Jev-reviewed befor
   assert.equal(orders.includes('jev →'), false, 'the synthetic reviewer is not a roster entry');
   assert.match(orders, /auto → Jev routing is off \(\/jev routing on\): resolves to build/);
   assert.match(orders, /Jev completion verdicts are on/);
-  assert.equal(orders.includes('"profile":"build"'), true, 'the example never names the synthetic reviewer');
+  assert.equal(orders.includes('"profile":"analyst"'), true, 'the example names a job, never the synthetic reviewer');
   assert.equal('head' in session.events.find(e => e.kind === 'task.started'), true, 'the Jev-reviewed task records its diff base');
 });

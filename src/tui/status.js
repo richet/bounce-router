@@ -42,6 +42,19 @@ export function agentRow(pane, now = Date.now(), width = 30) {
   return [head, shown, tail].filter(Boolean).join(' ');
 }
 
+// Under a working agent's row: the phase it last reported and how long ago that milestone was. A
+// spinner and a quiet time cannot tell steady progress from spinning; this can. Found live: seven
+// milestones in forty minutes ("baseline 66 passed / 1 failed", "two seams green") and the rail
+// showed none of them.
+export function progressRow(pane, now = Date.now(), width = 30) {
+  if (!isWorking(pane.state)) return '';
+  if (!pane.phase) return '  └ no milestone yet';
+  const tail = quietFor(pane.updatedAt, now);
+  const room = width - 4 - (tail ? [...tail].length + 3 : 0);
+  const phase = [...String(pane.phase)].length <= room ? String(pane.phase) : `${[...String(pane.phase)].slice(0, Math.max(1, room - 1)).join('')}…`;
+  return `  └ ${phase}${tail ? ` · ${tail}` : ''}`;
+}
+
 // The colour of a row. A worker that is "working" but has said nothing for two minutes is the one
 // to look at: that, not the word running, is what a stall looks like.
 export const STALL_MS = 120_000;

@@ -240,6 +240,12 @@ bounce report --report '{"op":"milestone","phase":"test","text":"…","next":"�
 
 A grant can publish only what its role allows: the orchestrator submits tasks and messages, a worker reports on its own task, and `control.*` rows belong to the user peer alone.
 
+### Big work is broken down
+
+However large the request, the orchestrator does not hand one worker the whole job. Its standing orders tell it to plan **phases in sequence, each made of chunks that run in parallel** where their owned paths are disjoint, to chain phases with `depends_on`, and to review each phase before the next starts. The scheduler holds it to that: no task may be given more than `taskMinutes` (config.json, default 15, 1–240). A deadline over the cap is refused before anything runs (`task.failed`, reason `size`), and the refusal says how to split. A task with no deadline gets the cap as its deadline.
+
+While a worker runs, the status rail shows under its row the phase it last reported and how long ago that milestone was, and its block in the conversation names the phase. The stall alarm treats five minutes without any output as silence and ten minutes without a milestone as a stall; at two minutes it used to fire on every test run.
+
 ## Agents and local models
 
 The orchestrator can submit work to two kinds of target. A **profile** is one AI (the shipped roster above, routed by tier and capabilities when `profile: "auto"` is on — see Jev below). An **agent** is a job — one markdown file: frontmatter for what bounce routes on, the body as the worker's system prompt.

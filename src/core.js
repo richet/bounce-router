@@ -93,6 +93,7 @@ export function config(root = dataRoot()) {
   if (!Array.isArray(value.order) || !value.order.length || value.order.some(p => !providers[p]) || new Set(value.order).size !== value.order.length) throw new Error('config.order must be a unique, nonempty list of claude, codex, muse');
   if (!['yolo', 'plan'].includes(value.mode)) throw new Error('config.mode must be yolo or plan');
   if (typeof value.sidebar !== 'boolean') throw new Error('config.sidebar must be true or false');
+  if (value.taskMinutes !== undefined && (!Number.isInteger(value.taskMinutes) || value.taskMinutes < 1 || value.taskMinutes > 240)) throw new Error('taskMinutes must be a whole number of minutes from 1 to 240');
   if (!Number.isFinite(value.contextChars) || value.contextChars < 4000 || value.contextChars > 200000) throw new Error('contextChars must be between 4000 and 200000');
   if (!Number.isFinite(value.cooldownMinutes) || value.cooldownMinutes < 0) throw new Error('Invalid cooldownMinutes');
   // A partial skills block keeps the defaults for the fields it leaves out.
