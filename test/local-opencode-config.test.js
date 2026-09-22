@@ -134,3 +134,15 @@ test('a config that cannot be generated fails before any process is started', as
   assert.match(status.config.reason, /model id is required/);
   assert.equal(launched, 0, 'nothing is spawned when the config itself is invalid');
 });
+
+// LM Studio loads these MLX models at their full 262k context whatever the CLI asks for, and a worker
+// that fills that in one turn is the memory that swapped the machine. `contextTokens` on the endpoint
+// is the limit OpenCode is told: it compacts the conversation at that size instead of growing past it.
+test('contextTokens on the endpoint becomes the model\'s context limit for OpenCode; absent, no limit is written', () => {
+  const capped = normalizeLocalSettings({endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234', contextTokens: 131072}}});
+  assert.equal(capped.endpoints.lmstudio.contextTokens, 131072);
+  const result = opencodeProviderConfig({settings: capped, model: 'm'});
+  assert.deepEqual(result.config.provider.lmstudio.models.m, {name: 'm', limit: {context: 131072, output: 32768}});
+  assert.deepEqual(opencodeProviderConfig({settings: normalizeLocalSettings(), model: 'm'}).config.provider.lmstudio.models.m, {name: 'm'});
+  for (const bad of [0, -1, 1.5, '131072', 500]) assert.throws(() => normalizeLocalSettings({endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234', contextTokens: bad}}}), /contextTokens must be a whole number of tokens, at least 4096/);
+});

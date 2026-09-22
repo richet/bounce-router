@@ -22,7 +22,7 @@ const isLoopback = url => ['127.0.0.1', '::1', '[::1]', 'localhost'].includes(ur
 
 function endpointConfig(id, input) {
   if (!endpointIdPattern.test(id) || !isObject(input)) throw error(`Invalid local endpoint ${id}`);
-  const fields = new Set(['backend', 'url', 'apiKeyEnv', 'trusted', 'loadPolicy', 'maxConcurrent']);
+  const fields = new Set(['backend', 'url', 'apiKeyEnv', 'trusted', 'loadPolicy', 'maxConcurrent', 'contextTokens']);
   if (Object.keys(input).some(field => !fields.has(field))) throw error(`Endpoint ${id} has unsupported settings`);
   if (input.backend !== 'lmstudio') throw error(`Endpoint ${id} must use backend lmstudio`);
   if (Object.hasOwn(input, 'apiKey')) throw error(`Endpoint ${id} must use apiKeyEnv, not apiKey`);
@@ -33,9 +33,13 @@ function endpointConfig(id, input) {
   if (input.trusted !== undefined && typeof input.trusted !== 'boolean') throw error(`Endpoint ${id} trusted must be boolean`);
   if (input.loadPolicy !== undefined && !['loaded-only', 'on-demand'].includes(input.loadPolicy)) throw error(`Endpoint ${id} has an invalid loadPolicy`);
   if (input.maxConcurrent !== undefined && (!Number.isInteger(input.maxConcurrent) || input.maxConcurrent < 1)) throw error(`Endpoint ${id} maxConcurrent must be a positive integer`);
+  // The context OpenCode is told a model has: it compacts the conversation at that size instead of
+  // growing to whatever LM Studio loaded (262k on these MLX builds, whatever the CLI asked for).
+  if (input.contextTokens !== undefined && (!Number.isInteger(input.contextTokens) || input.contextTokens < 4096)) throw error(`Endpoint ${id} contextTokens must be a whole number of tokens, at least 4096`);
   const normalized = {backend: 'lmstudio', url: parsed.href.replace(/\/$/, ''), loadPolicy: input.loadPolicy ?? DEFAULT_ENDPOINT.loadPolicy, maxConcurrent: input.maxConcurrent ?? DEFAULT_ENDPOINT.maxConcurrent};
   if (input.apiKeyEnv) normalized.apiKeyEnv = input.apiKeyEnv;
   if (input.trusted) normalized.trusted = true;
+  if (input.contextTokens !== undefined) normalized.contextTokens = input.contextTokens;
   return normalized;
 }
 

@@ -25,7 +25,7 @@ export function opencodeProviderConfig({settings, endpoint = 'lmstudio', model, 
         npm: '@ai-sdk/openai-compatible',
         name: providerID,
         options,
-        models: {[model]: {name: model}},
+        models: {[model]: {name: model, ...(entry.contextTokens ? {limit: {context: entry.contextTokens, output: Math.min(32768, Math.floor(entry.contextTokens / 4))}} : {})}},
       },
     },
   };
