@@ -281,3 +281,14 @@ test('any worker may reach a path outside the project folder, as a cloud worker 
   assert.deepEqual(logged('CONFIG').permission, {external_directory: 'allow'});
   assert.equal(logged('CONFIG').agent['bounce-worker'].tools.write, false, 'a plan session still changes nothing');
 });
+
+// Observed live: a worker said "I'll execute this task systematically…", did tool work for six
+// minutes, went silent, and that opening sentence became the task's completion (Jev caught it via
+// empty_diff, one wasted round). Text before tool work is not an answer to the orders.
+test('text the worker said BEFORE its tool work is not its answer: a turn that ends with tool calls and no text after them has no answer', async t => {
+  const {cwd, dir} = setup(t, {FAKE_OC_SCENARIO: 'opener-then-silence'});
+  const adapter = createOpencodeLive({});
+  const events = await drain(adapter, await adapter.launch({peer: 'worker:o', profile: profileFor({policy: 'read-only'}), cwd, dir, orders: 'do it'}));
+  assert.deepEqual(events.at(-1), {kind: 'result', status: 'failed', recoverable: true, text: 'no answer: the worker said nothing after its last tool call'});
+  assert.equal(events.some(e => e.kind === 'assistant' && e.text.startsWith('I will execute')), true, 'the opener is still shown');
+});

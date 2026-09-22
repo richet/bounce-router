@@ -62,6 +62,18 @@ process.stdin.on('end', () => {
     emit('step_finish', {type: 'step-finish', reason: 'stop', tokens: usage});
     return process.exit(0);
   }
+  // FAKE_OC_SCENARIO=opener-then-silence: says one sentence, does tool work, then the turn ends with
+  // no text after the last tool call — the shape of a worker that went quiet (observed live: that
+  // opener became the task's completion).
+  if (scenario === 'opener-then-silence') {
+    emit('text', {type: 'text', text: 'I will execute this task systematically. Let me start by reading the owned files.'});
+    emit('tool_use', {type: 'tool', tool: 'read', state: {status: 'completed', input: {filePath: 'a.js'}, output: 'x'}});
+    emit('step_finish', {type: 'step-finish', reason: 'tool-calls', tokens: usage});
+    emit('step_start', {type: 'step-start'});
+    emit('tool_use', {type: 'tool', tool: 'read', state: {status: 'completed', input: {filePath: 'b.js'}, output: 'y'}});
+    emit('step_finish', {type: 'step-finish', reason: 'stop', tokens: usage});
+    return process.exit(0);
+  }
   if (scenario === 'loop-unread') { setInterval(() => emit('tool_use', {type: 'tool', tool: 'glob', state: {status: 'completed', input: {pattern: '*.js'}, output: 'No files found'}}), 20); return; }
   if (scenario === 'loop') { emit('tool_use', {type: 'tool', tool: 'read', state: {status: 'completed', input: {filePath: 'CHANGE.diff'}, output: 'diff'}}); setInterval(() => emit('tool_use', {type: 'tool', tool: 'read', state: {status: 'completed', input: {filePath: 'src/a.js'}, output: 'x'}}), 20); return; }
   setTimeout(() => {
@@ -77,7 +89,8 @@ process.stdin.on('end', () => {
     }
     if (scenario === 'denied') emit('tool_use', {type: 'tool', tool: 'read', state: {status: 'error', input: {filePath: '/etc/hosts'}, error: 'The user rejected permission to use this specific tool call.'}});
     else emit('tool_use', {type: 'tool', tool: 'read', state: {status: 'completed', input: {filePath: 'note.txt'}, output: 'ok'}});
-    if (scenario !== 'notext') emit('text', {type: 'text', text: `echo: ${prompt}`});
+    // The echo is the ORDERS line only: bounce appends a report line to a local worker's prompt.
+    if (scenario !== 'notext') emit('text', {type: 'text', text: `echo: ${prompt.split('\n\n')[0]}`});
     // Observed live (qwen3-coder-30b): the whole report, then one more step whose only text is a
     // stray closing code fence.
     if (scenario === 'fence') { emit('step_finish', {type: 'step-finish', reason: 'tool-calls', tokens: usage}); emit('step_start', {type: 'step-start'}); emit('text', {type: 'text', text: '```'}); }

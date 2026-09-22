@@ -9,6 +9,7 @@ import {reportEvent, validateReport} from './reporting.js';
 import {normalizeLocalSettings} from './local-models.js';
 import {createLocalResolver} from './local-resolve.js';
 import {routingFallback} from './jev.js';
+import {validOwns, treeSnapshot, revertOutside} from './owned-paths.js';
 import {execFileSync} from 'node:child_process';
 
 const FALLBACK_REASONS = new Set(['limited', 'missing', 'backend_unavailable', 'watchdog', 'local_unavailable', 'worker_runtime', 'incomplete_report']);
@@ -213,6 +214,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (spec.budget?.rounds !== undefined && !isNonNegativeInt(spec.budget.rounds)) return 'budget';
     if (spec.checkpoint != null && typeof spec.checkpoint !== 'object') return 'checkpoint';
     if (spec.risk !== undefined && !RISKS.has(spec.risk)) return 'risk';
+    if (spec.owns !== undefined && !validOwns(spec.owns)) return 'owns';
     if (spec.size !== undefined && SIZE_FIELDS.some(field => !isNonNegativeInt(spec.size[field]))) return 'size';
     if (spec.depends_on !== undefined) {
       if (!Array.isArray(spec.depends_on)) return 'depends_on';
@@ -282,6 +284,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       depends_on: spec.depends_on ?? [],
       review: spec.review ?? null,
       steps: spec.steps ?? null,
+      ...(spec.owns ? {owns: spec.owns} : {}),
     });
   }
 
@@ -322,6 +325,14 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     : error.code === 'missing' || error.code === 'backend_unavailable' ? {reason: error.code, ...(error.message && error.message !== error.code ? {text: error.message} : {})}
     : error.code === 'limited' ? {reason: 'limited', text: error.message}
     : {reason: 'error', text: error.message};
+
+  // A write worker under a task that declares `owns` gets the tree snapshotted before its turn, so
+  // what it changed outside those paths can be put back afterwards (src/owned-paths.js).
+  function ownedSnapshot(task, profile) {
+    const owns = submittedRow(task)?.owns;
+    if (!Array.isArray(owns) || !owns.length || effectivePolicy(profile) === 'read-only' || !session.cwd) return null;
+    try { return {owns, before: treeSnapshot(session.cwd)}; } catch { return null; }
+  }
 
   function maybeFallback(row) {
     if (!FALLBACK_REASONS.has(row.reason)) return;
@@ -461,7 +472,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // journaling the worker's raw lines with its provider lets recordQuota see them exactly as
   // it sees the main provider's. Shared by the initial launch and by a rework resume — a
   // review's own event consumption (runReview) is a narrower variant of the same switch.
-  async function consumeWorkerEvents({adapter, handle, task, context, profile}) {
+  async function consumeWorkerEvents({adapter, handle, task, context, profile, owned = null}) {
     const from = workerFrom(task);
     let observedAt = -Infinity;
     try {
@@ -493,6 +504,13 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
               return;
             }
             if (handles.get(task)?.handle !== handle || reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) return;
+            // The task's owned paths are a contract, not a request: every change the turn made outside
+            // them is put back now, before any completion is journaled, so a review sees the tree the
+            // task was allowed to produce. Found live: a worker edited a forbidden file and said done.
+            if (owned) {
+              const reverted = revertOutside(session.cwd, owned.before, owned.owns);
+              if (reverted.length) append({kind: 'task.reverted', task, files: reverted, text: `Reverted ${reverted.length} change${reverted.length === 1 ? '' : 's'} outside the owned paths: ${reverted.join(', ')}`, from, context});
+            }
             if (requireFinalReport) append({kind: 'task.attempt.ended', task, attempt: reducers.tasks(session.events)[task]?.attempt, from, context});
             if (event.status === 'completed' && requireFinalReport) {
               const state = reducers.tasks(session.events)[task]?.state;
@@ -566,7 +584,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     let profile = reportEnv ? {...baseProfile, report: reportEnv} : baseProfile;
     let adapter = adapters[profile.adapter];
     let admission;
-    let handle;
+    let handle, owned = null;
     try {
       if (LOCAL_ADAPTERS.has(profile.adapter) && profile.backend === 'lmstudio') {
         admission = await admitLocal(profile, task, attempt, context);
@@ -614,7 +632,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     for (const staged of launchingAttempts.get(task)?.reports ?? []) report({task, attempt, report: staged.payload, from: staged.from, context: staged.context});
     launchingAttempts.delete(task);
     publish({kind: 'task.activity', task, text: 'Worker started · waiting for first activity', startup: true, from: workerFrom(task), context});
-    await consumeWorkerEvents({adapter, handle, task, context, profile});
+    await consumeWorkerEvents({adapter, handle, task, context, profile, owned});
   }
 
   // Rework, on the same worker: resume() carries the review's findings plus every message
@@ -697,7 +715,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         ? {kind: 'task.failed', task, reason: 'incomplete_report', text: 'Final report request timed out', context}
         : {kind: 'task.blocked', task, text: 'termination unverified', context});
     }, Math.max(1, Math.min(10000, (deadlineAtFor(task) ?? (clock() + 10000)) - clock()))) : null;
-    try { await consumeWorkerEvents({adapter, handle, task, context, profile}); }
+    try { await consumeWorkerEvents({adapter, handle, task, context, profile, owned}); }
     finally { clearTimeout(reportTimer); }
   }
 
@@ -712,7 +730,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     let adapter = adapters[profile.adapter];
     let admission;
     const launchState = {task, pending: true};
-    let handle;
+    let handle, owned = null;
     try {
       if (LOCAL_ADAPTERS.has(profile.adapter) && profile.backend === 'lmstudio') {
         reviews.set(peer, launchState);

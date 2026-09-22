@@ -125,7 +125,7 @@ export function createOpencodeLive({kill = process.kill, spawn} = {}) {
     async *events(handle) {
       let announced = false, lastText = null, lastError = null, tail = '', refused = null;
       const repeats = new Map();
-      let stepActed = false, emptySteps = 0, concluded = false, reads = 0, stalled = false;
+      let stepActed = false, emptySteps = 0, concluded = false, reads = 0, stalled = false, textAfterTools = false;
       const plain = text => String(text).replace(/\x1b\[[0-9;]*m/g, '').replace(/^[!\s]+/, '').trim();
       for await (const event of handle.live.events) {
         if (event.kind === 'diagnostic') {
@@ -150,6 +150,7 @@ export function createOpencodeLive({kill = process.kill, spawn} = {}) {
             if (answer !== null) { yield {kind: 'diagnostic', text: 'the conclusion turn answered: that answer is the result'}; yield {kind: 'result', status: 'completed', text: answer}; return; }
             yield {kind: 'diagnostic', text: 'the conclusion turn gave no answer'};
           }
+          if ((event.code === 0 || concluded) && lastText !== null && !lastError && !textAfterTools) lastError = 'no answer: the worker said nothing after its last tool call';
           if ((event.code === 0 || concluded) && lastText !== null && !lastError) yield {kind: 'result', status: 'completed', text: lastText};
           else yield {kind: 'result', status: 'failed', recoverable: true,
             text: lastError ?? (event.code === 0 ? (refused ? `opencode stopped the turn: ${refused}` : 'opencode finished without an answer') : `opencode exited ${event.signal ?? event.code}: ${tail.trim().split('\n').at(-1) ?? ''}`.trim())};
@@ -166,11 +167,15 @@ export function createOpencodeLive({kill = process.kill, spawn} = {}) {
           // The answer is the last text that SAYS something. Observed live: a model wrote its whole
           // report and then one more step holding only a closing code fence, and that fence became
           // the task's result. Text with no letter or digit is shown, never taken as the answer.
-          if (part.text.trim()) { const said = part.text.trim(); if (/[\p{L}\p{N}]/u.test(said)) lastText = said; stepActed = true; yield {kind: 'assistant', text: said}; }
+          if (part.text.trim()) { const said = part.text.trim(); if (/[\p{L}\p{N}]/u.test(said)) { lastText = said; textAfterTools = true; } stepActed = true; yield {kind: 'assistant', text: said}; }
         } else if (raw.type === 'tool_use') {
           const status = part.state?.status ?? '';
           stepActed = true;
           yield {kind: 'activity', text: `${part.tool ?? 'tool'} ${status}`.trim()};
+          // An answer is text said AFTER the worker's last tool call. Observed live: a worker's opening
+          // sentence ("I'll execute this systematically…"), six silent minutes of tool work, then the turn
+          // ended — and that opener became the task's completion. It was a plan, not an answer.
+          if (status === 'completed' || status === 'error') textAfterTools = false;
           if (status === 'completed' && READS.has(part.tool)) reads++;
           if (status === 'completed' && CHANGES.has(part.tool)) repeats.clear(); // the world changed: re-reading is legitimate
           else if (status === 'completed' || status === 'error') {
