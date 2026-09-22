@@ -47,11 +47,24 @@ test('the orders say who to submit to: the job first, auto next, a named AI only
 // Found live (ACE session): the orchestrator dispatched an analyst, then spent 19 tool calls of its own
 // answering the same question and wrote the next task from its own findings; the analyst's whole
 // 15-minute slot was wasted.
-test('the orders tell the orchestrator to wait on what it dispatched instead of doing it itself', () => {
+test('the orders tell the orchestrator to hand off what it dispatched instead of doing it itself', () => {
   const text = choosingOrders({agents: true, routingOn: true, localOn: true}).join('\n');
-  assert.equal(text.includes('Once you have dispatched a task, wait for it'), true);
+  assert.equal(text.includes('Once you have dispatched a task, end your turn'), true);
   assert.equal(text.includes('do not investigate the same question yourself'), true);
   assert.equal(text.includes('cancel the task first'), true);
+});
+
+// Found live (ACE session): the orchestrator spent 1560 s of a 2115 s turn inside seven `bounce wait`
+// calls — a 35-minute turn held open, its whole context live, doing nothing bounce would not have
+// done for it with a handoff. And a /btw delivered into that turn was read only when the wait returned.
+test('the orders make ending the turn the rule after dispatch, and a wait short and for a dependent step only', () => {
+  const choosing = choosingOrders({agents: true, routingOn: true, localOn: true}).join('\n');
+  assert.equal(choosing.includes('Do not hold your turn open in `bounce wait` while workers run'), true);
+  assert.equal(choosing.includes('bounce wakes you with each outcome'), true);
+  const text = fs.readFileSync(new URL('../src/reload.js', import.meta.url), 'utf8');
+  assert.equal(text.includes('`bounce wait` is for a short wait only, at most 120 seconds'), true);
+  assert.equal(text.includes('--timeout 120'), true);
+  assert.equal(text.includes('[bounce:wait.interrupted]'), true);
 });
 
 // Found live: an analyst ran out of its ten-minute deadline; the orders said a deadline means stop
