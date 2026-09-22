@@ -133,12 +133,17 @@ export function choosingOrders({agents = false, routingOn = false, localOn = fal
 }
 
 // The breakdown the orchestrator is held to, in its standing orders.
-export const breakdownOrders = minutes => [
+export const breakdownOrders = (minutes, {jevOn = false} = {}) => [
   'Break big work down: phases in sequence, each phase made of chunks that run in parallel.',
   `No task may be given more than ${minutes} minutes: a deadline over that is refused (task.failed, reason size) before anything runs.`,
   'However large the request, never hand one worker the whole job. Plan the phases first; within a phase submit every chunk whose',
   'owned paths are disjoint at once, so they run in parallel; give a task that needs another\'s result depends_on with its task id, so',
   'phases run in sequence without you polling. Each chunk gets disjoint owned paths, its own acceptance and how to verify it.',
+  'Before dispatching a phase, submit its plan and read the answer:',
+  `    bounce publish --event '{"kind":"plan.submitted","phase":"<phase name>","chunks":[{"id":"<short id>","profile":"<agent>","orders":"<goal, acceptance, how to verify>","owns":["<path or glob>"],"depends_on":["<chunk id>"],"deadline":${minutes * 60000}}]}'`,
+  `${jevOn ? 'Jev judges each chunk — phase-sized, no acceptance, overlapping paths, hidden dependency — and bounce' : 'bounce checks each chunk for overlapping owned paths and a deadline over the cap, and'} answers with plan.accepted`,
+  'or plan.rejected (findings per chunk, with the fix). Fix a rejected plan and submit it again; submit the chunks of an accepted one',
+  'with the same `owns` and `depends_on`.',
   'Review each phase before the next one starts: read what the chunks produced, integrate, run the gate, then submit the next',
   'phase. A chunk that runs out of time is reported as is — split what is left; do not extend it.', ''];
 
@@ -239,7 +244,7 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     'with reason `user`, or task.rejected mean stop and report that reason to the user. A refusal is such a task.failed row — read it before retrying.',
     'Terminal rows: task.completed, task.failed, task.cancelled, task.rejected. Steer a running worker with',
     `    bounce publish --event '{"kind":"message","to":"worker:<task id>","text":"..."}'`, '',
-    ...breakdownOrders(taskLimits(settings).minutes),
+    ...breakdownOrders(taskLimits(settings).minutes, {jevOn: Boolean(jev?.enabled)}),
     'Progress is a durable contract, not a heartbeat. Publish task.milestone with task, phase, text, next, and evidence',
     'after initial inspection, every phase change, and before completion. Phases: inspect, plan, implement, test,',
     'verify, review, document, done. `text` says what changed, `next` says what happens next, and `evidence` names',

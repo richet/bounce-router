@@ -56,6 +56,11 @@ test('the orders tell the orchestrator to wait on what it dispatched instead of 
 
 // Found live: an analyst ran out of its ten-minute deadline; the orders said a deadline means stop
 // and report, and the orchestrator ended the whole run over it, with the builder's work done.
+test('the orders tell the orchestrator to submit a plan before a phase and how bounce answers', () => {
+  const text = fs.readFileSync(new URL('../src/reload.js', import.meta.url), 'utf8');
+  for (const part of ['Before dispatching a phase, submit its plan', '"kind":"plan.submitted"', 'plan.accepted', 'plan.rejected', 'Fix a rejected plan and submit it again']) assert.equal(text.includes(part), true, part);
+});
+
 test('the orders say a deadline is a task to resubmit smaller, not a reason to stop the run', () => {
   const text = fs.readFileSync(new URL('../src/reload.js', import.meta.url), 'utf8');
   assert.equal(text.includes('it is not a reason to stop the run'), true);

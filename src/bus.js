@@ -9,7 +9,7 @@ import crypto from 'node:crypto';
 
 // Peers publish from a positive allowlist: everything a session, the scheduler or the daemon writes is refused regardless of `from`,
 // because handoff() folds user/note rows into every later prompt and Router reads cooldown rows.
-const PEER_KINDS = new Set(['task.submitted', 'task.milestone', 'task.blocked', 'task.input_required', 'task.usage', 'task.activity', 'message', 'task.accepted', 'agents.defined']);
+const PEER_KINDS = new Set(['plan.submitted', 'task.submitted', 'task.milestone', 'task.blocked', 'task.input_required', 'task.usage', 'task.activity', 'message', 'task.accepted', 'agents.defined']);
 const USER_ONLY_PREFIX = 'control.';
 // The scheduler alone owns task lifecycle transitions; a peer may report progress
 // (milestone/blocked/input_required/usage/activity), ask for work (submitted) or
@@ -196,6 +196,10 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         // The scheduler may decorate a valid submission before it is journaled (a Jev completion
         // reviewer for a root task that names none); the decorated row is what everyone reads.
         if (typeof prepare === 'function') e = prepare(e);
+      } else if (e.kind === 'plan.submitted') {
+        // A phase's breakdown, judged by Jev before any of its chunks run (scheduler: plan.accepted/plan.rejected).
+        if (!Array.isArray(e.chunks) || !e.chunks.length || e.chunks.some(c => !c || typeof c !== 'object' || typeof c.id !== 'string' || !c.id || typeof c.orders !== 'string' || !c.orders)) return refuse(id, -32602, 'invalid event: plan.submitted needs chunks, each with an id and orders');
+        if (typeof e.plan !== 'string' || !e.plan) e.plan = crypto.randomUUID();
       } else if (e.kind.startsWith('task.')) {
         // A task.* row without its task is a malformed event, not an authority failure: say so
         // (observed live: an orchestrator publishing a task.milestone with no `task` got a bare

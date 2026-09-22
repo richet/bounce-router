@@ -1356,6 +1356,18 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   const TERMINAL_ROW_KINDS = new Set(['task.completed', 'task.failed', 'task.cancelled', 'task.deadline', 'task.rejected', 'task.accepted']);
   const unsubscribe = session.subscribe(row => {
     if (row.task && TERMINAL_ROW_KINDS.has(row.kind) && reducers.TERMINAL.has(reducers.tasks(session.events)[row.task]?.state)) activity.delete(row.task);
+    if (row.kind === 'plan.submitted' && jev?.plan) {
+      // The plan gate: judged off the row, answered with plan.accepted or plan.rejected. Warns, never
+      // refuses the chunks that follow — the gate is new, and a wrong "phase-sized" would block a
+      // planning orchestrator; that switch flips once it has been seen right on real phases.
+      jev.plan({plan: row, taskMinutes: limits.minutes ?? null}).then(decision => {
+        const name = row.phase ? `Plan ${row.phase}` : 'Plan';
+        if (decision.verdict === 'accept') append({kind: 'plan.accepted', plan: row.plan, chunks: (row.chunks ?? []).length, noted: decision.noted ?? [], reason: decision.reason ?? null, model: decision.model ?? null, context: row.context,
+          text: `${name} accepted: ${(row.chunks ?? []).length} chunk${(row.chunks ?? []).length === 1 ? '' : 's'}${decision.reason ? ` (${decision.reason})` : ` (Jev, model ${decision.model})`}`});
+        else append({kind: 'plan.rejected', plan: row.plan, findings: decision.findings, noted: decision.noted ?? [], model: decision.model ?? null, context: row.context,
+          text: `${name} needs work: ${decision.findings.map(f => `chunk "${f.chunk}" — ${f.fix} (${f.confidence.toFixed(2)})`).join('; ')}`});
+      }).catch(error => append({kind: 'plan.accepted', plan: row.plan, reason: error.message, context: row.context, text: `Plan gate failed (${error.message}); the plan stands`}));
+    }
     if (row.kind === 'task.submitted') {
       // Any throw here (including one from before the first `await`, which an async
       // function turns into a rejection rather than a synchronous throw) must land on the

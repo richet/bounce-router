@@ -40,7 +40,7 @@ test('the cap is 15 minutes unless the config says otherwise, and ORDERS teaches
   assert.deepEqual(taskLimits({}), {minutes: 15});
   assert.deepEqual(taskLimits({taskMinutes: 30}), {minutes: 30});
   for (const bad of [0, -5, 1.5, '20', 999]) assert.throws(() => taskLimits({taskMinutes: bad}), /taskMinutes must be a whole number of minutes from 1 to 240/);
-  const lines = breakdownOrders(15);
+  const lines = breakdownOrders(15, {jevOn: true});
   assert.equal(lines[0], 'Break big work down: phases in sequence, each phase made of chunks that run in parallel.');
   const text = lines.join('\n');
   for (const part of ['No task may be given more than 15 minutes', 'a deadline over that is refused (task.failed, reason size)', 'depends_on', 'disjoint owned paths', 'Review each phase before the next one starts', 'never hand one worker the whole job'])

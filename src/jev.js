@@ -458,6 +458,68 @@ export async function routeTask({orders, profiles, settings, ask, notes = {}, or
   }
 }
 
+// ---- the plan gate: judge a phase's breakdown before any worker runs ----------------------------
+
+// Per chunk. Overlap and a deadline over the cap are structural and decided by bounce itself; the
+// other two are what Jev is for. Found live: a 40-minute "finish P2" task; two builders on git.ts at
+// once; chunks with no acceptance criterion; a chunk run against a tree another was still changing.
+export const PLAN_CHECKS = {
+  phase_sized: {instructions: chunk => `Chunk "${chunk}" describes a whole phase or several independent pieces of work, not one bounded piece a worker finishes in its deadline.`,
+    fix: 'this is a phase, not a chunk: split it into pieces a worker finishes within the deadline, each with its own acceptance'},
+  no_acceptance: {instructions: chunk => `Chunk "${chunk}" names no concrete acceptance criterion, or no way for the worker to verify it (a command, a test, an observable result).`,
+    fix: 'say what done looks like and how the worker proves it (a command to run and the output that means pass)'},
+  overlapping_paths: {instructions: chunk => `Chunk "${chunk}" would edit files that another chunk in this plan also edits, so two workers would write the same paths at once.`,
+    fix: 'give each chunk disjoint owned paths, or make one depend on the other'},
+  hidden_dependency: {instructions: chunk => `Chunk "${chunk}" needs the result of another chunk in this plan (a file it creates, a change it makes) but does not declare that dependency.`,
+    fix: 'declare depends_on so it runs after the chunk it needs'},
+};
+
+const globRe = glob => new RegExp(`^${glob.split('**').map(part => part.split('*').map(seg => seg.replace(/[.+^${}()|[\]\\]/g, '\\$&')).join('[^/]*')).join('.*')}$`);
+const pathsOverlap = (a, b) => a === b || globRe(a).test(b) || globRe(b).test(a);
+
+export function planQuestions(plan) {
+  const chunks = (plan?.chunks ?? []).map(c => ({id: c.id, profile: c.profile, orders: String(c.orders ?? '').slice(0, 6000), owns: c.owns ?? [], depends_on: c.depends_on ?? [],
+    ...(Number.isFinite(c.deadline) ? {deadline_minutes: Math.round(c.deadline / 60000)} : {})}));
+  const questions = {};
+  for (const c of chunks) for (const [name, check] of Object.entries(PLAN_CHECKS)) questions[`${c.id}.${name}`] = {type: 'noul', instructions: check.instructions(c.id)};
+  return {state: {phase: String(plan?.phase ?? ''), chunks}, questions};
+}
+
+// Pure. Structural findings first (no model needed), then Jev's confident ones; the rest are noted.
+export function decidePlan(answers, {plan, confidence = 0.8, taskMinutes = null} = {}) {
+  const chunks = plan?.chunks ?? [];
+  const findings = [], noted = [];
+  for (const c of chunks) {
+    const others = chunks.filter(o => o !== c && !(c.depends_on ?? []).includes(o.id) && !(o.depends_on ?? []).includes(c.id));
+    if ((c.owns ?? []).some(p => others.some(o => (o.owns ?? []).some(q => pathsOverlap(p, q))))) findings.push({chunk: c.id, check: 'overlapping_paths', confidence: 1, fix: PLAN_CHECKS.overlapping_paths.fix});
+    if (taskMinutes && Number.isFinite(c.deadline) && c.deadline > taskMinutes * 60000) findings.push({chunk: c.id, check: 'phase_sized', confidence: 1, fix: `${PLAN_CHECKS.phase_sized.fix} (deadline ${Math.round(c.deadline / 60000)} min over the ${taskMinutes} min cap)`});
+  }
+  for (const c of chunks) for (const name of Object.keys(PLAN_CHECKS)) {
+    if (findings.some(f => f.chunk === c.id && f.check === name)) continue;
+    const v = Number(answers?.[`${c.id}.${name}`]?.noul);
+    if (!Number.isFinite(v) || v < 0.5) continue;
+    if (v >= confidence) findings.push({chunk: c.id, check: name, confidence: v, fix: PLAN_CHECKS[name].fix});
+    else noted.push({chunk: c.id, check: name, confidence: v});
+  }
+  return {verdict: findings.length ? 'reject' : 'accept', findings, noted};
+}
+
+// Never throws: with Jev off or failing the plan is accepted with the reason on record, so the gate
+// itself never blocks an orchestrator that plans. Structural findings are still made without Jev.
+export async function judgePlan({plan, settings, ask, taskMinutes = null, signal} = {}) {
+  const s = normalizeJevSettings(settings);
+  const structural = decidePlan({}, {plan, confidence: s.confidence, taskMinutes});
+  const off = reason => ({...structural, reason, model: null});
+  if (!s.enabled) return off('jev disabled');
+  if (typeof ask !== 'function') return off('routing unavailable');
+  const {state, questions} = planQuestions(plan);
+  if (!Object.keys(questions).length) return off('no chunks');
+  try {
+    const result = await ask({state, questions, model: s.model, signal});
+    return {...decidePlan(result.answers, {plan, confidence: s.confidence, taskMinutes}), reason: null, model: result.model, latencyMs: result.latencyMs};
+  } catch (error) { return off(error?.code ?? error?.message ?? 'error'); }
+}
+
 // The read-only critic profile the daemon registers so a root task's `review.completion`
 // can name it. `model: ''` leaves the model to the settings read at verdict time.
 export function jevReviewerProfile(settings = {}) {
@@ -472,6 +534,7 @@ export function createJevDecisions({root = dataRoot(), adapter, readSettings = (
   return {
     reviewer: JEV_REVIEWER,
     settings: readSettings,
+    plan: ({plan, taskMinutes, signal}) => judgePlan({plan, settings: readSettings(), ask: adapter?.ask, taskMinutes, signal}),
     routeAI: ({orders, profiles, head, signal}) => routeAgentAI({orders, profiles, head, order: order(), ...(locals ? {locals} : {}), settings: readSettings(), ask: adapter?.ask, ...(notes ? {notes} : {}), signal}),
     route: ({orders, profiles, signal}) => routeTask({orders, profiles, order: order(), ...(locals ? {locals} : {}), settings: readSettings(), ask: adapter?.ask, ...(notes ? {notes} : {}), signal}),
   };
