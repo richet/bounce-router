@@ -4,6 +4,8 @@ import {resolveExecutable} from './executable.js';
 import {createMainClient} from './main-client.js';
 import {createInkTerminal} from './tui/ink-terminal.js';
 import {workspaceColumns} from './tui/Workspace.js';
+import {doingNow} from './tui/status.js';
+import {suggestionFrom} from './tui/suggestion.js';
 import {backspace, clampCursor, deleteForward, deleteWordBackward, deleteWordForward, insertText, moveCursor, moveLineEnd, moveLineStart, moveVertical, moveWord} from './tui/editor.js';
 import {inputDisposition} from './commands.js';
 import {commands as ownCommands, completions, typedCommand, inputLayout, windowAround, modelRows, checklistRows} from './terminal.js';
@@ -594,10 +596,13 @@ async function main() {
     }
     menu.length = Math.min(menu.length, menuBudget);
     terminal.update({
+      suggestion: textPrompt || localSetup || picker ? null : suggestion,
       agentsOpen, details, sidebar: settings.sidebar, selectedId: selectedAgentPane, input: textPrompt?.mask ? '•'.repeat(input.length) : input, inputCursor: clampCursor(input, inputCursor), inputTarget: textPrompt ? textPrompt.label : localSetup ? 'setup' : inputTarget(), scroll, busy, progress,
       paneScrolls: {...Object.fromEntries([...paneInputs].map(([id, value]) => [id, value.scroll])), [selectedAgentPane]: scroll},
       // When this turn began, so the header and the rail can say how long the main worker has been at it.
-      main: {...session.main, text: progress || notice, operation: orchestration.operation, startedAt: (busySince = busy ? busySince || new Date().toISOString() : null)},
+      // What the main worker is doing right now — thinking, a command, or a wait on a task — from the tail of the journal.
+      main: {...session.main, text: progress || notice, operation: orchestration.operation, startedAt: (busySince = busy ? busySince || new Date().toISOString() : null),
+        doing: busy ? doingNow(session.events.slice(-400), {tasks: reducers.tasks(session.events)}) : null},
       now: Date.now(),
       notice: localSetup?.state.question || notice, paused: copyPaused, mouseScroll,
       menu: menu.map(([text, paint]) => paint(clean(text))),

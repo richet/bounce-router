@@ -62,3 +62,62 @@ export function rowColor(pane, now = Date.now()) {
   if (isWorking(pane.state)) { const quiet = Number(now) - Date.parse(pane.activityAt ?? pane.updatedAt ?? pane.startedAt); return quiet >= STALL_MS ? 'red' : 'yellow'; }
   return {completed: 'green', accepted: 'green', failed: 'red', cancelled: 'red', timed_out: 'red', rejected: 'red', blocked: 'red', input_required: 'magenta', queued: 'gray'}[pane.state];
 }
+
+// "What is it doing right now?" for any worker, the main one included, from what is already
+// journaled. Found live: a main worker showed only a spinner for seven minutes; it was inside
+// `bounce wait` on a task that was on its second attempt. Four answers: thinking, running a command
+// (which one), waiting on a task (and that task's own state), or idle.
+const TOOL_CALL = /^([A-Za-z_][\w.-]*): (\{[\s\S]*\})$/;
+const WAIT_TASK = /bounce\s+wait\b[^]*?"task"\s*:\s*"([0-9a-f-]{8,})"/;
+// One row at a time (so a projection can keep it incrementally); `tasks` only matters for a wait.
+export function doingStep(state = {what: 'idle', since: null}, e, {tasks = {}} = {}) {
+  if (e.kind === 'main.started' || e.kind === 'task.started') return {what: 'thinking', since: e.time};
+  if (['main.terminal', 'main.blocked', 'task.completed', 'task.failed', 'task.cancelled', 'task.accepted'].includes(e.kind)) return {what: 'idle', since: e.time};
+  if (e.kind === 'progress') return state.what === 'command' || state.what === 'waiting' ? state : {what: 'thinking', since: state.what === 'thinking' ? state.since : e.time};
+  if (e.kind === 'assistant') return {what: 'thinking', since: e.time};
+  if (e.kind === 'tool') {
+    const m = TOOL_CALL.exec(String(e.text ?? '').trim());
+    if (!m) return {what: 'thinking', since: e.time}; // a tool result: the command is over
+    let input = {}; try { input = JSON.parse(m[2]); } catch {}
+    const command = typeof input.command === 'string' ? input.command : '';
+    const waitFor = WAIT_TASK.exec(command)?.[1];
+    if (waitFor) {
+      const target = Object.entries(tasks).find(([id]) => id.startsWith(waitFor));
+      const [id, t] = target ?? [waitFor, null];
+      const detail = t ? `${String(t.profile ?? '').split('@')[0]} ${t.state}${t.attempt > 1 || t.model ? ` (${[t.attempt > 1 ? `attempt ${t.attempt}` : '', t.model ? shortModel(t.model) : ''].filter(Boolean).join(', ')})` : ''}` : 'unknown task';
+      return {what: 'waiting', task: id, text: `waiting on ${id.slice(0, 8)} · ${detail}`, since: e.time};
+    }
+    const what = String(input.description || input.file_path || input.path || command.split('\n')[0] || input.pattern || input.query || '').trim();
+    return {what: 'command', text: `${m[1]}${what ? `: ${what}` : ''}`, since: e.time};
+  }
+  if (e.kind === 'task.activity' || e.kind === 'task.observed') {
+    const text = String(e.text ?? '').trim();
+    const mm = /^([A-Za-z_][\w.-]*) (running|started|completed|error)$/.exec(text);
+    if (mm && (mm[2] === 'running' || mm[2] === 'started')) return {what: 'command', text: mm[1], since: e.time};
+    if (mm) return {what: 'thinking', since: e.time};
+    if (e.kind === 'task.observed') return {what: 'thinking', since: e.time};
+  }
+  return state;
+}
+
+export function doingNow(events, {tasks = {}, now = Date.now(), task = null} = {}) {
+  const mine = events.filter(e => task ? e.task === task && ['task.started', 'task.activity', 'task.observed', 'task.completed', 'task.failed', 'task.cancelled', 'task.accepted'].includes(e.kind)
+    : (e.from === 'main' || e.kind.startsWith('main.')) && ['main.started', 'main.terminal', 'main.blocked', 'tool', 'assistant', 'progress'].includes(e.kind));
+  return mine.reduce((state, e) => doingStep(state, e, {tasks}), {what: 'idle', since: null});
+}
+
+// One line: a glyph for the kind of doing, the specifics trimmed to fit, and how long it has been so.
+export function doingLine(doing, now = Date.now(), width = 30) {
+  if (!doing || doing.what === 'idle') return '';
+  const glyph = {thinking: '…', command: '⚙', waiting: '⏳'}[doing.what] ?? '·';
+  const tail = quietFor(doing.since, now);
+  const full = doing.what === 'thinking' ? 'thinking' : doing.text ?? doing.what;
+  const room = width - [...glyph].length - 1 - (tail ? [...tail].length + 3 : 0);
+  let text = full;
+  if ([...text].length > room) {
+    // keep the first meaningful part: for a wait, "waiting on <id>"; else clip with an ellipsis
+    const head = doing.what === 'waiting' ? full.split(' · ')[0] : null;
+    text = head && [...head].length <= room ? head : `${[...full].slice(0, Math.max(1, room - 1)).join('')}…`;
+  }
+  return `${glyph} ${text}${tail ? ` · ${tail}` : ''}`;
+}

@@ -1,6 +1,6 @@
 import {clean, createFormatter, paneGrid} from '../format.js';
 import {promptLayout} from './prompt-layout.js';
-import {agentRow, glyph, progressRow, quietFor, rowColor, shortModel} from './status.js';
+import {agentRow, doingLine, glyph, progressRow, quietFor, rowColor, shortModel} from './status.js';
 
 // The status rail is on unless switched off (`/sidebar off`), and even then only fits a terminal
 // wide enough to leave a readable conversation beside it.
@@ -55,7 +55,8 @@ export function createWorkspace(React, Ink) {
       {text: `AGENTS · ${panes.length + 1}`, color: 'cyan', bold: true},
       // Each row moves while that worker works, names its model, and says how long it has been quiet.
       {text: agentRow({profile: metadata.orchestrator ?? 'main', state: status, model: main.model, startedAt: main.startedAt}, now), color: rowColor({state: status}, now)},
-      ...panes.flatMap(pane => [{text: agentRow(pane, now), color: rowColor(pane, now)}, ...(progressRow(pane, now) ? [{text: progressRow(pane, now), color: 'gray'}] : [])]),
+      ...(status === 'working' && doingLine(main.doing, now) ? [{text: `  ${doingLine(main.doing, now, 28)}`, color: main.doing?.what === 'waiting' ? 'cyan' : 'gray'}] : []),
+      ...panes.flatMap(pane => [{text: agentRow(pane, now), color: rowColor(pane, now)}, ...(pane.state === 'running' && doingLine(pane.doing, now) ? [{text: `  ${doingLine(pane.doing, now, 28)}`, color: 'gray'}] : []), ...(progressRow(pane, now) ? [{text: progressRow(pane, now), color: 'gray'}] : [])]),
     ];
     return React.createElement(Box, {
       width: 32, height, flexShrink: 0, borderStyle: 'single', borderLeft: true,
@@ -68,7 +69,7 @@ export function createWorkspace(React, Ink) {
   function Pane({pane, selected, x, y, width, height, scroll = 0, now = Date.now()}) {
     const title = pane.kind === 'orchestrator' ? 'orchestrator' : `${String(pane.profile).split('@')[0]} · ${pane.task.slice(0, 8)}${pane.model ? ` · ${shortModel(pane.model)}` : ''}`;
     const details = [
-      [pane.state, pane.phase ? `phase: ${pane.phase}` : null, pane.updatedAt ? `updated: ${ageText(pane.updatedAt, now)}` : null].filter(Boolean).join(' · '),
+      [pane.state, pane.state === 'running' || pane.kind === 'orchestrator' ? doingLine(pane.doing, now, 60) : null, pane.phase ? `phase: ${pane.phase}` : null, pane.updatedAt ? `updated: ${ageText(pane.updatedAt, now)}` : null].filter(Boolean).join(' · '),
       [pane.text, pane.next ? `next: ${pane.next}` : null].filter(Boolean).join(' · '),
       pane.operation ? `operation: ${pane.operation}` : '',
       [pane.evidence ? `evidence: ${evidenceText(pane.evidence)}` : null, pane.delivery ? `delivery: ${pane.delivery}` : null, pane.recovery ? `recovery: ${pane.recovery}` : null].filter(Boolean).join(' · '),
@@ -102,7 +103,7 @@ export function createWorkspace(React, Ink) {
     const allPanes = [{
       id: 'orchestrator', kind: 'orchestrator', role: main.role ?? 'orchestrator',
       profile: main.profile ?? view.metadata?.orchestrator ?? 'main',
-      state: mainState, model: mainModel, startedAt: main.startedAt,
+      state: mainState, model: mainModel, startedAt: main.startedAt, doing: main.doing,
       phase: main.phase,
       text: main.text ?? view.progress ?? view.notice ?? '',
       next: main.next,
@@ -128,7 +129,7 @@ export function createWorkspace(React, Ink) {
     const rows = transcript.slice(Math.max(0, end - bodyHeight), end);
     const content = React.createElement(Box, {flexDirection: 'column', width: columns, height, flexShrink: 0, overflow: 'hidden'},
       React.createElement(Box, {height: 1, flexShrink: 0}, React.createElement(Text, {bold: true, color: working ? 'yellow' : 'cyan', wrap: 'truncate-end'}, sidebar
-        ? `${glyph(mainState, now)} ${view.metadata?.orchestrator ?? 'main'}${mainModel ? ` · ${mainModel}` : ''} · ${mainState}${working && quietFor(main.startedAt, now) ? ` ${quietFor(main.startedAt, now)}` : ''} · ${view.agentsOpen ? 'Agent workspace · Tab changes pane' : `Conversation · ${view.details ? 'details expanded' : 'details folded'} · /details`}`
+        ? `${glyph(mainState, now)} ${view.metadata?.orchestrator ?? 'main'}${mainModel ? ` · ${mainModel}` : ''} · ${mainState}${working && quietFor(main.startedAt, now) ? ` ${quietFor(main.startedAt, now)}` : ''}${working && doingLine(main.doing, now, 60) ? ` · ${doingLine(main.doing, now, 60)}` : ''} · ${view.agentsOpen ? 'Agent workspace · Tab changes pane' : `Conversation · ${view.details ? 'details expanded' : 'details folded'} · /details`}`
         : `bounce · ${view.metadata?.provider ?? 'agent'} · ${view.metadata?.mode ?? 'READY'}`)),
       view.agentsOpen
         ? React.createElement(Box, {position: 'relative', width: columns, height: bodyHeight}, ...visible.slice(0, grid.visible).map((pane, index) => React.createElement(Pane, {

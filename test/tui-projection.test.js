@@ -68,7 +68,9 @@ test('worker panes retain progress evidence, current operation, delivery, and me
     {kind: 'task.delivered', id: '5', seq: 5, task: 'build', tier: 'live'},
   ]);
 
-  assert.deepEqual(projection.snapshot().panes[0], {
+  const {doing, ...pane} = projection.snapshot().panes[0];
+  assert.equal(doing.what, 'thinking', 'what the worker is doing now rides on the pane (test/tui-doing.test.js)');
+  assert.deepEqual(pane, {
     id: 'worker:build',
     kind: 'worker',
     task: 'build',
@@ -131,4 +133,26 @@ test('a task submitted as profile auto shows the profile the jev.routed row chos
   const pane = projection.snapshot().panes[0];
   assert.equal(pane.profile, 'build_claude');
   assert.equal(pane.state, 'running');
+});
+
+// Found live: a task Jev sent back for rework vanished from the rail while its second attempt ran —
+// `task.completed` removed the pane, and nothing brought it back on `task.rework`/`task.started`.
+test('a completed task that is sent back for rework stays on the rail, running its next attempt', () => {
+  const projection = createWorkspaceProjection();
+  const T = '79981b05-1e51-4da9-bd96-dd0dff5ad464';
+  projection.replay([
+    {id: '1', time: '2026-09-22T05:38:07.000Z', kind: 'task.submitted', task: T, profile: 'integrator', review: {completion: 'jev'}},
+    {id: '2', time: '2026-09-22T05:38:07.000Z', kind: 'task.started', task: T, requested: 'qwen3.6-35b-a3b-mlx', attempt: 1},
+    {id: '3', time: '2026-09-22T05:42:55.000Z', kind: 'task.completed', task: T, summary: 'done'},
+    {id: '4', time: '2026-09-22T05:42:55.000Z', kind: 'task.rework', task: T, round: 1, findings: ['x']},
+    {id: '5', time: '2026-09-22T05:42:55.000Z', kind: 'task.started', task: T, attempt: 2, resumed: true},
+    {id: '6', time: '2026-09-22T05:43:18.000Z', kind: 'task.activity', task: T, text: 'bash running'},
+  ]);
+  const pane = projection.snapshot().panes.find(p => p.task === T);
+  assert.equal(pane?.state, 'running', 'back on the rail for attempt 2');
+  assert.equal(pane.attempt, 2);
+  assert.deepEqual([pane.doing.what, pane.doing.text], ['command', 'bash']);
+  // and it leaves for good once accepted
+  projection.ingest({id: '7', time: '2026-09-22T05:50:00.000Z', kind: 'task.accepted', task: T});
+  assert.equal(projection.snapshot().panes.some(p => p.task === T), false);
 });

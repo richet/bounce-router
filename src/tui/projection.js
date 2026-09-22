@@ -1,3 +1,4 @@
+import {doingStep} from './status.js';
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'timed_out', 'rejected', 'accepted']);
 const HIDDEN_TRANSCRIPT_KINDS = new Set(['raw', 'usage', 'checkpoint', 'task.activity']);
 
@@ -44,7 +45,9 @@ export function createWorkspaceProjection({activityLimit = 400, transcriptLimit 
     return true;
   }
 
+  const submittedRows = new Map(); // task -> its task.submitted row, so a reworked task can come back
   function addTask(event) {
+    submittedRows.set(event.task, event);
     const logicalTask = event.replaces ? (lineages.get(event.replaces) ?? event.replaces) : event.task;
     lineages.set(event.task, logicalTask);
     lineageOrder.push(event.task);
@@ -82,7 +85,13 @@ export function createWorkspaceProjection({activityLimit = 400, transcriptLimit 
       if (!tasks.has(event.task)) addTask(event);
       return true;
     }
-    const task = tasks.get(event.task);
+    let task = tasks.get(event.task);
+    // A task that completed and was sent back for rework runs again: its pane comes back for the
+    // next attempt (found live: a reworked task vanished from the rail while its second attempt ran).
+    if (!task && event.kind === 'task.started') {
+      const submitted = submittedRows.get(event.task);
+      if (submitted) { addTask(submitted); task = tasks.get(event.task); }
+    }
     if (!task) return true;
     if (event.kind === 'task.activity' || event.kind === 'task.observed') {
       if (event.text) {
@@ -90,6 +99,7 @@ export function createWorkspaceProjection({activityLimit = 400, transcriptLimit 
         task.activityAt = event.time ?? task.activityAt;
         task.activity.push(String(event.text).slice(0, 16000));
         if (task.activity.length > limit) task.activity.splice(0, task.activity.length - limit);
+        task.doing = doingStep(task.doing, event); // what the worker is doing now, from its own rows
       }
       return true;
     }
@@ -98,6 +108,7 @@ export function createWorkspaceProjection({activityLimit = 400, transcriptLimit 
     const state = taskState(event.kind);
     if (state) task.state = state;
     if (event.kind === 'task.started') {
+      task.doing = doingStep(task.doing, event);
       task.model = event.requested ?? task.model;
       if (event.attempt != null) task.attempt = event.attempt;
     }
@@ -110,7 +121,12 @@ export function createWorkspaceProjection({activityLimit = 400, transcriptLimit 
     }
     if (event.kind === 'task.delivered') task.delivery = event.tier ?? task.delivery;
     if (event.kind === 'task.recovery') task.recovery = taskText(event) || event.reason || task.recovery;
-    if (TERMINAL.has(task.state)) {
+    // `completed` is not the end while a review may still send the task back: the pane leaves on
+    // acceptance, failure or cancellation, or on completion with no review pending.
+    // A completion under review (`review.started` follows it in the same tick) can be sent back, so the
+    // pane stays until `task.accepted`/`task.rejected` ends it; a completion with no review leaves now.
+    if (task.state === 'completed' && event.kind === 'task.completed' && submittedRows.get(task.task)?.review?.completion) { task.underReview = true; return true; }
+    if (TERMINAL.has(task.state) && !(task.state === 'completed' && task.underReview)) {
       outcomes.set(task.task, {task: task.task, state: task.state, text: taskText(event)});
       while (outcomes.size > outcomeCap) outcomes.delete(outcomes.keys().next().value);
       removeTask(task);
