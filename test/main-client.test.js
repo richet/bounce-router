@@ -70,3 +70,17 @@ test('main client snapshots next-turn routing and derives cooldowns from the sha
   f.emit({kind: 'main.terminal', requestId: f.calls[0][1].id, status: 'completed'});
   await done;
 });
+
+// Found live: the client sent `session.active || order[0]` and the classic per-agent model, so a
+// model chosen for the orchestrator never reached the daemon. The caller says what runs.
+test('main client runs on the selection its caller derives, not on the classic order', async () => {
+  const f = fixture();
+  const client = createMainClient(f.session, {order: ['claude', 'codex'], models: {claude: 'opus', codex: 'gpt-6-astra'}, mode: 'yolo'},
+    {selection: () => ({provider: 'claude', model: 'opus'})});
+  const completion = client.run('work');
+  const request = f.calls[0][1];
+  assert.equal(request.provider, 'claude', 'the fixture\'s active provider is codex; the selection wins');
+  assert.equal(request.model, 'opus');
+  f.emit({kind: 'main.terminal', requestId: request.id, status: 'completed'});
+  assert.equal(await completion, 'completed');
+});

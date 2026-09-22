@@ -234,7 +234,14 @@ test('W6 hard deadline despite activity: cancels at the deadline regardless, sta
   assert.equal(kinds.indexOf('task.deadline') < kinds.indexOf('task.cancelled'), true);
   assert.equal(adapter.calls.cancel, 1);
   assert.equal(scheduler.tasks()[row.task].state, 'timed_out');
-  assert.equal(session.events.some(e => e.kind === 'policy.escalated' && e.task === row.task), false); // deadline: no correction, no grace, no escalation row
+  // A deadline is bounce's decision, never the user's, and the orchestrator is told so it can decide
+  // what to do with the partial work (found live: the cancel was journaled as reason `user`, the
+  // orders say a user cancellation is final, and the orchestrator stopped the whole run).
+  assert.equal(session.events.find(e => e.kind === 'task.cancelled' && e.task === row.task).reason, 'deadline');
+  const escalated = session.events.find(e => e.kind === 'policy.escalated' && e.task === row.task);
+  assert.deepEqual([escalated.reason, escalated.to], ['deadline', 'user']);
+  assert.equal(escalated.text, 'A ran out of its 30 s deadline at 30 s with the work unfinished. Its partial progress is in the journal: resubmit what is left as a smaller task, or drop it.');
+  assert.equal(session.events.some(e => e.kind === 'policy.fallback.skipped' && e.task === row.task && e.reason === 'explicit_cancellation'), false, 'a deadline is not an explicit cancellation');
 });
 
 test('W7 deadline default: null deadline falls back to limits.minutes', async t => {

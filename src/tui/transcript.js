@@ -12,6 +12,25 @@ const WORKER_STATES = {
 };
 const WORKER_PROGRESS = new Set(['task.milestone', 'task.reported']);
 const HIDDEN = new Set(['turn', 'attempt', 'main.starting', 'main.started', 'main.delivery']);
+// What the folded view leaves out. All of it stays in details mode and in the journal.
+// Vendor plumbing that a CLI reports as status, and bounce rows that are machinery, not conversation:
+// the hand-off prompt is written FOR the orchestrator, a review's start and raw verdict JSON are
+// covered by the verdict line and the worker's block, control rows are the user's own commands, and
+// a stall ping is what the rail's red row already says.
+const PLUMBING = /^(hook_started|hook_response|background_tasks_changed|task_updated|Task (started|stopped|completed|updated) ·)/;
+const MACHINERY = new Set(['handoff', 'review.started', 'review.finished', 'policy.escalated', 'policy.corrected']);
+const TOOL_CALL = /^[A-Za-z_][\w.-]*: \{/;
+// What a finished turn leaves you with: the answer's TLDR (else its first sentence), without markdown.
+// Only a long answer earns it: a short one is still on screen right above, and repeating it is noise.
+const LONG_ANSWER = 600;
+function tldrOf(answer) {
+  const text = String(answer ?? '').trim();
+  if (text.length < LONG_ANSWER) return '';
+  const first = text.split(/\n\s*\n/)[0].replace(/\s+/g, ' ').trim();
+  const marked = /^\**\s*TL;?DR:?\s*\**:?\s*/i;
+  const plain = (marked.test(first) ? first.replace(marked, '') : (/^(.+?[.!?])(\s|$)/.exec(first)?.[1] ?? first)).replace(/\*\*/g, '');
+  return plain.length > 320 ? `${plain.slice(0, 319)}…` : plain;
+}
 // The part of a progress reading that names what is happening: `Thinking` of `Thinking · ~50 tokens`.
 const progressLabel = event => String(event.text ?? '').split(' · ')[0];
 
@@ -59,7 +78,14 @@ export function conversationEvents(events, {details = false} = {}) {
         if (text && text !== lastAnswer) {
           rows.push({...event, id: `${event.id}:answer`, kind: 'assistant', provider: event.provider ?? lastProvider});
         }
-        rows.push({...event, text: '', reason: undefined});
+        // The turn ends on how to continue, not on "Finished": the answer's TLDR, who still works, who waits on you.
+        if (details) rows.push({...event, text: '', reason: undefined});
+        else {
+          const states = [...workers.values()];
+          rows.push({id: `${event.id}:next`, time: event.time, kind: 'next', tldr: tldrOf(text || lastAnswer),
+            running: states.filter(w => ['running', 'queued'].includes(w.state)).length,
+            waiting: states.filter(w => w.state === 'input_required').map(w => ({profile: w.profile, task: w.task}))});
+        }
       } else {
         rows.push(event);
       }
@@ -69,7 +95,18 @@ export function conversationEvents(events, {details = false} = {}) {
       rows.push(event);
       continue;
     }
-    if (HIDDEN.has(event.kind)) continue;
+    if (HIDDEN.has(event.kind) || MACHINERY.has(event.kind) || event.kind?.startsWith('control.')) continue;
+    if (event.kind === 'status' && PLUMBING.test(String(event.text ?? ''))) continue;
+    // A run of tool rows — calls and their pasted output — is one line: how many calls, and the last.
+    if (event.kind === 'tool') {
+      const isCall = TOOL_CALL.test(String(event.text ?? '').trim());
+      const previous = rows.at(-1);
+      if (previous?.kind === 'tool.fold' && previous.provider === event.provider) {
+        if (isCall) { previous.calls++; previous.last = event.text; }
+        previous.id = `${previous.first}+${++previous.merged}`;
+      } else rows.push({...event, kind: 'tool.fold', first: event.id, merged: 1, calls: isCall ? 1 : 0, last: isCall ? event.text : null});
+      continue;
+    }
     if (event.kind === 'result' && event.success !== false) {
       const text = event.text?.trim();
       if (!text || text === lastAnswer || text === 'Turn completed') continue;
@@ -85,8 +122,10 @@ export function conversationEvents(events, {details = false} = {}) {
       const profile = event.profile ?? previous?.profile ?? `worker ${event.task.slice(0, 8)}`;
       const model = event.requested || previous?.model;
       const summary = String(event.summary ?? event.text ?? event.reason ?? '').replace(/\s+/g, ' ').trim();
-      const row = {...event, kind: 'task.fold', profile, state, model, started, preview: summary,
-        text: [profile, state, model, duration].filter(Boolean).join(' · ')};
+      // An acceptance carries no summary of its own: the block keeps what the worker said.
+      const row = {...event, kind: 'task.fold', profile, state, model, started, preview: summary || previous?.preview || '',
+        text: [profile, state, model, duration, state === 'running' && (event.phase ?? previous?.phase) ? `phase: ${event.phase ?? previous.phase}` : null].filter(Boolean).join(' · '),
+        phase: event.phase ?? previous?.phase};
       // Keep the latest update in chronological position, rather than repeated lifecycle dumps.
       if (previous) rows[previous.index] = null;
       row.index = rows.length;

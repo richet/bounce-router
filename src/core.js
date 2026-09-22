@@ -1,3 +1,4 @@
+import {serializeAgent, agentStore} from './agents.js';
 import {imagePaths, saveImages, providerInput} from './images.js';
 import {resolveExecutable} from './executable.js';
 import fs from 'node:fs';
@@ -31,12 +32,68 @@ export function saveJSON(file, value) {
   fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + '\n', {mode: 0o600});
   fs.renameSync(tmp, file);
 }
+// Configs written for the in-house `local` adapter are brought forward in place, so a machine that
+// worked before keeps working without the user editing JSON (docs/plans/opencode-adapter.md).
+// Saved configs move forward on load, once, "as if it had never been otherwise":
+//   - the in-house `local` adapter → `opencode`;
+//   - the old default `loadPolicy: loaded-only` → the current default (on-demand);
+//   - an explicit local worker PROFILE → an AGENT FILE naming the same model. A local worker is an
+//     agent's backend now (one roster), runs in the project like a cloud worker, and needs none of
+//     the container/workspace/scope fields, which are dropped.
+// Pure: returns the settings to keep, a report of what moved, and the agent files to write.
+const LOCAL_PROFILE_ADAPTERS = new Set(['local', 'opencode']);
+const READ_ONLY_LABELS = new Set(['critic', 'verifier', 'analyst', 'reviewer']);
+export function migrateSettings(raw) {
+  const value = structuredClone(raw);
+  const migrated = [], agents = [];
+  for (const [name, profile] of Object.entries(value.profiles ?? {})) {
+    if (!profile || typeof profile !== 'object' || !LOCAL_PROFILE_ADAPTERS.has(profile.adapter) || name === value.orchestrator) continue;
+    const agent = String(name).toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^[^a-z0-9]+/, '') || 'local-worker';
+    const policy = profile.policy ?? (READ_ONLY_LABELS.has(profile.role) || profile.policy === undefined ? 'read-only' : 'write');
+    const model = typeof profile.model === 'string' && profile.model ? profile.model : 'auto';
+    agents.push({name: agent, description: `Local worker migrated from the ${name} profile.`, policy,
+      models: [`${profile.endpoint ?? 'lmstudio'}/${model}`],
+      prompt: 'You are a bounce worker. Do what your orders say, in this project, and answer with what you found or did.'});
+    delete value.profiles[name];
+    migrated.push(name);
+  }
+  // A config profile may only fall back to another config profile; a fallback that named a migrated
+  // worker is dropped (an agent's own `models:` list is where its fallbacks live).
+  for (const profile of Object.values(value.profiles ?? {})) {
+    if (Array.isArray(profile?.fallback)) profile.fallback = profile.fallback.filter(target => Object.hasOwn(value.profiles, target));
+  }
+  for (const [id, endpoint] of Object.entries(value.local?.endpoints ?? {})) {
+    if (endpoint && typeof endpoint === 'object' && endpoint.loadPolicy === 'loaded-only') { delete endpoint.loadPolicy; migrated.push(`local.${id}.loadPolicy`); }
+  }
+  return {value, migrated, agents};
+}
+
 export function config(root = dataRoot()) {
   const file = path.join(root, 'config.json');
-  const value = {...defaults(), ...(fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {})};
+  const stored = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {};
+  const {value: forward, migrated, agents} = migrateSettings(stored);
+  // Persist once so the files themselves move forward; a read-only or racing filesystem must never
+  // turn a successful load into a failure, so the in-memory migration stands on its own. The agent
+  // files land BEFORE the profiles leave config.json, and an existing agent file is never replaced.
+  if (migrated.length) {
+    try {
+      const dir = agentStore(root);
+      for (const agent of agents) {
+        if (fs.existsSync(path.join(dir, `${agent.name}.md`))) continue;
+        fs.mkdirSync(dir, {recursive: true, mode: 0o700});
+        fs.writeFileSync(path.join(dir, `${agent.name}.md`), serializeAgent(agent), {mode: 0o600});
+      }
+      fs.writeFileSync(file, `${JSON.stringify(forward, null, 2)}\n`, {mode: 0o600});
+    } catch {}
+  }
+  const value = {...defaults(), ...forward};
+  // Non-enumerable: this is a report about THIS load, not configuration. It must never round-trip
+  // into config.json when a caller saves the settings object back.
+  Object.defineProperty(value, 'migratedProfiles', {value: migrated, enumerable: false});
   if (!Array.isArray(value.order) || !value.order.length || value.order.some(p => !providers[p]) || new Set(value.order).size !== value.order.length) throw new Error('config.order must be a unique, nonempty list of claude, codex, muse');
   if (!['yolo', 'plan'].includes(value.mode)) throw new Error('config.mode must be yolo or plan');
   if (typeof value.sidebar !== 'boolean') throw new Error('config.sidebar must be true or false');
+  if (value.taskMinutes !== undefined && (!Number.isInteger(value.taskMinutes) || value.taskMinutes < 1 || value.taskMinutes > 240)) throw new Error('taskMinutes must be a whole number of minutes from 1 to 240');
   if (!Number.isFinite(value.contextChars) || value.contextChars < 4000 || value.contextChars > 200000) throw new Error('contextChars must be between 4000 and 200000');
   if (!Number.isFinite(value.cooldownMinutes) || value.cooldownMinutes < 0) throw new Error('Invalid cooldownMinutes');
   // A partial skills block keeps the defaults for the fields it leaves out.

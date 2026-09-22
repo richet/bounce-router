@@ -1,10 +1,11 @@
 import {randomUUID} from 'node:crypto';
 import {isDeepStrictEqual} from 'node:util';
-import {validateOrchestration} from './profiles.js';
+import {validateOrchestration, LOCAL_ADAPTERS} from './profiles.js';
 
-// User-only control, independent of provider turns. The daemon reads the saved configuration;
-// a caller cannot smuggle a different permission grant into the activation event.
-export function createLocalActivation({session, scheduler, profiles, settings, readSettings, refresh}) {
+// User-only control, independent of provider turns: re-derive named agents from the agent files as
+// they are NOW and swap them into the running session. The daemon reads the files and the saved
+// configuration itself; a caller cannot smuggle a different grant into the activation event.
+export function createLocalActivation({session, scheduler, profiles, settings, readSettings, refresh, roles = null, readRoles = () => roles}) {
   return session.subscribe(row => {
     if (row.kind !== 'control.local_activate' || row.from !== 'user') return;
     try {
@@ -14,36 +15,33 @@ export function createLocalActivation({session, scheduler, profiles, settings, r
         throw new Error('Invalid local worker names');
       }
       const saved = readSettings();
-      const validated = validateOrchestration(saved).profiles;
-      const additions = {};
-      const selected = {};
+      const validated = validateOrchestration(saved, undefined, {roles: readRoles()}).profiles;
+      const agents = {};
       for (const name of new Set(row.names)) {
         const profile = validated[name];
-        if (!profile || profile.adapter !== 'local' || profile.role === 'orchestrator') throw new Error(`${name} is not a saved local worker`);
-        if (Object.hasOwn(profiles, name)) {
-          if (!isDeepStrictEqual(profiles[name], profile)) throw new Error(`Profile ${name} is already active with different settings`);
-        } else {
-          additions[name] = profile;
+        // An agent name activates its whole derived chain as the agent files define it NOW — the
+        // session's copy is replaced, whatever adapters the chain spans, so setup's edits are live.
+        if (profile?.agent?.name === name) {
+          const chain = {}; let current = name;
+          while (current && validated[current]?.agent?.name === name) { chain[current] = validated[current]; current = validated[current].fallback[0]; }
+          agents[name] = chain;
+          continue;
         }
-        selected[name] = profile;
+        throw new Error(`${name} is not an agent; see \`bounce agents\``);
       }
-      for (const profile of Object.values(additions)) {
-        if (profile.fallback.some(name => !Object.hasOwn(profiles, name) && !Object.hasOwn(additions, name))) {
-          throw new Error('Activate all referenced fallback profiles together');
-        }
-      }
-      scheduler.registerLocalProfiles(additions, saved.local);
+      for (const [name, chain] of Object.entries(agents)) scheduler.replaceAgent(name, chain, saved.local);
       let warning = '';
       try {
         refresh();
       } catch (error) {
         warning = ` Standing orders could not be refreshed: ${error.message}. Use the activated roster below.`;
       }
-      const names = Object.keys(selected);
-      const roster = Object.entries(profiles).filter(([, profile]) => profile.adapter === 'local')
-        .map(([name, profile]) => `${name} → ${profile.adapter}/${profile.model || 'auto'} (${profile.policy})`).join('; ');
+      const names = Object.keys(agents);
+      // A local worker is named by its provider and model; opencode is the runtime it runs through.
+      const ref = profile => LOCAL_ADAPTERS.has(profile.adapter) ? `${profile.endpoint ?? 'lmstudio'}/${profile.model || 'auto'} (via opencode)` : [profile.adapter, profile.model].filter(Boolean).join('/');
+      const team = Object.entries(agents).map(([name, chain]) => `${name} → ${Object.values(chain).map(ref).join(', ')} · ${Object.values(chain)[0].policy}`).join('; ');
       session.append({kind: 'local.profiles.activated', requestId: row.requestId, names,
-        text: `Local workers active in this session: ${roster}. Use these exact profiles for local requests; never substitute a cloud worker for a requested local worker. Read the updated orchestrator ORDERS.md for scopes and commands.${warning}`});
+        text: `Agents updated in this session: ${team}. Submit to these names; the roster in ORDERS.md was rewritten.${warning}`});
     } catch (error) {
       session.append({kind: 'local.profiles.rejected', requestId: row.requestId,
         text: `Configuration saved, but live activation failed: ${error.message}`});

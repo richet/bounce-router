@@ -1,5 +1,8 @@
 import './helpers/env.js';
 import test from 'node:test';
+import {config} from '../src/core.js';
+import {validateOrchestration} from '../src/profiles.js';
+import {agentMetadata, rolesFor} from '../src/agents.js';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -230,4 +233,69 @@ test('extraArgs(provider) is appended to the vendor invocation for this router o
   assert.equal(seen.length, 2);
   assert.deepEqual(seen[1], [...seen[0], '--disallowedTools', 'Agent,Task']);
   assert.equal(seen[0].includes('--disallowedTools'), false);
+});
+
+// Regression (2026-09-15): removing the in-house `local` adapter broke every saved config that named
+// it, and because the daemon is spawned with stdio:'ignore' the failure surfaced only as "Daemon did
+// not become ready". Such a config is now carried forward on load instead.
+test('a saved local worker profile becomes an agent file on load, once, as if it had never been otherwise', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-migrate-'));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const file = path.join(root, 'config.json');
+  fs.writeFileSync(file, JSON.stringify({
+    operation: 'orchestrator', orchestrator: 'main',
+    profiles: {
+      main: {adapter: 'claude', fallback: ['LocalWorker']},
+      LocalWorker: {adapter: 'local', backend: 'lmstudio', model: 'm', policy: 'read-only',
+        container: {image: 'node:22-alpine', memoryMiB: 512, cpus: 1, pids: 64, workspaceMiB: 200},
+        localOptions: {maxSteps: 32, maxOutputTokens: 2048, timeoutMs: 60000, maxContextBytes: 200000}},
+      Coder: {adapter: 'opencode', endpoint: 'lmstudio', policy: 'write', writePaths: ['src']},
+    }}));
+
+  const loaded = config(root);
+  assert.deepEqual(loaded.migratedProfiles, ['LocalWorker', 'Coder']);
+  assert.deepEqual(loaded.profiles, {main: {adapter: 'claude', fallback: []}}, 'local workers leave the config; a fallback that named one is dropped');
+  const agent = name => agentMetadata(fs.readFileSync(path.join(root, 'agents', `${name}.md`), 'utf8'));
+  assert.deepEqual([agent('localworker').policy, agent('localworker').models], ['read-only', ['lmstudio/m']]);
+  assert.deepEqual([agent('coder').policy, agent('coder').models, agent('coder').writePaths], ['write', ['lmstudio/auto'], undefined],
+    'container, workspace and scope fields have no meaning any more and are not carried over');
+  assert.match(agent('localworker').description, /migrated from the LocalWorker profile/);
+
+  // Persisted, so the files themselves move forward — and the report never round-trips into config.json.
+  const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.deepEqual(Object.keys(onDisk.profiles), ['main']);
+  assert.equal(JSON.stringify(config(root)).includes('migratedProfiles'), false);
+  assert.deepEqual(config(root).migratedProfiles, [], 'a second load has nothing left to migrate');
+
+  // An agent file the user already has is never replaced by a migration.
+  fs.writeFileSync(path.join(root, 'agents', 'localworker.md'), '---\nname: localworker\ndescription: Mine.\npolicy: read-only\nmodels: [lmstudio/mine]\n---\nMine.\n');
+  fs.writeFileSync(file, JSON.stringify({operation: 'orchestrator', orchestrator: 'main', profiles: {main: {adapter: 'claude'}, LocalWorker: {adapter: 'opencode', model: 'other'}}}));
+  config(root);
+  assert.deepEqual(agent('localworker').models, ['lmstudio/mine']);
+});
+
+test('the migrated worker is an ordinary agent the daemon derives a local backend from', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-migrate2-'));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify({
+    operation: 'orchestrator', orchestrator: 'main', mode: 'yolo',
+    profiles: {main: {adapter: 'claude'}, LocalWorker: {adapter: 'local', backend: 'lmstudio', policy: 'read-only'}}}));
+  const view = validateOrchestration(config(root), undefined, {roles: rolesFor(root)});
+  const worker = view.profiles.localworker;
+  assert.deepEqual([worker.adapter, worker.model, worker.policy, worker.endpoint, worker.fallback], ['opencode', 'auto', 'read-only', 'lmstudio', []]);
+  assert.equal(view.profiles.LocalWorker, undefined);
+});
+
+test('a persisted loaded-only load policy — the old default — migrates to on-demand once', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-migrate-policy-'));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const file = path.join(root, 'config.json');
+  fs.writeFileSync(file, JSON.stringify({operation: 'orchestrator', orchestrator: 'main', profiles: {main: {adapter: 'claude'}},
+    local: {enabled: true, endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234', loadPolicy: 'loaded-only', maxConcurrent: 3}}}}));
+  const loaded = config(root);
+  assert.deepEqual(loaded.migratedProfiles, ['local.lmstudio.loadPolicy']);
+  assert.equal(Object.hasOwn(loaded.local.endpoints.lmstudio, 'loadPolicy'), false, 'the endpoint follows the current default (on-demand)');
+  assert.equal(loaded.local.endpoints.lmstudio.maxConcurrent, 3, 'the rest of the endpoint is untouched');
+  assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(file, 'utf8')).local.endpoints.lmstudio, 'loadPolicy'), false);
+  assert.deepEqual(config(root).migratedProfiles, []);
 });

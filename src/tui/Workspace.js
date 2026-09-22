@@ -1,5 +1,6 @@
 import {clean, createFormatter, paneGrid} from '../format.js';
 import {promptLayout} from './prompt-layout.js';
+import {agentRow, doingLine, glyph, progressRow, quietFor, rowColor, shortModel} from './status.js';
 
 // The status rail is on unless switched off (`/sidebar off`), and even then only fits a terminal
 // wide enough to leave a readable conversation beside it.
@@ -38,7 +39,7 @@ function ageText(time, now) {
 export function createWorkspace(React, Ink) {
   const {Box, Text} = Ink;
   const activityFormatter = createFormatter({compact: true});
-  function Sidebar({metadata = {}, panes, main, height}) {
+  function Sidebar({metadata = {}, panes, main, height, now}) {
     const status = main.state ?? 'ready';
     const lines = [
       {text: 'BOUNCE', color: 'cyan', bold: true},
@@ -54,8 +55,10 @@ export function createWorkspace(React, Ink) {
       ...(metadata.modelLines?.length ? [{text: ''}, ...metadata.modelLines.map(text => ({text}))] : []),
       {text: ''},
       {text: `AGENTS · ${panes.length + 1}`, color: 'cyan', bold: true},
-      {text: `● ${metadata.orchestrator ?? 'main'} · ${status}`},
-      ...panes.map(pane => ({text: `● ${pane.profile} · ${pane.state}`})),
+      // Each row moves while that worker works, names its model, and says how long it has been quiet.
+      {text: agentRow({profile: metadata.orchestrator ?? 'main', state: status, model: main.model, startedAt: main.startedAt}, now), color: rowColor({state: status}, now)},
+      ...(status === 'working' && doingLine(main.doing, now) ? [{text: `  ${doingLine(main.doing, now, 28)}`, color: main.doing?.what === 'waiting' ? 'cyan' : 'gray'}] : []),
+      ...panes.flatMap(pane => [{text: agentRow(pane, now), color: rowColor(pane, now)}, ...(pane.state === 'running' && doingLine(pane.doing, now) ? [{text: `  ${doingLine(pane.doing, now, 28)}`, color: 'gray'}] : []), ...(progressRow(pane, now) ? [{text: progressRow(pane, now), color: 'gray'}] : [])]),
     ];
     return React.createElement(Box, {
       width: 32, height, flexShrink: 0, borderStyle: 'single', borderLeft: true,
@@ -66,9 +69,9 @@ export function createWorkspace(React, Ink) {
     }, row.text || ' ')));
   }
   function Pane({pane, selected, x, y, width, height, scroll = 0, now = Date.now()}) {
-    const title = pane.kind === 'orchestrator' ? 'orchestrator' : `${pane.profile} · ${pane.task.slice(0, 8)}${pane.model ? ` · ${pane.model}` : ''}`;
+    const title = pane.kind === 'orchestrator' ? 'orchestrator' : `${String(pane.profile).split('@')[0]} · ${pane.task.slice(0, 8)}${pane.model ? ` · ${shortModel(pane.model)}` : ''}`;
     const details = [
-      [pane.state, pane.phase ? `phase: ${pane.phase}` : null, pane.updatedAt ? `updated: ${ageText(pane.updatedAt, now)}` : null].filter(Boolean).join(' · '),
+      [pane.state, pane.state === 'running' || pane.kind === 'orchestrator' ? doingLine(pane.doing, now, 60) : null, pane.phase ? `phase: ${pane.phase}` : null, pane.updatedAt ? `updated: ${ageText(pane.updatedAt, now)}` : null].filter(Boolean).join(' · '),
       [pane.text, pane.next ? `next: ${pane.next}` : null].filter(Boolean).join(' · '),
       pane.operation ? `operation: ${pane.operation}` : '',
       [pane.evidence ? `evidence: ${evidenceText(pane.evidence)}` : null, pane.delivery ? `delivery: ${pane.delivery}` : null, pane.recovery ? `recovery: ${pane.recovery}` : null].filter(Boolean).join(' · '),
@@ -84,7 +87,7 @@ export function createWorkspace(React, Ink) {
     });
     const rows = [...details, ...activityRows];
     return React.createElement(Box, {position: 'absolute', left: x, top: y, borderStyle: 'round', borderColor: selected ? 'cyan' : 'gray', width, height, paddingX: 1, flexDirection: 'column', overflow: 'hidden'},
-      React.createElement(Text, {bold: true, color: selected ? 'cyan' : undefined}, `${selected ? '●' : '○'} ${title}`),
+      React.createElement(Text, {bold: true, color: selected ? 'cyan' : undefined}, `${pane.kind === 'orchestrator' ? (selected ? '●' : '○') : glyph(pane.state, now)} ${title}`),
       ...rows.map((text, index) => React.createElement(Text, {key: `${index}:${text}`, wrap: 'truncate-end'}, text || ' ')));
   }
   function Workspace({model, transcriptRows, view}) {
@@ -94,10 +97,15 @@ export function createWorkspace(React, Ink) {
     const menu = (view.menu ?? []).slice(0, Math.max(0, height - draft.length - 6))
       .map(item => typeof item === 'string' ? {text: item} : item);
     const main = view.main ?? {};
+    const now = view.now ?? Date.now();
+    // The main worker is working while a turn is in flight, whatever the daemon last said its state was.
+    const working = Boolean(view.busy) || ['running', 'starting'].includes(main.state);
+    const mainState = working ? 'working' : main.state === 'blocked' ? 'blocked' : 'ready';
+    const mainModel = shortModel(main.model || view.metadata?.model);
     const allPanes = [{
       id: 'orchestrator', kind: 'orchestrator', role: main.role ?? 'orchestrator',
       profile: main.profile ?? view.metadata?.orchestrator ?? 'main',
-      state: main.state ?? (view.busy ? 'working' : 'ready'),
+      state: mainState, model: mainModel, startedAt: main.startedAt, doing: main.doing,
       phase: main.phase,
       text: main.text ?? view.progress ?? view.notice ?? '',
       next: main.next,
@@ -122,8 +130,8 @@ export function createWorkspace(React, Ink) {
     const end = Math.max(0, transcript.length - Math.max(0, view.scroll ?? 0));
     const rows = transcript.slice(Math.max(0, end - bodyHeight), end);
     const content = React.createElement(Box, {flexDirection: 'column', width: columns, height, flexShrink: 0, overflow: 'hidden'},
-      React.createElement(Box, {height: 1, flexShrink: 0}, React.createElement(Text, {bold: true, color: 'cyan', wrap: 'truncate-end'}, sidebar
-        ? `${view.agentsOpen ? 'Agent workspace · Tab changes pane' : `Conversation · ${view.details ? 'details expanded' : 'details folded'} · /details`}`
+      React.createElement(Box, {height: 1, flexShrink: 0}, React.createElement(Text, {bold: true, color: working ? 'yellow' : 'cyan', wrap: 'truncate-end'}, sidebar
+        ? `${glyph(mainState, now)} ${view.metadata?.orchestrator ?? 'main'}${mainModel ? ` · ${mainModel}` : ''} · ${mainState}${working && quietFor(main.startedAt, now) ? ` ${quietFor(main.startedAt, now)}` : ''}${working && doingLine(main.doing, now, 60) ? ` · ${doingLine(main.doing, now, 60)}` : ''} · ${view.agentsOpen ? 'Agent workspace · Tab changes pane' : `Conversation · ${view.details ? 'details expanded' : 'details folded'} · /details`}`
         : `bounce · ${view.metadata?.provider ?? 'agent'} · ${view.metadata?.mode ?? 'READY'}`)),
       view.agentsOpen
         ? React.createElement(Box, {position: 'relative', width: columns, height: bodyHeight}, ...visible.slice(0, grid.visible).map((pane, index) => React.createElement(Pane, {
@@ -131,7 +139,7 @@ export function createWorkspace(React, Ink) {
           x: grid.panes[index].x, y: grid.panes[index].y,
           width: grid.panes[index].width, height: grid.panes[index].height,
           scroll: view.paneScrolls?.[pane.id] ?? (pane.id === view.selectedId ? view.scroll : 0),
-          now: view.now ?? Date.now(),
+          now,
         })))
         // An empty Text is zero rows high in Ink, which would swallow the blank row between
         // blocks, paragraphs and headings; a single space keeps the row.
@@ -143,10 +151,12 @@ export function createWorkspace(React, Ink) {
         ...draft.map((row, index) => React.createElement(Text, {key: `input:${index}`, wrap: 'truncate-end'},
           React.createElement(Text, {color: 'cyan'}, `${index === 0 ? '❯' : ' '} `),
           row.caret === undefined ? row.text : React.createElement(React.Fragment, null,
-            row.before, React.createElement(Text, {inverse: true}, row.atEnd ? '▏' : row.caret), row.after))),
+            row.before, React.createElement(Text, {inverse: true}, row.atEnd ? '▏' : row.caret), row.after),
+          // The main worker's proposed next step, dim after the caret while the input is empty: Tab takes it, typing replaces it.
+          index === 0 && !view.input && view.suggestion ? React.createElement(Text, {color: 'gray'}, ` ${view.suggestion}  ⇥ Tab`) : null)),
         React.createElement(Text, {color: 'yellow', wrap: 'truncate-end'}, (view.notice ?? '').replace(/\n/g, ' '))));
     return React.createElement(Box, {flexDirection: 'row', columnGap: sidebar ? 1 : 0, width: total, height}, content,
-      sidebar ? React.createElement(Sidebar, {metadata: view.metadata, panes: model.panes, main: allPanes[0], height}) : null);
+      sidebar ? React.createElement(Sidebar, {metadata: view.metadata, panes: model.panes, main: allPanes[0], height, now}) : null);
   }
   return Workspace;
 }

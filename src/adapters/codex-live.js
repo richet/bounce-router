@@ -4,7 +4,7 @@ import codex from './codex.js';
 import {connectBus} from '../bus.js';
 import {resolveExecutable} from '../executable.js';
 import {limitPattern} from '../providers.js';
-import {spawnLive, vendorEnv, verifiedCancel, TEXT_MAX} from './live-common.js';
+import {spawnLive, vendorEnv, verifiedCancel, reportGrant, makeStream, TEXT_MAX} from './live-common.js';
 import {validateReport} from '../reporting.js';
 import {version} from '../update.js';
 
@@ -62,46 +62,10 @@ const REPORT_TOOL_SPEC = {
   }, required: ['op', 'phase', 'text', 'next']},
 };
 
-const reportGrant = (profile, peer) => {
-  const grant = profile?.report;
-  const task = typeof peer === 'string' && peer.startsWith('worker:') ? peer.slice('worker:'.length) : null;
-  if (!task || !grant || typeof grant.BOUNCE_REPORT_BUS !== 'string' || !grant.BOUNCE_REPORT_BUS
-    || typeof grant.BOUNCE_REPORT_TOKEN_FILE !== 'string' || !grant.BOUNCE_REPORT_TOKEN_FILE
-    || (grant.task !== undefined && grant.task !== task)) return null;
-  return grant;
-};
-
 // A server that never answers must not hold cancel() open: every outcome here is a resolution.
 const bounded = promise => Promise.race([promise.then(() => {}, () => {}),
   new Promise(resolve => setTimeout(resolve, INTERRUPT_MS))]);
 
-// One iterable per handle, alive across turns: the reader pushes, the consumer pulls.
-// No return() — a `break` in a for-await leaves the stream open for the next turn.
-function makeStream() {
-  const ready = [], waiting = [];
-  let ended = false;
-  const iterator = {
-    [Symbol.asyncIterator]() { return iterator; },
-    next() {
-      if (ready.length) return Promise.resolve({value: ready.shift(), done: false});
-      if (ended) return Promise.resolve({value: undefined, done: true});
-      return new Promise(resolve => waiting.push(resolve));
-    },
-  };
-  return {
-    iterator,
-    push(event) {
-      if (ended) return;
-      const waiter = waiting.shift();
-      waiter ? waiter({value: event, done: false}) : ready.push(event);
-    },
-    end() {
-      if (ended) return;
-      ended = true;
-      for (const waiter of waiting.splice(0)) waiter({value: undefined, done: true});
-    },
-  };
-}
 
 function finish(handle) {
   if (handle.exited) return;
@@ -125,7 +89,8 @@ const request = (handle, {method, params}) => new Promise((resolve, reject) => {
   const id = handle.nextId++; // ids are single-use, so a late response can never resolve an older request
   const timer = handle.setTimeout(() => {
     if (!handle.pending.delete(id)) return;
-    reject(new Error(`codex app-server request timed out: ${method}`));
+    // An App Server that does not answer is an unavailable backend: the code the scheduler's fallback reads.
+    reject(Object.assign(new Error(`codex app-server request timed out: ${method}`), {code: 'backend_unavailable'}));
   }, handle.requestTimeoutMs);
   handle.pending.set(id, {resolve, reject, timer});
   if (!write(handle, {id, method, params})) {

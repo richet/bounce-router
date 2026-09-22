@@ -15,14 +15,16 @@ import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {Session} from '../src/core.js';
 import {starterProfiles, validateOrchestration} from '../src/profiles.js';
+import {rolesFor} from '../src/agents.js';
 
 const cliPath = fileURLToPath(new URL('../src/cli.js', import.meta.url));
 const tmpRoot = prefix => fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
 const bounceEnv = (root, extra = {}) => ({...process.env, BOUNCE_HOME: root, BOUNCE_NO_UPDATE_CHECK: '1', ...extra});
 
-function run(args, env, {timeout = 10000} = {}) {
+function run(args, env, {timeout = 10000, input = null} = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [cliPath, ...args], {env, stdio: ['ignore', 'pipe', 'pipe']});
+    const child = spawn(process.execPath, [cliPath, ...args], {env, stdio: [input === null ? 'ignore' : 'pipe', 'pipe', 'pipe']});
+    if (input !== null) child.stdin.end(input);
     let stdout = '', stderr = '';
     child.stdout.on('data', d => { stdout += d; });
     child.stderr.on('data', d => { stderr += d; });
@@ -190,21 +192,18 @@ test('bounce quota on an orchestrator config with no profiles block reports the 
   assert.deepEqual(dropped.stdout.trim().split('\n').map(line => line.split(' · ')[0]), ['claude']);
 });
 
-test('bounce local profile --save on a config with no profiles block saves only the worker; the validated view is the roster plus it', async t => {
+test('bounce agents set on a config with no profiles block leaves the config alone; the validated view is the roster plus the agent', async t => {
   const root = tmpRoot('bounce-cli-roster-');
   t.after(() => fs.rmSync(root, {recursive: true, force: true}));
-  fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify({
-    operation: 'orchestrator', order: ['claude'], mode: 'yolo', models: {}, skills: {scope: 'user', autoSync: false}, executables: {},
-  }));
-  const result = await run(['local', 'profile', 'local_read', '{"role":"researcher"}', '--save'], bounceEnv(root));
+  const config = {operation: 'orchestrator', order: ['claude'], mode: 'yolo', models: {}, skills: {scope: 'user', autoSync: false}, executables: {}};
+  fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify(config));
+  const result = await run(['agents', 'set', 'researcher'], bounceEnv(root), {input: '---\nname: researcher\ndescription: Reads and reports.\npolicy: read-only\nmodels: [lmstudio/auto, claude/default]\n---\nResearch.\n'});
   assert.equal(result.code, 0, result.stderr);
-  assert.match(result.stdout, /Saved\./);
-  const saved = JSON.parse(fs.readFileSync(path.join(root, 'config.json'), 'utf8'));
-  assert.deepEqual(saved.profiles, {local_read: {adapter: 'local', backend: 'lmstudio', model: 'auto', role: 'researcher'}}, 'the overlay only, never a copy of the roster');
-  assert.equal(saved.orchestrator, 'main');
-  const orchestration = validateOrchestration(saved);
+  assert.match(result.stdout, /Defined researcher \(user\) · read-only · lmstudio\/auto \(via opencode\), claude$/m);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root, 'config.json'), 'utf8')), config, 'an agent is a file: the config gains no profiles block, never a copy of the roster');
+  const orchestration = validateOrchestration(config, undefined, {roles: rolesFor(root)});
   assert.equal(orchestration.orchestrator, 'main');
-  assert.deepEqual(Object.keys(orchestration.profiles), [...Object.keys(starterProfiles(saved)), 'local_read']);
-  assert.equal(orchestration.profiles.local_read.adapter, 'local');
+  assert.deepEqual(Object.keys(orchestration.profiles).filter(name => !orchestration.profiles[name].derived), Object.keys(starterProfiles(config)));
+  assert.deepEqual([orchestration.profiles.researcher.adapter, orchestration.profiles['researcher~2'].adapter], ['opencode', 'claude']);
   assert.equal(orchestration.profiles.build.adapter, 'codex');
 });

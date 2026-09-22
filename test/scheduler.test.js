@@ -110,6 +110,23 @@ test('S3 no fallback on error/tests reason: adapter failure text "tests" yields 
   assert.equal(session.events.filter(e => e.kind === 'task.submitted').length, 1);
 });
 
+// Live finding (2026-09-20): a local worker's runtime failed and its claude fallback never ran —
+// the scheduler recognised failures by vendor-specific codes nobody emitted any more. An adapter now
+// says one thing: this failure was the runtime's (`recoverable`), so the next AI may try.
+test('S3b a recoverable failure falls back to the next profile in the chain; any other failure does not', async t => {
+  const {session} = setup(t);
+  const broken = fakeAdapter(() => [{kind: 'result', status: 'failed', recoverable: true, text: 'opencode exited 1: ECONNREFUSED'}]);
+  const cloud = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done via cloud'}]);
+  const profiles = {A: {adapter: 'opencode', model: 'q', mode: 'yolo', fallback: ['A~2']}, 'A~2': {adapter: 'claude', model: 'sonnet', mode: 'yolo', fallback: []}};
+  const scheduler = createScheduler({session, adapters: {opencode: broken, claude: cloud}, profiles});
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'scout', deadline: null});
+  const fallback = await waitFor(() => session.events.find(e => e.kind === 'policy.fallback'));
+  assert.deepEqual([fallback.reason, fallback.to_profile], ['worker_runtime', 'A~2']);
+  const retry = await waitFor(() => session.events.find(e => e.kind === 'task.submitted' && e.profile === 'A~2'));
+  await waitFor(() => scheduler.tasks()[retry.task]?.state === 'completed');
+  assert.equal(scheduler.tasks()[row.task].reason, 'worker_runtime');
+});
+
 test('S4 ratchet: worker mode yolo under session mode plan fails before launch', async t => {
   const {session} = setup(t);
   const adapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'x'}]);
@@ -910,4 +927,29 @@ test('R1 reconcile after a daemon restart blocks unknown writers and holds queue
   assert.equal(scheduler.tasks().q.state, 'blocked');
   assert.equal(scheduler.tasks().p.state, 'blocked');
   assert.equal(scheduler.tasks().ch.state, 'blocked');
+});
+
+// A role is an agent file. OpenCode runs the worker as that agent natively; any other adapter gets
+// the role's prompt ahead of the orders, so the role means the same thing whoever answers.
+test('S-role: a non-opencode worker receives its role prompt ahead of the orders; an opencode worker does not', async t => {
+  const {session} = setup(t);
+  const seen = {};
+  const capturing = name => {
+    const base = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'ok'}]);
+    return {...base, launch: async args => { seen[name] = args.orders; return base.launch(args); }};
+  };
+  const agent = {name: 'critic', description: 'Reviews.', policy: 'read-only', prompt: 'You are the reviewer.'};
+  const scheduler = createScheduler({session, adapters: {fake: capturing('fake'), opencode: capturing('opencode')}, profiles: {
+    cloud: {adapter: 'fake', model: 'x', mode: 'yolo', fallback: [], role: 'critic', agent},
+    local: {adapter: 'opencode', model: 'x', mode: 'yolo', fallback: [], role: 'critic', agent},
+  }});
+  t.after(() => scheduler.close());
+  const a = scheduler.submit({parent: null, profile: 'cloud', orders: 'review the tree'});
+  const b = scheduler.submit({parent: null, profile: 'local', orders: 'review the tree'});
+  await waitFor(() => seen.fake !== undefined && seen.opencode !== undefined, {timeout: 4000});
+  assert.equal(seen.fake, 'You are the reviewer.\n\n---\n\nreview the tree');
+  // opencode gets the agent natively, so no role prompt; a local worker is told its answer is its report.
+  assert.equal(seen.opencode.startsWith('review the tree\n\nYour final answer is your report:'), true, seen.opencode);
+  assert.equal(seen.opencode.includes('You are'), false);
+  await scheduler.cancel(a.task); await scheduler.cancel(b.task);
 });

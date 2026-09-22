@@ -1,18 +1,20 @@
-import fs from 'node:fs/promises';
-import path from 'node:path';
 import {stripVTControlCharacters} from 'node:util';
-import {discoverLocalModels, resolveLocalModel} from './local-models.js';
-import {recommendLocalModels, probeLocalModel} from './local-recommend.js';
-import {previewLocalProfile} from './local-setup.js';
+import {discoverLocalModels, normalizeLocalSettings} from './local-models.js';
+import {checkOpencodeBridge} from './local-opencode-config.js';
+import {writeAgent} from './agents.js';
 import {validateOrchestration} from './profiles.js';
-import {inspectLocalToolchain, prepareLocalToolchain} from './local-toolchain.js';
 
 const cancelled = Symbol('cancelled');
 const safe = value => stripVTControlCharacters(String(value)).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 1200);
 
-export async function runLocalSetup({settings, cwd, ask, write, save, discover = discoverLocalModels,
-  probe = probeLocalModel, inspect = inspectLocalToolchain, prepare = prepareLocalToolchain, loadedOnly = false, liveActivation = false, signal}) {
-  let draft = structuredClone(settings);
+// The one thing that is different about a local worker is configuration, so this is the whole of
+// the setup assist: see which models LM Studio has, and say which one plays each agent. An agent is
+// the job; picking a model puts `lmstudio/<model>` first in that agent's `models:` (a user-layer
+// override file), with the AIs that could already play it kept behind as fallbacks. Enter accepts a
+// suggestion for every agent, so setup can be next-next-next. Nothing is written before consent.
+export async function runLocalSetup({settings, ask, write, save, discover = discoverLocalModels,
+  bridge = checkOpencodeBridge, roles = null, agentsDir = null, loadedOnly = false, signal}) {
+  const draft = structuredClone(settings);
   const ensureActive = () => {if (signal?.aborted) throw cancelled;};
   const prompt = async (question, fallback = '') => {
     ensureActive();
@@ -22,13 +24,6 @@ export async function runLocalSetup({settings, cwd, ask, write, save, discover =
     return response.trim() || fallback;
   };
   const yes = async question => /^(y|yes)$/i.test(await prompt(question));
-  const choose = async (question, options, fallback) => {
-    for (;;) {
-      const answer = (await prompt(question, fallback)).toLowerCase();
-      if (options.includes(answer)) return answer;
-      write(`Choose ${options.join(', ')}; or type cancel.`);
-    }
-  };
   try {
     write('Local worker setup. Nothing is saved until final confirmation. Type cancel at any prompt.');
     if (draft.local?.enabled === false) {
@@ -38,141 +33,105 @@ export async function runLocalSetup({settings, cwd, ask, write, save, discover =
     if (draft.operation !== 'orchestrator') {
       if (!await yes('Enable orchestrator mode for future sessions? [y/N] ')) return {saved: false};
       draft.operation = 'orchestrator';
-      // The overlay only: the shipped roster stays underneath it in the validated view, so
-      // the switch never copies the roster into config.json (cli.js materialiseRoster does the same).
       draft.orchestrator ??= 'main';
+      // The overlay only: the shipped roster stays underneath it in the validated view, so the switch
+      // never copies the roster into config.json.
       draft.profiles ??= {};
     }
-    const purpose = await choose('Workers for research/review, coding, or both? [research/coding/both] ', ['research', 'coding', 'both'], 'research');
-    if (purpose !== 'research' && draft.mode !== 'yolo') {
-      write('Write workers require yolo session mode. This also relaxes cloud-provider permissions.');
-      if (!await yes('Enable yolo for future sessions? [y/N] ')) return {saved: false};
-      draft.mode = 'yolo';
-    }
-    const priority = await choose('Priority: balanced, speed, or context? [balanced] ', ['balanced', 'speed', 'context'], 'balanced');
     write('Discovering local models; no inference or model loading…');
-    const refresh = async () => {
+    const candidates = async () => {
       const catalogs = await discover(draft.local, {maxAge: 0, signal});
       ensureActive();
-      return loadedOnly ? catalogs.map(catalog => ({...catalog, models: catalog.models.filter(model => model.ready === true)})) : catalogs;
+      return catalogs.flatMap(catalog => (catalog.models ?? []).filter(model => model.type !== 'embedding' && model.tools !== false)
+        .flatMap(model => model.ready === true
+          ? (model.instances?.length ? model.instances : [{id: model.id, context: model.context}]).map(instance => ({endpoint: catalog.endpoint, id: instance.id, context: instance.context, loaded: true}))
+          : loadedOnly || model.ready !== false ? [] : [{endpoint: catalog.endpoint, id: model.id, context: model.context, loaded: false}]));
     };
-    let catalogs = await refresh();
-    if (loadedOnly) write('Using currently loaded models only. No model will be loaded or downloaded.');
-    const intents = purpose === 'both' ? ['research', 'coding'] : [purpose];
-    const selections = [];
-    for (const intent of intents) {
-      let recommendation = recommendLocalModels({catalogs, settings: draft, intent, priority});
-      for (const note of recommendation.notes) write(safe(note));
-      for (const candidate of recommendation.candidates) write(`${safe(candidate.ref)} · ${candidate.eligible ? 'eligible' : 'unavailable'} · ${safe(candidate.reasons.join('; '))}`);
-      if (!recommendation.recommended) {
-        write('No eligible loaded model. Load a tool-capable LLM in LM Studio, check its server, then rerun setup. Manual capability overrides remain available.');
-        return {saved: false};
-      }
-      const eligible = recommendation.candidates.filter(candidate => candidate.eligible);
-      const probes = [];
-      if (await yes(`Compare ${Math.min(eligible.length, 8)} loaded models with small synthetic ${intent} tests? Uses local inference only; ensure other local workers are idle. [y/N] `)) {
-        for (const candidate of eligible.slice(0, 8)) {
-          write(`Testing ${safe(candidate.ref)} (one request, up to 30 seconds)…`);
-          const result = await probe({local: draft.local, catalogs, ref: candidate.ref, intent, signal});
-          ensureActive();
-          probes.push(result);
-          write(`${safe(candidate.ref)}: ${result.status} · ${result.durationMs ?? '?'} ms · ${safe(result.evidence.join('; '))}`);
-          for (const limitation of result.limitations ?? []) write(safe(limitation));
-          if (result.status === 'uncertain') {
-            write('Inference termination is uncertain. Setup stopped without saving; check LM Studio before trying another model.');
-            return {saved: false};
-          }
-        }
-        recommendation = recommendLocalModels({catalogs, settings: draft, intent, priority, probes});
-      }
-      if (!recommendation.recommended) {
-        write('No candidate passed the selected checks. Nothing saved.');
-        return {saved: false};
-      }
-      write(`Recommendation for ${intent}: ${safe(recommendation.recommended)}. You can accept or choose any eligible model listed above.`);
-      let ref;
+    const models = await candidates();
+    const declared = [...(roles?.values() ?? [])].filter(role => !role.error && role.name !== draft.orchestrator);
+    if (!models.length) { write('No tool-capable model is loaded or downloaded in LM Studio. Load one (the LM Studio app, or `lms load <model>`), then run setup again.'); return {saved: false}; }
+    if (!declared.length || !agentsDir) { write('There are no agent files to fill. See `bounce agents`.'); return {saved: false}; }
+
+    // The TUI's setup pane shows about ten rows, so nothing here may depend on a long list staying on
+    // screen: loaded models lead and are repeated INSIDE every question; the (often many) downloaded
+    // ones keep their numbers but are only printed when asked for with `list`.
+    models.sort((a, b) => Number(b.loaded) - Number(a.loaded));
+    const loaded = models.filter(item => item.loaded), downloaded = models.filter(item => !item.loaded);
+    const size = item => item.context ? `${Math.round(item.context / 1024)}k` : '?';
+    const entry = item => `[${models.indexOf(item) + 1}] ${safe(item.id)} (${size(item)})`;
+    const inline = loaded.length ? loaded : models.slice(0, 4);
+    // Inside a question (the pane caps it at three rows) names are trimmed; the line above has them whole.
+    const brief = item => `[${models.indexOf(item) + 1}] ${safe(item.id).length > 26 ? `${safe(item.id).slice(0, 25)}…` : safe(item.id)}`;
+    write(`${loaded.length ? 'Loaded' : 'Nothing is loaded; downloaded (load on first use)'}: ${inline.map(entry).join(' · ')}`);
+    if (loaded.length && downloaded.length) write(`${downloaded.length} more ${downloaded.length === 1 ? 'is' : 'are'} downloaded and would load on first use — answer "list" to see ${downloaded.length === 1 ? 'it' : 'them'}.`);
+    write(`Agents (${declared.every(role => role.source === 'skill') ? 'shipped with skill agent-orchestrator' : 'from your agent files'}): Enter takes the suggestion, a number picks another model, auto lets Jev pick the AI per task, skip leaves the agent as is.`);
+    // A write agent gets the largest coder model (else the largest), a read-only one the largest;
+    // a loaded model always beats one that would have to be loaded.
+    const ranked = [...models].sort((a, b) => Number(b.loaded) - Number(a.loaded) || (b.context ?? 0) - (a.context ?? 0));
+    const suggest = role => (role.policy === 'write' ? ranked.find(item => item.loaded === ranked[0].loaded && /cod(e|er)/i.test(item.id)) : null) ?? ranked[0];
+    const picks = [];
+    for (const role of declared) {
+      const current = role.models?.[0] === 'auto' ? 'auto (Jev)' : role.models?.find(ref => Object.hasOwn(normalizeLocalSettings(draft.local).endpoints, ref.split('/')[0]));
+      const suggestion = suggest(role), suggested = String(models.indexOf(suggestion) + 1);
+      let item = null, auto = false;
       for (;;) {
-        ref = await prompt('Model endpoint/key [Enter accepts recommendation]: ', recommendation.recommended);
-        if (recommendation.candidates.some(candidate => candidate.ref === ref && candidate.eligible)) break;
-        write('Choose an eligible exact endpoint/model key from the list.');
-      }
-      let name;
-      for (;;) {
-        name = await prompt('Worker profile name: ', intent === 'coding' ? 'local_build' : 'local_read');
-        // Shipped names count as existing: the validated table, not the overlay alone.
-        if (/^[A-Za-z0-9_-]+$/.test(name) && !Object.hasOwn(validateOrchestration(draft).profiles, name)) break;
-        write('Use a new name containing letters, numbers, underscores or hyphens. Existing profiles are not overwritten.');
-      }
-      const slash = ref.indexOf('/');
-      const options = {model: ref.slice(slash + 1), endpoint: ref.slice(0, slash), role: intent === 'coding' ? 'builder' : 'analyst', policy: intent === 'coding' ? 'write' : 'read-only'};
-      if (intent === 'coding') {
-        const suggestedPaths = [];
-        for (const entry of ['src', 'test', 'tests']) {
-          if ((await fs.lstat(path.join(cwd, entry)).catch(() => null))?.isDirectory()) suggestedPaths.push(entry);
+        const answer = (await prompt(`${safe(role.name)} (${role.policy})${current ? ` · now ${safe(current)}` : ''} → ${inline.map(brief).join(' · ')} · ${downloaded.length && loaded.length ? 'list · ' : ''}skip (Enter = ${suggested}): `, suggested)).trim();
+        if (answer === 'list') {
+          const rest = loaded.length ? downloaded : models.slice(4);
+          for (let at = 0; at < rest.length; at += 3) write(rest.slice(at, at + 3).map(entry).join('   '));
+          if (!rest.length) write('There are no other models.');
+          continue;
         }
-        let manifest = {};
-        try { manifest = JSON.parse(await fs.readFile(path.join(cwd, 'package.json'), 'utf8')); } catch {}
-        options.writePaths = (await prompt(`Writable paths, comma-separated [${suggestedPaths.join(',')}]: `, suggestedPaths.join(','))).split(',').map(value => value.trim()).filter(Boolean);
-        const defaultCommand = manifest.scripts?.test ? 'npm test' : '';
-        const commands = await prompt(`Exact permitted commands, separated by ;; [${defaultCommand || 'none'}]; type none to grant none: `, defaultCommand);
-        options.commands = commands === 'none' ? [] : commands.split(';;').map(value => value.trim()).filter(Boolean);
-        write('Command permissions are exact strings. Commands run without network access in Docker/OrbStack.');
-        let image = await prompt('Container image [node:22-alpine]: ', 'node:22-alpine');
-        if (await yes('Prepare a cached npm dependency image now? Copies only package/lock metadata; install scripts disabled. [y/N] ')) {
-          const allowNetwork = await yes('Allow npm package downloads during this image build? Worker networking remains disabled. [y/N] ');
-          const prepared = await prepare({cwd, image, allowNetwork, onActivity: event => write(safe(event.text))});
-          image = prepared.profileImageID;
+        if (answer === 'auto') auto = true;
+        else if (answer && answer !== 'skip') {
+          item = models[Number(answer) - 1] ?? models.find(candidate => candidate.id === answer);
+          if (!item) { write(`No model ${safe(answer)}; leaving ${safe(role.name)} as is.`); }
         }
-        const check = await inspect({cwd, image});
-        if (!check.docker.ready || !check.image.ready) throw new Error(`Container is not ready: ${check.docker.reason ?? check.image.reason}`);
-        options.container = {image: check.image.id};
-        write('Image exists. Dependency compatibility and command success still require a worker test; image metadata alone does not prove them.');
+        break;
       }
-      if (await yes('Adjust worker token/time/container limits? [y/N] ')) {
-        const number = async (question, fallback) => {
-          const value = Number(await prompt(question, String(fallback)));
-          if (!Number.isInteger(value)) throw new Error('Limits must be whole numbers; nothing saved');
-          return value;
-        };
-        options.localOptions = {
-          maxOutputTokens: await number('Maximum output tokens [2048]: ', 2048),
-          timeoutMs: await number('Model request timeout in milliseconds [120000]: ', 120000),
-        };
-        if (intent === 'coding') {
-          options.container.memoryMiB = await number('Container memory MiB [512]: ', 512);
-          options.container.cpus = await number('Container CPUs [1]: ', 1);
-          options.container.pids = await number('Container process limit [64]: ', 64);
-          options.container.workspaceMiB = await number('Private workspace MiB [128]: ', 128);
-        }
+      if (!item && !auto) continue;
+      if (role.policy === 'write' && draft.mode !== 'yolo') {
+        write('A write agent needs yolo session mode. This also relaxes cloud-provider permissions.');
+        if (!await yes('Enable yolo for future sessions? [y/N] ')) return {saved: false};
+        draft.mode = 'yolo';
       }
-      const preview = previewLocalProfile({settings: draft, name, options});
-      resolveLocalModel({local: draft.local, catalogs, profile: preview.profile,
-        requirements: {tools: true, context: preview.profile.localOptions.maxOutputTokens + 1024}});
-      draft = preview.settings;
-      selections.push({name, ref, intent, probes});
-      write(`Profile preview ${safe(name)}:\n${JSON.stringify(preview.profile, null, 2)}`);
-      write(`Review ${safe(name)}: ${safe(ref)} · ${options.policy}`);
-      write(`Writable: ${safe((options.writePaths ?? []).join(', ') || 'none')} · Commands: ${safe((options.commands ?? []).join(' ;; ') || 'none')}`);
-      write(`Limits: ${preview.profile.localOptions.maxOutputTokens} output tokens · ${preview.profile.localOptions.timeoutMs} ms per request`);
-      if (options.container) write(`Image: ${safe(options.container.image)} · ${preview.profile.container.memoryMiB} MiB · ${preview.profile.container.cpus} CPU · ${preview.profile.container.pids} processes · ${preview.profile.container.workspaceMiB} MiB workspace`);
+      const ref = auto ? 'auto' : `${item.endpoint}/${item.id}`;
+      // The pick goes first; whoever could already play the agent stays behind it — including the
+      // implicit providers an agent with no `models:` had, so pinning never drops the cloud fallback.
+      const implicit = (draft.order ?? []).map(provider => `${provider}/${draft.models?.[provider] || 'default'}`);
+      // Picking a local model REPLACES the agent's other local models: the user is saying which one
+      // plays it. (Stacking them left a weak model as the first fallback — observed live: a 4B that
+      // "completed" a scout with a wrong answer.) Cloud AIs stay behind the pick.
+      const endpoints = Object.keys(normalizeLocalSettings(draft.local).endpoints);
+      // `auto` hands the AI to Jev per task and keeps every AI the agent had behind it; naming a model takes `auto` away.
+      const chain = [ref, ...(role.models ?? implicit).filter(other => other !== 'auto' && (auto || !endpoints.includes(other.split('/')[0])))];
+      for (const fallback of implicit) if (!chain.some(other => other.startsWith(`${fallback.split('/')[0]}/`))) chain.push(fallback);
+      const {file, source, error, ...agent} = role;
+      picks.push({agent: {...agent, models: chain}, item});
+      write(`${safe(role.name)} → ${auto ? 'auto (Jev picks the AI; needs `bounce jev on`)' : `${safe(item.id)}${item.loaded ? '' : ' (loads on first use)'}`}${chain.length > 1 ? ` · then ${safe(chain.slice(1).join(', '))}` : ''}`);
     }
-    validateOrchestration(draft);
-    write(liveActivation
-      ? 'After saving, Bounce will activate these workers in this session if its permission ceiling allows them. Existing agents and their permissions will not change.'
-      : 'These profiles apply to newly started sessions only. Existing sessions and workers will not change.');
+    if (!picks.length) { write('No agent changed. Nothing saved.'); return {saved: false}; }
+    if (picks.some(pick => pick.agent.policy === 'write')) write('A local write agent edits your project directly and may run commands, exactly like a cloud worker in yolo mode.');
+    validateOrchestration(draft, undefined, {roles});
+    write(`Agent files to write (${safe(agentsDir)}): ${picks.map(pick => `${safe(pick.agent.name)}.md`).join(', ')}.`);
     if (!await yes('Save this configuration? [y/N] ')) return {saved: false};
-    catalogs = await refresh();
-    for (const selection of selections) {
-      const current = recommendLocalModels({catalogs, settings: draft, intent: selection.intent, priority, probes: selection.probes});
-      if (!current.candidates.some(candidate => candidate.ref === selection.ref && candidate.eligible)) throw new Error('Model availability changed; rerun setup. Nothing saved.');
-      const profile = validateOrchestration(draft).profiles[selection.name];
-      resolveLocalModel({local: draft.local, catalogs, profile,
-        requirements: {tools: true, context: profile.localOptions.maxOutputTokens + 1024}});
+    const still = await candidates();
+    for (const pick of picks.filter(pick => pick.item)) if (!still.some(item => item.endpoint === pick.item.endpoint && item.id === pick.item.id)) throw new Error(`Model ${pick.item.id} is no longer available; rerun setup. Nothing saved.`);
+    // Local workers are driven by OpenCode, a second binary bounce does not ship. Prove the bridge with
+    // one real turn before writing anything, so a missing or unreachable setup is reported here.
+    const local = picks.find(pick => pick.item);
+    if (local) {
+      write('Checking the OpenCode bridge with a one-line test turn...');
+      const status = await bridge({settings: normalizeLocalSettings(draft.local), endpoint: local.item.endpoint, model: local.item.id});
+      if (!status.worker.ready) throw new Error(`OpenCode bridge not ready: ${status.worker.reason ?? status.config.reason}. Nothing saved.`);
+      write(`OpenCode bridge ready · ${safe(status.binary)}`);
     }
     ensureActive();
+    // The config first: if it changed under us, save() refuses and no agent file is left behind.
     await save(draft);
-    write(liveActivation ? 'Saved and activated in this session; existing agents unchanged.' : 'Saved. Start a new Bounce session to use these workers; running sessions were not changed.');
-    return {saved: true, profiles: selections.map(selection => selection.name)};
+    for (const pick of picks) write(`Wrote ${safe(writeAgent(agentsDir, pick.agent, {force: true}).file)}`);
+    write('Saved.');
+    return {saved: true, profiles: [], agents: picks.map(pick => pick.agent.name)};
   } catch (error) {
     if (error !== cancelled) throw error;
     write('Setup cancelled. No configuration saved.');

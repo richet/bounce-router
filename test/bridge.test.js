@@ -168,3 +168,13 @@ test('a task.* row published without its task is refused as invalid, naming the 
   const foreign = await bridgeCommand(['publish', '--event', JSON.stringify({kind: 'task.milestone', task: 'not-mine', text: 'x'})], env);
   assert.equal(foreign.stdout.trim(), 'bounce: -32001 unauthorized');
 });
+
+test('the plain publish reply shows the task id the next wait needs; non-task rows are unchanged', async t => {
+  const {bus} = await setup(t);
+  const grant = bus.grant({peer: 'worker:x', tasks: ['t1']});
+  const env = {BOUNCE_BUS: bus.path, BOUNCE_BUS_TOKEN_FILE: grant.file};
+  const task = await bridgeCommand(['publish', '--event', JSON.stringify({kind: 'task.milestone', task: 't1', text: 'm'})], env);
+  assert.equal(task.stdout, '[worker:x:task.milestone] task=t1 m\n');
+  const message = await bridgeCommand(['publish', '--event', JSON.stringify({kind: 'message', to: 'user', text: 'hi'})], env);
+  assert.equal(message.stdout, '[worker:x:message] hi\n');
+});

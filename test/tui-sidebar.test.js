@@ -108,7 +108,8 @@ test('right status rail stays beside conversation and split panes, never below i
     assert.ok(lines.length <= 28);
     assert.ok(lines.every(line => stringWidth(line) <= columns));
     for (const sentinel of ['sonnet', '/project', 'orchestrator ·', 'CODEX usage 2%']) {
-      assert.ok(lines.find(line => line.includes(sentinel)).indexOf(sentinel) >= columns - 32);
+      // in the rail's columns (the header names the model too, on the left)
+      assert.ok(lines.some(line => line.lastIndexOf(sentinel) >= columns - 32), sentinel);
     }
     assert.ok(lines[input].indexOf('my draft') < columns - 32);
   }

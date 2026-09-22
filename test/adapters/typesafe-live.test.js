@@ -10,7 +10,7 @@ const okResponse = (body, {status = 200, headers = {}} = {}) => ({ok: status < 3
 const drain = async (adapter, handle) => { const events = []; for await (const event of adapter.events(handle)) events.push(event); return events; };
 const lastVerdict = events => JSON.parse(events.at(-1).text);
 
-const gitStub = (diff = 'diff --git a/src/x.js b/src/x.js\n+added', untracked = 'notes.md\n') => async args => args[0] === 'diff' ? diff : args[0] === 'ls-files' ? untracked : '';
+const gitStub = (diff = 'diff --git a/src/x.js b/src/x.js\n+added', untracked = 'notes.md\n') => async args => args[0] === 'diff' ? diff : args[0] === 'ls-files' ? untracked : args[0] === 'rev-parse' ? 'true\n' : '';
 const review = {stage: 'completion', round: 1, orders: 'Own src/x.js. Add the feature and run npm test.', summary: 'Added it', report: {summary: 'Added it', text: 'Implemented x.\nnpm test\n# tests 12\n# pass 12\n# fail 0', evidence: ['src/x.js'], remaining: ''}, head: 'abc123'};
 const settings = {enabled: true, model: 'jev-1.13.0', review: true, routing: {enabled: false, default: null}, confidence: 0.8};
 const answers = (choice, confidence, nouls = {}) => ({decision: {type: 'choice', choice, probabilities: {accept: choice === 'accept' ? confidence : 1 - confidence, rework: choice === 'rework' ? confidence : 1 - confidence}, confidence}, ...Object.fromEntries(Object.entries(nouls).map(([name, noul]) => [name, {type: 'noul', noul}]))});

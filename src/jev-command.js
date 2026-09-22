@@ -10,6 +10,8 @@ import {
 } from './jev.js';
 import {createRosterSetup, readRosterNotes, rosterLines, setupAgent, undescribedModels, writeRosterNotes, modelKey} from './roster-notes.js';
 import {validateOrchestration} from './profiles.js';
+import {rolesFor, agentTable} from './agents.js';
+import {normalizeLocalSettings, discoverLocalModels, localCandidates} from './local-models.js';
 import {dataRoot} from './core.js';
 
 export const JEV_HELP = [
@@ -37,11 +39,28 @@ function rosterOf(settings) {
   } catch { return null; }
 }
 
-export async function jevCommand(parts = [], {root = dataRoot(), settings = {}, save = () => {}, env = process.env, fetchImpl, interactive = false, run = null} = {}) {
+export async function jevCommand(parts = [], {root = dataRoot(), cwd = process.cwd(), settings = {}, save = () => {}, env = process.env, fetchImpl, interactive = false, run = null, discover = discoverLocalModels} = {}) {
   const [sub = '', ...rest] = parts;
   const current = normalizeJevSettings(settings.jev);
   const key = () => readJevKey({root, env});
-  const status = () => `${jevStatusLine(settings.jev, key())}${normalizeJevSettings(settings.jev).enabled && !key() ? ` · no key: /jev key <KEY> or set ${JEV_KEY_ENV}` : ''}`;
+  // What routing will do with the team, under the one-line status: the jobs `auto` can route to (and
+  // the first AI on each one's list), which agents hand their AI to Jev, and where local models stand.
+  // Only while routing is on, so a disabled Jev still answers with the one line it always did.
+  const team = () => {
+    const s = normalizeJevSettings(settings.jev);
+    if (!s.enabled || !s.routing.enabled || settings.operation !== 'orchestrator') return [];
+    let rows = [];
+    try { rows = agentTable(rolesFor(root, {cwd}), settings).filter(row => !row.error && row.backends.length && row.name !== (settings.orchestrator ?? 'main')); } catch { return []; }
+    if (!rows.length) return [];
+    const handed = rows.filter(row => row.backends[0] === 'auto (Jev)').map(row => row.name);
+    let localOn = true;
+    try { localOn = normalizeLocalSettings(settings.local).enabled; } catch {}
+    return [`  jobs auto can route to: ${rows.map(row => `${row.name} → ${row.backends[0]}`).join(' · ')}`,
+      handed.length
+        ? `  AI picked by Jev: ${handed.join(', ')} · ${localOn ? 'by the tier the orders need: a local model of that tier first, else a cloud AI (/local off for cloud only)' : 'cloud AIs only: local models are off (/local on)'}`
+        : '  AI picked by Jev: none — every agent names its own AIs, so Jev never picks one, local or cloud. `models: [auto, …]` hands it the choice (/local on does that for every agent).'];
+  };
+  const status = () => [`${jevStatusLine(settings.jev, key())}${normalizeJevSettings(settings.jev).enabled && !key() ? ` · no key: /jev key <KEY> or set ${JEV_KEY_ENV}` : ''}`, ...team()].join('\n');
   const update = patch => {
     settings.jev = persistedJevSettings({...current, ...patch});
     save();
@@ -77,22 +96,30 @@ export async function jevCommand(parts = [], {root = dataRoot(), settings = {}, 
       const roster = rosterOf(settings);
       if (!roster) return {text: 'No worker roster: routing needs operation "orchestrator" with worker profiles in config.json', changed: false};
       const {profiles, orchestrator} = roster;
+      // The local models are in the roster too while `/local` is on: Jev may pick one as an agent's AI,
+      // so they are listed, counted as pending, and described by the same agent turn.
+      const localModels = async () => {
+        try { const local = normalizeLocalSettings(settings.local); return local.enabled ? localCandidates(await discover(local), readRosterNotes(root)) : []; } catch { return []; }
+      };
+      const asExtra = items => items.map(item => ({key: item.name, adapter: 'opencode', model: item.model, endpoint: item.endpoint}));
+      const localLines = items => { const cache = readRosterNotes(root); return items.map(item => `${item.name} → local · ${item.loaded ? 'loaded' : 'not loaded'}${item.context ? ` · ${Math.round(item.context / 1024)}k` : ''} · tier ${item.tier} · ${cache[item.name]?.capabilities ? `${item.capabilities}${cache[item.name].by ? ` (${cache[item.name].by})` : ''}` : `not described yet: ${item.capabilities}`}`); };
       if (rest[0] === 'refresh') {
         // Forget this roster's notes; the TUI's daemon rewrites them (control.jev refresh), headless
         // writes them here and now with the same agent the daemon would use.
-        const keys = new Set(Object.values(profiles).map(modelKey));
+        const keys = new Set([...Object.values(profiles).map(modelKey), ...(await localModels()).map(item => item.name)]);
         writeRosterNotes(Object.fromEntries(Object.entries(readRosterNotes(root)).filter(([key]) => !keys.has(key))), root);
         if (interactive) return {text: 'Roster notes cleared · describing the models again in the background; /jev roster shows them when written', changed: false, refresh: 'roster'};
         const agent = setupAgent({profiles, orchestrator, order: settings.order ?? [], models: settings.models ?? {}});
         const rows = [];
-        const setup = createRosterSetup({root, profiles, agent, executables: settings.executables ?? {}, session: {append: row => rows.push(row)}, ...(run ? {run} : {})});
+        const setup = createRosterSetup({root, profiles, agent, extra: async () => asExtra(await localModels()), executables: settings.executables ?? {}, session: {append: row => rows.push(row)}, ...(run ? {run} : {})});
         await setup.ensure({force: true});
-        return {text: [...rows.map(row => row.text), ...rosterLines(profiles, readRosterNotes(root))].join('\n'), changed: false};
+        return {text: [...rows.map(row => row.text), ...rosterLines(profiles, readRosterNotes(root)), ...localLines(await localModels())].join('\n'), changed: false};
       }
       if (rest[0]) throw new Error('Use /jev roster, or /jev roster refresh');
-      const pending = undescribedModels(profiles, readRosterNotes(root));
+      const here = await localModels();
+      const pending = undescribedModels(profiles, readRosterNotes(root), asExtra(here));
       return {text: [`Jev roster · ${jevStatusLine(settings.jev, key()).split(' · ').find(part => part.startsWith('routing')) ?? 'routing off'}`,
-        ...rosterLines(profiles, readRosterNotes(root)).map(line => `  ${line}`),
+        ...[...rosterLines(profiles, readRosterNotes(root)), ...localLines(here)].map(line => `  ${line}`),
         ...(pending.length ? [`${pending.length} model${pending.length === 1 ? '' : 's'} not described yet: bounce describes them when routing is on and the daemon starts, or on /jev roster refresh`] : [])].join('\n'), changed: false};
     }
     case 'model': {

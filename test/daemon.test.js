@@ -625,7 +625,16 @@ test('O2 orchestrator single-provider: the orchestrator submits over the bridge,
   // sentence, and the synthetic reviewer is neither a submit target nor the example's profile.
   assert.equal(orders.includes('auto →'), false);
   assert.equal(/jev/i.test(orders), false);
-  assert.equal(orders.includes('"profile":"build"'), true);
+  // the example submits to a JOB (the first agent), never to a cloud profile by name
+  assert.equal(orders.includes('"profile":"analyst"'), true);
+  assert.match(orders, /^Who to submit to — the job, not the AI:$/m);
+  // The team block: where the roster comes from, which AIs exist here, and how to change it —
+  // the orchestrator specialises the shipped defaults through the bridge, never by hand.
+  assert.match(orders, /^Team: analyst, builder, integrator, reviewer ← skill agent-orchestrator$/m);
+  assert.match(orders, /^AIs on this machine: codex, lmstudio\/<loaded model> \(via opencode\)$/m);
+  assert.match(orders, /bounce agents set NAME --scope project/);
+  assert.match(orders, /references\/team\.md/);
+  assert.match(orders, /^`bounce agents set` journals agents\.defined for you\.$/m);
 });
 
 test('O3 the orchestrator grant cannot publish a user row (even with `from` omitted) nor control.stop', async t => {
@@ -779,7 +788,8 @@ test('O-jev orchestrator with Jev review on: the root task is Jev-reviewed befor
     bodies.push(JSON.parse(options.body));
     return {ok: true, status: 200, headers: {get: () => null}, json: async () => ({model: 'jev-1.13.0', answers: {decision: {type: 'choice', choice: 'accept', probabilities: {accept: 0.96, rework: 0.04}, confidence: 0.93}}, usage: {input_tokens: 40, output_tokens: 2}})};
   };
-  const typesafe = createTypesafeLive({fetchImpl, readKey: () => ({key: 'daemon-test-key-4242', source: 'env'}), readSettings: () => ({enabled: true, model: 'jev-1.13.0', review: true, routing: {enabled: false, default: null}, confidence: 0.8}), git: async () => ''});
+  // the session's folder is a temp dir, not a repository: answer the repository probe so the verdict is asked
+  const typesafe = createTypesafeLive({fetchImpl, readKey: () => ({key: 'daemon-test-key-4242', source: 'env'}), readSettings: () => ({enabled: true, model: 'jev-1.13.0', review: true, routing: {enabled: false, default: null}, confidence: 0.8}), git: async args => args[0] === 'rev-parse' ? 'true\n' : ''});
   const session = await runOrchestratorSession(root, {adapters: {codex: completingAdapter(), typesafe}});
 
   const submitted = session.events.find(e => e.kind === 'task.submitted');
@@ -803,6 +813,6 @@ test('O-jev orchestrator with Jev review on: the root task is Jev-reviewed befor
   assert.equal(orders.includes('jev →'), false, 'the synthetic reviewer is not a roster entry');
   assert.match(orders, /auto → Jev routing is off \(\/jev routing on\): resolves to build/);
   assert.match(orders, /Jev completion verdicts are on/);
-  assert.equal(orders.includes('"profile":"build"'), true, 'the example never names the synthetic reviewer');
+  assert.equal(orders.includes('"profile":"analyst"'), true, 'the example names a job, never the synthetic reviewer');
   assert.equal('head' in session.events.find(e => e.kind === 'task.started'), true, 'the Jev-reviewed task records its diff base');
 });

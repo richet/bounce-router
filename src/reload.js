@@ -2,11 +2,12 @@ import fs from 'node:fs';
 import {createClaudeLive} from './adapters/claude-live.js';
 import {createCodexLive} from './adapters/codex-live.js';
 import {createMuseLive} from './adapters/muse-live.js';
-import {createLocalLive} from './adapters/local-live.js';
+import {createOpencodeLive} from './adapters/opencode-live.js';
 import {createTypesafeLive} from './adapters/typesafe-live.js';
 import {JEV_REVIEWER, createJevActivation, createJevDecisions, jevReviewerProfile, readJevSettings, routingFallback} from './jev.js';
 import {createRosterSetup, effectiveNotes, readRosterNotes, setupAgent} from './roster-notes.js';
 import {modelCatalog} from './models.js';
+import os from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {createHash} from 'node:crypto';
@@ -19,7 +20,9 @@ const SEED_NOTABLE = ['invalid', 'unmanaged', 'modified', 'withdrawn', 'failed']
 import {resolveSessionRef} from './sessions.js';
 export {pidAlive};
 import {createBus, connectBus} from './bus.js';
-import {validateOrchestration} from './profiles.js';
+import {validateOrchestration, LOCAL_ADAPTERS} from './profiles.js';
+import {rolesFor} from './agents.js';
+import {normalizeLocalSettings, discoverLocalModels, localCandidates} from './local-models.js';
 import {createLocalActivation} from './local-activation.js';
 import {providers} from './providers.js';
 import {createScheduler} from './scheduler.js';
@@ -92,6 +95,58 @@ function formatRow(row, json) {
 
 // Derives Phase 2's single orchestration profile from legacy settings — real adapters
 // arrive in Phase 3; see docs/local-orchestration.md "Process model".
+// A session opened in the home folder: every worker — a local model with a shell included — runs
+// from there. Said once, at the top of the session; null anywhere else.
+export function homeSessionWarning(cwd, home = os.homedir()) {
+  if (typeof cwd !== 'string' || path.resolve(cwd) !== path.resolve(home)) return null;
+  return `This session is in your home folder (${path.resolve(home)}): every worker runs, reads and edits from here, not inside a project. Quit and start bounce from the project folder.`;
+}
+
+// How long ONE task may be given (config.json `taskMinutes`). The scheduler refuses a longer
+// deadline, and the orders say so up front, so big work arrives already broken down.
+export const TASK_MINUTES = 15;
+export function taskLimits(settings = {}) {
+  const minutes = settings.taskMinutes ?? TASK_MINUTES;
+  if (!Number.isInteger(minutes) || minutes < 1 || minutes > 240) throw new Error('taskMinutes must be a whole number of minutes from 1 to 240');
+  return {minutes};
+}
+// Who a task is submitted to. Found live: with Jev on, local on and every agent on `auto`, the
+// orchestrator sent every task to a cloud profile by name — which skips Jev and the local models.
+// Its orders offered agents, profiles and `auto` side by side with no default, so it picked a tier
+// itself from the profile list. The default is the JOB; a named AI is the exception.
+const isAgentHead = ([name, p]) => p?.derived === true && p.agent?.name === name;
+export function defaultTarget(profiles = {}, orchestrator = 'main', {routingOn = false} = {}) {
+  return Object.entries(profiles).find(isAgentHead)?.[0] ?? (routingOn ? 'auto' : null)
+    ?? Object.keys(profiles).find(name => name !== orchestrator && name !== JEV_REVIEWER) ?? 'build';
+}
+export function choosingOrders({agents = false, routingOn = false, localOn = false} = {}) {
+  if (!agents && !routingOn) return [];
+  return ['Who to submit to — the job, not the AI:',
+    ...(agents ? ['    1. An agent, by the job the task is: analyst to find and read, builder to implement, integrator to land shared changes, reviewer to review.'] : []),
+    ...(routingOn ? [`    ${agents ? '2' : '1'}. \`auto\` when no agent is clearly the job: Jev routes it.`] : []),
+    `    ${[agents, routingOn].filter(Boolean).length + 1}. A worker profile by name ONLY when the user asks for that specific AI, or an agent's own list has been exhausted.`,
+    routingOn ? 'Do not pick a tier or a model yourself: for an agent or `auto`, Jev weighs the orders and picks the AI per task.'
+      : 'An agent runs on the AIs in the order its file lists them; naming a profile skips that list.',
+    'Once you have dispatched a task, end your turn: say in a line what you dispatched and what comes next, then stop. bounce wakes you with each outcome as your next turn (a `handoff` row), so nothing is lost. Do not hold your turn open in `bounce wait` while workers run — a turn held open keeps its whole context live and idle (observed: 74% of a 35-minute turn spent waiting), and do not investigate the same question yourself in parallel — that spends the worker\'s whole slot for nothing. If you must take the work back, cancel the task first.',
+    ...(localOn ? ['Local models are part of the normal path, not a special request: an agent runs on a local model when one fits the task, at no cost — do not wait for the user to ask for them, and do not route around them by naming a cloud profile.'] : []),
+    ''];
+}
+
+// The breakdown the orchestrator is held to, in its standing orders.
+export const breakdownOrders = (minutes, {jevOn = false} = {}) => [
+  'Break big work down: phases in sequence, each phase made of chunks that run in parallel.',
+  `No task may be given more than ${minutes} minutes: a deadline over that is refused (task.failed, reason size) before anything runs.`,
+  'However large the request, never hand one worker the whole job. Plan the phases first; within a phase submit every chunk whose',
+  'owned paths are disjoint at once, so they run in parallel; give a task that needs another\'s result depends_on with its task id, so',
+  'phases run in sequence without you polling. Each chunk gets disjoint owned paths, its own acceptance and how to verify it.',
+  'Before dispatching a phase, submit its plan and read the answer:',
+  `    bounce publish --event '{"kind":"plan.submitted","phase":"<phase name>","chunks":[{"id":"<short id>","profile":"<agent>","orders":"<goal, acceptance, how to verify>","owns":["<path or glob>"],"depends_on":["<chunk id>"],"deadline":${minutes * 60000}}]}'`,
+  `${jevOn ? 'Jev judges each chunk — phase-sized, no acceptance, overlapping paths, hidden dependency — and bounce' : 'bounce checks each chunk for overlapping owned paths and a deadline over the cap, and'} answers with plan.accepted`,
+  'or plan.rejected (findings per chunk, with the fix). Fix a rejected plan and submit it again; submit the chunks of an accepted one',
+  'with the same `owns` and `depends_on`.',
+  'Review each phase before the next one starts: read what the chunks produced, integrate, run the gate, then submit the next',
+  'phase. A chunk that runs out of time is reported as is — split what is left; do not extend it.', ''];
+
 export function buildProfiles(settings) {
   return {main: {adapter: settings.order[0], mode: settings.mode, fallback: settings.order.slice(1)}};
 }
@@ -105,7 +160,7 @@ const ORCHESTRATOR_ENV = ['BOUNCE_BUS', 'BOUNCE_BUS_TOKEN_FILE', 'BOUNCE_ROLE', 
 
 // The orchestrator profile's standing brief, written once per daemon start: where its skill
 // lives and how to reach the bridge. The prompt line cli.js prepends points at this file.
-function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, jev = null, notes = {}}) {
+function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, jev = null, notes = {}, roles = null, settings = {}, adapterNames = []}) {
   const dir = path.join(session.dir, 'orchestrator');
   const autoFallback = routingFallback(profiles, jev?.routing?.default);
   const routingOn = Boolean(jev?.enabled && jev?.routing?.enabled);
@@ -129,34 +184,74 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     'Bridge (already in your environment):',
     `    BOUNCE_BUS=${bus.path}`,
     `    BOUNCE_BUS_TOKEN_FILE=${grant.file}`, '',
-    'Worker profiles you can submit to (name → adapter/model):',
-    ...Object.entries(profiles).filter(([name]) => name !== orchestrator && name !== JEV_REVIEWER).map(([name, p]) => `    ${name} → ${[p.adapter, p.model].filter(Boolean).join('/')}${p.role ? ` (${p.role})` : ''}${about(name).tier ?? p.tier ? ` [tier ${about(name).tier ?? p.tier}]` : ''}${about(name).capabilities ?? p.capabilities ? ` — ${about(name).capabilities ?? p.capabilities}` : ''}`),
-    ...(jev && autoFallback ? [`    auto → ${routingOn ? 'Jev (TypeSafe) routes each task to the profile above that fits its orders; unconfident picks go to' : 'Jev routing is off (/jev routing on): resolves to'} ${autoFallback}`] : []),
-    ...Object.entries(profiles).filter(([, profile]) => profile.adapter === 'local').map(([name, profile]) =>
-      `    ${name}: LM Studio endpoint=${profile.endpoint}, model=${profile.model || 'auto'}, policy=${profile.policy}; reads=${JSON.stringify(profile.readPaths)}, writes=${JSON.stringify(profile.writePaths)}, commands=${JSON.stringify(profile.commands)}, localOnly=${profile.localOnly}. Commands use isolated Docker-compatible containers; no host shell fallback.`),
+    // Two layers, both submit targets. AGENTS are jobs: one line each, the hidden backend chain folded in;
+    // a model ref names its provider, and a local provider runs through opencode (said, not shown as the ref).
+    'Agents you can submit to (a job: name → the AIs that may play it, in fallback order):',
+    ...(() => {
+      const ref = p => `${LOCAL_ADAPTERS.has(p.adapter) ? `${p.endpoint ?? 'lmstudio'}/${p.model || 'auto'} (via opencode)` : [p.adapter, p.model].filter(Boolean).join('/')}`;
+      const seen = new Set(); const lines = [];
+      for (const [name, p] of Object.entries(profiles)) {
+        if (name === orchestrator || name === JEV_REVIEWER || seen.has(name) || !p.derived) continue;
+        const chain = []; let current = name;
+        while (current && !seen.has(current)) { seen.add(current); chain.push(profiles[current]); current = profiles[current].derived ? profiles[current].fallback[0] : null; }
+        const head = chain[0];
+        lines.push(`    ${name} → ${head.auto && routingOn ? 'Jev picks the AI per task, else ' : ''}${chain.map(ref).join(', ')}${head.agent ? ` · ${head.agent.policy} · ${head.agent.description}` : head.role ? ` (${head.role})` : ''}`);
+      }
+      return lines;
+    })(),
+    // The team block: what the roster is made of, which AIs exist here, and how to change it. The
+    // orchestrator specialises the shipped defaults through the bridge; a definition takes effect
+    // in the next session, so the block says so rather than letting it assume otherwise.
+    ...(() => {
+      const bySource = new Map();
+      for (const role of roles?.values() ?? []) { if (role.error) continue; const key = role.source === 'skill' || role.source === 'installed-skill' ? 'skill agent-orchestrator' : role.source === 'user' ? path.join(root, 'agents') : path.join(session.cwd ?? '', '.bounce', 'agents'); bySource.set(key, [...(bySource.get(key) ?? []), role.name]); }
+      const local = Object.keys(normalizeLocalSettings(settings.local).endpoints);
+      const ais = [...(settings.order ?? []).filter(name => adapterNames.includes(name)).map(name => [name, settings.models?.[name]].filter(Boolean).join('/')),
+        ...(adapterNames.includes('opencode') ? local.map(endpoint => `${endpoint}/<loaded model> (via opencode)`) : [])];
+      return [
+        ...[...bySource].map(([source, names]) => `Team: ${names.join(', ')} ← ${source}`),
+        `AIs on this machine: ${ais.join(', ') || 'none signed in'}`,
+        'Team setup: the shipped agents are generic. On your first task in a project, define the agents this repository actually needs',
+        '(one per job; the same job on another AI is a `models:` entry, not another agent) with',
+        '    bounce agents set NAME --scope project   # the agent file on stdin; format and fields in',
+        `    ${path.join(root, 'skills', 'agent-orchestrator', 'references', 'team.md')}`,
+        'It is validated against this machine before it lands. It applies to the NEXT session: say so to the user and continue on the current roster.',
+        '`bounce agents` lists the team in force; `bounce agents show NAME` prints one.', '',
+      ];
+    })(),
+    'Worker profiles (one AI each: name → adapter/model) — the exception: name one only when the user asks for that AI:',
+    ...Object.entries(profiles).filter(([name, p]) => name !== orchestrator && name !== JEV_REVIEWER && !p.derived).map(([name, p]) => `    ${name} → ${[p.adapter, p.model].filter(Boolean).join('/')}${p.role ? ` (${p.role})` : ''}${about(name).tier ?? p.tier ? ` [tier ${about(name).tier ?? p.tier}]` : ''}${about(name).capabilities ?? p.capabilities ? ` — ${about(name).capabilities ?? p.capabilities}` : ''}`),
+    ...(jev && autoFallback ? [`    auto → ${routingOn ? 'Jev (TypeSafe) routes each task: to the agent above whose job the orders clearly describe (that agent\'s own models then decide the AI), otherwise by the tier the orders need — the first fitting worker profile of that tier in the provider order; unconfident picks go to' : 'Jev routing is off (/jev routing on): resolves to'} ${autoFallback}`] : []),
     'Local discovery checks eligibility at dispatch. A downloaded model is not necessarily loaded or tool-capable.',
-    'When the user requests local/LM Studio workers, use a local profile from this roster. If none is available, report that and request /local setup or /local activate; never substitute a cloud worker.',
+    'If the user asks for a LOCAL worker specifically and no agent can run on one, report that and point to /local on and /local setup; do not quietly substitute a cloud worker for that request.',
     'Capacity waits, progress and failures are journaled. Do not infer a worker crash from silence alone; inspect its latest task state.',
-    'Require observed tests and a final report from local builders; their private changes publish only after verified container termination.',
+    'A local worker (… via opencode) works in the project directly, like any other worker: read-only agents can change nothing, write agents edit files and run commands. Its answer is its report.',
+    'Require observed tests from local builders, and review their diff as you would any worker\'s.',
     ...(jev?.enabled && jev?.review ? ['Jev completion verdicts are on: a root task you submit without review.completion gets a fast Jev accept/rework check against its orders, report and diff before it is accepted; a confident rework sends the same worker one rework round. Name a review.completion profile yourself to replace it.'] : []),
     '',
-    'Submit work with `bounce publish --event <json>` and wait for it with `bounce wait --match <json>`.',
-    'Example — submit one task, then wait for it to end:',
-    `    bounce publish --event '{"kind":"task.submitted","parent":null,"profile":"${Object.keys(profiles).find(n => n !== orchestrator && n !== JEV_REVIEWER) ?? 'build'}","orders":"<goal, owned paths, acceptance, how to verify>","deadline":3600000}'`,
-    `    bounce wait --match '{"kind":"task.completed","task":"<task id from the publish reply>"}' --timeout 3600`,
-    '`--timeout` is seconds and may be as long as the task deadline (the bridge re-arms the bus\'s 600 s wait for you); a `null`',
-    'reply means it expired, not that the task ended — wait again or end your turn: every outcome of a task you submitted that',
-    'no `wait` of yours returned is handed to you by bounce, as your next turn when you are idle (a `handoff` row in the journal)',
-    'or in front of the next prompt, so you never need to poll.',
+    ...choosingOrders({agents: Object.entries(profiles).some(isAgentHead), routingOn, localOn: (() => { try { return normalizeLocalSettings(settings.local).enabled && adapterNames.includes('opencode'); } catch { return false; } })()}),
+    'Submit work with `bounce publish --event <json>`; its outcome reaches you as a handoff when you end your turn.',
+    'Example — submit one task, then end your turn:',
+    `    bounce publish --event '{"kind":"task.submitted","parent":null,"profile":"${defaultTarget(profiles, orchestrator, {routingOn})}","orders":"<goal, owned paths, acceptance, how to verify>","deadline":${taskLimits(settings).minutes * 60000}}'`,
+    '`bounce wait` is for a short wait only, at most 120 seconds, when the very next step depends on an outcome you expect within it:',
+    `    bounce wait --match '{"kind":"task.completed","task":"<task id from the publish reply>"}' --timeout 120`,
+    '`--timeout` is seconds. A `null` reply means it expired, not that the task ended — end your turn: every outcome of a task you',
+    'submitted that no `wait` of yours returned is handed to you by bounce, as your next turn when you are idle (a `handoff` row in',
+    'the journal) or in front of the next prompt, so you never need to poll. A `[bounce:wait.interrupted]` reply means the user sent',
+    'you a message during the wait: it is in your turn now — read it and act on it before anything else.',
     'Fields: parent (null for a root task), profile (a name above), orders (the brief, required), deadline (ms, optional),',
     'depends_on (task ids, optional), review ({"prelaunch": <profile>, "completion": <profile>}, optional, review-role profiles only),',
     'steps (the verification steps, as text) — required when the completion reviewer is a verifier profile, refused with reason `steps` without it.',
     'A verifier is handed steps alone as its orders, so they must stand on their own. A strict session requires both review stages as well.',
+    'The publish reply shows the task id as `task=<id>` (add --json for the whole row). Always match on kind AND task: a match on the task alone returns the task.submitted row at once.',
     'The publish reply carries the task id. `wait` on a task outcome follows replacements and waits for completion review when configured. Read the',
-    'returned row\'s `kind`: task.completed or task.accepted is done; task.failed (with `reason` and `text`), task.cancelled, task.deadline or',
-    'task.rejected mean stop and report that reason to the user. A refusal is such a task.failed row — read it before retrying.',
+    'returned row\'s `kind`: task.completed or task.accepted is done. task.deadline (and the task.cancelled with reason `deadline` that',
+    'follows it) means the worker ran out of time with the work unfinished: its partial progress is in the journal — resubmit what is',
+    'left as a smaller task, or drop it; it is not a reason to stop the run. task.failed (with `reason` and `text`), a task.cancelled',
+    'with reason `user`, or task.rejected mean stop and report that reason to the user. A refusal is such a task.failed row — read it before retrying.',
     'Terminal rows: task.completed, task.failed, task.cancelled, task.rejected. Steer a running worker with',
     `    bounce publish --event '{"kind":"message","to":"worker:<task id>","text":"..."}'`, '',
+    ...breakdownOrders(taskLimits(settings).minutes, {jevOn: Boolean(jev?.enabled)}),
     'Progress is a durable contract, not a heartbeat. Publish task.milestone with task, phase, text, next, and evidence',
     'after initial inspection, every phase change, and before completion. Phases: inspect, plan, implement, test,',
     'verify, review, document, done. `text` says what changed, `next` says what happens next, and `evidence` names',
@@ -164,6 +259,7 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     'Every task.* row you publish needs `task` (an id from your own publish replies): without it the bus refuses',
     `    bounce publish --event '{"kind":"task.milestone","task":"<task id>","phase":"inspect","text":"…","next":"…","evidence":["…"]}'`, '',
     'You may publish only: task.submitted, task.accepted, task.milestone, task.blocked, task.input_required, task.usage, task.activity, message.',
+    '`bounce agents set` journals agents.defined for you.',
     'A Codex worker calls its scoped `bounce_report` tool; other workers use `bounce report --report <json>`. Reports require op (milestone, blocked,',
     'input_required or final), phase, text and next;',
     'a final report additionally requires outcome (completed|failed|blocked|input_required) and summary. Do not use publish for a final report.',
@@ -236,11 +332,13 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   const settings = config(root);
   // The live adapters are orchestrator mode's workers; a test may replace any of them by name.
   // Classic mode never dispatches, so registering them costs it nothing.
-  const adapters = {claude: createClaudeLive(), codex: createCodexLive(), muse: createMuseLive(), local: createLocalLive(), typesafe: createTypesafeLive(), ...extraAdapters};
+  const adapters = {claude: createClaudeLive(), codex: createCodexLive(), muse: createMuseLive(), opencode: createOpencodeLive(), typesafe: createTypesafeLive(), ...extraAdapters};
   // Validated once, before anything is created: an invalid orchestration config throws out of
   // supervise() (cli.js prints it and exits 1) with no session, daemon.json or socket behind it.
   // A profile whose vendor binary is absent fails at dispatch as task.failed{reason:'missing'}.
-  const orchestration = validateOrchestration(settings, [...new Set([...Object.keys(adapters), ...Object.keys(providers)])]);
+  // Roles are agent files: shipped with the orchestration skill, then <root>/agents, then <cwd>/.bounce/agents.
+  const roles = rolesFor(root, {cwd: fs.realpathSync(values.cwd || process.cwd())});
+  const orchestration = validateOrchestration(settings, [...new Set([...Object.keys(adapters), ...Object.keys(providers)])], {roles});
   const orchestrating = orchestration.operation === 'orchestrator';
   const cwd = fs.realpathSync(values.cwd || process.cwd());
   const session = new Session(cwd, {root, id: values.resume ? resolveSessionRef(root, values.resume) : undefined});
@@ -255,7 +353,15 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // cloud agent from the roster and cached under the data root. The router waits briefly for a
   // description in flight (the first `auto` after a fresh model) and otherwise routes on what
   // is known. `orders` (ORDERS.md) is rewritten once notes land; it is bound below.
-  const rosterSetup = orchestrating ? createRosterSetup({root, profiles, session, executables: settings.executables,
+  // The local models Jev may pick as an `auto` agent's AI: discovered at decision time (no inference,
+  // no loading), described by their roster note; none when local models are off or opencode is absent.
+  const localAIs = async () => {
+    const local = normalizeLocalSettings(settings.local);
+    if (!local.enabled || !adapters.opencode || !Object.values(profiles).some(profile => profile.auto)) return [];
+    return localCandidates(await discoverLocalModels(local), readRosterNotes(root));
+  };
+  const rosterSetup = orchestrating ? createRosterSetup({root, profiles, session,
+    extra: async () => (await localAIs()).map(item => ({key: item.name, adapter: 'opencode', model: item.model, endpoint: item.endpoint})), executables: settings.executables,
     agent: setupAgent({profiles, orchestrator: orchestration.orchestrator, order: settings.order, models: settings.models}),
     catalogs: () => modelCatalog(settings), onChange: () => orders()}) : null;
   const rosterNotes = async () => {
@@ -263,14 +369,14 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
     if (pending) await Promise.race([pending, new Promise(resolve => setTimeout(resolve, ROSTER_WAIT_MS).unref?.())]);
     return rosterSetup.notes();
   };
-  const jev = orchestrating ? createJevDecisions({root, adapter: adapters.typesafe, notes: rosterNotes}) : null;
+  const jev = orchestrating ? createJevDecisions({root, adapter: adapters.typesafe, notes: rosterNotes, order: () => settings.order ?? [], locals: localAIs}) : null;
 
   // Phase 8: the strategy seam, same shape as `adapters`/`profiles` above — a test (or, later, a
   // config-driven caller) may inject a strategy object directly; absent, the declarative
   // `strategy:` setting resolved by validateOrchestration (default: defaultStrategy) applies.
   let bus;
   const reportTokens = new Map();
-  const scheduler = createScheduler({session, adapters, profiles, localSettings: settings.local, sessionMode: settings.mode, strict: orchestration.strict,
+  const scheduler = createScheduler({session, adapters, profiles, localSettings: settings.local, sessionMode: settings.mode, strict: orchestration.strict, limits: taskLimits(settings),
     requireFinalReport: orchestrating, reportGrant: ({task, attempt, context}) => {
       if (!orchestrating || !bus) return null;
       const peer = `report:${task}:${attempt}`;
@@ -303,17 +409,20 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // ORDERS.md mentions Jev (the `auto` roster line) only when config.json has a `jev` block at
   // all: without one the generated brief is exactly today's.
   const jevBlock = () => { try { return JSON.parse(fs.readFileSync(path.join(root, 'config.json'), 'utf8')).jev !== undefined; } catch { return false; } };
+  const adapterNames = [...new Set([...Object.keys(adapters), ...Object.keys(providers)])];
+  const readRoles = () => rolesFor(root, {cwd});
   const orders = () => writeOrders({session, root, bus, grant: orchestratorGrant, profiles, orchestrator: orchestration.orchestrator, jev: jevBlock() ? readJevSettings(root) : null,
-    notes: effectiveNotes(profiles, readRosterNotes(root))});
+    notes: effectiveNotes(profiles, readRosterNotes(root)), roles: readRoles(), settings, adapterNames});
   if (orchestrating) orders();
   // Routing on: describe the roster's models now so the first `auto` need not wait; the outcome
   // is journaled either way.
   if (orchestrating) { const jevNow = readJevSettings(root); if (jevNow.enabled && jevNow.routing.enabled) rosterSetup.ensure().catch(() => {}); }
+  if (homeSessionWarning(session.cwd)) session.append({kind: 'status', text: homeSessionWarning(session.cwd)});
   if (orchestrating) session.append({kind: 'operation', operation: 'orchestrator', orchestrator: orchestration.orchestrator, shape: orchestration.shape, text: `Operation: orchestrator on ${orchestration.orchestrator} (${orchestration.shape})`});
   const main = orchestrating && positionals[0] !== 'run' ? createMainService({session, adapters, profile: orchestratorProfile, settings, profiles: orchestration.profiles, readRouting: () => config(root),
     orchestratorEnv: {BOUNCE_BUS: bus.path, BOUNCE_BUS_TOKEN_FILE: orchestratorGrant.file, BOUNCE_ROLE: 'orchestrator', BOUNCE_ORCHESTRATOR_PROFILE: JSON.stringify(orchestratorProfile)},
     brief: `Read and follow ${path.join(session.dir, 'orchestrator', 'ORDERS.md')}.`}) : null;
-  const closeLocalActivation = createLocalActivation({session, scheduler, profiles, settings,
+  const closeLocalActivation = createLocalActivation({session, scheduler, profiles, settings, roles, readRoles,
     readSettings: () => config(root),
     refresh: orders});
   const closeJevActivation = orchestrating ? createJevActivation({session, readSettings: () => readJevSettings(root), refresh: orders, setup: options => rosterSetup.ensure(options)}) : () => {};
@@ -580,6 +689,11 @@ async function interactiveView(args, {existing, restart} = {}) {
     : new Session(fs.realpathSync(values.cwd || process.cwd()), {root, id: values.resume ? resolveSessionRef(root, values.resume) : undefined});
   let info = existing?.info ?? readDaemonJson(session.dir);
   if (!info || !pidAlive(info.pid)) {
+    // The daemon is spawned with stdio:'ignore', so anything it throws is invisible and surfaces
+    // only as "did not become ready". Configuration errors are deterministic and detectable here,
+    // in the foreground, where the user can actually read them — a bad profile must name itself
+    // rather than masquerade as a daemon that failed to start.
+    validateOrchestration(config(root), undefined, {roles: rolesFor(root, {cwd: session.cwd ?? process.cwd()})});
     const daemonArgs = args.filter((value, index) => value !== '--resume' && args[index - 1] !== '--resume' && !value.startsWith('--resume='));
     const daemon = spawn(process.execPath, [cliPath, ...daemonArgs, '--resume', session.id], {
       detached: true, stdio: 'ignore', env: {...process.env, BOUNCE_VIEW_DAEMON: '1', BOUNCE_DETACHED: '1', BOUNCE_SUPERVISED: '', BOUNCE_REMOTE_SESSION: ''},

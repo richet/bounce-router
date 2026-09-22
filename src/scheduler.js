@@ -3,19 +3,24 @@ import fs from 'node:fs';
 import path from 'node:path';
 import * as reducers from './reducers.js';
 import {takeCheckpoint, sameTree} from './checkpoint.js';
-import {POLICY_RANK, effectivePolicy} from './profiles.js';
+import {POLICY_RANK, effectivePolicy, LOCAL_ADAPTERS, playedBy, READ_ONLY_ROLES as READONLY_ROLES} from './profiles.js';
 import {defaultStrategy} from './strategy.js';
 import {reportEvent, validateReport} from './reporting.js';
-import {createLocalAdmission} from './local-admission.js';
+import {normalizeLocalSettings} from './local-models.js';
+import {createLocalResolver} from './local-resolve.js';
 import {routingFallback} from './jev.js';
+import {validOwns, treeSnapshot, revertOutside} from './owned-paths.js';
 import {execFileSync} from 'node:child_process';
 
-const FALLBACK_REASONS = new Set(['limited', 'missing', 'backend_unavailable', 'watchdog', 'local_unavailable', 'local_protocol', 'incomplete_report']);
+const FALLBACK_REASONS = new Set(['limited', 'missing', 'backend_unavailable', 'watchdog', 'local_unavailable', 'worker_runtime', 'incomplete_report']);
 const RISKS = new Set(['boundary', 'process-model', 'logic', 'extraction']);
 const SIZE_FIELDS = ['lines', 'probes', 'minutes'];
+// Silence is five minutes, not two: at two the alarm fired on every test run and corrected itself
+// five seconds later (observed live, four times in one task), which only teaches you to ignore it.
+// No MILESTONE for ten minutes is still a stall, whatever the worker prints.
+export const WATCHDOG_DEFAULTS = {interval: 5000, silence: 300_000, stall: 600_000, grace: 120_000};
 const DEFAULT_DEADLINE_MINUTES = 60; // a worker with no declared deadline; the watchdog ladder still catches silence
 const TIERS = new Set(['live', 'next-turn', 'queued']);
-const READONLY_ROLES = new Set(['critic', 'verifier', 'analyst']);
 // The depends_on hold/fail decision (which dependency states fail a dependent outright vs.
 // merely hold it — A1) now lives in the strategy (src/strategy.js's DEPENDENCY_FAIL_STATES),
 // not here: this scheduler only executes the intent onSubmitted returns.
@@ -34,8 +39,10 @@ const isPositiveInt = n => Number.isInteger(n) && n > 0;
 // may take. It was 10 s, less than a resumed CLI's own startup plus one tool call: observed on
 // fb9181d5, every such continuation timed out and finished work was journaled as failed.
 const REPORT_ONLY_WINDOW_MS = 120000;
-const reportsByTool = profile => ['codex', 'local'].includes(profile?.adapter);
-const reportInstruction = profile => reportsByTool(profile)
+// `opencode` workers report by answering (or `bounce report` when they can run commands); it must be
+// told to CALL it, not to run `bounce report`, because the opencode tier has no shell (Q3).
+const LOCAL_REPORT_LINE = 'Your final answer is your report: when you are done, state the outcome, what you changed, how you verified it (paste the test output line), and what remains. There is no report tool or endpoint to reach.';
+const reportInstruction = profile => profile?.adapter === 'codex'
   ? 'call the bounce_report tool with the report object'
   : 'use bounce report --report <json>';
 // The whole report schema rides with the orders. A worker that is only told "final reports
@@ -75,18 +82,32 @@ function parseVerdict(status, text) {
 // Dispatch, fallback, permission ratchet, cancellation, review and reconcile as policies over
 // the log, driven by adapters. Everything the scheduler knows is re-derived from session.events
 // via the reducers — it keeps only a live-handle map, which cannot survive a restart by design.
-export function createScheduler({session, adapters, profiles, localSettings, localAdmission = createLocalAdmission({local: localSettings}), localRuntimeReconcile = async args => (await import('./local-runtime.js')).reconcileLocalRuntime(args), sessionMode = 'yolo', depthCap = 1, checkpointRunner, limits: suppliedLimits = {}, strict = false, requireFinalReport = false, reportGrant = null, clock = () => Date.now(), watchdog: suppliedWatchdog = {}, strategy = defaultStrategy, jev = null, gitHead = defaultGitHead}) {
+export function createScheduler({session, adapters, profiles, localSettings, localResolver = createLocalResolver({local: localSettings}), sessionMode = 'yolo', depthCap = 1, checkpointRunner, limits: suppliedLimits = {}, strict = false, requireFinalReport = false, reportGrant = null, clock = () => Date.now(), watchdog: suppliedWatchdog = {}, strategy = defaultStrategy, jev = null, gitHead = defaultGitHead}) {
   // Sizing limits (lines/probes/minutes) gate dispatch ONLY when the caller configures them: a
   // task's declared size is otherwise informational. The old built-in 150/6/15 defaults refused
   // real orchestrations (a 400-line brief) with no way to see why — a shallow rule, removed.
   const limits = {rounds: 2, ...suppliedLimits};
   if (!isPositiveInt(limits.rounds) || SIZE_FIELDS.some(field => limits[field] !== undefined && !isPositiveInt(limits[field]))) throw new Error('malformed: limits');
-  const watchdogConfig = {interval: 5000, silence: 120000, stall: 600000, grace: 120000, ...suppliedWatchdog};
+  const watchdogConfig = {...WATCHDOG_DEFAULTS, ...suppliedWatchdog};
   const intervalOk = watchdogConfig.interval === null || isPositiveInt(watchdogConfig.interval);
   if (!intervalOk || !isPositiveInt(watchdogConfig.silence) || !isPositiveInt(watchdogConfig.stall) || !isPositiveInt(watchdogConfig.grace)) throw new Error('malformed: watchdog');
   const handles = new Map(); // task -> {adapter, handle}
   const reviews = new Map(); // task -> {adapter, handle}, one review in flight per task (A3)
   const heldTasks = new Set(); // tasks queued behind an unaccepted depends_on, re-evaluated on terminal rows
+  // Local workers waiting for a slot: `local.endpoints.<name>.maxConcurrent` is how many the endpoint
+  // runs at once (LM Studio is loaded with that many parallel slots; more would queue inside it and
+  // look stalled, and each running model turn holds memory — observed live as a swapping machine).
+  // A task past the limit stays queued, says so once, and dispatches when a local turn ends.
+  const slotWaiters = new Set();
+  const localEndpoint = endpoint => { try { return normalizeLocalSettings(localSettings).endpoints[endpoint] ?? {}; } catch { return {}; } };
+  const localSlots = endpoint => localEndpoint(endpoint).maxConcurrent ?? 1;
+  // Per model: the endpoint's slotsPerModel, else the endpoint ceiling (one model, same number).
+  const modelSlots = endpoint => localEndpoint(endpoint).slotsPerModel ?? localSlots(endpoint);
+  // Running = a live handle, or a launch still in flight (the handle exists only after launch()
+  // resolves, and several dispatches can pass the check before the first one does).
+  const localEndpointOf = task => { const p = profiles[reducers.tasks(session.events)[task]?.profile]; return p && LOCAL_ADAPTERS.has(p.adapter) ? p.endpoint ?? 'lmstudio' : null; };
+  const localModelOf = task => profiles[reducers.tasks(session.events)[task]?.profile]?.model ?? null;
+  const localRunning = (endpoint, model = null) => new Set([...[...handles.entries()].filter(([t, h]) => h.local === endpoint && (model === null || localModelOf(t) === model)).map(([t]) => t), ...[...launchingAttempts.keys()].filter(t => localEndpointOf(t) === endpoint && (model === null || localModelOf(t) === model))]).size;
   const launchingAttempts = new Map(); // task -> {attempt, reports}; grants exist before task.started
   const resolvedLocalProfiles = new Map();
   // Live activity, never journaled (task.activity is a LIVE_KIND): task -> {at, expectUntil}.
@@ -99,10 +120,20 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   const rawSubmittedRow = task => session.events.find(e => e.kind === 'task.submitted' && e.task === task);
   const submittedRow = task => {
     const row = rawSubmittedRow(task);
-    if (row?.profile !== AUTO_PROFILE) return row;
+    // ...and so is a task for an agent whose `models:` opens with `auto`: Jev's AI for it is a routed row too.
+    if (row?.profile !== AUTO_PROFILE && profiles[row?.profile]?.auto !== true) return row;
     const routed = session.events.findLast(e => e.kind === 'jev.routed' && e.task === task);
     return routed ? {...row, profile: routed.chosen} : row;
   };
+  // A job on an AI Jev picked (`agent@ai`) is composed when it is first needed and again after a
+  // restart, from the rows that named it — it is never part of the validated table.
+  // `local` ({endpoint, model}) when the AI is a local model, which has no profile of its own.
+  const compose = (agent, ai, local = null) => {
+    const name = `${agent}@${ai}`;
+    if (profiles[agent]?.auto === true && (local || profiles[ai])) profiles[name] = playedBy(profiles[agent], ai, profiles[ai], local);
+    return profiles[name] ? name : null;
+  };
+  for (const e of session.events) if (e.kind === 'jev.routed' && e.agent && e.ai) compose(e.agent, e.ai, e.local ?? null);
   // Jev's diff base (`head` on the first task.started) is recorded only for a task a
   // decision-model (typesafe) reviewer will judge — the `jev` critic prepare() names when Jev
   // review is on. Otherwise the row carries no `head` and no git call is made, so with Jev
@@ -126,6 +157,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     append({kind: 'task.milestone', task, attempt, phase: event.phase, text: String(event.text).slice(0, 2000), next: 'continue local worker', context});
   };
 
+  // The one local-specific step of a dispatch: pick the model and build OpenCode's provider config.
+  // Bounded by the task's own deadline (discovery may wait on a model being loaded on demand) and
+  // cancellable while pending; after it, the worker is launched like any other.
   async function admitLocal(profile, task, attempt, context, launchState) {
     const controller = new AbortController();
     const launching = launchState ?? launchingAttempts.get(task);
@@ -133,36 +167,14 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     launching.phase = 'admission';
     const deadline = deadlineAtFor(task) ?? clock() + taskDeadlineMs(submittedRow(task));
     const timer = setTimeout(() => controller.abort(new Error('Local task deadline exceeded')), Math.max(1, deadline - clock()));
-    let lease;
     try {
-      lease = await localAdmission.acquire({profile, cwd: session.cwd, signal: controller.signal,
+      const resolved = await localResolver.resolve({profile, signal: controller.signal,
         onStatus: text => append({kind: 'task.milestone', task, attempt, phase: 'admission', text, next: 'launch worker', context})});
       controller.signal.throwIfAborted();
       launching.phase = 'launch';
-    } catch (error) {
-      clearTimeout(timer);
-      lease?.release({verified: true});
-      throw error;
-    }
-    const base = adapters.local;
-    let cancelled;
-    const adapter = {...base, async cancel(handle) {
-      if (!cancelled) cancelled = Promise.resolve(base.cancel(handle)).catch(() => ({verified: false})).then(result => {
-        clearTimeout(timer);
-        lease.release({verified: result?.verified === true});
-        append({kind: 'task.local_release', task, attempt, endpoint: lease.profile.localResolved?.endpoint ?? profile.endpoint ?? 'lmstudio', verified: result?.verified === true, inferenceVerified: handle.inferenceSettled === true, context});
-        if (result?.artifact) append({kind: 'task.artifact', task, path: result.artifact, text: 'Quarantined partial workspace; not automatically applied', context});
-        return result;
-      });
-      return cancelled;
-    }};
-    return {profile: lease.profile, adapter, signal: controller.signal,
-      failed: error => {
-        clearTimeout(timer);
-        const verified = error?.terminationVerified === true || (error?.terminationVerified !== false && ['backend_unavailable', 'IMAGE_MISSING', 'INVALID_RUNTIME', 'LOCAL_RESUME_UNAVAILABLE', 'LOCAL_RESUME_MISMATCH'].includes(error?.code));
-        lease.release({verified});
-        return verified;
-      }};
+      // Nothing ran before a launch fails, so the failure is always a verified non-start.
+      return {profile: resolved, adapter: adapters[profile.adapter], signal: controller.signal, failed: () => true};
+    } finally { clearTimeout(timer); }
   }
 
   // Called only by the restricted report endpoint. The endpoint binds task/attempt from its
@@ -226,6 +238,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (spec.budget?.rounds !== undefined && !isNonNegativeInt(spec.budget.rounds)) return 'budget';
     if (spec.checkpoint != null && typeof spec.checkpoint !== 'object') return 'checkpoint';
     if (spec.risk !== undefined && !RISKS.has(spec.risk)) return 'risk';
+    if (spec.owns !== undefined && !validOwns(spec.owns)) return 'owns';
     if (spec.size !== undefined && SIZE_FIELDS.some(field => !isNonNegativeInt(spec.size[field]))) return 'size';
     if (spec.depends_on !== undefined) {
       if (!Array.isArray(spec.depends_on)) return 'depends_on';
@@ -244,7 +257,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         if (!names.length) return 'review';
         for (const n of names) {
           const p = profiles[n];
-          if (!p || !READONLY_ROLES.has(p.role)) return 'review';
+          // A reviewer is whoever cannot change anything: by declared policy, not by the label it wears.
+          if (!p || !(effectivePolicy(p) === 'read-only' || READONLY_ROLES.has(p.role))) return 'review';
         }
       }
     }
@@ -294,6 +308,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       depends_on: spec.depends_on ?? [],
       review: spec.review ?? null,
       steps: spec.steps ?? null,
+      ...(spec.owns ? {owns: spec.owns} : {}),
     });
   }
 
@@ -326,6 +341,23 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   };
   const lineageProfiles = (rootId, view) => Object.keys(view).filter(id => lineageRootOf(id, view) === rootId).map(id => view[id].profile);
 
+  // Why a worker could not be started — launched or resumed — as the reason the fallback walk reads.
+  // A local model that cannot be resolved, a missing or unanswering vendor process, and a vendor
+  // that refuses because the account is exhausted (codex-live tags that `limited`; its own text,
+  // the reset time, rides along) all move the task to its next AI; anything else is an `error`.
+  const startFailure = error => error.code?.startsWith('LOCAL_') ? {reason: 'local_unavailable', text: error.message}
+    : error.code === 'missing' || error.code === 'backend_unavailable' ? {reason: error.code, ...(error.message && error.message !== error.code ? {text: error.message} : {})}
+    : error.code === 'limited' ? {reason: 'limited', text: error.message}
+    : {reason: 'error', text: error.message};
+
+  // A write worker under a task that declares `owns` gets the tree snapshotted before its turn, so
+  // what it changed outside those paths can be put back afterwards (src/owned-paths.js).
+  function ownedSnapshot(task, profile) {
+    const owns = submittedRow(task)?.owns;
+    if (!Array.isArray(owns) || !owns.length || effectivePolicy(profile) === 'read-only' || !session.cwd) return null;
+    try { return {owns, before: treeSnapshot(session.cwd)}; } catch { return null; }
+  }
+
   function maybeFallback(row) {
     if (!FALLBACK_REASONS.has(row.reason)) return;
     const view = reducers.tasks(session.events);
@@ -349,13 +381,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       return;
     }
     const maximumPolicy = POLICY_RANK[effectivePolicy(profiles[view[lineageRoot].profile])];
-    const originalProfile = profiles[view[lineageRoot].profile];
     const next = (profile.fallback ?? []).find(name => !tried.has(name) && profiles[name]
       && profiles[name].role !== 'orchestrator'
-      && !(originalProfile.adapter === 'local' && originalProfile.localOnly !== false && profiles[name].adapter !== 'local')
-      && !(originalProfile.adapter === 'local' && profiles[name].adapter === 'local' &&
-        ((profiles[name].writePaths ?? []).some(candidate => !(originalProfile.writePaths ?? []).some(root => candidate === root || candidate.startsWith(`${root}/`))) ||
-        (profiles[name].commands ?? []).some(command => !(originalProfile.commands ?? []).includes(command))))
       && POLICY_RANK[effectivePolicy(profiles[name])] <= maximumPolicy && !policyRefusal(profiles[name]));
     if (!next) {
       const reason = profile.fallback?.length ? 'no_compatible_profile' : 'no_profile_configured';
@@ -387,28 +414,19 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return recoveryPromise ??= reconcileState();
   }
   async function reconcileState() {
-    for (const t of Object.values(reducers.tasks(session.events))) {
-      if (t.state !== 'blocked' || session.events.findLast(row => row.task === t.id && row.kind === 'task.blocked')?.reason !== 'orphaned') continue;
-      const selection = session.events.findLast(row => row.task === t.id && row.kind === 'task.local_selected');
-      if (!selection) continue;
-      const endpoint = selection.selection?.endpoint;
-      append({kind: 'task.milestone', task: t.id, phase: 'recovery', text: 'Reconciling owned local containers after restart', next: 'verify termination and preserve partial work', context: t.context});
-      try {
-        const result = await localRuntimeReconcile({dir: path.join(session.dir, 'tasks', t.id)});
-        if (result.verified !== true || (!result.found && selection.policy !== 'read-only' && selection.policy !== 'plan')) throw new Error('No verified runtime ownership record; manual inspection required');
-        if (result.artifact) append({kind: 'task.artifact', task: t.id, path: result.artifact, text: 'Recovered partial workspace; not automatically applied', context: t.context});
-        const previous = session.events.findLast(row => row.task === t.id && row.kind === 'task.local_release');
-        if (previous?.inferenceVerified !== true && endpoint) {
-          localAdmission.quarantine?.({endpoint});
-          append({kind: 'task.local_release', task: t.id, endpoint, verified: false, inferenceVerified: false, text: 'Containers stopped; LM Studio inference release remains unverified', context: t.context});
-        }
-        append({kind: 'task.cancelled', task: t.id, reason: 'recovered', text: 'Owned containers stopped; partial work retained for explicit recovery', context: t.context});
-      } catch (error) {
-        append({kind: 'task.blocked', task: t.id, reason: 'orphaned', text: `Local recovery blocked: ${error.message}`, context: t.context});
-      }
-    }
+    // A local worker orphaned by a daemon restart has nothing to reconcile: there are no containers,
+    // and publication is atomic, so an interrupted worker published nothing — its task-local copy is
+    // simply abandoned. Termination of the previous process is still unverified, so such a task stays
+    // blocked for inspection rather than being auto-recovered on a guarantee this design cannot make.
     for (const [task, t] of Object.entries(reducers.tasks(session.events))) {
       if (t.state !== 'queued' || handles.has(task) || heldTasks.has(task) || routing.has(task)) continue;
+      const row = submittedRow(task);
+      if (row) dispatch(row).catch(error => append({kind: 'task.failed', task, reason: 'error', text: error.message, context: row.context}));
+    }
+  }
+  function wakeSlotWaiters() {
+    for (const task of [...slotWaiters]) {
+      if (!reducers.tasks(session.events)[task] || reducers.tasks(session.events)[task].state !== 'queued') { slotWaiters.delete(task); continue; }
       const row = submittedRow(task);
       if (row) dispatch(row).catch(error => append({kind: 'task.failed', task, reason: 'error', text: error.message, context: row.context}));
     }
@@ -478,7 +496,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // journaling the worker's raw lines with its provider lets recordQuota see them exactly as
   // it sees the main provider's. Shared by the initial launch and by a rework resume — a
   // review's own event consumption (runReview) is a narrower variant of the same switch.
-  async function consumeWorkerEvents({adapter, handle, task, context, profile}) {
+  async function consumeWorkerEvents({adapter, handle, task, context, profile, owned = null}) {
     const from = workerFrom(task);
     let observedAt = -Infinity;
     try {
@@ -498,7 +516,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
           case 'milestone': append({kind: 'task.milestone', task, text: event.text, evidence: event.evidence, from, context}); break;
           case 'blocked': append({kind: 'task.blocked', task, text: event.text, from, context}); break;
           case 'usage': append({kind: 'task.usage', task, usage: event.usage, from, context}); break;
-          case 'native': append({kind: 'peer.native', from, provider: event.provider, sessionId: event.sessionId, context}); break;
+          case 'native': append({kind: 'peer.native', from, provider: event.provider, sessionId: event.sessionId, ...(event.cwd ? {cwd: event.cwd} : {}), context}); break;
           case 'jev': append({kind: `jev.${event.name}`, ...(event.data ?? {}), text: event.text, task, from, context}); break;
           case 'result':
             // A terminal provider row is not a licence to overlap writers: prove the process
@@ -510,19 +528,31 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
               return;
             }
             if (handles.get(task)?.handle !== handle || reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) return;
+            // The task's owned paths are a contract, not a request: every change the turn made outside
+            // them is put back now, before any completion is journaled, so a review sees the tree the
+            // task was allowed to produce. Found live: a worker edited a forbidden file and said done.
+            if (owned) {
+              const reverted = revertOutside(session.cwd, owned.before, owned.owns);
+              if (reverted.length) append({kind: 'task.reverted', task, files: reverted, text: `Reverted ${reverted.length} change${reverted.length === 1 ? '' : 's'} outside the owned paths: ${reverted.join(', ')}`, from, context});
+            }
             if (requireFinalReport) append({kind: 'task.attempt.ended', task, attempt: reducers.tasks(session.events)[task]?.attempt, from, context});
             if (event.status === 'completed' && requireFinalReport) {
               const state = reducers.tasks(session.events)[task]?.state;
               const attempt = state ? reducers.tasks(session.events)[task]?.attempt : null;
               if (!finalizeReport({task, attempt, from, context}) && !reducers.TERMINAL.has(state) && state !== 'blocked' && state !== 'input_required') {
-                await requestFinalReport({task, attempt, context, adapter});
+                // A local worker's answer IS its report: asking a small model to also drive a report
+                // protocol is the step it fails most, and the continuation that chased it never once
+                // succeeded. Only `completed` is inferred, and the row says it was.
+                if (LOCAL_ADAPTERS.has(profile.adapter) && typeof event.text === 'string' && event.text.trim()) {
+                  append({kind: 'task.completed', task, summary: event.text, synthesized: true, from, context});
+                } else await requestFinalReport({task, attempt, context, adapter});
               }
             } else if (event.status === 'completed') append({kind: 'task.completed', task, summary: event.text, from, context});
             else {
-              const reason = event.status === 'limited' ? 'limited'
-                : profile.adapter === 'local' && event.code === 'LMSTUDIO_PROTOCOL' ? 'local_protocol'
-                : profile.adapter === 'local' && event.code === 'LMSTUDIO_HTTP' ? 'local_unavailable'
-                : profile.adapter === 'local' && event.code === 'INCOMPLETE_REPORT' ? 'incomplete_report' : 'error';
+              // An adapter marks a failure of its RUNTIME (process died, endpoint down, no answer) as
+              // recoverable: the same job may run on the next AI in the chain. A worker that did the
+              // work and failed it on its merits is not.
+              const reason = event.status === 'limited' ? 'limited' : event.recoverable === true ? 'worker_runtime' : 'error';
               append({kind: 'task.failed', task, reason, text: event.text, from, context});
             }
             return;
@@ -538,6 +568,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       else append({kind: 'task.blocked', task, text: 'termination unverified', from, context});
     } finally {
       if (handles.get(task)?.handle === handle && reducers.tasks(session.events)[task]?.blocker !== 'termination unverified') handles.delete(task);
+      if (slotWaiters.size) queueMicrotask(wakeSlotWaiters); // a local slot may have freed: the handle is gone only now
     }
   }
 
@@ -577,21 +608,28 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     let profile = reportEnv ? {...baseProfile, report: reportEnv} : baseProfile;
     let adapter = adapters[profile.adapter];
     let admission;
-    let handle;
+    let handle, owned = null;
     try {
-      if (profile.adapter === 'local' && profile.backend === 'lmstudio') {
+      if (LOCAL_ADAPTERS.has(profile.adapter) && profile.backend === 'lmstudio') {
         admission = await admitLocal(profile, task, attempt, context);
         ({profile, adapter} = admission);
         resolvedLocalProfiles.set(task, profile);
-        append({kind: 'task.local_selected', task, attempt, selection: profile.localResolved, policy: profile.policy, writePaths: profile.writePaths, context});
+        append({kind: 'task.local_selected', task, attempt, selection: profile.localResolved, policy: profile.policy, context});
       }
-      let workerOrders = reportEnv || (requireFinalReport && profile.adapter === 'local') ? `${row.orders}\n\n${reportContract(profile)}` : row.orders;
-      if (profile.adapter === 'local') {
-        workerOrders += `\n\nLocal execution policy: ${profile.policy}. Use project-relative paths. Read scope: ${JSON.stringify(profile.readPaths)}. Writable scope: ${JSON.stringify(profile.writePaths)}. Permitted exact commands: ${JSON.stringify(profile.commands)}. Commands execute in an isolated Linux container; host files change only after validated publication. Report actual command outcomes, never inferred success.`;
-      }
+      // OpenCode runs the worker AS its role agent (system prompt, step cap); every other adapter
+      // gets the role's prompt ahead of the orders instead, so the role means the same thing whoever
+      // answers the dispatch.
+      const roleLead = profile.agent?.prompt && profile.adapter !== 'opencode' ? `${profile.agent.prompt}\n\n---\n\n` : '';
+      // A local worker reports by answering, and is told so. Observed live: told to use `bounce report`,
+      // three local workers opened their reports with "the bounce API endpoint is not reachable" and
+      // had spent their turn on it. A cloud worker keeps the report protocol.
+      const canReport = reportEnv && !LOCAL_ADAPTERS.has(profile.adapter);
+      let workerOrders = canReport ? `${roleLead}${row.orders}\n\nTo report progress, ${reportInstruction(profile)} using your scoped report endpoint. Final reports require op:\"final\", outcome, summary, phase, text and next; do not publish task completion directly.`
+        : LOCAL_ADAPTERS.has(profile.adapter) ? `${roleLead}${row.orders}\n\n${LOCAL_REPORT_LINE}` : `${roleLead}${row.orders}`;
+      owned = ownedSnapshot(task, profile);
       handle = await adapter.launch({peer: workerFrom(task), profile, orders: workerOrders, cwd: session.cwd, dir,
         task, attempt, context, signal: admission?.signal,
-        onActivity: profile.adapter === 'local' ? localActivity(task, attempt, context) : undefined,
+        onActivity: LOCAL_ADAPTERS.has(profile.adapter) ? localActivity(task, attempt, context) : undefined,
         report: requireFinalReport ? ({report: payload}) => report({task, attempt, context, report: payload}) : undefined});
     } catch (error) {
       const verified = admission ? admission.failed(error) : true;
@@ -604,32 +642,25 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         append({kind: verified ? 'task.cancelled' : 'task.blocked', task, reason: verified ? cancelled : 'termination_unverified', text: verified ? 'Pending launch cancelled' : 'termination unverified after cancelled launch', from: workerFrom(task), context});
         return;
       }
-      if (error.code === 'LOCAL_CAPACITY_UNCERTAIN') append({kind: 'task.blocked', task, reason: 'termination_unverified', text: error.message, from: workerFrom(task), context});
-      else if (error.code?.startsWith('LOCAL_')) append({kind: 'task.failed', task, reason: 'local_unavailable', text: error.message, from: workerFrom(task), context});
-      else if (error.code === 'missing' || error.code === 'backend_unavailable') append({kind: 'task.failed', task, reason: error.code, from: workerFrom(task), context});
-      // A vendor that refuses the launch itself because the account is exhausted (codex-live tags
-      // the rejection `limited`) falls back exactly like a limited result would; the vendor's
-      // own text (its reset time) rides along for the orchestrator.
-      else if (error.code === 'limited') append({kind: 'task.failed', task, reason: 'limited', text: error.message, from: workerFrom(task), context});
-      else append({kind: 'task.failed', task, reason: 'error', text: error.message, from: workerFrom(task), context});
+      append({kind: 'task.failed', task, ...startFailure(error), from: workerFrom(task), context});
       return;
     }
     // The task may have been cancelled (or otherwise gone terminal) while launch() was
     // pending: don't adopt it as live, just shut down the now-unwanted process.
     if (launchingAttempts.get(task)?.cancelReason || reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) {
-      handles.set(task, {adapter, handle});
+      handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : {})});
       const reason = launchingAttempts.get(task)?.cancelReason ?? 'user';
       launchingAttempts.delete(task);
       await cancelOne(task, reducers.tasks(session.events), reason);
       return;
     }
-    handles.set(task, {adapter, handle});
+    handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : {})});
     append({kind: 'peer.joined', name: workerFrom(task), role: 'worker', adapter: profile.adapter, profile: row.profile, from: workerFrom(task), context});
       append({kind: 'task.started', task, attempt, requested: profile.model ?? '', ...(attempt === 1 && jevReviewed(row) ? {head: gitHead(session.cwd)} : {}), from: workerFrom(task), context});
     for (const staged of launchingAttempts.get(task)?.reports ?? []) report({task, attempt, report: staged.payload, from: staged.from, context: staged.context});
     launchingAttempts.delete(task);
     publish({kind: 'task.activity', task, text: 'Worker started · waiting for first activity', startup: true, from: workerFrom(task), context});
-    await consumeWorkerEvents({adapter, handle, task, context, profile});
+    await consumeWorkerEvents({adapter, handle, task, context, profile, owned});
   }
 
   // Rework, on the same worker: resume() carries the review's findings plus every message
@@ -652,22 +683,23 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     let profile = reportEnv ? {...baseProfile, report: reportEnv} : baseProfile;
     const dir = path.join(session.dir, 'tasks', task);
     const nativeRow = session.events.filter(e => e.kind === 'peer.native' && e.from === workerFrom(task)).at(-1);
-    const native = nativeRow ? {provider: nativeRow.provider, sessionId: nativeRow.sessionId} : {};
+    const native = nativeRow ? {provider: nativeRow.provider, sessionId: nativeRow.sessionId, ...(nativeRow.cwd ? {cwd: nativeRow.cwd} : {})} : {};
     const pending = reportOnly ? [] : pendingMessages(task);
     const message = reportOnly
       ? `Return the missing final report now: ${reportInstruction(profile)}. Do not perform additional implementation. Include op:final, outcome, phase, text, next, summary, evidence and remaining. Report blockers honestly.`
       : [`Rework round ${round}:`, ...findings.map(f => `- ${f}`), ...pending.map(m => m.text)].join('\n');
     let adapter = adapters[profile.adapter];
     let admission;
-    let handle;
+    let handle, owned = null;
     try {
-      if (profile.adapter === 'local' && profile.backend === 'lmstudio') {
+      if (LOCAL_ADAPTERS.has(profile.adapter) && profile.backend === 'lmstudio') {
         admission = await admitLocal(profile, task, attempt, context);
         ({profile, adapter} = admission);
       }
-      handle = await adapter.resume({peer: workerFrom(task), profile, native, message: reportEnv ? `${message}\n\nTo report, ${reportInstruction(profile)}; finals require outcome, summary, phase, text and next.` : message, cwd: session.cwd, dir, checkpoint: row.checkpoint,
+      owned = ownedSnapshot(task, profile);
+      handle = await adapter.resume({peer: workerFrom(task), profile, native, message: reportEnv && !LOCAL_ADAPTERS.has(profile.adapter) ? `${message}\n\nTo report, ${reportInstruction(profile)}; finals require outcome, summary, phase, text and next.` : LOCAL_ADAPTERS.has(profile.adapter) ? `${message}\n\n${LOCAL_REPORT_LINE}` : message, cwd: session.cwd, dir, checkpoint: row.checkpoint,
         task, attempt, context, signal: admission?.signal,
-        onActivity: profile.adapter === 'local' ? localActivity(task, attempt, context) : undefined,
+        onActivity: LOCAL_ADAPTERS.has(profile.adapter) ? localActivity(task, attempt, context) : undefined,
         report: requireFinalReport ? ({report: payload}) => report({task, attempt, context, report: payload}) : undefined});
     } catch (error) {
       const verified = admission ? admission.failed(error) : true;
@@ -682,7 +714,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         append({kind: verified ? 'task.cancelled' : 'task.blocked', task, reason: verified ? cancelled : 'termination_unverified', text: verified ? 'Pending resume cancelled' : 'termination unverified after cancelled resume', from: workerFrom(task), context});
         return;
       }
-      append({kind: 'task.failed', task, reason: reportOnly ? 'incomplete_report' : 'error', text: error.message, from: workerFrom(task), context});
+      // A worker that cannot be RESUMED is classified exactly as one that cannot be launched, so the
+      // task's next AI is tried. It used to be a bare `error`, which no fallback follows (found live:
+      // a codex thread/resume timed out after a Jev rework and the session stopped).
+      append({kind: 'task.failed', task, ...(reportOnly ? {reason: 'incomplete_report', text: error.message} : startFailure(error)), from: workerFrom(task), context});
       return;
     }
     // A resume that resolves is deemed to have delivered every message it folded in: journal
@@ -691,13 +726,13 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // A throwing resume (the branch above) journals none of this — nothing was delivered.
     for (const m of pending) append({kind: 'task.delivered', task, tier: 'next-turn', message: m.id, text: `rework round ${round}`, from: 'bounce', context});
     if (launchingAttempts.get(task)?.cancelReason || reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) {
-      handles.set(task, {adapter, handle});
+      handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : {})});
       const reason = launchingAttempts.get(task)?.cancelReason ?? 'user';
       launchingAttempts.delete(task);
       await cancelOne(task, reducers.tasks(session.events), reason);
       return;
     }
-    handles.set(task, {adapter, handle});
+    handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : {})});
     append({kind: 'task.started', task, attempt, resumed: true, requested: profile.model ?? '', from: workerFrom(task), context});
     for (const staged of launchingAttempts.get(task)?.reports ?? []) report({task, attempt, report: staged.payload, from: staged.from, context: staged.context});
     launchingAttempts.delete(task);
@@ -709,7 +744,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         ? {kind: 'task.failed', task, reason: 'incomplete_report', text: 'Final report request timed out', context}
         : {kind: 'task.blocked', task, text: 'termination unverified', context});
     }, Math.max(1, Math.min(REPORT_ONLY_WINDOW_MS, (deadlineAtFor(task) ?? (clock() + REPORT_ONLY_WINDOW_MS)) - clock()))) : null;
-    try { await consumeWorkerEvents({adapter, handle, task, context, profile}); }
+    try { await consumeWorkerEvents({adapter, handle, task, context, profile, owned}); }
     finally { clearTimeout(reportTimer); }
   }
 
@@ -724,9 +759,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     let adapter = adapters[profile.adapter];
     let admission;
     const launchState = {task, pending: true};
-    let handle;
+    let handle, owned = null;
     try {
-      if (profile.adapter === 'local' && profile.backend === 'lmstudio') {
+      if (LOCAL_ADAPTERS.has(profile.adapter) && profile.backend === 'lmstudio') {
         reviews.set(peer, launchState);
         admission = await admitLocal(profile, task, round, context, launchState);
         ({profile, adapter} = admission);
@@ -763,7 +798,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
           case 'usage': append({kind: 'task.usage', task, usage: event.usage, from: peer, context}); break;
           case 'raw': append({kind: 'raw', raw: event.raw ?? null, provider: profile.adapter, task, from: peer, context}); break;
           case 'model': append({kind: 'model', model: String(event.model), provider: profile.adapter, task, from: peer, context}); break;
-          case 'native': append({kind: 'peer.native', from: peer, provider: event.provider, sessionId: event.sessionId, context}); break;
+          case 'native': append({kind: 'peer.native', from: peer, provider: event.provider, sessionId: event.sessionId, ...(event.cwd ? {cwd: event.cwd} : {}), context}); break;
           // A decision-model reviewer's own rows (jev.verdict / jev.skipped): the answer, never the request.
           case 'jev': append({kind: `jev.${event.name}`, ...(event.data ?? {}), text: event.text, task, from: peer, context}); break;
           case 'activity': case 'assistant': case 'tool': case 'progress': case 'diagnostic': case 'status':
@@ -805,6 +840,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       const root = budgetRootOf(id, reducers.tasks(session.events));
       return reducers.budgets(session.events).roots[root]?.reserved?.rounds || 0;
     },
+    // The previous rework round of this task (its findings), and the checks Jev fired for the latest
+    // verdict — what the repeated-findings rule compares and names.
+    lastRework: id => session.events.findLast(e => e.kind === 'task.rework' && e.task === id) ?? null,
+    lastFired: id => session.events.findLast(e => e.kind === 'jev.verdict' && e.task === id)?.fired ?? null,
     roundsCap: id => {
       const root = budgetRootOf(id, reducers.tasks(session.events));
       return submittedRow(root)?.budget?.rounds ?? limits.rounds;
@@ -1005,6 +1044,14 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       append({kind: 'task.failed', task, reason: 'size', text: `${oversizedField} ${size[oversizedField]} exceeds limit ${limits[oversizedField]}`, context});
       return;
     }
+    // The cap on how long ONE task may be given. A declared size is the orchestrator's own estimate;
+    // the deadline is what it actually grants, so that is what is held to the cap. Found live: one
+    // worker given 40 minutes for "finish P2", never reviewed on the way, nothing accepted at the end.
+    // The refusal says how to split, because a bare refusal was the flaw of the old size defaults.
+    if (limits.minutes !== undefined && Number.isFinite(row.deadline) && row.deadline > limits.minutes * 60000) {
+      append({kind: 'task.failed', task, reason: 'size', text: `a ${Math.ceil(row.deadline / 60000)}-minute task exceeds the ${limits.minutes}-minute cap: split it into phases in sequence (depends_on), each phase made of chunks that run in parallel on disjoint paths, none longer than ${limits.minutes} minutes`, context});
+      return;
+    }
     const view = reducers.tasks(session.events);
     // Cycle-guarded: only a directly-journaled row (never submit(), which requires a
     // pre-existing parent) can make a task its own ancestor.
@@ -1032,9 +1079,33 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         append({kind: 'task.failed', task, reason: 'error', text: 'malformed: profile (no worker profile to route auto to)', context});
         return;
       }
-      append({kind: 'jev.routed', task, chosen: decision.chosen, probabilities: decision.probabilities ?? {}, confidence: decision.confidence ?? 0, fallback: decision.fallback === true, reason: decision.reason ?? null, model: decision.model ?? null,
-        text: decision.fallback ? `Routed auto → ${decision.chosen} (fallback: ${decision.reason ?? 'unavailable'})` : `Routed auto → ${decision.chosen} (Jev, confidence ${Number(decision.confidence ?? 0).toFixed(2)})`, context});
+      // A job AND its AI from the one ask: the agent's `models:` opens with `auto` and the AI answer was confident.
+      const played = decision.agent && decision.ai ? compose(decision.agent, decision.ai, decision.local ?? null) : null;
+      if (played) {
+        append({kind: 'jev.routed', task, chosen: played, agent: decision.agent, ai: decision.ai, ...(decision.local ? {local: decision.local} : {}), via: 'auto', probabilities: decision.probabilities ?? {}, confidence: decision.confidence ?? 0, fallback: false, reason: null, model: decision.model ?? null,
+          text: `Routed auto → ${decision.agent} on ${decision.ai} (job and AI chosen by Jev, confidence ${Number(decision.confidence ?? 0).toFixed(2)})`, context});
+      } else
+      append({kind: 'jev.routed', task, chosen: decision.chosen, ...(decision.tier ? {tier: decision.tier} : {}), ...(decision.agent !== undefined ? {agent: decision.agent, ...(decision.agentReason ? {agentReason: decision.agentReason} : {})} : {}), probabilities: decision.probabilities ?? {}, confidence: decision.confidence ?? 0, fallback: decision.fallback === true, reason: decision.reason ?? null, model: decision.model ?? null,
+        text: decision.fallback ? `Routed auto → ${decision.chosen} (fallback: ${decision.reason ?? 'unavailable'})` : `Routed auto → ${decision.chosen} (${decision.agent ? 'job chosen by ' : ''}Jev${decision.tier ? `: tier ${decision.tier}` : ''}, confidence ${Number(decision.confidence ?? 0).toFixed(2)})`, context});
       row = submittedRow(task);
+    } else if (profiles[row.profile]?.auto === true && !row.replaces && jev?.routeAI && !session.events.some(e => e.kind === 'jev.routed' && e.task === task)) {
+      // An agent whose `models:` opens with `auto`: the job is given, Jev picks the AI. A recovery
+      // task (`replaces`) is never routed — it is the job falling to its own chain.
+      if (routing.has(task)) return;
+      routing.add(task);
+      const agent = row.profile;
+      let decision;
+      try { decision = await jev.routeAI({task, orders: row.orders, profiles, head: profiles[agent]}); }
+      finally { routing.delete(task); }
+      if (reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) return;
+      const played = decision?.ai ? compose(agent, decision.ai, decision.local ?? null) : null;
+      // Jev off asks nothing and journals nothing: the journal is what it was without `auto`.
+      if (decision?.asked) {
+        append({kind: 'jev.routed', task, chosen: played ?? agent, agent, ai: played ? decision.ai : null, via: 'agent-auto', probabilities: decision.probabilities ?? {}, confidence: decision.confidence ?? 0, fallback: !played, reason: played ? null : decision.reason ?? 'unavailable', model: decision.model ?? null,
+          ...(played && decision.tier ? {tier: decision.tier} : {}), ...(played && decision.local ? {local: decision.local} : {}),
+          text: played ? `Routed ${agent} → ${decision.ai} (AI chosen by Jev${decision.tier ? `: tier ${decision.tier}` : ''}, confidence ${Number(decision.confidence ?? 0).toFixed(2)})` : `Routed ${agent} → its own models (fallback: ${decision.reason ?? 'unavailable'})`, context});
+        row = submittedRow(task);
+      }
     }
     const profile = profiles[row.profile];
     if (!profile) {
@@ -1052,6 +1123,19 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         append({kind: 'task.failed', task, reason: refusal.reason, text: refusal.text, context});
         return;
       }
+    }
+    if (LOCAL_ADAPTERS.has(profile.adapter)) {
+      const endpoint = profile.endpoint ?? 'lmstudio';
+      const running = localRunning(endpoint), slots = localSlots(endpoint);
+      const onModel = localRunning(endpoint, profile.model), perModel = modelSlots(endpoint);
+      const full = running >= slots ? `Waiting for a local slot on ${endpoint}: ${running} of ${slots} in use`
+        : onModel >= perModel ? `Waiting for a local slot on ${endpoint} for ${profile.model}: ${onModel} of ${perModel} in use` : null;
+      if (full) {
+        if (!slotWaiters.has(task)) append({kind: 'task.milestone', task, phase: 'queued', text: full, next: 'dispatch when a local turn ends', context});
+        slotWaiters.add(task);
+        return;
+      }
+      slotWaiters.delete(task);
     }
     // STRATEGY (CONTRACT.md §0/§1): the depends_on hold/fail decision and the prelaunch-review
     // decision both come from onSubmitted now — the CORE only executes the returned intent, it
@@ -1183,9 +1267,6 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const view = reducers.tasks(session.events);
     const root = lineageRootOf(task, view);
     const startedRows = session.events.filter(e => e.kind === 'task.started' && e.task === root);
-    if (profiles[submittedRow(root)?.profile]?.adapter === 'local') {
-      return Date.parse(submittedRow(root).time) + taskDeadlineMs(submittedRow(root));
-    }
     if (!startedRows.length) return null;
     return Date.parse(startedRows[0].time) + taskDeadlineMs(submittedRow(root));
   }
@@ -1233,7 +1314,14 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const row = submittedRow(r.task);
     const durationMs = r.deadlineAt - r.startedAt;
     append({kind: 'task.deadline', task: r.task, text: `deadline ${durationMs} ms exceeded at ${r.elapsed} ms`, from: 'bounce', context: row?.context});
-    await cancel(r.task, {force: true});
+    // A deadline is bounce's decision, never the user's: the cancel says so, and whoever submitted the
+    // task is told, with the way forward. Found live: journaled as reason `user`, the orders' "a user
+    // cancellation is final" applied, and the orchestrator stopped the whole run over one slow analyst.
+    await cancel(r.task, {force: true, reason: 'deadline'});
+    const seconds = ms => `${Math.round(ms / 1000)} s`;
+    const to = rootSubmitterFrom(r.task) === 'orchestrator' ? 'orchestrator' : 'user';
+    append({kind: 'policy.escalated', task: r.task, reason: 'deadline', to, context: row?.context,
+      text: `${row?.profile ?? 'the worker'} ran out of its ${seconds(durationMs)} deadline at ${seconds(r.elapsed)} with the work unfinished. Its partial progress is in the journal: resubmit what is left as a smaller task, or drop it.`});
   }
 
   async function handleSignature(r, reason, now) {
@@ -1293,35 +1381,26 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // task.accepted/rejected/rework path does its own transition and gets checked in turn).
   const TERMINAL_ROW_KINDS = new Set(['task.completed', 'task.failed', 'task.cancelled', 'task.deadline', 'task.rejected', 'task.accepted']);
   const unsubscribe = session.subscribe(row => {
-    if (row.kind === 'control.local_preferences' && row.from === 'user') {
-      const previous = profiles[row.profile];
-      if (previous?.adapter !== 'local' || previous.role === 'orchestrator' || !['prefer', 'exclude'].includes(row.field) || !Array.isArray(row.refs) || row.refs.length > 128 || row.refs.some(ref => typeof ref !== 'string' || ref.length > 1024)) return;
-      profiles[row.profile] = {...previous, [row.field]: [...row.refs]};
-      append({kind: 'status', text: `Local worker ${row.profile} preferences updated for future attempts`});
-      return;
-    }
-    if (row.kind === 'control.local_model' && row.from === 'user') {
-      const previous = profiles[row.profile];
-      if (previous?.adapter !== 'local' || previous.role === 'orchestrator' || typeof row.model !== 'string') return;
-      const slash = row.model.indexOf('/');
-      const endpoint = row.model === 'auto' ? previous.endpoint : row.model.slice(0, slash);
-      const model = row.model === 'auto' ? 'auto' : row.model.slice(slash + 1);
-      if (!model || (row.model !== 'auto' && slash < 1) || !/^[A-Za-z0-9_-]+$/.test(endpoint)) {
-        append({kind: 'status', text: 'Worker model selection rejected: invalid endpoint/model'});
-        return;
-      }
-      profiles[row.profile] = {...previous, model, endpoint};
-      append({kind: 'status', text: `Worker ${row.profile}: ${row.model} · applies to future attempts`});
-      return;
-    }
     if (row.task && TERMINAL_ROW_KINDS.has(row.kind) && reducers.TERMINAL.has(reducers.tasks(session.events)[row.task]?.state)) activity.delete(row.task);
+    if (row.kind === 'plan.submitted' && jev?.plan) {
+      // The plan gate: judged off the row, answered with plan.accepted or plan.rejected. Warns, never
+      // refuses the chunks that follow — the gate is new, and a wrong "phase-sized" would block a
+      // planning orchestrator; that switch flips once it has been seen right on real phases.
+      jev.plan({plan: row, taskMinutes: limits.minutes ?? null}).then(decision => {
+        const name = row.phase ? `Plan ${row.phase}` : 'Plan';
+        if (decision.verdict === 'accept') append({kind: 'plan.accepted', plan: row.plan, chunks: (row.chunks ?? []).length, noted: decision.noted ?? [], reason: decision.reason ?? null, model: decision.model ?? null, context: row.context,
+          text: `${name} accepted: ${(row.chunks ?? []).length} chunk${(row.chunks ?? []).length === 1 ? '' : 's'}${decision.reason ? ` (${decision.reason})` : ` (Jev, model ${decision.model})`}`});
+        else append({kind: 'plan.rejected', plan: row.plan, findings: decision.findings, noted: decision.noted ?? [], model: decision.model ?? null, context: row.context,
+          text: `${name} needs work: ${decision.findings.map(f => `chunk "${f.chunk}" — ${f.fix} (${f.confidence.toFixed(2)})`).join('; ')}`});
+      }).catch(error => append({kind: 'plan.accepted', plan: row.plan, reason: error.message, context: row.context, text: `Plan gate failed (${error.message}); the plan stands`}));
+    }
     if (row.kind === 'task.submitted') {
       // Any throw here (including one from before the first `await`, which an async
       // function turns into a rejection rather than a synchronous throw) must land on the
       // task as its own failure — never disappear, leaving the task queued forever.
       dispatch(row).catch(error => append({kind: 'task.failed', task: row.task, reason: 'error', text: error.message, context: row.context}));
     }
-    else if (row.kind === 'task.completed') {
+    if (row.kind === 'task.completed') {
       // STRATEGY (CONTRACT.md §2 onCompleted): a second (and later) task.completed on the same
       // task re-enters review exactly the same way — the hook and runCompletionReview both
       // read state fresh off the log every time.
@@ -1330,7 +1409,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     else if (row.kind === 'task.failed') { maybeFallback(row); handleTerminal(row); }
     else if (row.kind === 'task.cancelled') {
       if (row.reason === 'watchdog') maybeFallback(row);
-      else append({kind: 'policy.fallback.skipped', task: row.task, reason: 'explicit_cancellation', text: 'user cancellation never recovers', context: row.context});
+      else if (row.reason !== 'deadline') append({kind: 'policy.fallback.skipped', task: row.task, reason: 'explicit_cancellation', text: 'user cancellation never recovers', context: row.context});
       handleTerminal(row);
     }
     else if (row.kind === 'task.deadline') {
@@ -1367,9 +1446,6 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // `attempt` is set by task.started: a parent is 'waiting' the moment a child is submitted even
   // if it never launched, and a dispatch refusal leaves a never-started task 'blocked' — neither
   // had a worker to lose, so neither is orphaned.
-  for (const row of session.events.filter(row => row.kind === 'task.local_release' && row.verified === false)) {
-    if (row.endpoint) { try { localAdmission.quarantine?.({endpoint: row.endpoint}); } catch {} }
-  }
   for (const t of Object.values(initialView)) if ((MID_FLIGHT.has(t.state) || t.state === 'queued') && (t.attempt != null || session.events.some(row => row.task === t.id && row.kind === 'task.local_selected')) && !handles.has(t.id))
     if (session.events.findLast(e => e.task === t.id && e.kind === 'task.blocked')?.reason !== 'orphaned') append({kind: 'task.blocked', task: t.id, reason: 'orphaned', text: 'termination unverified after daemon restart; inspect the previous worker process before resubmitting', context: t.context});
 
@@ -1450,16 +1526,23 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   }
 
   return {
-    registerLocalProfiles(additions, local) {
-      for (const [name, profile] of Object.entries(additions)) {
-        if (Object.hasOwn(profiles, name)) throw new Error(`Profile ${name} is already active`);
-        if (profile.adapter !== 'local' || profile.role === 'orchestrator') throw new Error('Only local worker profiles can be activated');
+    // An agent's derived chain, replaced wholesale from the agent files: every entry passes the
+    // same policy ceiling as an activation, and entries the new chain no longer has are dropped.
+    // Tasks already running keep the profile object they were dispatched with.
+    replaceAgent(name, chain, local) {
+      for (const [key, profile] of Object.entries(chain)) {
+        if (profile.agent?.name !== name || profile.role === 'orchestrator') throw new Error(`${key} is not a backend of agent ${name}`);
         const refusal = policyRefusal(profile);
         if (refusal) throw new Error(refusal.text);
       }
-      if (typeof localAdmission.configure !== 'function') throw new Error('Live local activation is unavailable');
-      localAdmission.configure(local);
-      Object.assign(profiles, additions);
+      if (Object.values(chain).some(profile => LOCAL_ADAPTERS.has(profile.adapter))) {
+        localResolver.configure(local);
+      }
+      // `name@ai` entries are this agent played by an AI Jev picked: they follow the new head, or go with `auto`.
+      const played = Object.entries(profiles).filter(([, profile]) => profile.agent?.name === name && profile.ai).map(([, profile]) => [profile.ai, profile.backend ? {endpoint: profile.endpoint, model: profile.model} : null]);
+      for (const key of Object.keys(profiles)) if (profiles[key].agent?.name === name && !Object.hasOwn(chain, key)) delete profiles[key];
+      Object.assign(profiles, chain);
+      for (const [ai, local] of played) compose(name, ai, local);
     },
     // The submit predicate, exposed so the bus refuses a malformed task.submitted before it is journaled.
     validate: spec => validate(spec, reducers.tasks(session.events)),

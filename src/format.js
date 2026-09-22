@@ -26,6 +26,9 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     tool: c.magenta, error: c.bold.red, status: c.yellow, result: c.green,
     note: c.blue, diagnostic: c.yellow, selected: c.bold.inverse, prompt: c.cyan, quota: c.bold.blue,
     skills: c.bold.magenta, help: c.bold.cyan,
+    // The answer to the user is the one thing in colour; everything around it (tool runs, bounce's own
+    // rows, worker mechanics) is dim, so the eye lands on what was said.
+    answer: c.white,
   };
   function codeColors(text, language) {
     if (!color) return text;
@@ -122,6 +125,7 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     return lines.length > 40 ? [...lines.slice(0, 40), `… ${lines.length - 40} more lines`] : lines;
   };
   // A transcript block: its glyph on the first row, every other row two columns in under it.
+  const oneLine = (text, width, paint = value => value) => paint(stripAnsi(text).length > width ? `${stripAnsi(text).slice(0, Math.max(0, width - 1))}…` : text);
   const block = (glyph, rows) => rows.map((row, index) => index ? (row ? '  ' + row : '') : `${glyph} ${row}`);
   // Short bookkeeping events read as one line; only real content earns a block of its own.
   const inline = ['status', 'progress', 'route', 'cooldown', 'attempt', 'turn', 'diagnostic', 'note', 'aside'];
@@ -165,14 +169,37 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
       const more = lines.length > preview.length ? [style.muted(`… +${lines.length - preview.length} lines`)] : [];
       return [...[...preview, ...more].map((line, index) => (index ? '     ' : `  ${style.muted('⎿')}  `) + style.muted(line)), ''];
     }
+    if (compact && e.kind === 'tool.fold') {
+      if (!e.calls) return [];
+      let last = '';
+      const m = /^([A-Za-z_][\w.-]*): (\{[\s\S]*\})$/.exec(clean(e.last ?? '').trim());
+      if (m) { try { const o = JSON.parse(m[2]); const what = String(o.description || o.path || o.file_path || (typeof o.command === 'string' ? o.command.split('\n')[0] : '') || o.pattern || o.query || ''); last = ` · last: ${m[1]}${what ? `(${what})` : ''}`; } catch { last = ` · last: ${m[1]}`; } }
+      return [oneLine(`  ⚙ ${e.calls} tool call${e.calls === 1 ? '' : 's'}${last}`, width, style.muted)];
+    }
+    // How a finished turn ends: what it came to, and who is still working or waiting on you.
+    if (compact && e.kind === 'next') {
+      const said = e.tldr ? wrap(`▸ Next · ${clean(e.tldr)}`, width - 2).slice(0, 4).map((row, index) => index ? `  ${row.trimStart()}` : style.title(row)) : [];
+      const workers = [e.running ? `${e.running} worker${e.running === 1 ? '' : 's'} running` : '',
+        e.waiting?.length ? `${e.waiting.length} waiting on you: ${e.waiting.map(w => `${clean(w.profile)} (/agents ${w.task.slice(0, 8)})`).join(', ')}` : ''].filter(Boolean).join(' · ');
+      return [...said, ...(workers ? [clip(`  ${e.waiting?.length ? style.status(workers) : style.muted(workers)}`, width)] : []), ''];
+    }
     if (compact && e.kind === 'task.fold') {
       const paint = ['failed', 'timed_out', 'cancelled', 'rejected'].includes(e.state) ? style.error
         : ['completed', 'accepted'].includes(e.state) ? style.result
         : ['blocked', 'input_required'].includes(e.state) ? style.status : style.title;
-      const head = clip(`${paint(stateGlyph(e.state))} ${paint(clean(e.text))}`, width);
-      const preview = e.preview ? [clip(`  ${style.muted(clean(e.preview))}`, width)] : [];
-      if (e.state === 'failed' || e.state === 'timed_out') return [head, ...preview, clip(`  ${style.muted('⎿')}  ${style.muted(`next: ${failureHint(e.reason, e.text)}`)}`, width)];
-      return [head, ...preview];
+      // What the worker said is the point of the block: the whole summary, wrapped, not one line cut
+      // at the screen edge. A worker waiting on you is marked in place, with its whole question and
+      // how to answer it. A long report is capped and says where the rest is.
+      const waiting = e.state === 'input_required';
+      const id = String(e.task ?? '').slice(0, 8);
+      const head = waiting ? clip(c.bold(style.status(`? ${clean(e.profile)} is waiting on you${e.model ? ` · ${clean(e.model)}` : ''}`)), width)
+        : clip(`${paint(stateGlyph(e.state))} ${paint(clean(e.text))}`, width);
+      const said = e.preview ? wrap(clean(e.preview), width - 2) : [];
+      const cap = waiting ? 12 : 6;
+      const body = [...said.slice(0, cap).map(row => `  ${waiting ? row : style.muted(row)}`), ...(said.length > cap ? [style.muted(`  … /agents ${id} or /details for the rest`)] : [])];
+      if (waiting) return [head, ...body, clip(`  ${style.muted('⎿')}  ${style.status(`answer: /agents ${id}, then type your reply`)}`, width)];
+      if (e.state === 'failed' || e.state === 'timed_out') return [head, ...body, clip(`  ${style.muted('⎿')}  ${style.muted(`next: ${failureHint(e.reason, e.text)}`)}`, width)];
+      return [head, ...body];
     }
     // /help is a reference card, not a status line: headed sections, commands in one colour and
     // their arguments in another, descriptions aligned in a column that wraps under itself.
@@ -183,11 +210,14 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     }
     if (compact && e.kind === 'user' && e.typed) return [...block(style.user('>'), wrap(clean(e.typed), width - 2)), clip(`  ${style.muted('⎿')}  ${style.muted(`expanded to ${withoutBrief(e.text).length.toLocaleString()} chars · /details shows it`)}`, width), ''];
     if (compact && e.kind === 'user') return [...block(style.user('>'), wrap(clean(withoutBrief(e.text)), width - 2)), ''];
-    if (compact && ['assistant', 'delta', 'result'].includes(e.kind)) return [...block('●', markdown(e.text, width - 2)), ''];
+    if (compact && ['assistant', 'delta', 'result'].includes(e.kind)) return [...block(style.result('●'), markdown(e.text, width - 2).map(line => line ? style.answer(line) : line)), ''];
     const names = {user: 'You', assistant: 'Response', delta: 'Response', result: 'Result',
       status: 'Activity', route: 'Agent selected', tool: 'Tool output', error: 'Error',
       diagnostic: 'Diagnostics', note: 'Saved note', cooldown: 'Retry delay', attempt: 'Agent finished',
       turn: 'Turn finished', quota: 'Reported quota', skills: 'Skills', review: 'Work Done review', aside: 'By the way'};
+    // A row of bounce's own (routing, a verdict, an activation…) is one line in the conversation, and
+    // nothing at all when it has nothing to say. It used to be a three-line block headed by its kind.
+    if (compact && !names[e.kind] && !inline.includes(e.kind)) return clean(e.text ?? '').trim() ? [oneLine(`  · ${clean(e.text).replace(/\s+/g, ' ').trim()}`, width, style.muted)] : [];
     const label = e.kind === 'user' ? 'You' : e.kind === 'aside' ? 'You · By the way' : `${who(e)} · ${names[e.kind] || e.kind}`;
     const paint = style[e.kind] || style.muted;
     if (inline.includes(e.kind)) return compact ? hang(`  ${paint(clean(label))}  ${clean(e.text)}`, width) : wrap(`${paint(clean(label))}  ${clean(e.text)}`, width);
@@ -404,6 +434,7 @@ const WORKER_ROW = {
   'task.submitted': e => ({kind: 'note', text: `Task submitted · ${e.profile}${e.orders ? `\n${e.orders}` : ''}`}),
   'task.started': e => ({kind: 'status', text: `started · attempt ${e.attempt}${e.requested ? ` · model ${e.requested}` : ''}`}),
   'task.milestone': e => ({kind: 'note', text: `milestone · ${e.text}`}),
+  'agents.defined': e => ({kind: 'note', text: e.text ?? `agent ${e.name} defined (${e.scope})`}),
   'task.blocked': e => ({kind: 'error', text: `blocked · ${e.text}`}),
   'task.delivered': e => ({kind: 'status', text: `delivered (${e.tier})${e.text ? ` · ${e.text}` : ''}`}),
   'task.rework': e => ({kind: 'status', text: `rework round ${e.round}${Array.isArray(e.findings) && e.findings.length ? `\n${e.findings.map(f => `- ${typeof f === 'string' ? f : f.text ?? JSON.stringify(f)}`).join('\n')}` : ''}`}),

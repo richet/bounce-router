@@ -36,6 +36,20 @@ test('Codex discovery respects override and PATH then finds bundled desktop CLI'
  assert.equal(resolveExecutable('codex',undefined,{...options,accessible:p=>['/bin/codex','/Applications/ChatGPT.app/Contents/Resources/codex'].includes(p)}),'/bin/codex');
  assert.equal(resolveExecutable('codex',undefined,{...options,accessible:()=>false}),'codex');
 });
+// opencode's installer puts the binary in ~/.opencode/bin and adds that to the interactive shell's
+// PATH — so a context with a reduced PATH (GUI-launched terminal, stripped env, a daemon that did
+// not inherit the login profile) reported it missing while it was installed.
+test('OpenCode discovery finds the installer location when PATH does not carry it',()=>{
+ const installed='/user/.opencode/bin/opencode';
+ const options={env:{PATH:'/bin'},home:'/user',platform:'darwin',accessible:p=>p===installed};
+ assert.equal(resolveExecutable('opencode',undefined,options),installed);
+ // PATH still wins when it has one, and an explicit override still wins over everything.
+ assert.equal(resolveExecutable('opencode',undefined,{...options,accessible:p=>['/bin/opencode',installed].includes(p)}),'/bin/opencode');
+ assert.equal(resolveExecutable('opencode','/custom/oc',options),'/custom/oc');
+ assert.equal(resolveExecutable('opencode',undefined,{...options,accessible:()=>false}),'opencode');
+ // The fallback is opencode's alone; it must not leak into other providers.
+ assert.equal(resolveExecutable('claude',undefined,{env:{PATH:'/bin'},home:'/user',platform:'darwin',accessible:p=>p==='/user/.opencode/bin/claude'}),'claude');
+});
 
 test('mouse input handles split/coalesced wheel reports without changing prompt text', async () => {
  const {createMouseInput, mouseTracking} = await import('../src/terminal.js');

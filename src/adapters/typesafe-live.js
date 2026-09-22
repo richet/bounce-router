@@ -102,6 +102,14 @@ export function createTypesafeLive({fetchImpl, readKey, readSettings = () => rea
     if (review.stage !== 'completion') return skipped(stream, 'stage', `${review.stage} review is not a Jev decision`);
     if (!settings.enabled) return skipped(stream, 'disabled', 'Jev is disabled (/jev on)');
     if (!settings.review) return skipped(stream, 'review_off', 'Jev completion review is off (/jev review on)');
+    // Every verdict question is about the diff. Outside a repository there is none: an empty diff
+    // reads as "nothing was done" and sends correct work back for rework round after round (observed
+    // live), so Jev is not asked at all.
+    if ((await git(['rev-parse', '--is-inside-work-tree'], cwd, controller.signal)).trim() !== 'true') return skipped(stream, 'no_repository', 'the working folder is not a git repository, so there is no diff to judge');
+    // A repository with no commit yet (`git init`, nothing tracked) is inside a work tree, but every
+    // diff against it is empty. Observed live: a worker that made the change and passed every gate was
+    // sent back three times on `empty_diff`.
+    if (!(await git(['rev-parse', '--verify', 'HEAD'], cwd, controller.signal)).trim()) return skipped(stream, 'no_repository', 'the working folder has no commit to diff against, so there is no diff to judge');
     stream.push({kind: 'activity', text: 'Jev verdict · collecting the report and diff'});
     const state = await buildReviewState({review, cwd, git, signal: controller.signal});
     if (controller.signal.aborted) return skipped(stream, 'aborted', 'cancelled');
@@ -112,7 +120,7 @@ export function createTypesafeLive({fetchImpl, readKey, readSettings = () => rea
     } catch (error) {
       return skipped(stream, error?.code ?? 'error', error?.message ?? String(error));
     }
-    const decision = decideVerdict(result.answers, {confidence: settings.confidence});
+    const decision = decideVerdict(result.answers, {confidence: settings.confidence, state});
     const fired = decision.fired.length ? ` · fired: ${decision.fired.join(', ')}` : '';
     stream.push({kind: 'model', model: result.model});
     if (result.usage && Number.isFinite(result.usage.input_tokens)) stream.push({kind: 'usage', usage: {input: result.usage.input_tokens, output: result.usage.output_tokens ?? 0}});

@@ -47,11 +47,11 @@ test('real daemon keeps a held main turn across view detach, then steers and exp
   assert.equal(second.main.currentTurnId, turn.turnId);
   assert.equal(second.events.filter(row => row.kind === 'main.started').length, 1);
   const saved = JSON.parse(fs.readFileSync(path.join(root, 'config.json')));
-  saved.profiles.local_read = {adapter: 'local', policy: 'read-only', model: 'test-local-model'};
+  saved.profiles.local_read = {adapter: 'opencode', policy: 'read-only', model: 'test-local-model'};
   fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify(saved));
   const activated = await activateLocalProfiles(second, ['local_read']);
   assert.deepEqual(activated.names, ['local_read']);
-  assert.match(fs.readFileSync(path.join(session.dir, 'orchestrator', 'ORDERS.md'), 'utf8'), /local_read → local\/test-local-model/);
+  assert.match(fs.readFileSync(path.join(session.dir, 'orchestrator', 'ORDERS.md'), 'utf8'), /local_read → lmstudio\/test-local-model \(via opencode\)/);
   assert.equal(second.main.currentTurnId, turn.turnId);
   assert.equal(second.events.filter(row => row.kind === 'main.started').length, 1);
   assert.equal((await second.deliverMain({text: 'correction', expectedTurnId: turn.turnId})).state, 'acknowledged');

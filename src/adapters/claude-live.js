@@ -68,12 +68,19 @@ export function createClaudeLive({connect = nodeConnect, fs = nodeFs, kill = pro
     async *events(handle) {
       let sawResult = false, limited = false;
       for (;;) {
-        let relaunch = null;
+        let relaunch = null, withheld = null;
         for await (const event of handle.live.events) {
           if (event.kind === 'diagnostic') { yield event; continue; }
           if (event.kind === 'error') { yield {kind: 'error', code: event.code, text: event.text}; return; }
           if (event.kind === 'exit') {
-            if (relaunch) break;
+            // The turn ended on the withheld zero-turn result alone: a resume is relaunched once (the
+            // notice is consumed by then); a launch passes that empty result on as its outcome.
+            if (!sawResult && withheld && handle.relaunch) {
+              relaunch = handle.relaunch; handle.relaunch = null;
+              yield {kind: 'status', text: 'Resumed session returned no turn (the CLI spent it on a stopped background task); relaunching the resume once'};
+              break;
+            }
+            if (!sawResult && withheld) { sawResult = true; yield withheld; return; }
             if (!sawResult) yield {kind: 'result', status: event.limited ? 'limited' : 'failed', text: 'protocol error: claude exited without result'};
             return;
           }
@@ -88,9 +95,12 @@ export function createClaudeLive({connect = nodeConnect, fs = nodeFs, kill = pro
             }
             if (normalized.kind === 'error') limited ||= limitPattern.test(normalized.text);
             if (normalized.kind === 'result') {
-              if (normalized.success && raw.num_turns === 0 && handle.relaunch) {
-                relaunch = handle.relaunch; handle.relaunch = null;
-                yield {kind: 'status', text: 'Resumed session returned no turn (the CLI spent it on a stopped background task); relaunching the resume once'};
+              // A zero-turn empty result is the CLI flushing a stopped background task, not the answer.
+              // Sometimes the same process then runs the prompt (reproduced with 2.1.278, test L9), so
+              // the result is withheld and the stream read on; what happens at exit decides (above).
+              if (normalized.success && raw.num_turns === 0 && !String(raw.result ?? '').trim() && !withheld) {
+                withheld = {kind: 'result', text: normalized.text, success: normalized.success, status: 'completed'};
+                yield {kind: 'diagnostic', text: 'claude reported leftover background tasks with an empty result; waiting for the turn itself'};
                 continue;
               }
               sawResult = true;

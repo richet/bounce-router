@@ -530,6 +530,10 @@ test('a request deadline rejects an unanswered App Server request and cancels it
   ]);
   assert.equal(outcome, 'rejected');
   assert.equal(killed >= 1, true);
+  // An App Server that does not answer is an unavailable backend, not a bare error: that code is
+  // what lets the scheduler try the task's next AI (found live on a timed-out thread/resume).
+  const error = await launching.catch(e => e);
+  assert.deepEqual([error.code, error.message], ['backend_unavailable', 'codex app-server request timed out: initialize']);
 });
 
 test('a thread response without an id rejects at the adapter boundary and leaves no process behind', async () => {

@@ -9,7 +9,7 @@ import crypto from 'node:crypto';
 
 // Peers publish from a positive allowlist: everything a session, the scheduler or the daemon writes is refused regardless of `from`,
 // because handoff() folds user/note rows into every later prompt and Router reads cooldown rows.
-const PEER_KINDS = new Set(['task.submitted', 'task.milestone', 'task.blocked', 'task.input_required', 'task.usage', 'task.activity', 'message', 'task.accepted']);
+const PEER_KINDS = new Set(['plan.submitted', 'task.submitted', 'task.milestone', 'task.blocked', 'task.input_required', 'task.usage', 'task.activity', 'message', 'task.accepted', 'agents.defined']);
 const USER_ONLY_PREFIX = 'control.';
 // The scheduler alone owns task lifecycle transitions; a peer may report progress
 // (milestone/blocked/input_required/usage/activity), ask for work (submitted) or
@@ -196,6 +196,10 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         // The scheduler may decorate a valid submission before it is journaled (a Jev completion
         // reviewer for a root task that names none); the decorated row is what everyone reads.
         if (typeof prepare === 'function') e = prepare(e);
+      } else if (e.kind === 'plan.submitted') {
+        // A phase's breakdown, judged by Jev before any of its chunks run (scheduler: plan.accepted/plan.rejected).
+        if (!Array.isArray(e.chunks) || !e.chunks.length || e.chunks.some(c => !c || typeof c !== 'object' || typeof c.id !== 'string' || !c.id || typeof c.orders !== 'string' || !c.orders)) return refuse(id, -32602, 'invalid event: plan.submitted needs chunks, each with an id and orders');
+        if (typeof e.plan !== 'string' || !e.plan) e.plan = crypto.randomUUID();
       } else if (e.kind.startsWith('task.')) {
         // A task.* row without its task is a malformed event, not an authority failure: say so
         // (observed live: an orchestrator publishing a task.milestone with no `task` got a bare
@@ -234,7 +238,7 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
     // never come. The caller reads `kind` to learn which outcome it got.
     const TASK_TERMINAL = new Set(['task.completed', 'task.failed', 'task.cancelled', 'task.deadline', 'task.rejected', 'task.accepted']);
     function handleWait(id, {match = {}, timeout, afterSeq = 0}) {
-      if (!Number.isInteger(timeout) || timeout > 600000) return refuse(id, -32602, 'invalid params');
+      if (!Number.isInteger(timeout) || timeout > 600000) return refuse(id, -32602, 'invalid params: timeout must be an integer number of ms, at most 600000 (10 minutes); wait again to keep waiting');
       const outcomeWait = typeof match.task === 'string' && TASK_TERMINAL.has(match.kind);
       const latestReplacement = task => {
         let current = task;
@@ -266,7 +270,13 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
           session.append({kind: 'wait.served', task: row.task, served: row.seq ?? null, outcome: row.kind, from: 'orchestrator', context: authenticated.context});
         }
       };
-      const unsubscribe = session.subscribe(row => { if (matches(row)) finish(row); });
+      // A message delivered live into the orchestrator's turn is only read when its current tool
+      // call returns (observed: acknowledged at 07:01, read at 07:08 when a 7-minute wait came
+      // back), so a live delivery ends the orchestrator's wait with a row saying why.
+      const interruption = row => authenticated.peer === 'orchestrator' && row.kind === 'main.delivery' && row.state === 'acknowledged'
+        && {kind: 'wait.interrupted', from: 'bounce', reason: 'message', messageId: row.messageId,
+          text: 'A message from the user was delivered to your turn: read it and act on it before waiting again'};
+      const unsubscribe = session.subscribe(row => { if (matches(row)) finish(row); else { const cut = interruption(row); if (cut) finish(cut); } });
       const timer = setTimeout(() => finish(null), timeout);
       timer.unref?.();
       pendingWaits.add(cleanup);

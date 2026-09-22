@@ -11,6 +11,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {dataRoot, saveJSON} from './core.js';
 import {PROFILE_TIERS, TIER_HINT, routable} from './jev.js';
+import {LOCAL_ADAPTERS} from './profiles.js';
 import {invocation, runProcess} from './providers.js';
 import {resolveExecutable} from './executable.js';
 import {CATALOG_SOURCE, catalogNote} from './model-catalog.js';
@@ -23,7 +24,11 @@ export const CAPABILITIES_MAX = 400;
 const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
 // The cache key: one note per model, shared by every profile that runs it.
-export const modelKey = profile => `${profile.adapter}/${profile.model || (profile.adapter === 'local' ? 'auto' : 'default')}`;
+// A local model is named by its provider (`lmstudio/<model>`), like everywhere else — never by the
+// runtime it runs through.
+export const modelKey = profile => LOCAL_ADAPTERS.has(profile.adapter)
+  ? `${profile.endpoint ?? 'lmstudio'}/${profile.model || 'auto'}`
+  : `${profile.adapter}/${profile.model || 'default'}`;
 
 // ---- the store ---------------------------------------------------------------------------
 
@@ -63,13 +68,16 @@ export function effectiveNotes(profiles = {}, cache = {}) {
 
 // The models the roster runs that nobody has described yet: no `capabilities` on any profile
 // running them, not in the shipped catalog, and no cached note. Unique, in roster order.
-export function undescribedModels(profiles = {}, cache = {}) {
+// `extra` are models outside the roster that routing may still pick — the local candidates of an
+// `auto` agent — in the same {key, adapter, model, endpoint} shape.
+export function undescribedModels(profiles = {}, cache = {}, extra = []) {
   const seen = new Map();
   for (const [, p] of rosterEntries(profiles)) {
     const key = modelKey(p);
     if (p.capabilities || noteFor(key, cache)?.capabilities || seen.has(key)) continue;
-    seen.set(key, {key, adapter: p.adapter, model: p.model || '', ...(p.adapter === 'local' && p.endpoint ? {endpoint: p.endpoint} : {})});
+    seen.set(key, {key, adapter: p.adapter, model: p.model || '', ...(LOCAL_ADAPTERS.has(p.adapter) && p.endpoint ? {endpoint: p.endpoint} : {})});
   }
+  for (const item of extra) if (!noteFor(item.key, cache)?.capabilities && !seen.has(item.key)) seen.set(item.key, item);
   return [...seen.values()];
 }
 
@@ -87,10 +95,12 @@ export function setupAgent({profiles = {}, orchestrator = null, order = [], mode
 
 // ---- the one-shot description ------------------------------------------------------------
 
-export function setupPrompt(models, catalogs = []) {
+// `reference` ([key, tier] pairs) is what the roster already rates: shown so a new model — a local
+// one above all — lands on the same scale instead of being ranked only against its neighbours.
+export function setupPrompt(models, catalogs = [], reference = []) {
   const vendorSays = ({adapter, model}) => catalogs.find(c => c?.provider === adapter)?.models?.find(m => m.id === model)?.description || '';
   const line = m => {
-    const where = m.adapter === 'local' ? `a local model served through LM Studio${m.endpoint ? ` at ${m.endpoint}` : ''}${m.model && m.model !== 'auto' ? `, model "${m.model}"` : ', the model loaded at the time'}`
+    const where = LOCAL_ADAPTERS.has(m.adapter) ? `a local model served through LM Studio${m.endpoint ? ` (endpoint ${m.endpoint})` : ''}${m.model && m.model !== 'auto' ? `, model "${m.model}"` : ', the model loaded at the time'}`
       : `the ${m.adapter} CLI${m.model ? `, model "${m.model}"` : ', its default model'}`;
     const vendor = vendorSays(m);
     return `- ${m.key}: ${where}${vendor ? ` — the vendor describes it as: ${JSON.stringify(vendor)}` : ''}`;
@@ -105,6 +115,7 @@ export function setupPrompt(models, catalogs = []) {
     'Do not use any tools, do not read files, and do not ask questions.',
     'Reply with ONLY a JSON object — no prose, no code fence — keyed by the model key exactly as listed:',
     `{${models.map(m => `${JSON.stringify(m.key)}: {"tier": "cheapest|mid|strongest", "capabilities": "…"}`).join(', ')}}`,
+    ...(reference.length ? ['', 'Already rated, for scale — place the models below on this same scale:', ...reference.map(([key, tier]) => `  ${key} → ${tier}`)] : []),
     '', 'Models:', ...models.map(line),
   ].join('\n');
 }
@@ -130,10 +141,10 @@ export function parseSetupAnswer(text, models) {
 // One read-only, tool-free turn of `agent` answering setupPrompt. Resolves the parsed notes
 // (each stamped with who wrote them and when); rejects with the agent's failure. `run` is the
 // classic runner (providers.js runProcess): the vendor child sees no bus and no grant.
-export async function describeModels({models, agent, catalogs = [], root = dataRoot(), executables = {}, run = runProcess, timeoutMs = SETUP_TIMEOUT_MS, clock = () => Date.now(), signal} = {}) {
+export async function describeModels({models, agent, catalogs = [], reference = [], root = dataRoot(), executables = {}, run = runProcess, timeoutMs = SETUP_TIMEOUT_MS, clock = () => Date.now(), signal} = {}) {
   if (!models.length) return {};
   if (!agent) throw new Error('no signed-in cloud agent to describe the roster with');
-  const prompt = setupPrompt(models, catalogs);
+  const prompt = setupPrompt(models, catalogs, reference);
   const dir = path.join(root, 'roster-setup');
   fs.mkdirSync(dir, {recursive: true, mode: 0o700});
   const promptFile = path.join(dir, 'prompt.txt');
@@ -172,7 +183,7 @@ export async function describeModels({models, agent, catalogs = [], root = dataR
 // agent costs one attempt per daemon, not one per task. Every outcome is journaled: `jev.roster`
 // with the notes written, or `jev.skipped` with the reason. `onChange` (ORDERS.md) runs after
 // notes are written.
-export function createRosterSetup({root = dataRoot(), profiles = {}, agent = null, catalogs = async () => [], session = null, executables = {}, run, timeoutMs, clock, onChange = () => {}} = {}) {
+export function createRosterSetup({root = dataRoot(), profiles = {}, agent = null, catalogs = async () => [], extra = async () => [], session = null, executables = {}, run, timeoutMs, clock, onChange = () => {}} = {}) {
   let inflight = null, failed = false;
   const append = row => { try { session?.append(row); } catch {} };
   const notes = () => effectiveNotes(profiles, readRosterNotes(root));
@@ -180,14 +191,17 @@ export function createRosterSetup({root = dataRoot(), profiles = {}, agent = nul
     if (inflight) return inflight;
     if (failed && !force) return Promise.resolve(null);
     const cache = force ? {} : readRosterNotes(root);
-    const models = undescribedModels(profiles, cache);
-    if (!models.length) return Promise.resolve(null);
     inflight = (async () => {
       try {
+        let others = [];
+        try { others = await extra(); } catch {}
+        const models = undescribedModels(profiles, cache, Array.isArray(others) ? others : []);
+        if (!models.length) return null;
         if (!agent) throw new Error('no cloud agent in the roster or the provider order to describe the models with');
         let known = [];
         try { known = await catalogs(); } catch {}
-        const written = await describeModels({models, agent, catalogs: Array.isArray(known) ? known : [], root, executables, run, timeoutMs, clock});
+        const reference = [...new Map(Object.values(effectiveNotes(profiles, cache)).filter(note => note.tier).map(note => [note.model, note.tier]))];
+        const written = await describeModels({models, agent, catalogs: Array.isArray(known) ? known : [], reference, root, executables, run, timeoutMs, clock});
         writeRosterNotes({...readRosterNotes(root), ...written}, root);
         failed = false;
         const roster = effectiveNotes(profiles, readRosterNotes(root));

@@ -94,7 +94,7 @@ test('P1 legacy config is untouched and classic', () => {
   // Phase 8 §3: a resolved `strategy` rides along even in classic mode (absent settings.strategy
   // resolves to defaultStrategy) — classic mode never engages review/dispatch reactions, so this
   // is inert for it, but createScheduler always receives a strategy value either way.
-  assert.deepEqual(view, {operation: 'classic', orchestrator: null, profiles: {}, shape: 'none', strict: false, strategy: defaultStrategy});
+  assert.deepEqual(view, {operation: 'classic', orchestrator: null, profiles: {}, shape: 'none', strict: false, strategy: defaultStrategy, skipped: []});
   assert.deepEqual(input, before);
 });
 
@@ -139,7 +139,7 @@ test('P4 error messages, one case each', () => {
   assert.throws(() => validateOrchestration({...base, profiles: {}, orchestrator: 'nope'}), {message: 'orchestrator must name a profile'});
   assert.throws(() => validateOrchestration({...base, profiles: {main: null}}), {message: 'orchestrator must name a profile'});
   assert.throws(() => validateOrchestration({...base, profiles: {main: {adapter: 'gpt5'}}}),
-    {message: 'profile main: adapter must be one of claude, codex, muse, local, typesafe'});
+    {message: 'profile main: adapter must be one of claude, codex, muse, opencode, typesafe'});
   assert.throws(() => validateOrchestration({...base, profiles: {main: {adapter: 'claude', mode: 'sideways'}}}),
     {message: 'profile main: mode must be yolo or plan'});
   assert.throws(() => validateOrchestration({...base, profiles: {main: {adapter: 'claude', policy: 'delete'}}}),
@@ -241,4 +241,20 @@ test('typesafe profiles default to read-only, refuse write, and tier is kept onl
   assert.throws(() => validateOrchestration({...settings, profiles: {...settings.profiles, verdict: {adapter: 'typesafe', policy: 'write'}}}), {message: 'profile verdict: typesafe must be read-only'});
   // the default adapter list (used by nine callers) accepts typesafe without the daemon's registry
   assert.doesNotThrow(() => validateOrchestration({operation: 'orchestrator', mode: 'yolo', orchestrator: 'main', profiles: {main: {adapter: 'claude'}, v: {adapter: 'typesafe'}}}));
+});
+
+// A local worker is an agent's backend, never a config profile. Saved configs are migrated on load
+// (src/core.js); hand-built settings that still name a local adapter are told where to go — and the
+// message names the profile, because the daemon is spawned with stdio:'ignore'.
+test('a profile naming a local adapter — the removed `local` or `opencode` — fails with where to go instead', () => {
+  for (const adapter of ['local', 'opencode']) {
+    const settings = {operation: 'orchestrator', mode: 'yolo', orchestrator: 'main',
+      profiles: {main: {adapter: 'claude'}, LocalWorker: {adapter, backend: 'lmstudio', policy: 'read-only'}}};
+    assert.throws(() => validateOrchestration(settings), error => {
+      assert.match(error.message, /^profile LocalWorker: local workers are agent files now\./);
+      assert.match(error.message, /~\/\.bounce\/agents\/localworker\.md with "models: \[lmstudio\/<model>\]"/);
+      assert.match(error.message, /saved configs are migrated automatically/);
+      return true;
+    });
+  }
 });

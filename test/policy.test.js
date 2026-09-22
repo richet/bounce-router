@@ -119,9 +119,11 @@ test('P4 rounds cap: two reworks in a row blocks instead of a silent third round
 
   const escalated = session.events.filter(e => e.kind === 'policy.escalated');
   assert.equal(escalated.length, 1);
-  assert.equal(escalated[0].reason, 'rounds');
+  // The critic repeats the same finding, so the repeated-findings rule fires at the same moment the
+  // rounds cap would: same outcome (blocked, one rework, no third round), the more specific reason.
+  assert.equal(escalated[0].reason, 'repeated_findings');
   const blockedRow = session.events.filter(e => e.kind === 'task.blocked').at(-1);
-  assert.equal(blockedRow.text, 'rounds exhausted');
+  assert.equal(blockedRow.text, 'Sent back twice for the same findings; the worker cannot satisfy them. Accept, resubmit with different orders, or cancel.');
   assert.equal(workerAdapter.calls.resume, 1);
   assert.equal(scheduler.tasks()[row.task].state, 'blocked');
 });
@@ -402,4 +404,17 @@ test('P14 limits merge over defaults (A5): an override changes only that field, 
 test('P15 non-positive limits.rounds throws malformed: limits (A5)', t => {
   const {session} = setup(t);
   assert.throws(() => createScheduler({session, adapters: {}, profiles: {}, limits: {rounds: 0}}), {message: 'malformed: limits'});
+});
+
+test('P4b rounds cap still bites on its own when every rework brings NEW findings', async t => {
+  const {session} = setup(t);
+  let n = 0;
+  const workerAdapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'pass'}]);
+  const criticAdapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: `{"verdict":"rework","findings":["problem ${++n}"]}`}]);
+  const scheduler = createScheduler({session, adapters: {worker: workerAdapter, critic: criticAdapter}, profiles: {A: worker(), C: critic()}});
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null, review: {completion: 'C'}, budget: {rounds: 1}});
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'blocked');
+  assert.equal(session.events.filter(e => e.kind === 'policy.escalated')[0].reason, 'rounds');
+  assert.equal(session.events.filter(e => e.kind === 'task.blocked').at(-1).text, 'rounds exhausted');
+  assert.equal(workerAdapter.calls.resume, 1);
 });
