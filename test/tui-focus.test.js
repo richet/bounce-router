@@ -97,3 +97,20 @@ test('a finished turn ends on what to do next: the answer\'s TLDR, who is still 
   const failed = render([ev(1, 'user', {text: 'hi'}), ev(2, 'main.terminal', {status: 'failed', text: 'claude exited 1', provider: 'claude'})]);
   assert.equal(failed.some(line => line.includes('Finished · claude exited 1')), true);
 });
+
+// "A bit unreadable between the commands and inner comms": the answer's body was painted in the
+// terminal's default colour, the same as everything around it. Now the answer to you is the one
+// thing in colour, and the machinery around it is dim.
+test('what the orchestrator says to you is painted in its own colour on every line; tool runs, routing rows and worker blocks stay dim', () => {
+  const formatter = createFormatter({color: true, compact: true});
+  const paint = (lines) => lines.map(l => l.replace(/\x1b\[39m/g, '').match(/\x1b\[(\d+)m/)?.[1] ?? null);
+  const answer = formatter.event({kind: 'assistant', provider: 'claude', text: 'First line of the answer.\n\nA second paragraph, wrapped over more than one line so that a second line exists here too.'}, 40);
+  const codes = paint(answer.filter(Boolean).map(l => l.replace(/^\x1b\[32m●\x1b\[39m /, ''))); // past the green ● marker
+  assert.equal(codes.every(code => code === '37'), true, `every answer line opens in the answer colour, got ${JSON.stringify(codes)}: ${JSON.stringify(answer)}`);
+  const tools = formatter.event({kind: 'tool.fold', calls: 2, last: 'Bash: {"description":"Run the gate"}'}, 80);
+  assert.equal(paint(tools)[0], '90', 'a tool run is dim');
+  const routed = formatter.event({kind: 'jev.routed', text: 'Routed builder → its own models'}, 80);
+  assert.equal(paint(routed)[0], '90', 'a bounce bookkeeping row is dim');
+  const next = formatter.event({kind: 'next', tldr: 'The gate passes.', running: 1, waiting: []}, 80);
+  assert.equal(paint(next)[0], '1', 'the Next line is bold, so the eye lands on it');
+});

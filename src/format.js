@@ -26,6 +26,9 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     tool: c.magenta, error: c.bold.red, status: c.yellow, result: c.green,
     note: c.blue, diagnostic: c.yellow, selected: c.bold.inverse, prompt: c.cyan, quota: c.bold.blue,
     skills: c.bold.magenta, help: c.bold.cyan,
+    // The answer to the user is the one thing in colour; everything around it (tool runs, bounce's own
+    // rows, worker mechanics) is dim, so the eye lands on what was said.
+    answer: c.white,
   };
   function codeColors(text, language) {
     if (!color) return text;
@@ -207,7 +210,7 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     }
     if (compact && e.kind === 'user' && e.typed) return [...block(style.user('>'), wrap(clean(e.typed), width - 2)), clip(`  ${style.muted('⎿')}  ${style.muted(`expanded to ${withoutBrief(e.text).length.toLocaleString()} chars · /details shows it`)}`, width), ''];
     if (compact && e.kind === 'user') return [...block(style.user('>'), wrap(clean(withoutBrief(e.text)), width - 2)), ''];
-    if (compact && ['assistant', 'delta', 'result'].includes(e.kind)) return [...block('●', markdown(e.text, width - 2)), ''];
+    if (compact && ['assistant', 'delta', 'result'].includes(e.kind)) return [...block(style.result('●'), markdown(e.text, width - 2).map(line => line ? style.answer(line) : line)), ''];
     const names = {user: 'You', assistant: 'Response', delta: 'Response', result: 'Result',
       status: 'Activity', route: 'Agent selected', tool: 'Tool output', error: 'Error',
       diagnostic: 'Diagnostics', note: 'Saved note', cooldown: 'Retry delay', attempt: 'Agent finished',
