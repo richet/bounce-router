@@ -270,7 +270,13 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
           session.append({kind: 'wait.served', task: row.task, served: row.seq ?? null, outcome: row.kind, from: 'orchestrator', context: authenticated.context});
         }
       };
-      const unsubscribe = session.subscribe(row => { if (matches(row)) finish(row); });
+      // A message delivered live into the orchestrator's turn is only read when its current tool
+      // call returns (observed: acknowledged at 07:01, read at 07:08 when a 7-minute wait came
+      // back), so a live delivery ends the orchestrator's wait with a row saying why.
+      const interruption = row => authenticated.peer === 'orchestrator' && row.kind === 'main.delivery' && row.state === 'acknowledged'
+        && {kind: 'wait.interrupted', from: 'bounce', reason: 'message', messageId: row.messageId,
+          text: 'A message from the user was delivered to your turn: read it and act on it before waiting again'};
+      const unsubscribe = session.subscribe(row => { if (matches(row)) finish(row); else { const cut = interruption(row); if (cut) finish(cut); } });
       const timer = setTimeout(() => finish(null), timeout);
       timer.unref?.();
       pendingWaits.add(cleanup);

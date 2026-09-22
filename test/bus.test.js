@@ -731,3 +731,26 @@ test('publish applies the scheduler\'s prepare hook to a valid task.submitted an
   const explicit = await client.publish({kind: 'task.submitted', parent: null, profile: 'A', orders: 'do it', review: {completion: 'C'}});
   assert.deepEqual(explicit.review, {completion: 'C'});
 });
+
+// A /btw delivered live lands in the orchestrator's turn, but the orchestrator only reads it when
+// its current tool call returns. Observed: a message acknowledged at 07:01 and read at 07:08, when
+// a 7-minute `bounce wait` came back. So a live delivery ends every pending orchestrator wait
+// with a row saying why; a worker's wait is not the orchestrator's and keeps waiting.
+test('a live main.delivery ends the orchestrator\'s pending wait with an interruption row, not a worker\'s', async t => {
+  const {bus, session} = await setup(t);
+  const main = await connect(bus, 'orchestrator', {tasks: [], canSubmit: true, context: session.id});
+  const worker = await connect(bus, 'worker:a', {tasks: ['t1']});
+  t.after(() => { main.close(); worker.close(); });
+  const mainWait = main.wait({match: {kind: 'task.completed', task: 't1'}, timeout: 2000});
+  const workerWait = worker.wait({match: {kind: 'task.milestone', task: 't1'}, timeout: 300});
+  await new Promise(resolve => setTimeout(resolve, 30));
+  session.append({kind: 'main.delivery', from: 'main', messageId: 'm1', turnId: 'turn-1', state: 'accepted'});
+  session.append({kind: 'main.delivery', from: 'main', messageId: 'm1', turnId: 'turn-1', state: 'acknowledged', tier: 'live'});
+  const started = Date.now();
+  const interrupted = await mainWait;
+  assert.ok(Date.now() - started < 1000, 'the wait ended on the delivery, not on its timeout');
+  assert.equal(interrupted.kind, 'wait.interrupted');
+  assert.equal(interrupted.reason, 'message');
+  assert.equal(interrupted.text, 'A message from the user was delivered to your turn: read it and act on it before waiting again');
+  assert.equal(await workerWait, null);
+});

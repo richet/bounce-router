@@ -333,7 +333,7 @@ async function main() {
       notice = 'Sending to the active turn…'; render();
       const result = await router.deliver(text);
       notice = result.state === 'acknowledged' || result.tier === 'live'
-        ? 'Live delivery acknowledged by the provider'
+        ? 'Delivered into the main worker\'s turn · read when its current command returns; a pending wait ends now'
         : `Delivery ${result.state ?? result.tier ?? 'failed'}${result.reason ? ': ' + result.reason : ''}`;
       return;
     }
