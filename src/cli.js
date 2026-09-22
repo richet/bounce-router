@@ -6,6 +6,7 @@ import {createInkTerminal} from './tui/ink-terminal.js';
 import {workspaceColumns} from './tui/Workspace.js';
 import {doingNow} from './tui/status.js';
 import {suggestionFrom} from './tui/suggestion.js';
+import {headerProvider} from './cli-view.js';
 import {backspace, clampCursor, deleteForward, deleteWordBackward, deleteWordForward, insertText, moveCursor, moveLineEnd, moveLineStart, moveVertical, moveWord} from './tui/editor.js';
 import {inputDisposition} from './commands.js';
 import {commands as ownCommands, completions, typedCommand, inputLayout, windowAround, modelRows, checklistRows} from './terminal.js';
@@ -608,7 +609,7 @@ async function main() {
       notice: localSetup?.state.question || notice, paused: copyPaused, mouseScroll,
       menu: menu.map(([text, paint]) => paint(clean(text))),
       metadata: {
-        provider: selected(), model: settings.models[selected()] || '', mode: settings.mode,
+        ...headerProvider({settings, orchestration, active: session.active}), mode: settings.mode,
         cwd: session.cwd, sessionId: session.id, operation: orchestration.operation, jev: jevSidebarLabel(settings.jev),
         orchestrator: orchestration.orchestrator ?? 'main', pendingTurns: pendingTurns.length,
         // The sidebar spends 11 rows on the header block, the AGENTS list and the two gaps, plus one per worker.

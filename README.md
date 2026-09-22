@@ -125,7 +125,7 @@ The status rail on the right shows who is working: a moving glyph while a worker
 
 Live progress — Claude's thinking-token counters, tool heartbeats and the start and end of each foreground Bash call, Codex's command starts — is never written to the journal, and a run of readings for the same thing (`Thinking · ~50 tokens`, `~150`, `~265`…) is one transcript line showing the latest, so a long turn no longer buries the conversation in repeated `thinking_tokens` rows. Short bookkeeping events (agent selected, activity, cooldown, agent finished, turn finished) render as a single line. `/details` shows everything: every tool call field by field with real newlines rather than as escaped JSON, full tool output, and worker dispatch (`/details on|off` sets it explicitly); the journal keeps the original text for handoffs.
 
-The header labels the selected model and updates when the provider reports its model. If neither a model override nor runtime metadata is available, it shows `Default (not reported)`; use `/model ID` to select one explicitly. Bounce activity labels describe local progress. Restart validation shows concise success messages and retains diagnostic output on failure.
+The header names the agent that is actually running: under orchestration, the orchestrator profile's adapter and model; in classic mode, the active provider in the fallback order. It updates when the provider reports its model. If neither a model override nor runtime metadata is available, it shows `Default (not reported)`; use `/model ID` to select one explicitly. Bounce activity labels describe local progress. Restart validation shows concise success messages and retains diagnostic output on failure.
 
 ## Image attachments
 
