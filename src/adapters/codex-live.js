@@ -89,7 +89,8 @@ const request = (handle, {method, params}) => new Promise((resolve, reject) => {
   const id = handle.nextId++; // ids are single-use, so a late response can never resolve an older request
   const timer = handle.setTimeout(() => {
     if (!handle.pending.delete(id)) return;
-    reject(new Error(`codex app-server request timed out: ${method}`));
+    // An App Server that does not answer is an unavailable backend: the code the scheduler's fallback reads.
+    reject(Object.assign(new Error(`codex app-server request timed out: ${method}`), {code: 'backend_unavailable'}));
   }, handle.requestTimeoutMs);
   handle.pending.set(id, {resolve, reject, timer});
   if (!write(handle, {id, method, params})) {

@@ -321,3 +321,36 @@ test('outside a git repository there is no diff to judge, so Jev is not asked an
   assert.deepEqual([skipped.reason, skipped.text], ['no_repository', 'Jev verdict skipped · the working folder is not a git repository, so there is no diff to judge · accepting as today']);
   assert.equal(session.events.some(e => e.kind === 'task.rework'), false);
 });
+
+test('a rework whose worker cannot be resumed falls back to the next AI, exactly as a launch that cannot start does', async t => {
+  // Found live: Jev sent a codex worker back for rework, `thread/resume` timed out, and the task
+  // failed as a bare `error` — so its fallback (claude_sonnet) was never tried and the session stopped.
+  const {session} = setup(t);
+  let round = 0;
+  const worker = fakeAdapter(() => (++round === 1
+    ? [{kind: 'native', provider: 'worker', sessionId: 's1'}, {kind: 'result', status: 'completed', text: 'done, mostly'}]
+    : {launchError: 'backend_unavailable'}));
+  const backup = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'finished by the backup'}]);
+  let reviews = 0;
+  const {profiles, typesafe, jev} = jevScheduler(session, {settings: {enabled: true},
+    respond: () => (++reviews === 1 ? {answers: answers('rework', 0.95, {remaining_work: 0.9})} : {answers: answers('accept', 0.95)}),
+    profiles: {A: {adapter: 'worker', model: 'w', mode: 'yolo', fallback: ['B'], role: 'builder', policy: 'write'}, B: {adapter: 'backup', model: 'b', mode: 'yolo', fallback: [], role: 'builder', policy: 'write'}}});
+  const scheduler = createScheduler({session, adapters: {worker, backup, typesafe}, profiles, jev, gitHead: () => 'start-sha'});
+  t.after(() => scheduler.close());
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'Own src/x.js; run npm test', deadline: null});
+  const failed = await waitFor(() => session.events.find(e => e.kind === 'task.failed' && e.task === row.task));
+  assert.equal(failed.reason, 'backend_unavailable');
+  const fallback = await waitFor(() => session.events.find(e => e.kind === 'policy.fallback' || e.kind === 'policy.fallback.skipped'));
+  assert.deepEqual([fallback.kind, fallback.from_profile, fallback.to_profile, fallback.reason], ['policy.fallback', 'A', 'B', 'backend_unavailable']);
+  await waitFor(() => backup.calls.launch === 1);
+  // the other codes a resume can fail with are classified the same way a launch classifies them
+  for (const [code, reason] of [['limited', 'limited'], ['missing', 'missing'], ['LOCAL_MODEL_UNAVAILABLE', 'local_unavailable'], ['whatever', 'error']]) {
+    const s2 = setup(t).session; let r2 = 0, v2 = 0;
+    const w2 = fakeAdapter(() => (++r2 === 1 ? [{kind: 'native', provider: 'worker', sessionId: 's1'}, {kind: 'result', status: 'completed', text: 'done'}] : {launchError: code}));
+    const j2 = jevScheduler(s2, {settings: {enabled: true}, respond: () => (++v2 === 1 ? {answers: answers('rework', 0.95)} : {answers: answers('accept', 0.95)})});
+    const sch = createScheduler({session: s2, adapters: {worker: w2, typesafe: j2.typesafe}, profiles: j2.profiles, jev: j2.jev, gitHead: () => 'sha'});
+    const task = sch.submit({parent: null, profile: 'A', orders: 'go', deadline: null}).task;
+    assert.equal((await waitFor(() => s2.events.find(e => e.kind === 'task.failed' && e.task === task))).reason, reason, code);
+    sch.close();
+  }
+});
