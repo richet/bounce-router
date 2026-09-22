@@ -257,3 +257,19 @@ test('the daemon answers a user control.jev row with a status row (last 4 key ch
   close();
   assert.equal(fs.readFileSync(session.file, 'utf8').includes('ts-secret-key-abcd'), false);
 });
+
+// A check the worker cannot act on is not a finding. `empty_diff` says "the orders require changes and
+// the diff shows none" — when the diff Jev was shown is NOT empty, that check is contradicted by the
+// state itself and is dropped; if dropping it leaves a rework with nothing actionable, it is an accept.
+test('decideVerdict drops an empty_diff finding when the state shows a diff, and a rework with no actionable finding left becomes an accept', () => {
+  const nouls = Object.fromEntries(Object.keys(VERDICT_CHECKS).map(n => [n, {type: 'noul', noul: 0.05}]));
+  const rework = choice => ({decision: {type: 'choice', choice: 'rework', probabilities: {rework: 0.95, accept: 0.05}, confidence: 0.95}, ...nouls, ...choice});
+  const withDiff = {diff: 'diff --git a/x b/x\n+changed'};
+  const onlyEmpty = decideVerdict(rework({empty_diff: {type: 'noul', noul: 0.9}}), {confidence: 0.8, state: withDiff});
+  assert.deepEqual([onlyEmpty.verdict, onlyEmpty.fired, onlyEmpty.dropped], ['accept', [], ['empty_diff']]);
+  const mixed = decideVerdict(rework({empty_diff: {type: 'noul', noul: 0.9}, unbacked_tests: {type: 'noul', noul: 0.9}}), {confidence: 0.8, state: withDiff});
+  assert.deepEqual([mixed.verdict, mixed.fired, mixed.dropped], ['rework', ['unbacked_tests'], ['empty_diff']]);
+  const trulyEmpty = decideVerdict(rework({empty_diff: {type: 'noul', noul: 0.9}}), {confidence: 0.8, state: {diff: ''}});
+  assert.deepEqual([trulyEmpty.verdict, trulyEmpty.fired], ['rework', ['empty_diff']], 'an empty diff is a real finding when the diff really is empty');
+  assert.equal(decideVerdict(rework({}), {confidence: 0.8}).verdict, 'rework', 'no state: nothing is dropped, today\'s behaviour');
+});

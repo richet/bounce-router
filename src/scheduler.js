@@ -817,6 +817,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       const root = budgetRootOf(id, reducers.tasks(session.events));
       return reducers.budgets(session.events).roots[root]?.reserved?.rounds || 0;
     },
+    // The previous rework round of this task (its findings), and the checks Jev fired for the latest
+    // verdict — what the repeated-findings rule compares and names.
+    lastRework: id => session.events.findLast(e => e.kind === 'task.rework' && e.task === id) ?? null,
+    lastFired: id => session.events.findLast(e => e.kind === 'jev.verdict' && e.task === id)?.fired ?? null,
     roundsCap: id => {
       const root = budgetRootOf(id, reducers.tasks(session.events));
       return submittedRow(root)?.budget?.rounds ?? limits.rounds;

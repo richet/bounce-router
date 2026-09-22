@@ -216,15 +216,21 @@ export function verdictQuestions() {
 
 // Pure: `rework` only when the Choice says so with confidence at or above the threshold;
 // anything else (accept, low confidence, an unexpected answer shape) is today's accept.
-export function decideVerdict(answers, {confidence = 0.8} = {}) {
+export function decideVerdict(answers, {confidence = 0.8, state = null} = {}) {
   const decision = isObject(answers?.decision) ? answers.decision : {};
   const choice = typeof decision.choice === 'string' ? decision.choice : null;
   const conf = Number.isFinite(Number(decision.confidence)) ? Number(decision.confidence) : 0;
   const checks = Object.fromEntries(Object.keys(VERDICT_CHECKS).map(name => [name, Number.isFinite(Number(answers?.[name]?.noul)) ? Number(answers[name].noul) : null]));
-  const fired = Object.keys(VERDICT_CHECKS).filter(name => checks[name] !== null && checks[name] >= 0.5);
-  const rework = choice === 'rework' && conf >= confidence;
+  const firedRaw = Object.keys(VERDICT_CHECKS).filter(name => checks[name] !== null && checks[name] >= 0.5);
+  // A check the state itself contradicts is not a finding the worker can act on: `empty_diff` says
+  // the diff shows nothing, so when the diff Jev was shown is not empty the check is dropped. A rework
+  // that keeps no actionable finding is an accept. (Observed live: a correct change sent back three
+  // times on checks it could not satisfy.)
+  const dropped = state && typeof state.diff === 'string' && state.diff.trim() ? firedRaw.filter(name => name === 'empty_diff') : [];
+  const fired = firedRaw.filter(name => !dropped.includes(name));
+  const rework = choice === 'rework' && conf >= confidence && !(dropped.length && !fired.length);
   const findings = rework ? (fired.length ? fired.map(name => VERDICT_CHECKS[name].fix) : ['Jev judged the work not ready against the orders; re-read the orders and the report against the diff before resubmitting.']) : [];
-  return {verdict: rework ? 'rework' : 'accept', choice, confidence: conf, threshold: confidence, probabilities: isObject(decision.probabilities) ? decision.probabilities : {}, checks, fired, findings};
+  return {verdict: rework ? 'rework' : 'accept', choice, confidence: conf, threshold: confidence, probabilities: isObject(decision.probabilities) ? decision.probabilities : {}, checks, fired, ...(dropped.length ? {dropped} : {}), findings};
 }
 
 // ---- model routing: a Choice over the roster plus Nouls for the access the orders need ----

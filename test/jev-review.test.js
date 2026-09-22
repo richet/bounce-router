@@ -377,3 +377,40 @@ test('a repository with no commit is judged the way no repository is: Jev is not
   const skipped = session.events.find(e => e.kind === 'jev.skipped');
   assert.deepEqual([skipped.reason, skipped.text], ['no_repository', 'Jev verdict skipped · the working folder has no commit to diff against, so there is no diff to judge · accepting as today']);
 });
+
+// Found live (ACE, task 79981b05): a worker made the change and passed every gate, Jev sent it back,
+// it redid every gate, Jev sent it back with the SAME five checks, and a third identical round began.
+// The rounds cap alone allows that. A rework whose fired checks are the same set as the previous
+// round's is evidence the worker cannot satisfy them: the task is escalated to the orchestrator
+// instead of run again, with both verdicts on record.
+test('a second rework for the same fired checks escalates to the orchestrator instead of running a third identical round', async t => {
+  const {session} = setup(t);
+  let turns = 0;
+  const worker = fakeAdapter(() => { turns++; return [{kind: 'native', provider: 'worker', sessionId: 's1'}, {kind: 'result', status: 'completed', text: `attempt ${turns}: one-line change, 78 passed`}]; });
+  const {profiles, typesafe, jev} = jevScheduler(session, {settings: {enabled: true},
+    respond: () => ({answers: answers('rework', 0.95, {unbacked_tests: 0.9, unverified_claims: 0.9})})});
+  const scheduler = createScheduler({session, adapters: {worker, typesafe}, profiles, jev, gitHead: () => 'sha', limits: {rounds: 5}});
+  t.after(() => scheduler.close());
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'make the change', deadline: null});
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'blocked');
+  assert.equal(turns, 2, 'the worker ran twice: the original and ONE rework; no third identical round');
+  const escalated = session.events.find(e => e.kind === 'policy.escalated' && e.task === row.task);
+  assert.equal(escalated.reason, 'repeated_findings');
+  assert.equal(escalated.findings.length, 2, 'the repeated findings ride on the escalation');
+  const blocked = session.events.find(e => e.kind === 'task.blocked' && e.task === row.task);
+  assert.equal(blocked.text, 'Sent back twice for the same findings (unbacked_tests, unverified_claims); the worker cannot satisfy them. Accept, resubmit with different orders, or cancel.');
+  assert.equal(session.events.filter(e => e.kind === 'task.rework' && e.task === row.task).length, 1);
+});
+
+test('a rework whose findings DIFFER from the previous round still runs, up to the rounds cap', async t => {
+  const {session} = setup(t);
+  let turns = 0, verdicts = 0;
+  const worker = fakeAdapter(() => { turns++; return [{kind: 'native', provider: 'worker', sessionId: 's1'}, {kind: 'result', status: 'completed', text: `attempt ${turns}`}]; });
+  const {profiles, typesafe, jev} = jevScheduler(session, {settings: {enabled: true},
+    respond: () => (++verdicts === 1 ? {answers: answers('rework', 0.95, {unbacked_tests: 0.9})} : verdicts === 2 ? {answers: answers('rework', 0.95, {remaining_work: 0.9})} : {answers: answers('accept', 0.95)})});
+  const scheduler = createScheduler({session, adapters: {worker, typesafe}, profiles, jev, gitHead: () => 'sha', limits: {rounds: 5}});
+  t.after(() => scheduler.close());
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'go', deadline: null});
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'accepted');
+  assert.equal(turns, 3, 'two reworks with different findings, then accepted');
+});

@@ -120,7 +120,7 @@ export function createTypesafeLive({fetchImpl, readKey, readSettings = () => rea
     } catch (error) {
       return skipped(stream, error?.code ?? 'error', error?.message ?? String(error));
     }
-    const decision = decideVerdict(result.answers, {confidence: settings.confidence});
+    const decision = decideVerdict(result.answers, {confidence: settings.confidence, state});
     const fired = decision.fired.length ? ` · fired: ${decision.fired.join(', ')}` : '';
     stream.push({kind: 'model', model: result.model});
     if (result.usage && Number.isFinite(result.usage.input_tokens)) stream.push({kind: 'usage', usage: {input: result.usage.input_tokens, output: result.usage.output_tokens ?? 0}});

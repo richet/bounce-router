@@ -30,6 +30,8 @@ const reviewersFor = spec => Array.isArray(spec) ? spec : [spec];
 // CONTRACT.md §2 — byte-identical to Phase 3–7 (the decisive self-host, S1). Single reviewer,
 // quorum 1, prelaunch never reworks (any non-accept/non-unreadable verdict rejects), completion
 // reworks bounded by the root's own rounds allowance (or the scheduler's limits.rounds default).
+const sameFindings = (a = [], b = []) => a.length > 0 && a.length === b.length && [...a].sort().every((f, i) => f === [...b].sort()[i]);
+
 export const defaultStrategy = {
   onSubmitted(task, view, api) {
     const row = api.submittedRow(task);
@@ -51,6 +53,14 @@ export const defaultStrategy = {
     // any other verdict string is a rejection, same as today.
     if (view[task]?.state === 'queued') return {action: 'reject', questions: v.questions ?? v.findings ?? []};
     const findings = v.findings ?? v.questions ?? [];
+    // A rework for the SAME findings as the previous round is evidence the worker cannot satisfy
+    // them (observed live: a correct change sent back three times on the same five checks). The
+    // decision goes to the orchestrator instead of a further identical round.
+    const previous = api.lastRework?.(task);
+    if (previous && sameFindings(previous.findings, findings)) {
+      const checks = api.lastFired?.(task);
+      return {action: 'escalate', reason: 'repeated_findings', findings, text: `Sent back twice for the same findings${checks?.length ? ` (${checks.join(', ')})` : ''}; the worker cannot satisfy them. Accept, resubmit with different orders, or cancel.`};
+    }
     if (api.roundsUsed(task) < api.roundsCap(task)) return {action: 'rework', findings};
     return {action: 'escalate', reason: 'rounds', findings};
   },
