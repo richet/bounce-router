@@ -16,6 +16,9 @@ const setup = (t, env = {}) => {
   const dir = path.join(cwd, '.task'); fs.mkdirSync(dir, {mode: 0o700});
   const log = path.join(dir, 'fake.log');
   const saved = {...process.env};
+  // Every test names its scenario (default: a normal turn). Some tests switch it mid-test by writing
+  // process.env directly; without this a later test inherited the last one — once a worker that holds forever.
+  env = {FAKE_OC_SCENARIO: 'ok', ...env};
   Object.assign(process.env, {FAKE_OC_LOG: log, ...env});
   t.after(() => { for (const key of Object.keys({FAKE_OC_LOG: 1, ...env})) delete process.env[key]; Object.assign(process.env, saved); fs.rmSync(cwd, {recursive: true, force: true}); });
   const logged = prefix => JSON.parse(fs.readFileSync(log, 'utf8').split('\n').find(line => line.startsWith(`${prefix} `)).slice(prefix.length + 1));
@@ -177,7 +180,7 @@ test('cancel is killing our own child: verified within bounds even when it ignor
 // Observed live twice (qwen3-4b re-reading PROGRESS.md; qwen3.8-27b alternating read/todowrite for 42
 // steps when asked to use a tool it did not have): a stuck model repeats itself until the step cap.
 test('a worker repeating the same call with nothing changed is stopped as no progress, recoverably, and the process is gone', async t => {
-  const {cwd, dir} = setup(t, {FAKE_OC_SCENARIO: 'loop'});
+  const {cwd, dir} = setup(t, {FAKE_OC_SCENARIO: 'loop', FAKE_OC_CONCLUDE: 'silent'});
   const adapter = createOpencodeLive({});
   const handle = await adapter.launch({peer: 'worker:t1', profile: profileFor({policy: 'read-only'}), orders: 'x', cwd, dir});
   const started = Date.now();
@@ -187,6 +190,42 @@ test('a worker repeating the same call with nothing changed is stopped as no pro
   assert.equal(events.filter(e => e.kind === 'activity' && e.text === 'read completed').length >= 4, true);
   assert.equal(Date.now() - started < 8000, true);
   assert.throws(() => process.kill(handle.pid, 0), {code: 'ESRCH'});
+});
+
+// Traced live (qwen3.6-35b-a3b as reviewer): it read the diff and every file a review needs, then
+// repeated one identical glob 26 times and never wrote a verdict. The stall is real, but the reading
+// was done — so after the guard stops the turn, the same session is asked ONCE, with no tools, to
+// state its conclusion from what it has. An answer completes the task; silence is the failure it was.
+test('a stalled worker that had read material is asked once, tools off, for its conclusion: an answer is the result, silence stays a no-progress failure', async t => {
+  const {cwd, dir, logged} = setup(t, {FAKE_OC_SCENARIO: 'loop', FAKE_OC_CONCLUDE: 'answer'});
+  const adapter = createOpencodeLive({});
+  const handle = await adapter.launch({peer: 'worker:t2', profile: profileFor({policy: 'read-only', agent: {name: 'reviewer', prompt: 'You review.', maxSteps: 40}}), orders: 'review it', cwd, dir});
+  const events = await drain(adapter, handle);
+  assert.equal(events.at(-1).status, 'completed');
+  assert.match(events.at(-1).text, /^FAIL: the boundary is off by one/);
+  const diagnostics = events.filter(e => e.kind === 'diagnostic').map(e => e.text);
+  assert.equal(diagnostics.some(text => text.startsWith('no progress: read')), true, 'the stall is still on record');
+  assert.equal(diagnostics.some(text => /^stalled after reading \d+ files?; asked once, tools off, for its conclusion$/.test(text)), true, diagnostics.join(' | '));
+  assert.equal(diagnostics.includes('the conclusion turn answered: that answer is the result'), true);
+  // the conclusion turn resumed the SAME session with every tool off and a prompt that says why
+  const lines = fs.readFileSync(path.join(dir, 'fake.log'), 'utf8').split('\n');
+  const argvs = lines.filter(l => l.startsWith('ARGV ')).map(l => JSON.parse(l.slice(5)));
+  assert.equal(argvs.length, 2);
+  assert.equal(argvs[1].includes('-s'), true);
+  const configs = lines.filter(l => l.startsWith('CONFIG ')).map(l => JSON.parse(l.slice(7)));
+  assert.deepEqual(Object.values(configs[1].agent.reviewer.tools).every(v => v === false), true);
+  assert.equal(configs[1].agent.reviewer.maxSteps, 2);
+  const prompts = lines.filter(l => l.startsWith('PROMPT ')).map(l => JSON.parse(l.slice(7)));
+  assert.match(prompts[1], /^Your tools are off\. You repeated the same call with nothing new/);
+  assert.throws(() => process.kill(handle.pid, 0), {code: 'ESRCH'});
+
+  // a worker that stalled WITHOUT having read anything is not asked: it has nothing to conclude from
+  fs.rmSync(path.join(dir, 'fake.log'));
+  process.env.FAKE_OC_SCENARIO = 'loop-unread';
+  const bare = await adapter.launch({peer: 'worker:t3', profile: profileFor({policy: 'read-only'}), orders: 'x', cwd, dir});
+  const bareEvents = await drain(adapter, bare);
+  assert.equal(bareEvents.at(-1).status, 'failed');
+  assert.equal(fs.readFileSync(path.join(dir, 'fake.log'), 'utf8').split('\n').filter(l => l.startsWith('ARGV ')).length, 1, 'no conclusion turn');
 });
 
 // Observed live (qwen3-coder-30b-a3b): the answer arrives at step 2, every step claims `tool-calls`,
@@ -222,7 +261,7 @@ test('the answer is the last text that says something: a stray closing fence aft
   assert.deepEqual(events.filter(event => event.kind === 'assistant').map(event => event.text), ['echo: report please', '```'], 'the fence is still shown in the pane');
 });
 
-test('a write worker in a yolo session may work outside the project folder, as a cloud yolo worker may; a read-only one may not', async t => {
+test('any worker may reach a path outside the project folder, as a cloud worker may; what it can DO there is still its tools', async t => {
   // Found live: the orchestrator put a gate script and an evidence folder under /private/tmp, and
   // opencode auto-rejected the first path outside --dir, which ends the whole turn.
   const {cwd, dir, logged} = setup(t);
@@ -231,8 +270,14 @@ test('a write worker in a yolo session may work outside the project folder, as a
   assert.deepEqual(logged('CONFIG').permission, {external_directory: 'allow'});
   fs.rmSync(path.join(dir, 'fake.log'));
   await drain(adapter, await adapter.launch({peer: 'worker:r', profile: profileFor({policy: 'read-only'}), cwd, dir, orders: 'go'}));
-  assert.equal(Object.hasOwn(logged('CONFIG'), 'permission'), false);
+  // Found live, twice: a READ-ONLY reviewer was pointed at evidence under /private/tmp, opencode
+  // auto-rejected the path and ended its turn. A cloud read-only worker reads anywhere; so does this
+  // one — and it still has no tool that writes or runs anything, outside or inside.
+  const readOnly = logged('CONFIG');
+  assert.deepEqual(readOnly.permission, {external_directory: 'allow'});
+  assert.deepEqual([readOnly.agent['bounce-worker'].tools.write, readOnly.agent['bounce-worker'].tools.edit, readOnly.agent['bounce-worker'].tools.bash], [false, false, false]);
   fs.rmSync(path.join(dir, 'fake.log'));
   await drain(adapter, await adapter.launch({peer: 'worker:p', profile: profileFor({policy: 'write', mode: 'plan'}), cwd, dir, orders: 'go'}));
-  assert.equal(Object.hasOwn(logged('CONFIG'), 'permission'), false, 'a plan session changes nothing, inside or outside');
+  assert.deepEqual(logged('CONFIG').permission, {external_directory: 'allow'});
+  assert.equal(logged('CONFIG').agent['bounce-worker'].tools.write, false, 'a plan session still changes nothing');
 });

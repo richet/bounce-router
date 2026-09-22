@@ -50,7 +50,7 @@ test('live: a read-only worker answers from the project, reports real usage, res
   assert.equal(again.find(e => e.kind === 'native').sessionId, native.sessionId);
 });
 
-test('live: a read-only worker cannot change the project, and a path outside it is refused by opencode itself', {skip, timeout: 300_000}, async t => {
+test('live: a read-only worker cannot change the project, and reads a path outside it as a cloud worker would', {skip, timeout: 300_000}, async t => {
   const {cwd, dir} = project(t);
   const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-oc-outside-')); fs.writeFileSync(path.join(outside, 'secret.txt'), 'nope');
   t.after(() => fs.rmSync(outside, {recursive: true, force: true}));
@@ -64,8 +64,9 @@ test('live: a read-only worker cannot change the project, and a path outside it 
   assert.equal(Date.now() - started < 120_000, true, `the turn must not grind to the step cap: ${Date.now() - started}ms, ${impossible.at(-1).text}`);
   assert.equal(fs.readFileSync(path.join(cwd, 'src/a.js'), 'utf8'), 'export const x = 1;\n');
   const events = await run(adapter, await adapter.launch({peer: 'worker:live-ro3', profile, cwd, dir, orders: `Call the read tool on ${path.join(outside, 'secret.txt')} and tell me exactly what came back.`}));
-  assert.equal(events.some(e => e.kind === 'diagnostic' && /rejected permission|auto-rejecting/i.test(e.text)), true, JSON.stringify(events.slice(-4)));
-  assert.equal(events.some(e => e.kind === 'assistant' && e.text.includes('nope')), false, 'the outside file was never read');
+  assert.equal(events.some(e => e.kind === 'diagnostic' && /rejected permission|auto-rejecting/i.test(e.text)), false, JSON.stringify(events.slice(-4)));
+  assert.equal(events.some(e => e.kind === 'assistant' && e.text.includes('nope')), true, 'the outside file was read, not refused');
+  assert.equal(events.at(-1).status, 'completed', 'and the turn was not ended by a permission ask');
 });
 
 test('live: a write worker edits the real file, and cancelling a turn is verified with nothing left running', {skip, timeout: 300_000}, async t => {

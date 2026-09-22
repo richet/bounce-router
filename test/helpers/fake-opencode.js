@@ -53,7 +53,17 @@ process.stdin.on('end', () => {
     setInterval(() => { emit('step_start', {type: 'step-start'}); emit('step_finish', {type: 'step-finish', reason: 'tool-calls', tokens: usage}); }, 20);
     return;
   }
-  if (scenario === 'loop') { setInterval(() => emit('tool_use', {type: 'tool', tool: 'read', state: {status: 'completed', input: {filePath: 'src/a.js'}, output: 'x'}}), 20); return; }
+  // FAKE_OC_CONCLUDE=answer|silent: on a resumed turn (-s) whose config gives the agent NO tools —
+  // the conclusion turn bounce asks for after a stall — answer, or say nothing.
+  const cfg = process.env.OPENCODE_CONFIG_CONTENT ? JSON.parse(process.env.OPENCODE_CONFIG_CONTENT) : {};
+  const agentName = flag('--agent'); const toolsOff = agentName && cfg.agent?.[agentName]?.tools && Object.values(cfg.agent[agentName].tools).every(v => v === false);
+  if (flag('-s') && toolsOff) {
+    if (process.env.FAKE_OC_CONCLUDE === 'answer') emit('text', {type: 'text', text: `FAIL: the boundary is off by one (conclusion for ${prompt.slice(0, 20)})`});
+    emit('step_finish', {type: 'step-finish', reason: 'stop', tokens: usage});
+    return process.exit(0);
+  }
+  if (scenario === 'loop-unread') { setInterval(() => emit('tool_use', {type: 'tool', tool: 'glob', state: {status: 'completed', input: {pattern: '*.js'}, output: 'No files found'}}), 20); return; }
+  if (scenario === 'loop') { emit('tool_use', {type: 'tool', tool: 'read', state: {status: 'completed', input: {filePath: 'CHANGE.diff'}, output: 'diff'}}); setInterval(() => emit('tool_use', {type: 'tool', tool: 'read', state: {status: 'completed', input: {filePath: 'src/a.js'}, output: 'x'}}), 20); return; }
   setTimeout(() => {
     for (const entry of (process.env.FAKE_OC_WRITE ?? '').split(',').filter(Boolean)) {
       const cut = entry.indexOf(':'); const target = path.resolve(dir, entry.slice(0, cut));

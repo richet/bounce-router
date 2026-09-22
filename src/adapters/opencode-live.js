@@ -18,6 +18,14 @@ const DEFAULT_STEPS = 30;
 // the same file (or rewrites the same todo list) until the step cap, minutes of inference later.
 // The same call with the same input this many times, with nothing changed in between, is a loop.
 const REPEAT_LIMIT = 4;
+// Traced live (qwen3.6-35b-a3b as reviewer): it read the diff and every file a review needs, then
+// repeated one identical glob 26 times and never wrote a verdict. The reading was done; the stopping
+// was not. So a worker the guard stops AFTER it has read something gets one more turn on the same
+// session with every tool off and a two-step cap: state your conclusion from what you have. An
+// answer is the task's result (still reviewed like any other); silence leaves the failure as it was.
+const CONCLUDE_STEPS = 2;
+const CONCLUDE_PROMPT = 'Your tools are off. You repeated the same call with nothing new; you have already read what you need. From what you have read, give your final answer now, in full, as the orders asked. If you cannot, say what is missing.';
+const READS = new Set(['read', 'grep']); // listing files (glob) is not reading material
 const CHANGES = new Set(['write', 'edit', 'apply_patch', 'bash']);
 // Observed live (qwen3-coder-30b-a3b via LM Studio): the model answers, but every step is reported as
 // finishing for `tool-calls` even when it called none, so opencode keeps looping on empty steps until
@@ -70,19 +78,21 @@ export const scrubCredentials = (env, keep = []) =>
 export function createOpencodeLive({kill = process.kill, spawn} = {}) {
   const pendingPath = dir => `${dir}/pending.jsonl`;
 
-  const start = ({profile = {}, session = null, stdin, cwd, dir}) => {
+  const start = ({profile = {}, session = null, stdin, cwd, dir, conclude = false}) => {
     const executable = resolveExecutable('opencode', profile.executables?.opencode);
     const agent = profile.agent ?? {};
     const name = agent.name ?? DEFAULT_AGENT;
     // The worker IS its agent: the agent file's prompt and step cap, and the tier's tools. Defined
     // for every worker, because `run` takes its tools from the agent, not from the prompt.
-    // A write worker in a yolo session may work outside --dir, as a cloud yolo worker may. Without
-    // this opencode auto-rejects the first path outside the project and ENDS the turn — observed
-    // live when orders pointed at a script and an evidence folder under /private/tmp.
-    const outside = effectiveTier(profile) === 'write' ? {permission: {...(profile.opencodeConfig?.permission ?? {}), external_directory: 'allow'}} : {};
+    // Any worker may reach a path outside --dir, as a cloud worker may: without this opencode
+    // auto-rejects the first such path and ENDS the turn. Observed live for a write worker (a gate
+    // script under /private/tmp) and then twice for a READ-ONLY reviewer sent to read evidence there.
+    // What a worker can DO outside is still its tools: a read-only one has none that write or run.
+    const outside = {permission: {...(profile.opencodeConfig?.permission ?? {}), external_directory: 'allow'}};
     const config = {...(profile.opencodeConfig ?? {}), ...outside, agent: {...(profile.opencodeConfig?.agent ?? {}), [name]: {
       description: agent.description ?? 'A bounce worker.', mode: 'primary',
-      ...(agent.prompt ? {prompt: agent.prompt} : {}), maxSteps: agent.maxSteps ?? DEFAULT_STEPS, tools: toolsFor(effectiveTier(profile))}}};
+      ...(agent.prompt ? {prompt: agent.prompt} : {}), maxSteps: conclude ? CONCLUDE_STEPS : agent.maxSteps ?? DEFAULT_STEPS,
+      tools: conclude ? Object.fromEntries(Object.keys(toolsFor(effectiveTier(profile))).map(tool => [tool, false])) : toolsFor(effectiveTier(profile))}}};
     const model = profile.providerID && profile.model ? ['-m', `${profile.providerID}/${profile.model}`] : [];
     const args = [...RUN_ARGS, '--agent', name, ...model, '--dir', cwd, ...(session ? ['-s', session] : [])];
     const keep = profile.apiKeyEnv ? [profile.apiKeyEnv] : [];
@@ -96,7 +106,7 @@ export function createOpencodeLive({kill = process.kill, spawn} = {}) {
       OPENCODE_DISABLE_CLAUDE_CODE: '1', OPENCODE_DISABLE_CLAUDE_CODE_PROMPT: '1', OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: '1',
       OPENCODE_DISABLE_EXTERNAL_SKILLS: '1'};
     const live = spawnLive({executable, args, cwd, env, stdin, ...(spawn ? {spawn} : {})});
-    return {live, child: live.child, pid: live.child.pid, args, dir, cwd, sessionId: session, tools: config.agent[name].tools, agent: name};
+    return {live, child: live.child, pid: live.child.pid, args, dir, cwd, sessionId: session, tools: config.agent[name].tools, agent: name, profile, conclude};
   };
 
   return {
@@ -115,7 +125,7 @@ export function createOpencodeLive({kill = process.kill, spawn} = {}) {
     async *events(handle) {
       let announced = false, lastText = null, lastError = null, tail = '', refused = null;
       const repeats = new Map();
-      let stepActed = false, emptySteps = 0, concluded = false;
+      let stepActed = false, emptySteps = 0, concluded = false, reads = 0, stalled = false;
       const plain = text => String(text).replace(/\x1b\[[0-9;]*m/g, '').replace(/^[!\s]+/, '').trim();
       for await (const event of handle.live.events) {
         if (event.kind === 'diagnostic') {
@@ -131,6 +141,15 @@ export function createOpencodeLive({kill = process.kill, spawn} = {}) {
         if (event.kind === 'exit') {
           // Exit IS the turn ending. A clean exit with text is the worker's answer; anything else is
           // a failure of the runtime rather than of the task, so the next AI in the chain may try.
+          if (stalled && reads > 0 && !handle.conclude && handle.sessionId) {
+            yield {kind: 'diagnostic', text: `stalled after reading ${reads} file${reads === 1 ? '' : 's'}; asked once, tools off, for its conclusion`};
+            const again = start({profile: handle.profile, session: handle.sessionId, stdin: CONCLUDE_PROMPT, cwd: handle.cwd, dir: handle.dir, conclude: true});
+            handle.child = again.child; handle.pid = again.pid; // cancel() must reach the turn that is running now
+            let answer = null;
+            for await (const e of this.events(again)) { if (e.kind === 'result') { answer = e.status === 'completed' ? e.text : null; break; } if (e.kind !== 'result') yield e; }
+            if (answer !== null) { yield {kind: 'diagnostic', text: 'the conclusion turn answered: that answer is the result'}; yield {kind: 'result', status: 'completed', text: answer}; return; }
+            yield {kind: 'diagnostic', text: 'the conclusion turn gave no answer'};
+          }
           if ((event.code === 0 || concluded) && lastText !== null && !lastError) yield {kind: 'result', status: 'completed', text: lastText};
           else yield {kind: 'result', status: 'failed', recoverable: true,
             text: lastError ?? (event.code === 0 ? (refused ? `opencode stopped the turn: ${refused}` : 'opencode finished without an answer') : `opencode exited ${event.signal ?? event.code}: ${tail.trim().split('\n').at(-1) ?? ''}`.trim())};
@@ -152,12 +171,14 @@ export function createOpencodeLive({kill = process.kill, spawn} = {}) {
           const status = part.state?.status ?? '';
           stepActed = true;
           yield {kind: 'activity', text: `${part.tool ?? 'tool'} ${status}`.trim()};
+          if (status === 'completed' && READS.has(part.tool)) reads++;
           if (status === 'completed' && CHANGES.has(part.tool)) repeats.clear(); // the world changed: re-reading is legitimate
           else if (status === 'completed' || status === 'error') {
             const call = `${part.tool} ${JSON.stringify(part.state?.input ?? {})}`.slice(0, 300);
             repeats.set(call, (repeats.get(call) ?? 0) + 1);
             if (repeats.get(call) >= REPEAT_LIMIT && !lastError) {
               lastError = `no progress: ${call} repeated ${REPEAT_LIMIT} times with nothing changed in between`;
+              stalled = true;
               yield {kind: 'diagnostic', text: lastError};
               void verifiedCancel(handle.child, {kill}); // our own child: the exit below reports it
             }
