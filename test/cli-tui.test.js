@@ -71,7 +71,7 @@ test('CLI commands and live steering work while the daemon main turn is held', {
   assert.equal(calls.filter(([kind]) => kind === 'cancel').length, 0);
   // Bare /order reads the order in effect (narrowed to the orchestrator's adapter here) without saving.
   child.stdin.write('/order\r');
-  await waitFor(() => session.events.some(row => row.kind === 'status' && row.text?.startsWith('Fallback order: codex (default) · orchestrator profile decides')));
+  await waitFor(() => session.events.some(row => row.kind === 'status' && row.text?.startsWith('Fallback order: codex (default) · the first agent is the orchestrator')));
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root, 'config.json'))).order, ['codex']);
   // The sidebar is on by default at 120 columns, /sidebar hides it and the choice is saved.
   assert.match(output, /BOUNCE/);
@@ -111,7 +111,9 @@ test('CLI commands and live steering work while the daemon main turn is held', {
   session.append({kind: 'task.completed', task: 'bbb', summary: 'Done'});
   await waitFor(() => session.events.some(row => row.kind === 'note' && row.text?.includes('Unsent draft for worker:aaa')));
   assert.equal(calls.filter(([kind]) => kind === 'run').length, 1, 'retired pane draft never becomes an orchestrator prompt');
-  // A daemon fallback updates both the selected provider and the next turn's model.
+  // A daemon fallback is the daemon's for that turn: the next turn is still sent on the chosen
+  // orchestrator (the profile's adapter and model); the daemon skips it again while it cools down.
+  // Sending the fallback provider back would silently move the orchestrator off what the user chose.
   const requestId = calls.find(([kind]) => kind === 'run')[1].id;
   const selected = session.append({kind: 'main.starting', provider: 'claude', model: 'fallback-opus', mode: 'plan', requestId, state: 'starting'});
   for (const fn of listeners) fn(selected);
@@ -121,8 +123,8 @@ test('CLI commands and live steering work while the daemon main turn is held', {
   await waitFor(() => output.includes('Focused orchestrator pane'));
   child.stdin.write('next turn\r');
   await waitFor(() => calls.filter(([kind]) => kind === 'run').length === 2);
-  assert.equal(calls.at(-1)[1].provider, 'claude');
-  assert.equal(calls.at(-1)[1].model, 'fallback-opus');
+  assert.equal(calls.at(-1)[1].provider, 'codex');
+  assert.equal(calls.at(-1)[1].model, '');
 
   // /operation to the other mode restarts the session into it — refused (and not saved) while a
   // worker still runs, then a restart request naming the mode and exit 75 once the tree is idle.

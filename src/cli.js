@@ -6,7 +6,7 @@ import {createInkTerminal} from './tui/ink-terminal.js';
 import {workspaceColumns} from './tui/Workspace.js';
 import {doingNow} from './tui/status.js';
 import {suggestionFrom, lastAnswer} from './tui/suggestion.js';
-import {headerProvider} from './cli-view.js';
+import {headerProvider, chooseModel, chooseOrder} from './cli-view.js';
 import {backspace, clampCursor, deleteForward, deleteWordBackward, deleteWordForward, insertText, moveCursor, moveLineEnd, moveLineStart, moveVertical, moveWord} from './tui/editor.js';
 import {inputDisposition} from './commands.js';
 import {commands as ownCommands, completions, typedCommand, inputLayout, windowAround, modelRows, checklistRows} from './terminal.js';
@@ -282,7 +282,7 @@ async function main() {
     settings.models[session.main.provider] = session.main.model ?? '';
     settings.mode = session.main.mode ?? settings.mode;
   }
-  let router = remoteMain ? createMainClient(session, settings) : new Router(session, settings, routerOptions);
+  let router = remoteMain ? createMainClient(session, settings, {selection: () => headerProvider({settings, orchestration, active: session.active})}) : new Router(session, settings, routerOptions);
   const orchestratorBrief = orchestrating
     ? `You are the orchestrator peer of session ${session.id}; the bounce bridge is available via BOUNCE_BUS/BOUNCE_BUS_TOKEN_FILE; see ${path.join(session.dir, 'orchestrator', 'ORDERS.md')}.\n`
     : '';
@@ -404,7 +404,8 @@ async function main() {
   const acceptCompletion = () => {const options = suggestions(); if (options.length) {input = '/' + options[completionIndex % options.length][0] + ' '; inputCursor = input.length; completionIndex = 0; menuDismissed = false; return true;} return false;};
   let notice = [restarted?.updateNotice, migrationNotice, skillNotice, 'Ready. Mouse wheel scrolls the transcript · Option-drag selects text (F3 turns the wheel off) · F2 pause for copying · /help'].filter(Boolean).join(' ');
   const history = session.events.filter(e => e.kind === 'user').map(e => e.typed ?? e.text);
-  const selected = () => session.active || settings.order[0];
+  // What the next turn runs on: the orchestrator profile in orchestrator mode, else the active agent.
+  const selected = () => headerProvider({settings, orchestration, active: session.active}).provider;
   const setupDefaults = {};
   const savedSettings = () => ({...settings, ...setupDefaults});
   const save = () => saveJSON(path.join(root, 'config.json'), savedSettings());
@@ -463,12 +464,18 @@ async function main() {
   // Picking a model also picks the agent that reported it.
   const applyModel = entry => {
     router.select(entry.provider);
-    settings.order = [entry.provider, ...settings.order.filter(p => p !== entry.provider)];
-    settings.models[entry.provider] = entry.id;
+    chooseModel(settings, orchestration, {provider: entry.provider, model: entry.id});
+    refreshOrchestration();
     save();
-    session.append({kind: 'status', text: `Model: ${entry.provider} · ${entry.label}${entry.id ? ` (${entry.id})` : ''}`});
-    notice = `${entry.provider} · ${entry.label}. Saved as the default.`;
+    const target = orchestration.operation === 'orchestrator' ? `Orchestrator ${orchestration.orchestrator}: ` : 'Model: ';
+    session.append({kind: 'status', text: `${target}${entry.provider} · ${entry.label}${entry.id ? ` (${entry.id})` : ''}`});
+    notice = `${entry.provider} · ${entry.label}. ${orchestration.operation === 'orchestrator' ? 'The orchestrator runs on it from the next turn.' : 'Saved as the default.'}`;
   };
+  // A profile change made here (model, order) is re-read the way the daemon reads it.
+  function refreshOrchestration() {
+    try { orchestration = validateOrchestration(settings, undefined, {roles}); }
+    catch (error) { notice = `Configuration not applied: ${error.message}`; }
+  }
   // Shared by the /operation command and its picker (menu, also behind Ctrl+O) — one place
   // applies a mode change: open an (empty) overlay on the shipped roster on the first switch to
   // orchestrator, validate the whole config, persist, and — when the chosen mode is not the one
@@ -842,7 +849,11 @@ async function main() {
           router.select(arg); settings.order = [arg, ...settings.order.filter(p => p !== arg)]; save();
         } else if (command === 'model') {
           if (!arg || arg === 'refresh') { await openModelPicker(arg === 'refresh'); return; }
-          settings.models[selected()] = arg === 'default' ? '' : arg; save();
+          const chosen = chooseModel(settings, orchestration, {provider: selected(), model: arg === 'default' ? '' : arg});
+          refreshOrchestration(); save();
+          session.append({kind: 'status', text: orchestration.operation === 'orchestrator'
+            ? `Orchestrator ${orchestration.orchestrator}: ${chosen.provider} · ${chosen.model || 'default'} — runs on it from the next turn`
+            : `Model: ${chosen.provider} · ${chosen.model || 'default'}`});
         } else if (command === 'mode') {
           if (!['yolo','plan'].includes(arg)) throw new Error('Use /mode yolo or /mode plan'); settings.mode = arg; delete setupDefaults.mode; save();
         } else if (command === 'operation') {
@@ -864,11 +875,11 @@ async function main() {
           if (arg) {
             const order = arg.split(',').map(p => p.trim());
             if (!order.length || order.some(p => !providers[p]) || new Set(order).size !== order.length) throw new Error('Use unique provider names separated by commas');
-            settings.order = order; router.select(order[0]); save();
+            chooseOrder(settings, orchestration, order); router.select(order[0]); refreshOrchestration(); save();
           }
           // Explicit profile fallback takes precedence over this legacy provider order.
           const reading = settings.order.map(p => `${p} (${settings.models[p] || 'default'})`).join(' → ');
-          const note = arg ? 'saved' : orchestrating ? 'orchestrator profile decides when fallback is explicit; otherwise this order applies' : '/order claude,codex,muse changes it';
+          const note = arg ? (orchestrating ? `saved · the orchestrator now runs on ${settings.order[0]}` : 'saved') : orchestrating ? 'the first agent is the orchestrator; /order codex,claude moves it' : '/order claude,codex,muse changes it';
           session.append({kind: 'status', text: `Fallback order: ${reading} · ${note}`});
         } else if (command === 'sidebar') {
           if (!['', 'on', 'off'].includes(arg)) throw new Error('Use /sidebar [on|off]');

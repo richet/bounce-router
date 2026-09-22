@@ -2,7 +2,9 @@ import {randomUUID} from 'node:crypto';
 import {cooldowns} from './reducers.js';
 
 // Provider ownership stays in the daemon; this facade only waits for its events.
-export function createMainClient(session, settings) {
+// `selection` says what the next turn runs on (adapter and model); the default is the classic
+// reading. In orchestrator mode the TUI passes the orchestrator profile's (src/cli-view.js).
+export function createMainClient(session, settings, {selection = null} = {}) {
   let activeRequest = null;
   return {
     get cooldowns() { return cooldowns(session.events ?? [], Date.now()); },
@@ -12,7 +14,9 @@ export function createMainClient(session, settings) {
       if (activeRequest) throw new Error('A main turn is already active');
       const id = randomUUID();
       activeRequest = id;
-      const provider = session.active || settings.order[0];
+      const chosen = selection?.() ?? {provider: session.active || settings.order[0]};
+      const provider = chosen.provider;
+      const model = chosen.model ?? (settings.models[provider] || '');
       let resolve, reject;
       const terminal = new Promise((yes, no) => { resolve = yes; reject = no; });
       // A disconnect can arrive while the RPC acknowledgement is still pending.
@@ -26,7 +30,7 @@ export function createMainClient(session, settings) {
         }
       });
       try {
-        const ack = await session.runMain({id, text, files, provider, model: settings.models[provider] || '', mode: settings.mode, routing: {order: [...settings.order], models: {...settings.models}}, ...(typed ? {typed} : {})});
+        const ack = await session.runMain({id, text, files, provider, model, mode: settings.mode, routing: {order: [...settings.order], models: {...settings.models}}, ...(typed ? {typed} : {})});
         if (ack.accepted === false) throw new Error(ack.reason || 'Main turn refused');
         return await terminal;
       } finally {
