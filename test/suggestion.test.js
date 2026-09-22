@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import React from 'react';
 import * as Ink from 'ink';
 import stripAnsi from 'strip-ansi';
-import {suggestionFrom} from '../src/tui/suggestion.js';
+import {suggestionFrom, lastAnswer} from '../src/tui/suggestion.js';
 import {createWorkspace} from '../src/tui/Workspace.js';
 
 test('a suggestion is the answer\'s stated next step, as a prompt the user could send', () => {
@@ -35,4 +35,28 @@ test('rendered: the suggestion sits dim after the caret while the input is empty
   const typed = frame('re', 'Finish the acceptance audit in smaller chunks');
   assert.equal(typed.includes('Finish the acceptance audit'), false);
   assert.match(typed, /❯ re/);
+});
+
+// Found live (ACE session): the prefill never appeared. It was computed from the main.terminal
+// row's text, which only carries a failure reason, and only on a daemon-woken turn; a turn's
+// answer lives in its last `assistant` row. The answer of a turn is that row, after the turn's
+// own prompt (user or handoff), and only when the turn completed.
+test('the answer of the last turn is its last assistant row, and none for a cancelled or answerless turn', () => {
+  const events = [
+    {seq: 1, kind: 'user', text: 'first'},
+    {seq: 2, kind: 'assistant', text: 'Next: do the old thing'},
+    {seq: 3, kind: 'turn', status: 'completed'},
+    {seq: 4, kind: 'handoff', text: 'outcomes'},
+    {seq: 5, kind: 'assistant', text: 'Reading the tracker.'},
+    {seq: 6, kind: 'task.observed', task: 't1', text: 'Next: a worker line that is not the answer'},
+    {seq: 7, kind: 'assistant', text: 'All nine toggles are green. Next: publish the milestone and wait on the review chunks.'},
+    {seq: 8, kind: 'turn', status: 'completed'},
+  ];
+  assert.equal(lastAnswer(events), 'All nine toggles are green. Next: publish the milestone and wait on the review chunks.');
+  assert.equal(suggestionFrom(lastAnswer(events)), 'Publish the milestone and wait on the review chunks.');
+  assert.equal(lastAnswer([...events, {seq: 9, kind: 'user', text: 'again'}, {seq: 10, kind: 'turn', status: 'completed'}]), null, 'a turn with no answer offers nothing');
+  // a classic (non-orchestrator) turn row says how it ended in `text` alone
+  assert.equal(lastAnswer([{seq: 1, kind: 'user', text: 'q'}, {seq: 2, kind: 'assistant', text: 'Next: rerun the gate on main'}, {seq: 3, kind: 'turn', text: 'completed'}]), 'Next: rerun the gate on main');
+  assert.equal(lastAnswer([{seq: 1, kind: 'user', text: 'q'}, {seq: 2, kind: 'assistant', text: 'Next: rerun the gate on main'}, {seq: 3, kind: 'turn', text: 'cancelled'}]), null);
+  assert.equal(lastAnswer([...events, {seq: 9, kind: 'user', text: 'again'}, {seq: 10, kind: 'assistant', text: 'Next: half done'}, {seq: 11, kind: 'turn', status: 'cancelled'}]), null, 'a cancelled turn offers nothing');
 });

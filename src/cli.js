@@ -5,7 +5,7 @@ import {createMainClient} from './main-client.js';
 import {createInkTerminal} from './tui/ink-terminal.js';
 import {workspaceColumns} from './tui/Workspace.js';
 import {doingNow} from './tui/status.js';
-import {suggestionFrom} from './tui/suggestion.js';
+import {suggestionFrom, lastAnswer} from './tui/suggestion.js';
 import {headerProvider} from './cli-view.js';
 import {backspace, clampCursor, deleteForward, deleteWordBackward, deleteWordForward, insertText, moveCursor, moveLineEnd, moveLineStart, moveVertical, moveWord} from './tui/editor.js';
 import {inputDisposition} from './commands.js';
@@ -638,7 +638,8 @@ async function main() {
       attachedTurn = false;
       busy = false;
       notice = event.text || `Turn ${event.status ?? 'blocked'}.`;
-      suggestion = event.kind === 'main.terminal' && !input ? suggestionFrom(event.text) : null;
+      // The answer is the turn's last assistant row, never this row's text (that is a failure reason).
+      suggestion = event.kind === 'main.terminal' && event.status === 'completed' && !input ? suggestionFrom(lastAnswer(session.events)) : null;
     }
     if (event?.kind === 'progress') progress = clean(event.text);
     terminal?.ingest(event);
@@ -953,6 +954,7 @@ async function main() {
         const expanded = text.startsWith('/') ? expandVendorCommand(text, vendorOptions()) : null;
         notice = expanded ? `Running /${expanded.name} (${expanded.origin}) · Esc or Ctrl+C cancels the agent process group` : 'Running · Esc or Ctrl+C cancels the agent process group';
         render(); const result = await router.run((remoteMain ? '' : orchestratorBrief) + withAsides(expanded?.prompt ?? text, asides.splice(0)), [], expanded ? {typed: text} : {}); notice = `Turn ${result}. Session saved.`;
+        suggestion = result === 'completed' && !input ? suggestionFrom(lastAnswer(session.events)) : null;
         void refreshQuota(settings, {root, store: quotas, cwd: session.cwd}).then(render, () => {});
         if (dev && result === 'completed' && fingerprint() !== loadedFingerprint) await restart();
       }

@@ -25,3 +25,15 @@ export function suggestionFrom(answer) {
   if (/\?$/.test(step) || /^(which|what|where|how|why|who)\b/i.test(step)) return null; // an open question
   return capitalise(step);
 }
+
+// The answer of the last turn: its last `assistant` row after the turn's own prompt (a `user` or
+// `handoff` row), and only when that turn completed — a cancelled turn's half-answer is no proposal.
+// Worker output never lands as `assistant` (it is `task.observed`), so main's rows are the only ones.
+export function lastAnswer(events) {
+  const rows = Array.isArray(events) ? events : [];
+  const end = rows.findLast(row => row.kind === 'turn');
+  if (!end || (end.status ?? end.text) !== 'completed') return null;
+  const start = rows.findLast(row => ['user', 'handoff'].includes(row.kind) && (row.seq ?? 0) < (end.seq ?? Infinity));
+  const answer = rows.findLast(row => row.kind === 'assistant' && (row.seq ?? 0) > (start?.seq ?? -1) && (row.seq ?? 0) < (end.seq ?? Infinity));
+  return answer?.text?.trim() ? answer.text : null;
+}
