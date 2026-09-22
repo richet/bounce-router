@@ -4,6 +4,7 @@
 // profile list advertised tiers (so it picked the tier itself), the submit example named a cloud
 // profile, and one sentence said local workers are for when the user asks.
 import test from 'node:test';
+import fs from 'node:fs';
 import assert from 'node:assert/strict';
 import {choosingOrders, defaultTarget} from '../src/reload.js';
 
@@ -51,4 +52,12 @@ test('the orders tell the orchestrator to wait on what it dispatched instead of 
   assert.equal(text.includes('Once you have dispatched a task, wait for it'), true);
   assert.equal(text.includes('do not investigate the same question yourself'), true);
   assert.equal(text.includes('cancel the task first'), true);
+});
+
+// Found live: an analyst ran out of its ten-minute deadline; the orders said a deadline means stop
+// and report, and the orchestrator ended the whole run over it, with the builder's work done.
+test('the orders say a deadline is a task to resubmit smaller, not a reason to stop the run', () => {
+  const text = fs.readFileSync(new URL('../src/reload.js', import.meta.url), 'utf8');
+  assert.equal(text.includes('it is not a reason to stop the run'), true);
+  assert.equal(/task\.cancelled, task\.deadline or',\n\s*'task\.rejected mean stop/.test(text), false, 'a deadline is no longer listed among the stop reasons');
 });

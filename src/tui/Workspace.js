@@ -149,7 +149,9 @@ export function createWorkspace(React, Ink) {
         ...draft.map((row, index) => React.createElement(Text, {key: `input:${index}`, wrap: 'truncate-end'},
           React.createElement(Text, {color: 'cyan'}, `${index === 0 ? '❯' : ' '} `),
           row.caret === undefined ? row.text : React.createElement(React.Fragment, null,
-            row.before, React.createElement(Text, {inverse: true}, row.atEnd ? '▏' : row.caret), row.after))),
+            row.before, React.createElement(Text, {inverse: true}, row.atEnd ? '▏' : row.caret), row.after),
+          // The main worker's proposed next step, dim after the caret while the input is empty: Tab takes it, typing replaces it.
+          index === 0 && !view.input && view.suggestion ? React.createElement(Text, {color: 'gray'}, ` ${view.suggestion}  ⇥ Tab`) : null)),
         React.createElement(Text, {color: 'yellow', wrap: 'truncate-end'}, (view.notice ?? '').replace(/\n/g, ' '))));
     return React.createElement(Box, {flexDirection: 'row', columnGap: sidebar ? 1 : 0, width: total, height}, content,
       sidebar ? React.createElement(Sidebar, {metadata: view.metadata, panes: model.panes, main: allPanes[0], height, now}) : null);

@@ -316,6 +316,7 @@ async function main() {
   }
   let attachedTurn = remoteMain && ['running', 'starting', 'blocked'].includes(session.main?.state);
   let input = '', inputCursor = 0, verticalColumn = null, busy = attachedTurn, suspended = false, scroll = 0, historyIndex = -1;
+  let suggestion = null; // the main worker's proposed next step, offered in the prompt; never sent on its own
   const pendingTurns = [];
   const asides = [];
   async function noteAside(text) {
@@ -636,6 +637,7 @@ async function main() {
       attachedTurn = false;
       busy = false;
       notice = event.text || `Turn ${event.status ?? 'blocked'}.`;
+      suggestion = event.kind === 'main.terminal' && !input ? suggestionFrom(event.text) : null;
     }
     if (event?.kind === 'progress') progress = clean(event.text);
     terminal?.ingest(event);
@@ -1027,6 +1029,8 @@ async function main() {
     if (key.name === 'enter' || (key.name === 'return' && (key.meta || key.ctrl || key.shift))) {({input, cursor: inputCursor} = insertText(input, inputCursor, '\n')); menuDismissed = true; render(); return;}
     const options = suggestions();
     if (options.length && ['up', 'down'].includes(key.name)) {completionIndex = (completionIndex + (key.name === 'up' ? -1 : 1) + options.length) % options.length; render(); return;}
+    if (suggestion && !input && key.name === 'tab') { input = suggestion; inputCursor = input.length; suggestion = null; render(); return; }
+    if (suggestion && !key.ctrl && !key.meta && str && !['tab', 'up', 'down', 'left', 'right'].includes(key.name)) suggestion = null; // typing replaces it
     if (options.length && key.name === 'tab') {acceptCompletion(); render(); return;}
     if (localSetup && key.name === 'tab') {render(); return;}
     if (agentsOpen && key.name === 'tab') {

@@ -1288,7 +1288,14 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const row = submittedRow(r.task);
     const durationMs = r.deadlineAt - r.startedAt;
     append({kind: 'task.deadline', task: r.task, text: `deadline ${durationMs} ms exceeded at ${r.elapsed} ms`, from: 'bounce', context: row?.context});
-    await cancel(r.task, {force: true});
+    // A deadline is bounce's decision, never the user's: the cancel says so, and whoever submitted the
+    // task is told, with the way forward. Found live: journaled as reason `user`, the orders' "a user
+    // cancellation is final" applied, and the orchestrator stopped the whole run over one slow analyst.
+    await cancel(r.task, {force: true, reason: 'deadline'});
+    const seconds = ms => `${Math.round(ms / 1000)} s`;
+    const to = rootSubmitterFrom(r.task) === 'orchestrator' ? 'orchestrator' : 'user';
+    append({kind: 'policy.escalated', task: r.task, reason: 'deadline', to, context: row?.context,
+      text: `${row?.profile ?? 'the worker'} ran out of its ${seconds(durationMs)} deadline at ${seconds(r.elapsed)} with the work unfinished. Its partial progress is in the journal: resubmit what is left as a smaller task, or drop it.`});
   }
 
   async function handleSignature(r, reason, now) {
@@ -1364,7 +1371,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     else if (row.kind === 'task.failed') { maybeFallback(row); handleTerminal(row); }
     else if (row.kind === 'task.cancelled') {
       if (row.reason === 'watchdog') maybeFallback(row);
-      else append({kind: 'policy.fallback.skipped', task: row.task, reason: 'explicit_cancellation', text: 'user cancellation never recovers', context: row.context});
+      else if (row.reason !== 'deadline') append({kind: 'policy.fallback.skipped', task: row.task, reason: 'explicit_cancellation', text: 'user cancellation never recovers', context: row.context});
       handleTerminal(row);
     }
     else if (row.kind === 'task.deadline') {
