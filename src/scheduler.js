@@ -80,11 +80,15 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // look stalled, and each running model turn holds memory — observed live as a swapping machine).
   // A task past the limit stays queued, says so once, and dispatches when a local turn ends.
   const slotWaiters = new Set();
-  const localSlots = endpoint => { try { return normalizeLocalSettings(localSettings).endpoints[endpoint]?.maxConcurrent ?? 1; } catch { return 1; } };
+  const localEndpoint = endpoint => { try { return normalizeLocalSettings(localSettings).endpoints[endpoint] ?? {}; } catch { return {}; } };
+  const localSlots = endpoint => localEndpoint(endpoint).maxConcurrent ?? 1;
+  // Per model: the endpoint's slotsPerModel, else the endpoint ceiling (one model, same number).
+  const modelSlots = endpoint => localEndpoint(endpoint).slotsPerModel ?? localSlots(endpoint);
   // Running = a live handle, or a launch still in flight (the handle exists only after launch()
   // resolves, and several dispatches can pass the check before the first one does).
   const localEndpointOf = task => { const p = profiles[reducers.tasks(session.events)[task]?.profile]; return p && LOCAL_ADAPTERS.has(p.adapter) ? p.endpoint ?? 'lmstudio' : null; };
-  const localRunning = endpoint => new Set([...[...handles.entries()].filter(([, h]) => h.local === endpoint).map(([t]) => t), ...[...launchingAttempts.keys()].filter(t => localEndpointOf(t) === endpoint)]).size;
+  const localModelOf = task => profiles[reducers.tasks(session.events)[task]?.profile]?.model ?? null;
+  const localRunning = (endpoint, model = null) => new Set([...[...handles.entries()].filter(([t, h]) => h.local === endpoint && (model === null || localModelOf(t) === model)).map(([t]) => t), ...[...launchingAttempts.keys()].filter(t => localEndpointOf(t) === endpoint && (model === null || localModelOf(t) === model))]).size;
   const launchingAttempts = new Map(); // task -> {attempt, reports}; grants exist before task.started
   const resolvedLocalProfiles = new Map();
   // Live activity, never journaled (task.activity is a LIVE_KIND): task -> {at, expectUntil}.
@@ -1104,8 +1108,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (LOCAL_ADAPTERS.has(profile.adapter)) {
       const endpoint = profile.endpoint ?? 'lmstudio';
       const running = localRunning(endpoint), slots = localSlots(endpoint);
-      if (running >= slots) {
-        if (!slotWaiters.has(task)) append({kind: 'task.milestone', task, phase: 'queued', text: `Waiting for a local slot on ${endpoint}: ${running} of ${slots} in use`, next: 'dispatch when a local turn ends', context});
+      const onModel = localRunning(endpoint, profile.model), perModel = modelSlots(endpoint);
+      const full = running >= slots ? `Waiting for a local slot on ${endpoint}: ${running} of ${slots} in use`
+        : onModel >= perModel ? `Waiting for a local slot on ${endpoint} for ${profile.model}: ${onModel} of ${perModel} in use` : null;
+      if (full) {
+        if (!slotWaiters.has(task)) append({kind: 'task.milestone', task, phase: 'queued', text: full, next: 'dispatch when a local turn ends', context});
         slotWaiters.add(task);
         return;
       }
