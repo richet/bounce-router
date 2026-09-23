@@ -48,7 +48,18 @@ export const defaultStrategy = {
   onReviewVerdict(task, verdicts, view, api) {
     const v = verdicts[0];
     if (v.verdict === 'accept') return {action: 'accept'};
-    if (v.verdict === 'unreadable') return {action: 'escalate', reason: 'review', text: 'unreadable review verdict'};
+    // An unreadable verdict from a reviewer that RAN used to block the task, which needs a human. Found
+    // live (ACE 12ca0d9f): the reviewer hit its step cap, its notice failed to parse, and the task sat
+    // blocked. That fails instead, so the orchestrator is woken by an outcome and decides. A review that
+    // never produced anything — launch failed, cancelled, or still before any worker ran (prelaunch) — is
+    // an infrastructure problem, not a verdict, and still escalates exactly as before.
+    if (v.verdict === 'unreadable') {
+      if (v.launchFailed || v.cancelled || view[task]?.state === 'queued') return {action: 'escalate', reason: 'review', text: 'unreadable review verdict'};
+      // A reviewer that answered in prose is asked once for the verdict line alone; twice unreadable is
+      // the reviewer's answer, and the task fails with it rather than waiting for a person.
+      if (!api.reAsked?.(task)) return {action: 'rereview', text: 'Your last answer carried no readable verdict. Answer again with the verdict line only, as JSON.'};
+      return {action: 'fail', reason: 'review_unreadable', text: 'the reviewer returned no readable verdict'};
+    }
     // Prelaunch (state still 'queued' at the moment the verdict is decided) never reworks:
     // any other verdict string is a rejection, same as today.
     if (view[task]?.state === 'queued') return {action: 'reject', questions: v.questions ?? v.findings ?? []};

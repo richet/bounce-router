@@ -36,7 +36,7 @@ Own only your paths.
   assert.throws(() => agentMetadata('---\nname: x\ndescription: d\nmodels: [sonnet]\n---\n'), /provider\/model refs/);
   assert.throws(() => agentMetadata('---\nname: x\ndescription: d\nwritePaths: [../out]\n---\n'), /relative workspace paths/);
   assert.throws(() => agentMetadata('---\nname: orchestrator\ndescription: d\n---\n'), /reserved/);
-  assert.throws(() => agentMetadata('---\nname: x\ndescription: d\npolicy: root\n---\n'), /read-only or write/);
+  assert.throws(() => agentMetadata('---\nname: x\ndescription: d\npolicy: root\n---\n'), /policy must be read-only, probe or write/);
   assert.throws(() => agentMetadata('---\nname: x\ndescription: d\nmaxSteps: 0\n---\n'), /between 1 and 500/);
 });
 
@@ -121,7 +121,8 @@ test('an agent with no models may be played by every signed-in provider in order
   assert.deepEqual(chain.map(p => [p.adapter, p.model]), [['claude', 'sonnet'], ['codex', 'gpt-5.6-terra'], ['muse', ''], ['opencode', 'auto']]);
   assert.deepEqual(chain.map(p => p.fallback), [['reviewer~2'], ['reviewer~3'], ['reviewer~4'], []]);
   assert.equal(view.profiles.reviewer.policy, 'read-only', 'the policy comes from reviewer.md');
-  assert.equal(view.profiles['reviewer~4'].policy, 'read-only');
+  assert.equal(view.profiles['reviewer~4'].policy, 'probe', 'the shipped reviewer probes where the AI can enforce it (local, codex)');
+  assert.deepEqual(['reviewer~2', 'reviewer~3'].map(name => view.profiles[name].policy), ['probe', 'read-only']);
   // A write agent runs locally like any other: no scope to declare, nothing skipped.
   assert.deepEqual([view.profiles['builder~4'].adapter, view.profiles['builder~4'].policy], ['opencode', 'write']);
   assert.deepEqual(view.skipped, []);
@@ -221,7 +222,7 @@ test('agents set validates the file against this machine, writes it in the chose
   // list and show read the layered set; remove takes only a file in a writable store.
   const list = agentsCommand(['list'], options());
   assert.match(list.text, /^  coder · write · project · claude\/sonnet, lmstudio\/auto \(via opencode\)$/m);
-  assert.match(list.text, /^  reviewer · read-only · skill · auto \(Jev\), claude\/sonnet, codex\/gpt-5.6-terra, muse, lmstudio\/auto \(via opencode\)$/m);
+  assert.match(list.text, /^  reviewer · probe · skill · auto \(Jev\), claude\/sonnet, codex\/gpt-5.6-terra, muse, lmstudio\/auto \(via opencode\)$/m);
   assert.equal(agentsCommand(['show', 'coder'], options()).text, fs.readFileSync(set.report.file, 'utf8'));
   assert.throws(() => agentsCommand(['show', 'nope'], options()), /no agent named nope/);
   assert.throws(() => agentsCommand(['remove', 'reviewer'], options()), /shipped with skill agent-orchestrator/);

@@ -39,7 +39,7 @@ test('launch: the prompt goes in on stdin, the worker runs in the real tree as i
 
   assert.deepEqual(events.filter(e => e.kind !== 'activity'), [
     {kind: 'native', provider: 'opencode', sessionId: handle.sessionId},
-    {kind: 'assistant', text: 'echo: say hello'},
+    {kind: 'assistant', speaker: 'worker', text: 'echo: say hello'},
     {kind: 'usage', usage: {input: 11, cache_read: 3, cache_write: 2, output: 7}},
     {kind: 'result', status: 'completed', text: 'echo: say hello'},
   ]);
@@ -216,7 +216,7 @@ test('a stalled worker that had read material is asked once, tools off, for its 
   assert.deepEqual(Object.values(configs[1].agent.reviewer.tools).every(v => v === false), true);
   assert.equal(configs[1].agent.reviewer.maxSteps, 2);
   const prompts = lines.filter(l => l.startsWith('PROMPT ')).map(l => JSON.parse(l.slice(7)));
-  assert.match(prompts[1], /^Your tools are off\. You repeated the same call with nothing new/);
+  assert.match(prompts[1], /^Stop using tools and give your final answer now, in full, as the orders asked \(you repeated the same call with nothing new\)\./);
   assert.throws(() => process.kill(handle.pid, 0), {code: 'ESRCH'});
 
   // a worker that stalled WITHOUT having read anything is not asked: it has nothing to conclude from
@@ -226,6 +226,86 @@ test('a stalled worker that had read material is asked once, tools off, for its 
   const bareEvents = await drain(adapter, bare);
   assert.equal(bareEvents.at(-1).status, 'failed');
   assert.equal(fs.readFileSync(path.join(dir, 'fake.log'), 'utf8').split('\n').filter(l => l.startsWith('ARGV ')).length, 1, 'no conclusion turn');
+});
+
+// Task leases: when bounce asks a running worker to conclude (ceiling reached, no progress, stuck),
+// the running turn is stopped and the same session is asked, tools off, for its final answer, with
+// the prompt bounce gives. The answer is the task's result; silence is a recoverable failure.
+test('conclude stops the running turn and asks the same session, tools off, with bounce\'s prompt: the answer is the result', async t => {
+  const {cwd, dir} = setup(t, {FAKE_OC_SCENARIO: 'hold', FAKE_OC_CONCLUDE: 'answer'});
+  const adapter = createOpencodeLive({});
+  const handle = await adapter.launch({peer: 'worker:t9', profile: profileFor({policy: 'read-only', agent: {name: 'reviewer', prompt: 'You review.', maxSteps: 40}}), orders: 'review it', cwd, dir});
+  const drained = drain(adapter, handle);
+  const started = Date.now();
+  while (!handle.sessionId && Date.now() - started < 5000) await new Promise(resolve => setTimeout(resolve, 10));
+  const firstPid = handle.pid;
+  await adapter.conclude(handle, {prompt: 'bounce: time is up (the 60 min ceiling). Give your final answer now.'});
+  const events = await drained;
+  assert.equal(events.at(-1).status, 'completed');
+  assert.match(events.at(-1).text, /^FAIL: the boundary is off by one \(conclusion for bounce: time is up/);
+  assert.equal(events.some(e => e.kind === 'diagnostic' && e.text === 'asked, tools off, for its conclusion: bounce: time is up (the 60 min ceiling). Give your final answer now.'), true);
+  assert.throws(() => process.kill(firstPid, 0), {code: 'ESRCH'});
+  const lines = fs.readFileSync(path.join(dir, 'fake.log'), 'utf8').split('\n');
+  const argvs = lines.filter(l => l.startsWith('ARGV ')).map(l => JSON.parse(l.slice(5)));
+  assert.equal(argvs.length, 2);
+  assert.equal(argvs[1][argvs[1].indexOf('-s') + 1], handle.sessionId);
+  const configs = lines.filter(l => l.startsWith('CONFIG ')).map(l => JSON.parse(l.slice(7)));
+  assert.equal(Object.values(configs[1].agent.reviewer.tools).every(v => v === false), true);
+  assert.equal(configs[1].agent.reviewer.maxSteps, 2);
+  const prompts = lines.filter(l => l.startsWith('PROMPT ')).map(l => JSON.parse(l.slice(7)));
+  assert.equal(prompts[1], 'bounce: time is up (the 60 min ceiling). Give your final answer now.');
+});
+
+test('a tool call is reported with its target, so bounce can tell new work from repeated work', async t => {
+  const {cwd, dir} = setup(t, {FAKE_OC_SCENARIO: 'loop', FAKE_OC_CONCLUDE: 'answer'});
+  const adapter = createOpencodeLive({});
+  const handle = await adapter.launch({peer: 'worker:t10', profile: profileFor({policy: 'read-only'}), orders: 'x', cwd, dir});
+  const events = await drain(adapter, handle);
+  const calls = events.filter(e => e.kind === 'activity' && e.call).map(e => [e.call, e.change]);
+  assert.deepEqual(calls.slice(0, 2), [['read CHANGE.diff', false], ['read src/a.js', false]]);
+});
+
+// Measured on the review-quality benchmark (2026-09-22): `opencode run --format json` prints nothing while
+// a step generates, and one 27B step ran past 6 minutes writing its review — a silence watchdog killed a
+// working model. While a step is open the adapter says so on a heartbeat; after the per-step cap it stops,
+// so a step that never ends still goes silent and the watchdog still catches it.
+test('an open step heartbeats as activity until the per-step cap, so a long generation is not silence', async t => {
+  const {cwd, dir} = setup(t, {FAKE_OC_SCENARIO: 'hold'});
+  const adapter = createOpencodeLive({heartbeatMs: 40, stepBeatCapMs: 200});
+  const handle = await adapter.launch({peer: 'worker:t11', profile: profileFor({policy: 'read-only'}), orders: 'x', cwd, dir});
+  const beats = []; let opened = null;
+  const drained = (async () => { for await (const e of adapter.events(handle)) {
+    if (e.kind === 'activity' && e.text === '' && opened === null) opened = Date.now();
+    if (e.kind === 'activity' && /^generating · step open \d+ s$/.test(e.text)) beats.push(Date.now() - opened);
+  } })();
+  await new Promise(resolve => setTimeout(resolve, 600));
+  await adapter.cancel(handle);
+  await drained;
+  assert.equal(beats.length >= 3, true, `beats at ${beats.join(', ')} ms`);
+  assert.equal(beats.every(at => at < 200 + 40 + 60), true, `a beat after the cap: ${beats.join(', ')} ms`);
+});
+
+// The probing reviewer: it may read and run commands, never change the tree. OpenCode's bash can write
+// anywhere, so the whole opencode process runs under macOS sandbox-exec: writes to the project are refused
+// by the OS, temp dirs stay writable, and the network reaches only the model endpoint.
+test('a probe worker has read tools and bash, and runs sandboxed: it cannot write the project', async t => {
+  assert.deepEqual(toolsFor('probe'), {read: true, grep: true, glob: true, write: false, edit: false, apply_patch: false, bash: true,
+    todowrite: false, task: false, websearch: false, webfetch: false, skill: false, question: false, invalid: false});
+  const adapter = createOpencodeLive({});
+  assert.equal(adapter.capabilities().executionPolicies.includes('probe'), true);
+  const {cwd, dir} = setup(t, {FAKE_OC_WRITE: 'src/probe-wrote.txt:x'});
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-probe-log-'));
+  t.after(() => fs.rmSync(outside, {recursive: true, force: true}));
+  process.env.FAKE_OC_LOG = path.join(outside, 'fake.log');
+  const handle = await adapter.launch({peer: 'worker:t12', profile: profileFor({policy: 'probe', opencodeConfig: {provider: {lmstudio: {options: {baseURL: 'http://127.0.0.1:1234/v1'}}}}}), orders: 'probe it', cwd, dir});
+  assert.equal(handle.args[0], '-p', 'launched through sandbox-exec with an inline profile');
+  await drain(adapter, handle);
+  assert.equal(fs.existsSync(path.join(cwd, 'src/probe-wrote.txt')), false, 'the project write was refused');
+  assert.equal(fs.existsSync(path.join(outside, 'fake.log')), true, 'a temp dir outside the project stays writable');
+  // the same worker without probe writes the tree, as a yolo worker does
+  const free = await adapter.launch({peer: 'worker:t13', profile: profileFor({}), orders: 'write it', cwd, dir});
+  await drain(adapter, free);
+  assert.equal(fs.readFileSync(path.join(cwd, 'src/probe-wrote.txt'), 'utf8'), 'x');
 });
 
 // Observed live (qwen3-coder-30b-a3b): the answer arrives at step 2, every step claims `tool-calls`,
@@ -249,7 +329,7 @@ test('empty steps after an answer end the turn AS that answer; empty steps with 
 
 test('capabilities: the same ladder as before, live and resumable', () => {
   assert.deepEqual(createOpencodeLive().capabilities(), {live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'],
-    executionPolicies: ['read-only', 'plan', 'write', 'yolo'], quota: 'stream'});
+    executionPolicies: ['read-only', 'probe', 'plan', 'write', 'yolo'], quota: 'stream'});
 });
 
 test('the answer is the last text that says something: a stray closing fence after the report is not the result', async t => {
@@ -291,4 +371,31 @@ test('text the worker said BEFORE its tool work is not its answer: a turn that e
   const events = await drain(adapter, await adapter.launch({peer: 'worker:o', profile: profileFor({policy: 'read-only'}), cwd, dir, orders: 'do it'}));
   assert.deepEqual(events.at(-1), {kind: 'result', status: 'failed', recoverable: true, text: 'no answer: the worker said nothing after its last tool call'});
   assert.equal(events.some(e => e.kind === 'assistant' && e.text.startsWith('I will execute')), true, 'the opener is still shown');
+});
+
+// Found live (ACE 12ca0d9f, 2026-09-22): a reviewer hit opencode's step cap; opencode injected
+// "CRITICAL - MAXIMUM STEPS REACHED … Respond with text only", and bounce recorded THAT as the
+// worker's answer — the review was blocked as an unreadable verdict after 24 minutes. The notice is
+// opencode talking, not the worker: the same session is asked once, tools off, for its real answer,
+// and a model's stray thinking markers never reach the answer either.
+test('the step-cap notice is not an answer: the worker is asked to conclude, and thinking tags are stripped', async t => {
+  const {cwd, dir} = setup(t, {FAKE_OC_SCENARIO: 'stepcap', FAKE_OC_CONCLUDE: 'answer'});
+  const adapter = createOpencodeLive({});
+  const handle = await adapter.launch({peer: 'worker:t14', profile: profileFor({policy: 'read-only', agent: {name: 'reviewer', prompt: 'You review.', maxSteps: 40}}), orders: 'review it', cwd, dir});
+  const events = await drain(adapter, handle);
+  const said = events.filter(e => e.kind === 'assistant').map(e => e.text);
+  assert.equal(said.some(text => /MAXIMUM STEPS REACHED/.test(text)), false, 'opencode\'s own notice is never the worker speaking');
+  assert.equal(said.some(text => /<\/?think>/.test(text)), false, 'thinking markers are stripped');
+  assert.equal(events.at(-1).status, 'completed');
+  assert.match(events.at(-1).text, /^FAIL: the boundary is off by one/);
+  const prompts = fs.readFileSync(path.join(dir, 'fake.log'), 'utf8').split('\n').filter(l => l.startsWith('PROMPT ')).map(l => JSON.parse(l.slice(7)));
+  assert.match(prompts[1], /^Stop using tools and give your final answer now, in full, as the orders asked \(your step budget is spent\)\./);
+});
+
+test('a step cap with no answer at all is a clean failure, not a fake result', async t => {
+  const {cwd, dir} = setup(t, {FAKE_OC_SCENARIO: 'stepcap', FAKE_OC_CONCLUDE: 'silent'});
+  const adapter = createOpencodeLive({});
+  const handle = await adapter.launch({peer: 'worker:t15', profile: profileFor({policy: 'read-only'}), orders: 'review it', cwd, dir});
+  const events = await drain(adapter, handle);
+  assert.deepEqual([events.at(-1).kind, events.at(-1).status, events.at(-1).text], ['result', 'failed', 'step cap reached without an answer']);
 });

@@ -42,6 +42,16 @@ process.stdin.on('end', () => {
   if (scenario === 'fail') { process.stderr.write('Error: connect ECONNREFUSED 127.0.0.1:1234\n'); process.exit(1); }
   if (scenario === 'garbage') process.stdout.write('not json at all\n');
   emit('step_start', {type: 'step-start'});
+  // FAKE_OC_CONCLUDE=answer|silent: on a resumed turn (-s) whose config gives the agent NO tools —
+  // the conclusion turn bounce asks for after a stall or at a lease end — answer, or say nothing,
+  // whatever the scenario the first turn played (a held turn is concluded too).
+  const cfg = process.env.OPENCODE_CONFIG_CONTENT ? JSON.parse(process.env.OPENCODE_CONFIG_CONTENT) : {};
+  const agentName = flag('--agent'); const toolsOff = agentName && cfg.agent?.[agentName]?.tools && Object.values(cfg.agent[agentName].tools).every(v => v === false);
+  if (flag('-s') && toolsOff) {
+    if (process.env.FAKE_OC_CONCLUDE === 'answer') emit('text', {type: 'text', text: `FAIL: the boundary is off by one (conclusion for ${prompt.slice(0, 20)})`});
+    emit('step_finish', {type: 'step-finish', reason: 'stop', tokens: usage});
+    return process.exit(0);
+  }
   if (scenario === 'hold' || scenario === 'stubborn') { setInterval(() => {}, 1000); return; }
   if (scenario === 'empty' || scenario === 'empty-notext') {
     // The shape observed from qwen3-coder-30b-a3b: every step ends for `tool-calls`, even the empty ones.
@@ -53,15 +63,6 @@ process.stdin.on('end', () => {
     setInterval(() => { emit('step_start', {type: 'step-start'}); emit('step_finish', {type: 'step-finish', reason: 'tool-calls', tokens: usage}); }, 20);
     return;
   }
-  // FAKE_OC_CONCLUDE=answer|silent: on a resumed turn (-s) whose config gives the agent NO tools —
-  // the conclusion turn bounce asks for after a stall — answer, or say nothing.
-  const cfg = process.env.OPENCODE_CONFIG_CONTENT ? JSON.parse(process.env.OPENCODE_CONFIG_CONTENT) : {};
-  const agentName = flag('--agent'); const toolsOff = agentName && cfg.agent?.[agentName]?.tools && Object.values(cfg.agent[agentName].tools).every(v => v === false);
-  if (flag('-s') && toolsOff) {
-    if (process.env.FAKE_OC_CONCLUDE === 'answer') emit('text', {type: 'text', text: `FAIL: the boundary is off by one (conclusion for ${prompt.slice(0, 20)})`});
-    emit('step_finish', {type: 'step-finish', reason: 'stop', tokens: usage});
-    return process.exit(0);
-  }
   // FAKE_OC_SCENARIO=opener-then-silence: says one sentence, does tool work, then the turn ends with
   // no text after the last tool call — the shape of a worker that went quiet (observed live: that
   // opener became the task's completion).
@@ -71,6 +72,16 @@ process.stdin.on('end', () => {
     emit('step_finish', {type: 'step-finish', reason: 'tool-calls', tokens: usage});
     emit('step_start', {type: 'step-start'});
     emit('tool_use', {type: 'tool', tool: 'read', state: {status: 'completed', input: {filePath: 'b.js'}, output: 'y'}});
+    emit('step_finish', {type: 'step-finish', reason: 'stop', tokens: usage});
+    return process.exit(0);
+  }
+  // FAKE_OC_SCENARIO=stepcap: the shape observed live when opencode's maxSteps runs out — it injects its
+  // own notice as the assistant's last text, with the model's stray thinking tag ahead of it.
+  if (scenario === 'stepcap') {
+    emit('tool_use', {type: 'tool', tool: 'read', state: {status: 'completed', input: {filePath: 'src/a.js'}, output: 'x'}});
+    emit('step_finish', {type: 'step-finish', reason: 'tool-calls', tokens: usage});
+    emit('step_start', {type: 'step-start'});
+    emit('text', {type: 'text', text: '</think>\n\nCRITICAL - MAXIMUM STEPS REACHED\n\nThe maximum number of steps allowed for this task has been reached. Tools are disabled until next user input. Respond with text only.'});
     emit('step_finish', {type: 'step-finish', reason: 'stop', tokens: usage});
     return process.exit(0);
   }

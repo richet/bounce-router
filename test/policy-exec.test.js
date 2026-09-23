@@ -140,7 +140,7 @@ test('E5 backward compat: no executionPolicies key means unconstrained', async t
 
 // E6: live-adapter capabilities — exact executionPolicies lists.
 test('E6-opencode live-adapter capabilities: executionPolicies deepEqual the declared ladder rungs', () => {
-  assert.deepEqual(createOpencodeLive().capabilities().executionPolicies, ['read-only', 'plan', 'write', 'yolo']);
+  assert.deepEqual(createOpencodeLive().capabilities().executionPolicies, ['read-only', 'probe', 'plan', 'write', 'yolo']);
 });
 
 // E7-opencode (ported from the legacy `local` read-only refusal case): opencode's enforcement is

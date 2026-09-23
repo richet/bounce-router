@@ -12,6 +12,9 @@ import {inputDisposition} from './commands.js';
 import {commands as ownCommands, completions, typedCommand, inputLayout, windowAround, modelRows, checklistRows} from './terminal.js';
 import {modelCatalog, modelEntries, catalogNotes} from './models.js';
 import {discoverLocalModels, switchLocal} from './local-models.js';
+import {readMachine, resourceReport, createResources} from './resources.js';
+import {taskView, taskList} from './task-view.js';
+import {formatTaskView, formatTaskList} from './task-report.js';
 import {runLocalSetup} from './local-wizard.js';
 import {createLocalSetupView} from './local-setup-view.js';
 import {activateLocalProfiles} from './local-activation.js';
@@ -26,8 +29,9 @@ import {loadQuota, recordQuota, refreshQuota, quotaSnapshot, quotaShort, quotaPa
 import {skillsCommand, syncSkills, inspectSkills, skillsChanged, importCandidates, importSelected, importSummary, importOrigin, syncSummary, skillAreas} from './skills.js';
 import {expandVendorCommand, findVendorCommand, vendorCommandRows} from './vendor-commands.js';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import {spawn} from 'node:child_process';
+import {spawn, spawnSync} from 'node:child_process';
 
 import {parseArgs} from 'node:util';
 import {Session, Router, config, saveJSON, dataRoot} from './core.js';
@@ -55,7 +59,7 @@ async function main() {
   const {values, positionals} = parseArgs({allowPositionals: true, options: {
     image: {type: 'string', multiple: true}, cwd: {type: 'string'}, resume: {type: 'string'}, provider: {type: 'string'}, model: {type: 'string'},
     mode: {type: 'string'}, json: {type: 'boolean'}, verify: {type: 'boolean'}, help: {type: 'boolean', short: 'h'}, version: {type: 'boolean', short: 'v'},
-    check: {type: 'boolean'}, scope: {type: 'string'}, force: {type: 'boolean'}, list: {type: 'boolean'}, all: {type: 'boolean'},
+    check: {type: 'boolean'}, scope: {type: 'string'}, force: {type: 'boolean'}, list: {type: 'boolean'}, all: {type: 'boolean'}, session: {type: 'string'},
     save: {type: 'boolean'}, 'allow-network': {type: 'boolean'},
   }});
   if (values.help) return console.log(helpText(process.stdout.columns || 100));
@@ -162,6 +166,13 @@ async function main() {
     }
     return;
   }
+  // What the machine can run right now: the same numbers the memory gate uses before a local dispatch.
+  if (positionals[0] === 'resources') {
+    const machine = readMachine();
+    const fleet = await discoverLocalModels(settings.local, {maxAge: 0}).catch(() => []);
+    if (values.json) return console.log(JSON.stringify({machine, fleet}, null, 2));
+    return console.log(resourceReport({machine, fleet, busy: [], swapping: false}));
+  }
   if (positionals[0] === 'quota') {
     const store = await refreshQuota(settings, {root, cwd});
     // Every vendor the config can spend on: the validated roster, so a vendor reached only
@@ -196,6 +207,56 @@ async function main() {
   // CONTRACT.md #5 bullet 4: the built-in A/B, legacy CLI path, no daemon. Unknown session/task
   // is a thrown Error, which the top-level .catch prints to stderr and exits 1 (same convention
   // as every other legacy command's error here, e.g. Session's own "Session not found").
+  // Registering that server with the agents, so nobody edits a config by hand (Daniel: "let bounce do it").
+  if (positionals[0] === 'mcp' && ['install', 'uninstall'].includes(positionals[1])) {
+    const {withCodexEntry, withoutCodexEntry} = await import('./mcp-install.js');
+    const installing = positionals[1] === 'install';
+    const codexConfig = path.join(os.homedir(), '.codex', 'config.toml');
+    const said = [];
+    let before = '';
+    try { before = fs.readFileSync(codexConfig, 'utf8'); } catch { before = ''; }
+    const result = installing ? withCodexEntry(before, process.execPath === process.argv[1] ? 'bounce' : (process.argv[1] ?? 'bounce')) : withoutCodexEntry(before);
+    if (result.changed) { fs.mkdirSync(path.dirname(codexConfig), {recursive: true}); fs.writeFileSync(codexConfig, result.text); }
+    said.push(`codex: ${result.changed ? (installing ? 'registered' : 'removed') : (result.reason ?? 'already current')} · ${codexConfig}`);
+    // claude owns its own MCP registry: ask its CLI rather than editing its file.
+    const claude = spawnSync('claude', installing ? ['mcp', 'add', '--scope', 'user', 'bounce', '--', 'bounce', 'mcp-serve'] : ['mcp', 'remove', '--scope', 'user', 'bounce'], {encoding: 'utf8'});
+    said.push(`claude: ${claude.error ? `not installed here (${claude.error.code})` : claude.status === 0 ? (installing ? 'registered' : 'removed') : (claude.stderr || claude.stdout || 'refused').trim().split('\n')[0]}`);
+    return console.log(said.join('\n'));
+  }
+  // The agent-facing interface over MCP (docs/plans/bridge-interface.md): the same verbs and views the
+  // bridge and these commands use, as typed tools, so an orchestrator stops shelling and parsing.
+  if (positionals[0] === 'mcp-serve') {
+    const {createOps} = await import('./bridge-ops.js');
+    const {createMcpServer, serveStdio} = await import('./mcp.js');
+    // Which session: the bus socket lives in its directory; failing that, the live one.
+    const busDir = process.env.BOUNCE_BUS && process.env.BOUNCE_BUS.endsWith('bus.sock') ? path.dirname(process.env.BOUNCE_BUS) : null;
+    const id = busDir && path.basename(path.dirname(busDir)) === 'sessions' ? path.basename(busDir)
+      : (listSessions(root).find(row => row.live)?.id ?? listSessions(root)[0]?.id ?? null);
+    const journal = id ? path.join(root, 'sessions', id, 'journal.jsonl') : null;
+    const events = () => id ? new Session(process.cwd(), {root, id}).events : [];
+    const server = createMcpServer({
+      ops: createOps({env: process.env}),
+      views: {taskView: task => taskView(events(), task, {journal}), taskList: options => taskList(events(), options)},
+      version,
+    });
+    serveStdio(server);
+    return new Promise(() => {}); // stdio server: it ends when its client closes the pipe
+  }
+  // The reads the orchestrator used to fake with `tail | jq` — the same view its tools return.
+  if (positionals[0] === 'task' && positionals[1] !== 'compare') {
+    const ref = values.session || listSessions(root).find(row => row.live)?.id || listSessions(root)[0]?.id;
+    if (!ref) throw new Error('No session to read · start one with `bounce`');
+    const id = resolveSessionRef(root, ref);
+    const target = new Session(process.cwd(), {root, id});
+    const journal = path.join(root, 'sessions', id, 'journal.jsonl');
+    if (positionals[1]) {
+      const view = taskView(target.events, positionals[1], {journal});
+      if (!view) throw new Error(`Unknown task: ${positionals[1]}`);
+      return console.log(values.json ? JSON.stringify(view, null, 2) : formatTaskView(view));
+    }
+    const rows = taskList(target.events, {all: Boolean(values.all)});
+    return console.log(values.json ? JSON.stringify(rows, null, 2) : formatTaskList(rows));
+  }
   if (positionals[0] === 'task' && positionals[1] === 'compare') {
     const [, , sessionId, taskA, taskB] = positionals;
     if (!sessionId || !taskA || !taskB) throw new Error('Use: bounce task compare SESSION TASK_A TASK_B');

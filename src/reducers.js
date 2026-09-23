@@ -204,14 +204,24 @@ export function watchdog(events, now, {activity = new Map(), watchdog: cfg} = {}
   const result = [];
   for (const t of Object.values(taskView)) {
     if (t.state === 'blocked') { result.push({task: t.id, verdicts: ['blocked']}); continue; }
-    if (t.state !== 'running') continue;
+    // A completion review is a worker turn too, with its own lease from `review.started` — the worker's
+    // own elapsed time is not the reviewer's budget. Found live: a 24-minute review nothing was watching.
+    const reviewing = t.state === 'reviewing';
+    if (t.state !== 'running' && !reviewing) continue;
     const root = lineageRoot(t.id);
-    const startedRows = events.filter(e => e.kind === 'task.started' && e.task === root);
+    const startedRows = reviewing
+      ? events.filter(e => e.kind === 'review.started' && e.task === t.id)
+      : events.filter(e => e.kind === 'task.started' && e.task === root);
     if (!startedRows.length) continue;
-    const startedAt = Date.parse(startedRows[0].time);
+    const startedAt = Date.parse(reviewing ? startedRows.at(-1).time : startedRows[0].time);
     const submitted = events.find(e => e.kind === 'task.submitted' && e.task === root);
-    const deadlineMs = submitted?.deadline ?? cfg.defaultDeadlineMs;
-    const deadlineAt = startedAt + deadlineMs;
+    // The deadline is a lease (docs/plans/task-leases.md): each `task.lease.renewed` in the lineage
+    // adds one more lease, and none reaches past the ceiling, measured from the lineage's first start.
+    const leaseMs = submitted?.deadline ?? cfg.defaultDeadlineMs;
+    const renewals = events.filter(e => e.kind === 'task.lease.renewed' && (reviewing ? e.stage === 'review' && e.task === t.id : !e.stage && taskView[e.task] && lineageRoot(e.task) === root)).length;
+    const ceilingAt = startedAt + Math.max(cfg.ceilingMs ?? leaseMs, leaseMs);
+    const leaseStartAt = Math.min(startedAt + leaseMs * renewals, ceilingAt);
+    const deadlineAt = Math.min(startedAt + leaseMs * (renewals + 1), ceilingAt);
     let progressAt = Date.parse(startedRows.at(-1).time);
     for (const e of events) {
       if (e.task !== t.id) continue;
@@ -238,7 +248,7 @@ export function watchdog(events, now, {activity = new Map(), watchdog: cfg} = {}
     // F4/A7: absolute timestamps (a moment), never durations — lastActivityAt/lastProgressAt.
     // The policy that consumes this row (scheduler tick()) is the one place that turns them
     // into elapsed ms, under the duration names, inside its own evidence object.
-    if (verdicts.length) result.push({task: t.id, startedAt, deadlineAt, elapsed, lastActivityAt: activityAt, lastProgressAt: progressAt, expectUntil, verdicts});
+    if (verdicts.length) result.push({task: t.id, stage: reviewing ? 'review' : 'turn', startedAt, deadlineAt, leaseMs, leaseStartAt, renewals, ceilingAt, elapsed, lastActivityAt: activityAt, lastProgressAt: progressAt, expectUntil, verdicts});
   }
   return result;
 }

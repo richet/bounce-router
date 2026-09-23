@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {handoff} from './core.js';
+import {failedAttempts} from './loop-guard.js';
 import {imagePaths, saveImages, providerInput} from './images.js';
 import {cooldowns, tasks, TERMINAL} from './reducers.js';
 
@@ -34,6 +35,11 @@ export function handoffBlock(session, ended) {
     const outcome = row.summary ?? row.text ?? (Array.isArray(row.questions) && row.questions.length ? row.questions.join('; ') : null) ?? t.summary ?? t.error ?? '';
     lines.push(`- task ${row.task} · profile ${t.profile ?? '?'} · ${row.kind}${row.reason ? ` · reason: ${row.reason}` : ''}${t.replaces ? ` · replaces ${t.replaces}` : ''}`);
     if (outcome) lines.push(`  ${String(outcome).slice(0, HANDOFF_TEXT_MAX).replace(/\n/g, '\n  ')}`);
+    // You see one outcome at a time; bounce sees the pattern. Found live: ten identical reviewer tasks,
+    // each killed at its ceiling and resubmitted, because no single handoff showed the repetition.
+    const submitted = session.events.find(e => e.kind === 'task.submitted' && e.task === row.task);
+    const earlier = submitted ? failedAttempts(session.events.filter(e => e.task !== row.task), submitted) : [];
+    if (earlier.length) lines.push(`  this job has now failed ${earlier.length + 1} times the same way (${[...earlier.map(a => a.reason), row.reason ?? row.kind].join(', ')}): change the scope or the AI before asking again — bounce refuses a third identical attempt.`);
   }
   lines.push(running.length ? `Still running: ${running.map(t => `${t.id} (${t.profile}, ${t.state})`).join(', ')}` : 'No other task of yours is still running.');
   return lines.join('\n');

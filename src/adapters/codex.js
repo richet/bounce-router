@@ -1,3 +1,5 @@
+import {toolText} from './transcript.js';
+
 const describe = value => typeof value === 'string' ? value : JSON.stringify(value ?? '');
 
 export default {
@@ -26,7 +28,7 @@ export default {
       if (item.type === 'agent_message') add('assistant', item.text);
       else if (item.type === 'user_message') { /* the orders echoed back: not a tool row */ }
       else if (item.type === 'dynamic_tool_call') add('tool', `${item.tool ?? 'Tool'} · ${item.success === true ? 'accepted' : item.success === false ? 'rejected' : item.status ?? 'completed'}`);
-      else if (item.type !== 'reasoning') add('tool', item.command ? `${item.command}\n${item.aggregatedOutput ?? item.aggregated_output ?? ''}` : item);
+      else if (item.type !== 'reasoning') add('tool', item.command ? toolText(item.command, item.aggregatedOutput ?? item.aggregated_output ?? '') : item);
     }
     if (raw.type === 'item.started' && item?.command) add('progress', `Running · ${describe(item.command).split('\n')[0]}`);
     if (raw.type === 'error' || raw.type === 'turn.failed') add('error', raw.error?.message ?? raw.message ?? raw.error ?? raw);

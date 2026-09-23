@@ -8,6 +8,10 @@ import {defaultStrategy} from './strategy.js';
 import {reportEvent, validateReport} from './reporting.js';
 import {normalizeLocalSettings} from './local-models.js';
 import {createLocalResolver} from './local-resolve.js';
+import {createResources, residentModels, sizeOf, fitLocal, gb, DEFAULT_RESERVE_BYTES} from './resources.js';
+import {concludeAsk} from './adapters/live-common.js';
+import {failedAttempts, repeatRefusal, REPEAT_LIMIT} from './loop-guard.js';
+import {discoverLocalModels} from './local-models.js';
 import {routingFallback} from './jev.js';
 import {validOwns, treeSnapshot, revertOutside} from './owned-paths.js';
 import {execFileSync} from 'node:child_process';
@@ -18,8 +22,14 @@ const SIZE_FIELDS = ['lines', 'probes', 'minutes'];
 // Silence is five minutes, not two: at two the alarm fired on every test run and corrected itself
 // five seconds later (observed live, four times in one task), which only teaches you to ignore it.
 // No MILESTONE for ten minutes is still a stall, whatever the worker prints.
-export const WATCHDOG_DEFAULTS = {interval: 5000, silence: 300_000, stall: 600_000, grace: 120_000};
+// concludeGrace: how long a worker asked for its conclusion has to give it. Five minutes, not two: one
+// step of the local 27B at 77k tokens of context took up to three minutes of prefill (ACE, 2026-09-22).
+// concludeCap: the most a conclusion that keeps showing activity is waited for. Found live: a 27B was
+// still generating its answer 284 s into a fixed 300 s grace, and a whole 60 min review was lost.
+export const WATCHDOG_DEFAULTS = {interval: 5000, silence: 300_000, stall: 600_000, grace: 120_000, concludeGrace: 300_000, concludeCap: 900_000};
 const DEFAULT_DEADLINE_MINUTES = 60; // a worker with no declared deadline; the watchdog ladder still catches silence
+const DEFAULT_CEILING_MINUTES = 60; // no lease is renewed past this, measured from the lineage's first start
+const CALL_MEMORY = 200; // tool calls remembered per running task, to tell new work from repeated work
 const TIERS = new Set(['live', 'next-turn', 'queued']);
 // The depends_on hold/fail decision (which dependency states fail a dependent outright vs.
 // merely hold it — A1) now lives in the strategy (src/strategy.js's DEPENDENCY_FAIL_STATES),
@@ -82,15 +92,21 @@ function parseVerdict(status, text) {
 // Dispatch, fallback, permission ratchet, cancellation, review and reconcile as policies over
 // the log, driven by adapters. Everything the scheduler knows is re-derived from session.events
 // via the reducers — it keeps only a live-handle map, which cannot survive a restart by design.
-export function createScheduler({session, adapters, profiles, localSettings, localResolver = createLocalResolver({local: localSettings}), sessionMode = 'yolo', depthCap = 1, checkpointRunner, limits: suppliedLimits = {}, strict = false, requireFinalReport = false, reportGrant = null, clock = () => Date.now(), watchdog: suppliedWatchdog = {}, strategy = defaultStrategy, jev = null, gitHead = defaultGitHead}) {
+export function createScheduler({session, adapters, profiles, localSettings, localResolver = createLocalResolver({local: localSettings}),
+  // What the machine can run: one reader, the LM Studio catalog, and the one command that frees memory.
+  resources = createResources(), localFleet = ({signal} = {}) => discoverLocalModels(localSettings, {signal, maxAge: 2000}),
+  unloadLocal = async name => { execFileSync('lms', ['unload', String(name).split('/').slice(1).join('/')], {timeout: 60000}); },
+  sessionMode = 'yolo', depthCap = 1, checkpointRunner, limits: suppliedLimits = {}, strict = false, requireFinalReport = false, reportGrant = null, clock = () => Date.now(), watchdog: suppliedWatchdog = {}, strategy = defaultStrategy, jev = null, gitHead = defaultGitHead}) {
   // Sizing limits (lines/probes/minutes) gate dispatch ONLY when the caller configures them: a
   // task's declared size is otherwise informational. The old built-in 150/6/15 defaults refused
   // real orchestrations (a 400-line brief) with no way to see why — a shallow rule, removed.
   const limits = {rounds: 2, ...suppliedLimits};
-  if (!isPositiveInt(limits.rounds) || SIZE_FIELDS.some(field => limits[field] !== undefined && !isPositiveInt(limits[field]))) throw new Error('malformed: limits');
+  if (!isPositiveInt(limits.rounds) || SIZE_FIELDS.some(field => limits[field] !== undefined && !isPositiveInt(limits[field])) || (limits.ceiling !== undefined && !isPositiveInt(limits.ceiling))) throw new Error('malformed: limits');
+  // The deadline is a lease renewed while the worker makes progress; the ceiling is the hard stop.
+  const ceilingMs = (limits.ceiling ?? Math.max(DEFAULT_CEILING_MINUTES, limits.minutes ?? DEFAULT_DEADLINE_MINUTES)) * 60000;
   const watchdogConfig = {...WATCHDOG_DEFAULTS, ...suppliedWatchdog};
   const intervalOk = watchdogConfig.interval === null || isPositiveInt(watchdogConfig.interval);
-  if (!intervalOk || !isPositiveInt(watchdogConfig.silence) || !isPositiveInt(watchdogConfig.stall) || !isPositiveInt(watchdogConfig.grace)) throw new Error('malformed: watchdog');
+  if (!intervalOk || !isPositiveInt(watchdogConfig.silence) || !isPositiveInt(watchdogConfig.stall) || !isPositiveInt(watchdogConfig.grace) || !isPositiveInt(watchdogConfig.concludeGrace) || !isPositiveInt(watchdogConfig.concludeCap)) throw new Error('malformed: watchdog');
   const handles = new Map(); // task -> {adapter, handle}
   const reviews = new Map(); // task -> {adapter, handle}, one review in flight per task (A3)
   const heldTasks = new Set(); // tasks queued behind an unaccepted depends_on, re-evaluated on terminal rows
@@ -113,6 +129,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // Live activity, never journaled (task.activity is a LIVE_KIND): task -> {at, expectUntil}.
   // Updated straight off the subscriber below, the same way it sees every other peer-published row.
   const activity = new Map();
+  // Live too: the worker's recent tool calls ({at, call, change}), for adapters that name them.
+  const toolCalls = new Map();
+  const leaseChecks = new Set(); // tasks whose lease end is being decided right now (a Jev call may be in flight)
   const workerFrom = task => `worker:${task}`;
   const reviewFrom = task => `review:${task}`;
   // A task submitted with `profile: "auto"` is routed at dispatch (jev.routed): every reader of
@@ -171,10 +190,55 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       const resolved = await localResolver.resolve({profile, signal: controller.signal,
         onStatus: text => append({kind: 'task.milestone', task, attempt, phase: 'admission', text, next: 'launch worker', context})});
       controller.signal.throwIfAborted();
+      await admitMemory({profile: resolved, task, attempt, context, signal: controller.signal});
+      controller.signal.throwIfAborted();
       launching.phase = 'launch';
       // Nothing ran before a launch fails, so the failure is always a verified non-start.
       return {profile: resolved, adapter: adapters[profile.adapter], signal: controller.signal, failed: () => true};
     } finally { clearTimeout(timer); }
+  }
+
+  // The memory gate, between resolving the model and launching it. Greedy by decision: the budget is
+  // what is actually free. A machine bounce cannot read has no opinion and nothing below runs.
+  async function admitMemory({profile, task, attempt, context, signal}) {
+    const endpoint = profile.endpoint ?? 'lmstudio';
+    const cfg = localEndpoint(endpoint);
+    const reserve = Number.isFinite(cfg.reserveGb) ? cfg.reserveGb * 1024 ** 3 : DEFAULT_RESERVE_BYTES;
+    const waitMs = (Number.isFinite(cfg.waitMinutes) ? cfg.waitMinutes : 10) * 60000;
+    const pollMs = Number.isFinite(cfg.pollMs) ? cfg.pollMs : 5000;
+    const startedAt = clock();
+    let said = false, escalated = false;
+    for (;;) {
+      signal?.throwIfAborted();
+      const machine = resources.read();
+      if (!machine?.known) return;
+      // Swapping is the one state bounce does not wait out: the machine is already too slow, and the
+      // agent's next AI (the cloud) can take the task now.
+      if (resources.swapping()) throw Object.assign(new Error('the machine is swapping: a local worker would make it worse'), {code: 'LOCAL_SWAPPING'});
+      const fleet = await localFleet({signal}).catch(() => null);
+      if (!fleet) return;
+      const busy = [...handles.keys()].filter(id => id !== task).map(id => localModelOf(id)).filter(Boolean);
+      const resident = residentModels(fleet, busy);
+      const size = sizeOf(fleet, endpoint, profile.model);
+      const fit = fitLocal({sizeBytes: size, loaded: resident.some(row => row.model === profile.model), machine, resident, reserve});
+      if (fit.ok) {
+        for (const name of fit.unload ?? []) {
+          const freed = resident.find(row => row.name === name)?.sizeBytes ?? 0;
+          await unloadLocal(name);
+          append({kind: 'local.unloaded', task, attempt, model: name, freed, context,
+            text: `Unloaded idle ${name} (${gb(freed)}) to make room for ${profile.model} (${gb(size)}, ${gb(machine.available)} free)`});
+        }
+        return;
+      }
+      if (!said) { said = true; append({kind: 'task.milestone', task, attempt, phase: 'queued', next: 'dispatch when memory frees', context,
+        text: `Waiting for memory on ${endpoint} for ${profile.model}: ${fit.reason}`}); }
+      if (!escalated && clock() - startedAt >= waitMs) {
+        escalated = true;
+        append({kind: 'policy.escalated', task, reason: 'resources', to: submitterOf(task), context,
+          text: `${profile.model} has waited ${Math.round((clock() - startedAt) / 60000)} min for memory on ${endpoint}: ${fit.reason}. It keeps waiting; cancel it, or send it to a cloud AI.`});
+      }
+      await new Promise(resolve => setTimeout(resolve, pollMs));
+    }
   }
 
   // Called only by the restricted report endpoint. The endpoint binds task/attempt from its
@@ -258,7 +322,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         for (const n of names) {
           const p = profiles[n];
           // A reviewer is whoever cannot change anything: by declared policy, not by the label it wears.
-          if (!p || !(effectivePolicy(p) === 'read-only' || READONLY_ROLES.has(p.role))) return 'review';
+          if (!p || !(['read-only', 'probe'].includes(effectivePolicy(p)) || READONLY_ROLES.has(p.role))) return 'review';
         }
       }
     }
@@ -506,8 +570,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
           append({kind: 'task.observed', task, text: String(event.text ?? '').slice(0, 16000), from, context});
         }
         switch (event.kind) {
-          case 'activity': publish({kind: 'task.activity', task, text: event.text, from, context}); break;
-          case 'assistant': case 'tool': case 'progress': publish({kind: 'task.activity', task, text: event.text, from, context}); break;
+          case 'activity': publish({kind: 'task.activity', task, text: event.text, ...(typeof event.call === 'string' ? {call: event.call.slice(0, 300), change: event.change === true} : {}), from, context}); break;
+          case 'assistant': recordFindings(task, event.text, context); publish({kind: 'task.activity', task, text: event.text, from, context}); break;
+          case 'tool': case 'progress': publish({kind: 'task.activity', task, text: event.text, from, context}); break;
           case 'error': publish({kind: 'task.activity', task, text: `error: ${event.text}`, from, context}); break;
           case 'diagnostic': case 'status': publish({kind: 'task.activity', task, text: event.text, from, context}); break;
           case 'delta': break; // streaming fragments; the assembled text arrives as 'assistant'
@@ -843,6 +908,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // The previous rework round of this task (its findings), and the checks Jev fired for the latest
     // verdict — what the repeated-findings rule compares and names.
     lastRework: id => session.events.findLast(e => e.kind === 'task.rework' && e.task === id) ?? null,
+    // Whether this task's review has already been asked again for a readable verdict (once is the cap).
+    reAsked: id => session.events.some(e => e.kind === 'review.reasked' && e.task === id),
     lastFired: id => session.events.findLast(e => e.kind === 'jev.verdict' && e.task === id)?.fired ?? null,
     roundsCap: id => {
       const root = budgetRootOf(id, reducers.tasks(session.events));
@@ -899,7 +966,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // reservation before calling in (dispatch's shared review-or-worker reservation, §4);
   // `reserveFirst: true` means this function reserves it too (the completion path, which has
   // no such shared reservation).
-  async function runReviewers({task, stage, round, reviewers, row, context, root, reserveFirst}) {
+  async function runReviewers({task, stage, round, reviewers, row, context, root, reserveFirst, note = null}) {
     const verdicts = [];
     for (let i = 0; i < reviewers.length; i++) {
       const profileName = reviewers[i];
@@ -962,7 +1029,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       const review = {stage, round, orders: row.orders, summary: reducers.tasks(session.events)[task]?.summary ?? null,
         report: reported ? {summary: reported.summary, text: reported.text, evidence: reported.evidence, remaining: reported.remaining, phase: reported.phase} : null,
         head: session.events.find(e => e.kind === 'task.started' && e.task === lineageRoot)?.head ?? null};
-      const verdict = await runReview({task, stage, round, profileName, profile: reviewProfile, orders, dir, context, peer, review});
+      const verdict = await runReview({task, stage, round, profileName, profile: reviewProfile, orders: note ? `${orders}\n\n${note}` : orders, dir, context, peer, review: note ? {...review, note} : review});
       if (verdict.launchFailed && !exempt) append({kind: 'budget.released', task, root, amount: {starts: 1}, text: 'review launch failed', context});
       if (verdict.cancelled) return null;
       verdicts.push(verdict);
@@ -973,12 +1040,21 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // Executes an onReviewVerdict intent, shared by the prelaunch and completion callers: only
   // 'accept' behaves differently by stage (prelaunch also launches the worker), everything else
   // is identical. Returns nothing; every branch is terminal for this dispatch/review pass.
-  async function applyVerdictIntent(intent, {task, stage, row, round, context, root}) {
+  async function applyVerdictIntent(intent, {task, stage, row, round, context, root, reviewIntent}) {
     if (intent.action === 'reject') {
       append({kind: 'task.rejected', task, questions: intent.questions ?? [], context});
       return;
     }
     if (intent.action === 'escalate') { applyEscalate(task, intent, context); return; }
+    // One more ask for a verdict bounce can read; `review.reasked` on record is what caps it at one.
+    if (intent.action === 'rereview') {
+      append({kind: 'review.reasked', task, stage, round, text: intent.text ?? '', context});
+      await runCompletionReview(task, reviewIntent, {note: intent.text ?? ''});
+      return;
+    }
+    // A review that produced nothing usable ends the task with its reason, so the orchestrator is woken
+    // by an outcome instead of a `blocked` row that waits for a person.
+    if (intent.action === 'fail') { append({kind: 'task.failed', task, reason: intent.reason ?? 'review', text: intent.text ?? '', context}); return; }
     if (intent.action === 'rework') {
       if (stage === 'prelaunch') {
         // No worker has ever launched yet at prelaunch — there is nothing to resume: a
@@ -1001,9 +1077,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     }
   }
 
-  const VERDICT_ACTIONS = new Set(['accept', 'reject', 'rework', 'escalate']);
+  const VERDICT_ACTIONS = new Set(['accept', 'reject', 'rework', 'escalate', 'fail', 'rereview']);
 
-  async function runCompletionReview(task, reviewIntent) {
+  async function runCompletionReview(task, reviewIntent, {note = null} = {}) {
     const view = reducers.tasks(session.events);
     const t = view[task];
     if (!t || t.state !== 'reviewing') return; // stale trigger (already handled, or never entered review)
@@ -1017,7 +1093,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       return;
     }
 
-    const verdicts = await runReviewers({task, stage: 'completion', round, reviewers, row, context, root, reserveFirst: true});
+    const verdicts = await runReviewers({task, stage: 'completion', round, reviewers, row, context, root, reserveFirst: true, note});
     if (!verdicts) return;
     // Same guard as the prelaunch path: a review that finishes after the task left `reviewing`
     // for an unrelated reason journals its verdict but drives no accept/reject/rework (A3).
@@ -1029,7 +1105,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       append({kind: 'task.failed', task, reason: 'strategy', text: 'malformed onReviewVerdict intent', context});
       return;
     }
-    await applyVerdictIntent(hook.intent, {task, stage: 'completion', row, round, context, root});
+    await applyVerdictIntent(hook.intent, {task, stage: 'completion', row, round, context, root, reviewIntent});
   }
 
   async function dispatch(row) {
@@ -1044,12 +1120,19 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       append({kind: 'task.failed', task, reason: 'size', text: `${oversizedField} ${size[oversizedField]} exceeds limit ${limits[oversizedField]}`, context});
       return;
     }
-    // The cap on how long ONE task may be given. A declared size is the orchestrator's own estimate;
-    // the deadline is what it actually grants, so that is what is held to the cap. Found live: one
-    // worker given 40 minutes for "finish P2", never reviewed on the way, nothing accepted at the end.
-    // The refusal says how to split, because a bare refusal was the flaw of the old size defaults.
-    if (limits.minutes !== undefined && Number.isFinite(row.deadline) && row.deadline > limits.minutes * 60000) {
-      append({kind: 'task.failed', task, reason: 'size', text: `a ${Math.ceil(row.deadline / 60000)}-minute task exceeds the ${limits.minutes}-minute cap: split it into phases in sequence (depends_on), each phase made of chunks that run in parallel on disjoint paths, none longer than ${limits.minutes} minutes`, context});
+    // The ceiling is the only limit on how long ONE task may be given: the deadline is a lease,
+    // renewed while the worker makes progress (docs/plans/task-leases.md). Found live: a 15-minute cap
+    // killed every local reviewer mid-review, and the orchestrator answered by shrinking the next one.
+    if ((limits.minutes !== undefined || limits.ceiling !== undefined) && Number.isFinite(row.deadline) && row.deadline > ceilingMs) {
+      append({kind: 'task.failed', task, reason: 'size', text: `a ${Math.ceil(row.deadline / 60000)}-minute task exceeds the ${ceilingMs / 60000}-minute ceiling: give it at most ${ceilingMs / 60000} minutes; bounce renews its lease while it makes progress`, context});
+      return;
+    }
+    // The same job, failed the same way this many times, is a loop: bounce stops rather than running it
+    // again, and says what to change. Found live: ten identical reviewer tasks, each killed at the ceiling.
+    const attempts = failedAttempts(session.events.filter(e => e.task !== task), row);
+    if (attempts.length >= REPEAT_LIMIT) {
+      append({kind: 'task.failed', task, reason: 'repeat', attempts: attempts.map(a => a.task), context,
+        text: repeatRefusal(row, attempts, profiles[row.profile]?.model || null)});
       return;
     }
     const view = reducers.tasks(session.events);
@@ -1263,12 +1346,17 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // `deadline` is null. `deadlineAtFor` needs the task's actual first-start time, so it reads
   // nothing until at least one task.started row exists.
   function taskDeadlineMs(submitted) { return submitted?.deadline ?? ((limits.minutes ?? DEFAULT_DEADLINE_MINUTES) * 60000); }
+  // With leases: the end of the current lease — one lease per `task.lease.renewed` in the lineage,
+  // plus the first — never past the ceiling. The same arithmetic as reducers.watchdog.
   function deadlineAtFor(task) {
     const view = reducers.tasks(session.events);
     const root = lineageRootOf(task, view);
     const startedRows = session.events.filter(e => e.kind === 'task.started' && e.task === root);
     if (!startedRows.length) return null;
-    return Date.parse(startedRows[0].time) + taskDeadlineMs(submittedRow(root));
+    const startedAt = Date.parse(startedRows[0].time);
+    const leaseMs = taskDeadlineMs(submittedRow(root));
+    const renewals = session.events.filter(e => e.kind === 'task.lease.renewed' && view[e.task] && lineageRootOf(e.task, view) === root).length;
+    return Math.min(startedAt + leaseMs * (renewals + 1), startedAt + Math.max(ceilingMs, leaseMs));
   }
 
   // §3: a signature (task, 'silent'|'stalled') resets the moment a NEW progress row lands —
@@ -1310,18 +1398,105 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     append({kind: 'policy.escalated', task: r.task, reason: 'blocked', text: blocker, to, context: row?.context});
   }
 
-  async function handleDeadline(r) {
+  // A lease end (docs/plans/task-leases.md). The deadline is not a kill: a worker that made progress
+  // in this lease, is not repeating itself and that Jev (when present) does not judge stuck gets
+  // another lease; otherwise, or at the ceiling, it is asked for its conclusion, and only a worker
+  // that gives none within concludeGrace is cancelled. Nothing here needs Jev.
+  const seconds = ms => `${Math.round(ms / 1000)} s`;
+  const minutesText = ms => `${Math.round(ms / 60000)} min`;
+  const concludeWhy = {ceiling: r => `the ${minutesText(r.ceilingAt - r.startedAt)} ceiling`, no_progress: () => 'no progress in the last lease', stuck: () => 'repeating earlier work with nothing new'};
+  const concludePrompt = concludeAsk;
+  const expiredHead = (reason, who, r) => reason === 'ceiling' ? `${who} reached its ${minutesText(r.ceilingAt - r.startedAt)} ceiling`
+    : reason === 'stuck' ? `${who} repeated earlier work with nothing new` : `${who} made no progress in its last ${minutesText(r.leaseMs)} lease`;
+  const submitterOf = task => rootSubmitterFrom(task) === 'orchestrator' ? 'orchestrator' : 'user';
+
+  async function handleLeaseEnd(r, now) {
     const row = submittedRow(r.task);
-    const durationMs = r.deadlineAt - r.startedAt;
-    append({kind: 'task.deadline', task: r.task, text: `deadline ${durationMs} ms exceeded at ${r.elapsed} ms`, from: 'bounce', context: row?.context});
+    const concluding = session.events.findLast(e => e.kind === 'task.concluding' && e.task === r.task);
+    if (concluding) {
+      // Waited for while it shows activity (the adapter heartbeats a step that is still generating),
+      // never past concludeCap; quiet for concludeGrace, it has nothing coming.
+      const askedAt = Date.parse(concluding.time);
+      if (now - Math.max(r.lastActivityAt, askedAt) >= watchdogConfig.concludeGrace || now - askedAt >= watchdogConfig.concludeCap) await expireLease(r, concluding.reason, row, now - askedAt);
+      return;
+    }
+    if (leaseChecks.has(r.task)) return;
+    leaseChecks.add(r.task);
+    try {
+      if (r.deadlineAt >= r.ceilingAt) { await concludeTask(r, 'ceiling', row); return; }
+      const decision = await leaseDecision(r, now, row);
+      if (reducers.TERMINAL.has(reducers.tasks(session.events)[r.task]?.state)) return; // it ended while Jev was asked
+      if (decision.conclude) { await concludeTask(r, decision.conclude, row); return; }
+      append({kind: 'task.lease.renewed', task: r.task, ...(r.stage === 'review' ? {stage: 'review'} : {}), lease: r.renewals + 1, until: Math.min(r.deadlineAt + r.leaseMs, r.ceilingAt),
+        evidence: {sinceProgress: now - Math.max(r.lastActivityAt, r.lastProgressAt), calls: decision.calls},
+        jev: decision.jev ? {verdict: decision.jev.verdict, confidence: decision.jev.confidence} : null, context: row?.context});
+      if (decision.jev?.verdict === 'drifting') append({kind: 'policy.escalated', task: r.task, reason: 'drifting', to: submitterOf(r.task), context: row?.context,
+        text: `Jev judged ${row?.profile ?? 'the worker'} to be drifting from its orders (${decision.jev.confidence.toFixed(2)}) at its lease renewal; it keeps running. Steer it with a message, cancel it, or let it run.`});
+    } finally { leaseChecks.delete(r.task); }
+  }
+
+  // Progress in this lease, then repetition, then Jev — each only able to stop a renewal, and the
+  // first two need nothing but the log and the live activity. A tool call only counts when the
+  // adapter names it (OpenCode does): a generic activity line says nothing about what was read.
+  async function leaseDecision(r, now, row) {
+    const calls = toolCalls.get(r.task) ?? [];
+    const inLease = calls.filter(c => c.at > r.leaseStartAt);
+    const before = calls.filter(c => c.at <= r.leaseStartAt);
+    if (Math.max(r.lastActivityAt, r.lastProgressAt) <= r.leaseStartAt) return {conclude: 'no_progress', jev: null, calls: inLease.length};
+    if (inLease.length && before.length && !inLease.some(c => c.change) && inLease.every(c => before.some(b => b.call === c.call))) return {conclude: 'stuck', jev: null, calls: inLease.length};
+    let judged = null;
+    if (jev?.lease) {
+      try {
+        judged = await jev.lease({task: r.task, orders: row?.orders ?? '', lease: r.renewals + 1, minutes: Math.round((now - r.startedAt) / 60000),
+          observed: session.events.filter(e => e.kind === 'task.observed' && e.task === r.task).slice(-3).map(e => e.text), calls: calls.slice(-20).map(c => c.call)});
+      } catch (error) { judged = {verdict: null, confidence: 0, reason: error?.code ?? error?.message ?? 'error', model: null}; }
+      if (judged?.reason === 'jev disabled') judged = null;
+      else append({kind: 'jev.lease', task: r.task, verdict: judged?.verdict ?? null, confidence: judged?.confidence ?? 0, reason: judged?.reason ?? null, model: judged?.model ?? null, context: row?.context});
+    }
+    return {conclude: judged?.verdict === 'stuck' ? 'stuck' : null, jev: judged, calls: inLease.length};
+  }
+
+  // A worker states a finding the moment it confirms it, as a `FINDING: {json}` line (the reviewer's
+  // orders ask for it), so a review stopped before its final answer still hands its findings on. Kept
+  // once each; a line that is not JSON is kept as text.
+  function recordFindings(task, text, context) {
+    for (const line of String(text ?? '').split('\n')) {
+      const match = /^\s*FINDING:\s*(.+)$/.exec(line);
+      if (!match) continue;
+      const said = `FINDING: ${match[1].trim()}`;
+      if (session.events.some(e => e.kind === 'task.finding' && e.task === task && e.text === said)) continue;
+      let finding = null;
+      try { const parsed = JSON.parse(match[1]); if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) finding = parsed; } catch {}
+      append({kind: 'task.finding', task, finding, text: said.slice(0, 4000), from: workerFrom(task), context});
+    }
+  }
+  const findingLine = e => e.finding ? [e.finding.severity, e.finding.file ? `${e.finding.file}${e.finding.line ? `:${e.finding.line}` : ''}` : null, e.finding.title ?? e.finding.description].filter(Boolean).join(' ')
+    : e.text.replace(/^FINDING:\s*/, '');
+
+  // Asked through the adapter when it can stop the turn and ask again with its tools off (OpenCode);
+  // otherwise as a message on the ordinary delivery path (a codex steer, the claude socket).
+  async function concludeTask(r, reason, row) {
+    const prompt = concludePrompt(concludeWhy[reason](r));
+    append({kind: 'task.concluding', task: r.task, ...(r.stage === 'review' ? {stage: 'review'} : {}), reason, text: prompt, context: row?.context});
+    // A review's turn belongs to its own peer handle, not the worker's.
+    const entry = r.stage === 'review' ? [...reviews.values()].find(candidate => candidate.task === r.task && candidate.handle) : handles.get(r.task);
+    if (typeof entry?.adapter?.conclude === 'function') {
+      try { await entry.adapter.conclude(entry.handle, {prompt, reason}); return; }
+      catch (error) { append({kind: 'diagnostic', task: r.task, text: `conclude failed: ${error.message}; asking by message`, context: row?.context}); }
+    }
+    append({kind: 'message', to: r.stage === 'review' ? reviewFrom(r.task) : workerFrom(r.task), from: 'bounce', text: prompt, context: row?.context});
+  }
+
+  async function expireLease(r, reason, row, waited) {
+    const found = session.events.filter(e => e.kind === 'task.finding' && e.task === r.task);
+    const findings = found.length ? `. ${found.length} finding${found.length === 1 ? '' : 's'} recorded before the stop:\n${found.map(e => `- ${findingLine(e)}`).join('\n')}` : '';
+    append({kind: 'task.deadline', task: r.task, reason, text: `no final answer ${seconds(waited)} after being asked to conclude (${reason}) at ${seconds(r.elapsed)}${findings}`, findings: found.length, from: 'bounce', context: row?.context});
     // A deadline is bounce's decision, never the user's: the cancel says so, and whoever submitted the
     // task is told, with the way forward. Found live: journaled as reason `user`, the orders' "a user
     // cancellation is final" applied, and the orchestrator stopped the whole run over one slow analyst.
     await cancel(r.task, {force: true, reason: 'deadline'});
-    const seconds = ms => `${Math.round(ms / 1000)} s`;
-    const to = rootSubmitterFrom(r.task) === 'orchestrator' ? 'orchestrator' : 'user';
-    append({kind: 'policy.escalated', task: r.task, reason: 'deadline', to, context: row?.context,
-      text: `${row?.profile ?? 'the worker'} ran out of its ${seconds(durationMs)} deadline at ${seconds(r.elapsed)} with the work unfinished. Its partial progress is in the journal: resubmit what is left as a smaller task, or drop it.`});
+    append({kind: 'policy.escalated', task: r.task, reason: 'deadline', to: submitterOf(r.task), context: row?.context,
+      text: `${expiredHead(reason, row?.profile ?? 'the worker', r)} and gave no final answer within ${seconds(waited)} of being asked.${found.length ? ` Its ${found.length} recorded finding${found.length === 1 ? ' is' : 's are'} in the deadline row.` : ''} Its partial progress is in the journal: resubmit what is left with that progress in the orders, or drop it.`});
   }
 
   async function handleSignature(r, reason, now) {
@@ -1362,10 +1537,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // the same log/activity/now is idempotent beyond the dedupe rules §3 already specifies.
   async function tick() {
     const now = clock();
-    const rows = reducers.watchdog(session.events, now, {activity, watchdog: {...watchdogConfig, defaultDeadlineMs: (limits.minutes ?? DEFAULT_DEADLINE_MINUTES) * 60000}});
+    const rows = reducers.watchdog(session.events, now, {activity, watchdog: {...watchdogConfig, defaultDeadlineMs: (limits.minutes ?? DEFAULT_DEADLINE_MINUTES) * 60000, ceilingMs}});
     for (const r of rows) {
       if (r.verdicts.includes('blocked')) { await handleBlocked(r); continue; }
-      if (r.verdicts.includes('deadline')) { await handleDeadline(r); continue; } // no correction, no grace (§3)
+      if (r.verdicts.includes('deadline')) { await handleLeaseEnd(r, now); continue; }
       for (const reason of ['silent', 'stalled']) if (r.verdicts.includes(reason)) await handleSignature(r, reason, now);
     }
   }
@@ -1381,12 +1556,12 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // task.accepted/rejected/rework path does its own transition and gets checked in turn).
   const TERMINAL_ROW_KINDS = new Set(['task.completed', 'task.failed', 'task.cancelled', 'task.deadline', 'task.rejected', 'task.accepted']);
   const unsubscribe = session.subscribe(row => {
-    if (row.task && TERMINAL_ROW_KINDS.has(row.kind) && reducers.TERMINAL.has(reducers.tasks(session.events)[row.task]?.state)) activity.delete(row.task);
+    if (row.task && TERMINAL_ROW_KINDS.has(row.kind) && reducers.TERMINAL.has(reducers.tasks(session.events)[row.task]?.state)) { activity.delete(row.task); toolCalls.delete(row.task); }
     if (row.kind === 'plan.submitted' && jev?.plan) {
       // The plan gate: judged off the row, answered with plan.accepted or plan.rejected. Warns, never
       // refuses the chunks that follow — the gate is new, and a wrong "phase-sized" would block a
       // planning orchestrator; that switch flips once it has been seen right on real phases.
-      jev.plan({plan: row, taskMinutes: limits.minutes ?? null}).then(decision => {
+      jev.plan({plan: row, ceilingMinutes: limits.minutes !== undefined || limits.ceiling !== undefined ? ceilingMs / 60000 : null}).then(decision => {
         const name = row.phase ? `Plan ${row.phase}` : 'Plan';
         if (decision.verdict === 'accept') append({kind: 'plan.accepted', plan: row.plan, chunks: (row.chunks ?? []).length, noted: decision.noted ?? [], reason: decision.reason ?? null, model: decision.model ?? null, context: row.context,
           text: `${name} accepted: ${(row.chunks ?? []).length} chunk${(row.chunks ?? []).length === 1 ? '' : 's'}${decision.reason ? ` (${decision.reason})` : ` (Jev, model ${decision.model})`}`});
@@ -1433,6 +1608,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         expectUntil = dAt != null ? Math.min(at + row.expect, dAt) : at + row.expect;
       }
       activity.set(row.task, {at, expectUntil});
+      if (typeof row.call === 'string') {
+        const calls = toolCalls.get(row.task) ?? [];
+        calls.push({at, call: row.call, change: row.change === true});
+        toolCalls.set(row.task, calls.slice(-CALL_MEMORY));
+      }
     }
   });
 

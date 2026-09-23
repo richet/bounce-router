@@ -299,3 +299,18 @@ test('a persisted loaded-only load policy — the old default — migrates to on
   assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(file, 'utf8')).local.endpoints.lmstudio, 'loadPolicy'), false);
   assert.deepEqual(config(root).migratedProfiles, []);
 });
+
+// Found live (session c70dbb61, 2026-09-22): the orchestrator ran `tail -n 20` on its own journal and the
+// whole 143 KB of raw JSON came back as one tool row — into the chat, the journal and its own next packet.
+// A tool row keeps the command and the head of its output; the rest is counted, not carried.
+test('a tool row carries the command and a bounded head of its output, never the whole dump', () => {
+  const output = Array.from({length: 4000}, (_, i) => `line ${i} of json noise`).join('\n');
+  const row = normalize('codex', {type: 'item.completed', item: {type: 'command_execution', command: 'tail -n 20 journal.jsonl', aggregated_output: output}})[0];
+  assert.equal(row.kind, 'tool');
+  assert.equal(row.text.startsWith('tail -n 20 journal.jsonl\nline 0 of json noise'), true, 'the command and the start of what it printed');
+  assert.equal(row.text.length < 4500, true, `kept ${row.text.length} characters`);
+  assert.match(row.text, /\n… \+\d+ more lines \(\d+ KB\) not shown$/);
+  // a small output is untouched
+  const small = normalize('codex', {type: 'item.completed', item: {type: 'command_execution', command: 'echo hi', aggregated_output: 'hi'}})[0];
+  assert.equal(small.text, 'echo hi\nhi');
+});

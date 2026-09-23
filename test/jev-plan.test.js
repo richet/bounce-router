@@ -44,8 +44,13 @@ test('decidePlan: a confident finding rejects the plan naming the chunk and the 
   assert.deepEqual(bad.noted, [{chunk: 'fix', check: 'no_acceptance', confidence: 0.6}]);
   // the structural checks bounce can make itself are made without Jev: overlapping owns, a missing chunk id, a deadline over the cap
   const overlap = {phase: 'x', chunks: [{id: 'a', profile: 'builder', orders: 'x', owns: ['src/git.ts']}, {id: 'b', profile: 'builder', orders: 'y', owns: ['src/**']}]};
-  const structural = decidePlan({}, {plan: overlap, confidence: 0.8, taskMinutes: 15});
+  const structural = decidePlan({}, {plan: overlap, confidence: 0.8, ceilingMinutes: 60});
   assert.deepEqual(structural.findings.map(f => [f.chunk, f.check]), [['a', 'overlapping_paths'], ['b', 'overlapping_paths']]);
+  // the structural size check is the ceiling, not the lease: 45 minutes is a long chunk, 61 is over the ceiling
+  const timed = {phase: 'x', chunks: [{id: 'long', profile: 'reviewer', orders: 'x', owns: [], deadline: 45 * 60000}, {id: 'over', profile: 'reviewer', orders: 'y', owns: [], deadline: 61 * 60000}]};
+  assert.deepEqual(decidePlan({}, {plan: timed, confidence: 0.8, ceilingMinutes: 60}).findings,
+    [{chunk: 'over', check: 'phase_sized', confidence: 1, fix: 'this is a phase, not a chunk: split it into pieces with one owner and one acceptance each (deadline 61 min over the 60 min ceiling)'}]);
+  assert.equal(PLAN_CHECKS.phase_sized.instructions('c'), 'Chunk "c" describes a whole phase or several independent pieces of work, not one bounded piece with a single owner and a single acceptance.');
 });
 
 test('judgePlan never throws: Jev off or failing accepts the plan with the reason on record, so an orchestrator that plans is never blocked by the gate itself', async () => {

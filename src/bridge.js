@@ -5,9 +5,8 @@
 // (src/cli.js, tests) never touch process.exit themselves.
 import fs from 'node:fs';
 import {parseArgs} from 'node:util';
-import {connectBus} from './bus.js';
+import {createOps, DEFAULT_WAIT_MS, WAIT_CHUNK_MS} from './bridge-ops.js';
 
-const WAIT_CHUNK_MS = 600_000;
 
 function formatRow(row, json) {
   if (row == null) return 'null';
@@ -25,16 +24,9 @@ function parseJsonArg(value, label) {
 
 export async function bridgeCommand(argv, env = process.env, {waitChunkMs = WAIT_CHUNK_MS} = {}) {
   const [command, ...rest] = argv;
-  // Reporting is deliberately a separate, attempt-scoped credential. A worker cannot turn a
-  // report capability into the general publish/wait capability even by invoking this CLI.
-  const reporting = command === 'report';
-  const busPath = reporting ? env.BOUNCE_REPORT_BUS : env.BOUNCE_BUS;
-  const tokenFile = reporting ? env.BOUNCE_REPORT_TOKEN_FILE : env.BOUNCE_BUS_TOKEN_FILE;
-  if (!busPath || !tokenFile) return {stdout: `bounce: ${reporting ? 'BOUNCE_REPORT_BUS and BOUNCE_REPORT_TOKEN_FILE' : 'BOUNCE_BUS and BOUNCE_BUS_TOKEN_FILE'} must be set\n`, exitCode: 2};
-
-  let token;
-  try { token = fs.readFileSync(tokenFile, 'utf8').trim(); }
-  catch (error) { return {stdout: `bounce: cannot read token file: ${error.message}\n`, exitCode: 2}; }
+  // A transport: argv in, stdout out. Credentials, defaults and the verbs themselves live in
+  // src/bridge-ops.js, so the MCP transport cannot drift from this one.
+  const ops = createOps({env, waitChunkMs});
 
   let values;
   try {
@@ -44,51 +36,31 @@ export async function bridgeCommand(argv, env = process.env, {waitChunkMs = WAIT
     }}));
   } catch (error) { return {stdout: `bounce: ${error.message}\n`, exitCode: 2}; }
 
-  let event, report, match, timeout, afterSeq = 0;
+  let call;
   try {
     if (command === 'publish') {
       if (!values.event) throw new Error('publish requires --event');
-      event = parseJsonArg(values.event, 'event');
+      const event = parseJsonArg(values.event, 'event');
+      call = () => ops.submit(event);
     } else if (command === 'report') {
       if (!values.report) throw new Error('report requires --report');
-      report = parseJsonArg(values.report, 'report');
+      const report = parseJsonArg(values.report, 'report');
+      call = () => ops.report(report);
     } else if (command === 'wait') {
       if (!values.match) throw new Error('wait requires --match');
-      match = parseJsonArg(values.match, 'match');
-      timeout = Math.round(Number(values.timeout ?? 30) * 1000);
+      const match = parseJsonArg(values.match, 'match');
+      const timeout = Math.round(Number(values.timeout ?? DEFAULT_WAIT_MS / 1000) * 1000);
       if (!Number.isFinite(timeout) || timeout < 0) throw new Error('invalid --timeout');
+      let afterSeq = 0;
       if (values['after-seq'] !== undefined) {
         afterSeq = Number(values['after-seq']);
         if (!Number.isInteger(afterSeq)) throw new Error('invalid --after-seq');
       }
+      call = () => ops.wait(match, {timeout, afterSeq});
     } else throw new Error(`unknown bridge command: ${command}`);
   } catch (error) { return {stdout: `bounce: ${error.message}\n`, exitCode: 2}; }
 
-  let client;
-  try { client = await connectBus({path: busPath, token}); }
-  catch (error) { return {stdout: `bounce: ${error.code ?? -32001} ${error.message}\n`, exitCode: 3}; }
-
-  try {
-    if (command === 'publish') {
-      const row = await client.publish(event);
-      return {stdout: formatRow(row, values.json) + '\n', exitCode: 0};
-    }
-    if (command === 'report') {
-      const row = await client.report(report);
-      return {stdout: formatRow(row, values.json) + '\n', exitCode: 0};
-    }
-    // One bus wait is capped at 600 s (src/bus.js handleWait); a longer --timeout — the task
-    // deadline is the natural one — is re-armed here in chunks. Every chunk re-scans the log
-    // before subscribing, so a row that lands between two chunks is still returned.
-    const deadline = Date.now() + timeout;
-    let row = null;
-    do {
-      row = await client.wait({match, timeout: Math.min(Math.max(deadline - Date.now(), 0), waitChunkMs), afterSeq});
-    } while (!row && Date.now() < deadline);
-    return {stdout: formatRow(row, values.json) + '\n', exitCode: row ? 0 : 1};
-  } catch (error) {
-    return {stdout: `bounce: ${error.code ?? -32001} ${error.message}\n`, exitCode: 3};
-  } finally {
-    try { await client.close(); } catch {}
-  }
+  const result = await call();
+  if (!result.ok) return {stdout: `bounce: ${result.code === 'no_credential' ? result.reason : `${result.code} ${result.reason}`}\n`, exitCode: result.code === 'no_credential' ? 2 : 3};
+  return {stdout: formatRow(result.row, values.json) + '\n', exitCode: result.timedOut ? 1 : 0};
 }

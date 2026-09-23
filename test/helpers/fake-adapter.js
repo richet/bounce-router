@@ -60,7 +60,11 @@ export function fakeAdapter(script) {
     async *events(handle) {
       calls.events++;
       if (handle.never) {
+        // A never-ending task may first say something (a reviewer's findings), then hold.
+        for (const event of handle.events) yield event;
         while (!handle.ended) await new Promise(resolve => handle.waiters.push(resolve));
+        // A test may leave events for a never-ending task to end with (a conclusion's answer).
+        for (const event of handle.after ?? []) yield event;
         return;
       }
       for (const event of handle.events) {

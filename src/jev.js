@@ -295,7 +295,17 @@ const namedLocals = (profiles, head) => {
   for (let current = head; current && !seen.has(current); current = profiles[current.fallback?.[0]]) { seen.add(current); if (current.backend) names.push(`${current.endpoint}/${current.model}`); }
   return names;
 };
+// Which local models an agent may be offered: the loaded ones, plus the ones its own `models:` list
+// names (choosing one costs a load). Found live 2026-09-22: the reviewer's own model was unloaded, so
+// no `strongest` local existed and every review went to the cloud; offering everything downloaded
+// instead would put the machine's biggest models in the running for a job nobody pointed them at.
+export const offerable = (locals = [], profiles = {}, head = null) => {
+  const named = head ? namedLocals(profiles, head) : [];
+  return locals.filter(item => item.loaded || named.includes(item.name));
+};
+
 function tierPick(answers, {profiles, notes, order = [], fits = () => true, unfit = '', locals = [], head = null}) {
+  locals = offerable(locals, profiles, head);
   if (!isObject(answers?.tier)) return {name: null, reason: null};
   const tier = PROFILE_TIERS.includes(answers.tier.choice) ? answers.tier.choice : null;
   const confidence = Number.isFinite(Number(answers.tier.confidence)) ? Number(answers.tier.confidence) : 0;
@@ -387,6 +397,7 @@ export function decideRoute(answers, {profiles = {}, confidence = 0.8, fallback 
 // Which AI plays an agent whose `models:` opens with `auto`. The job is given, so the question is
 // about ability and cost alone: no role, no policy, no access Nouls.
 export function aiQuestions(profiles = {}, notes = {}, head = null, locals = []) {
+  locals = offerable(locals, profiles, head);
   const named = {profile: {
     type: 'choice',
     instructions: {
@@ -394,7 +405,7 @@ export function aiQuestions(profiles = {}, notes = {}, head = null, locals = [])
       guidance: 'Weigh each AI\'s capabilities against what the orders demand, then prefer the cheapest tier that fits: cheapest for locating files and extracting facts, mid for research and routine implementation, strongest for independent review, ambiguous or cross-cutting debugging and security-sensitive work.',
     },
     criteria: {...profileCriteria(profiles, notes, {job: true}), ...Object.fromEntries(locals.map(item => [item.name, [
-      `local model ${item.name}`, 'runs on this machine at no cost', ...(item.loaded ? [] : ['not loaded: choosing it costs a model load first']),
+      `local model ${item.name}`, 'runs on this machine at no cost', ...(item.size ? [`${(item.size / 1024 ** 3).toFixed(1)} GB of memory`] : []), ...(item.loaded ? [] : ['not loaded: choosing it costs a model load first']),
       ...(item.context ? [`context ${Math.round(item.context / 1024)}k`] : []), `tier ${TIER_HINT[item.tier] ?? item.tier}`, `capabilities: ${item.capabilities}`].join(' · ')]))},
   }};
   return {...tierQuestion(profiles, notes, locals), ...named};
@@ -460,12 +471,12 @@ export async function routeTask({orders, profiles, settings, ask, notes = {}, or
 
 // ---- the plan gate: judge a phase's breakdown before any worker runs ----------------------------
 
-// Per chunk. Overlap and a deadline over the cap are structural and decided by bounce itself; the
+// Per chunk. Overlap and a deadline over the ceiling are structural and decided by bounce itself; the
 // other two are what Jev is for. Found live: a 40-minute "finish P2" task; two builders on git.ts at
 // once; chunks with no acceptance criterion; a chunk run against a tree another was still changing.
 export const PLAN_CHECKS = {
-  phase_sized: {instructions: chunk => `Chunk "${chunk}" describes a whole phase or several independent pieces of work, not one bounded piece a worker finishes in its deadline.`,
-    fix: 'this is a phase, not a chunk: split it into pieces a worker finishes within the deadline, each with its own acceptance'},
+  phase_sized: {instructions: chunk => `Chunk "${chunk}" describes a whole phase or several independent pieces of work, not one bounded piece with a single owner and a single acceptance.`,
+    fix: 'this is a phase, not a chunk: split it into pieces with one owner and one acceptance each'},
   no_acceptance: {instructions: chunk => `Chunk "${chunk}" names no concrete acceptance criterion, or no way for the worker to verify it (a command, a test, an observable result).`,
     fix: 'say what done looks like and how the worker proves it (a command to run and the output that means pass)'},
   overlapping_paths: {instructions: chunk => `Chunk "${chunk}" would edit files that another chunk in this plan also edits, so two workers would write the same paths at once.`,
@@ -486,13 +497,13 @@ export function planQuestions(plan) {
 }
 
 // Pure. Structural findings first (no model needed), then Jev's confident ones; the rest are noted.
-export function decidePlan(answers, {plan, confidence = 0.8, taskMinutes = null} = {}) {
+export function decidePlan(answers, {plan, confidence = 0.8, ceilingMinutes = null} = {}) {
   const chunks = plan?.chunks ?? [];
   const findings = [], noted = [];
   for (const c of chunks) {
     const others = chunks.filter(o => o !== c && !(c.depends_on ?? []).includes(o.id) && !(o.depends_on ?? []).includes(c.id));
     if ((c.owns ?? []).some(p => others.some(o => (o.owns ?? []).some(q => pathsOverlap(p, q))))) findings.push({chunk: c.id, check: 'overlapping_paths', confidence: 1, fix: PLAN_CHECKS.overlapping_paths.fix});
-    if (taskMinutes && Number.isFinite(c.deadline) && c.deadline > taskMinutes * 60000) findings.push({chunk: c.id, check: 'phase_sized', confidence: 1, fix: `${PLAN_CHECKS.phase_sized.fix} (deadline ${Math.round(c.deadline / 60000)} min over the ${taskMinutes} min cap)`});
+    if (ceilingMinutes && Number.isFinite(c.deadline) && c.deadline > ceilingMinutes * 60000) findings.push({chunk: c.id, check: 'phase_sized', confidence: 1, fix: `${PLAN_CHECKS.phase_sized.fix} (deadline ${Math.round(c.deadline / 60000)} min over the ${ceilingMinutes} min ceiling)`});
   }
   for (const c of chunks) for (const name of Object.keys(PLAN_CHECKS)) {
     if (findings.some(f => f.chunk === c.id && f.check === name)) continue;
@@ -506,9 +517,9 @@ export function decidePlan(answers, {plan, confidence = 0.8, taskMinutes = null}
 
 // Never throws: with Jev off or failing the plan is accepted with the reason on record, so the gate
 // itself never blocks an orchestrator that plans. Structural findings are still made without Jev.
-export async function judgePlan({plan, settings, ask, taskMinutes = null, signal} = {}) {
+export async function judgePlan({plan, settings, ask, ceilingMinutes = null, signal} = {}) {
   const s = normalizeJevSettings(settings);
-  const structural = decidePlan({}, {plan, confidence: s.confidence, taskMinutes});
+  const structural = decidePlan({}, {plan, confidence: s.confidence, ceilingMinutes});
   const off = reason => ({...structural, reason, model: null});
   if (!s.enabled) return off('jev disabled');
   if (typeof ask !== 'function') return off('routing unavailable');
@@ -516,8 +527,48 @@ export async function judgePlan({plan, settings, ask, taskMinutes = null, signal
   if (!Object.keys(questions).length) return off('no chunks');
   try {
     const result = await ask({state, questions, model: s.model, signal});
-    return {...decidePlan(result.answers, {plan, confidence: s.confidence, taskMinutes}), reason: null, model: result.model, latencyMs: result.latencyMs};
+    return {...decidePlan(result.answers, {plan, confidence: s.confidence, ceilingMinutes}), reason: null, model: result.model, latencyMs: result.latencyMs};
   } catch (error) { return off(error?.code ?? error?.message ?? 'error'); }
+}
+
+// ---- the lease judge: is a running task still getting somewhere, at the end of its lease? --------
+
+// One Choice over the worker's recent text and tool calls against its orders (docs/plans/task-leases.md).
+// Jev only adds to bounce's own progress rule: `stuck` concludes the task, `drifting` renews it and
+// tells whoever submitted it. Off, failing or unsure, the verdict is null and the rule alone decides —
+// bounce never depends on Jev being installed.
+export const LEASE_CRITERIA = {
+  on_track: 'The recent work advances what the orders ask for.',
+  drifting: 'The recent work is outside what the orders ask for, or outside the paths they name.',
+  stuck: 'The recent work repeats earlier reads or calls and adds nothing new.',
+};
+
+export function leaseQuestions({orders = '', observed = [], calls = [], minutes = 0, lease = 1} = {}) {
+  return {
+    state: {orders: String(orders).slice(0, 6000), recent_text: observed.map(text => String(text).slice(0, 2000)), recent_calls: calls.map(call => String(call).slice(0, 300)), minutes_used: minutes, lease},
+    questions: {progress: {type: 'choice', instructions: 'Given the orders and what the worker has done most recently, is it still getting somewhere?', criteria: LEASE_CRITERIA}},
+  };
+}
+
+// Pure: a verdict only when the choice is one of the criteria at or above the threshold.
+export function decideLease(answers, {confidence = 0.8} = {}) {
+  const progress = isObject(answers?.progress) ? answers.progress : {};
+  const conf = Number.isFinite(Number(progress.confidence)) ? Number(progress.confidence) : 0;
+  const choice = typeof progress.choice === 'string' && Object.hasOwn(LEASE_CRITERIA, progress.choice) ? progress.choice : null;
+  return {verdict: choice && conf >= confidence ? choice : null, confidence: conf};
+}
+
+// Never throws: off, without a client, or failing, the answer is verdict null with the reason.
+export async function judgeLease({settings, ask, signal, ...request} = {}) {
+  const s = normalizeJevSettings(settings);
+  const none = reason => ({verdict: null, confidence: 0, reason, model: null});
+  if (!s.enabled) return none('jev disabled');
+  if (typeof ask !== 'function') return none('jev unavailable');
+  const {state, questions} = leaseQuestions(request);
+  try {
+    const result = await ask({state, questions, model: s.model, signal});
+    return {...decideLease(result.answers, {confidence: s.confidence}), reason: null, model: result.model ?? s.model};
+  } catch (error) { return none(error?.code ?? error?.message ?? 'error'); }
 }
 
 // The read-only critic profile the daemon registers so a root task's `review.completion`
@@ -534,7 +585,8 @@ export function createJevDecisions({root = dataRoot(), adapter, readSettings = (
   return {
     reviewer: JEV_REVIEWER,
     settings: readSettings,
-    plan: ({plan, taskMinutes, signal}) => judgePlan({plan, settings: readSettings(), ask: adapter?.ask, taskMinutes, signal}),
+    plan: ({plan, ceilingMinutes, signal}) => judgePlan({plan, settings: readSettings(), ask: adapter?.ask, ceilingMinutes, signal}),
+    lease: request => judgeLease({...request, settings: readSettings(), ask: adapter?.ask}),
     routeAI: ({orders, profiles, head, signal}) => routeAgentAI({orders, profiles, head, order: order(), ...(locals ? {locals} : {}), settings: readSettings(), ask: adapter?.ask, ...(notes ? {notes} : {}), signal}),
     route: ({orders, profiles, signal}) => routeTask({orders, profiles, order: order(), ...(locals ? {locals} : {}), settings: readSettings(), ask: adapter?.ask, ...(notes ? {notes} : {}), signal}),
   };
