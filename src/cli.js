@@ -226,7 +226,7 @@ async function main() {
   // The agent-facing interface over MCP (docs/plans/bridge-interface.md): the same verbs and views the
   // bridge and these commands use, as typed tools, so an orchestrator stops shelling and parsing.
   if (positionals[0] === 'mcp-serve') {
-    const {createOps} = await import('./bridge-ops.js');
+    const {createOps, liveSessionCredentials} = await import('./bridge-ops.js');
     const {createMcpServer, serveStdio} = await import('./mcp.js');
     // Which session: the bus socket lives in its directory; failing that, the live one.
     const busDir = process.env.BOUNCE_BUS && process.env.BOUNCE_BUS.endsWith('bus.sock') ? path.dirname(process.env.BOUNCE_BUS) : null;
@@ -235,7 +235,9 @@ async function main() {
     const journal = id ? path.join(root, 'sessions', id, 'journal.jsonl') : null;
     const events = () => id ? new Session(process.cwd(), {root, id}).events : [];
     const server = createMcpServer({
-      ops: createOps({env: process.env}),
+      // Codex launches this server from its own config, so the per-session grant never reaches its env:
+      // without one, it finds the live session itself and refuses when that answer is not unique.
+      ops: createOps({env: process.env, discover: () => liveSessionCredentials(root)}),
       views: {taskView: task => taskView(events(), task, {journal}), taskList: options => taskList(events(), options)},
       version,
     });
