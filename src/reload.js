@@ -140,6 +140,32 @@ export function choosingOrders({agents = false, routingOn = false, localOn = fal
 }
 
 // The breakdown the orchestrator is held to, in its standing orders.
+// Whose task is this, for the bus grant? A task the orchestrator submitted, or a replacement bounce made
+// for one — a fallback is submitted `from: bounce`, but the work is still the orchestrator's and it must be
+// able to submit under it. Found live: a rework under a fallback replacement was refused `-32001
+// unauthorized` on both transports, and the campaign stopped with the fix already written. Cycle-guarded.
+// Every task the orchestrator owns, for seeding its bus grant at startup. The grant is otherwise built
+// empty and widened only by rows arriving live, so a restart disowned everything from before it — and a
+// submit parented under earlier work was refused. Finished tasks are included: they can still be parents.
+export function orchestratorTasks(events) {
+  const owned = [];
+  for (const e of events) if (e.kind === 'task.submitted' && orchestratorOwns(events, e.task)) owned.push(e.task);
+  return owned;
+}
+
+export function orchestratorOwns(events, task) {
+  const seen = new Set();
+  let id = task;
+  while (id && !seen.has(id)) {
+    seen.add(id);
+    const row = events.find(e => e.kind === 'task.submitted' && e.task === id);
+    if (!row) return false;
+    if (row.from === 'orchestrator') return true;
+    id = row.replaces;
+  }
+  return false;
+}
+
 export const breakdownOrders = (minutes, {jevOn = false, ceiling = Math.max(TASK_CEILING_MINUTES, minutes)} = {}) => [
   'Break big work down: phases in sequence, each phase made of chunks that run in parallel.',
   `A task runs under a ${minutes}-minute lease that bounce renews while the worker makes progress, up to a ${ceiling}-minute ceiling; a deadline over the ceiling is refused (task.failed, reason size) before anything runs. Size a chunk by scope (one owner, one acceptance), not by minutes: long work is normal.`,
@@ -411,7 +437,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // orchestrator grant (canSubmit, its own context, no tasks — never the user grant), its profile
   // to run on, and a standing brief on disk; classic mode reaches none of this.
   const orchestratorProfile = orchestrating ? orchestration.profiles[orchestration.orchestrator] : null;
-  const orchestratorGrant = orchestrating ? bus.grant({peer: 'orchestrator', canSubmit: true, tasks: [], context: session.id}) : null;
+  const orchestratorGrant = orchestrating ? bus.grant({peer: 'orchestrator', canSubmit: true, tasks: orchestratorTasks(session.events), context: session.id}) : null;
   // A read-only home or similar must not take the session down: the ORDERS.md pointer would
   // simply dangle, same as before this skill existed. Silence is the wrong answer for the
   // outcomes that leave the pointer dangling or the skill stale, though — those are said out
@@ -450,7 +476,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // scheduler stays unaware of the bus; token paths are daemon-side state, never journaled.
   const workerTokens = new Map(); // peer -> token file, for the life of that worker's grant
   const grantsUnsubscribe = !orchestrating ? () => {} : session.subscribe(row => {
-    if (row.kind === 'task.submitted' && row.from === 'orchestrator') bus.extendGrant('orchestrator', [row.task]);
+    if (row.kind === 'task.submitted' && orchestratorOwns(session.events, row.task)) bus.extendGrant('orchestrator', [row.task]);
     else if (row.kind === 'task.started') {
       const peer = `worker:${row.task}`;
       workerTokens.set(peer, bus.grant({peer, tasks: [row.task], context: row.context,
