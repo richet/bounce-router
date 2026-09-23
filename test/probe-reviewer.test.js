@@ -1,4 +1,4 @@
-// The probing reviewer (docs/plans/probing-reviewer.md). Found live (ACE ee68c678): a read-only reviewer was
+// The probing reviewer (docs/plans/probing-reviewer.md). Found live: a read-only reviewer was
 // told to run probes it had no tool for, reasoned through the whole tree for 60 minutes instead, and was
 // killed while writing its conclusion, taking every finding with it. A `probe` worker may read and run
 // commands but never change anything; a reviewer states each finding as it confirms it, and bounce keeps
@@ -97,7 +97,7 @@ test('P5 the orders split a heavy review by risk area', () => {
   assert.equal(text.includes('A review of a whole phase, or of more than one risk area, is heavy: split it into one reviewer per area (for example locking and journaling, ownership, the CLI), each with the verification commands for its area. Reviewers probe: they run commands but cannot change the tree.'), true);
 });
 
-// Found live (ACE 12ca0d9f): the reviewer hit its step cap, its notice did not parse as a verdict, and the
+// Found live: the reviewer hit its step cap, its notice did not parse as a verdict, and the
 // task sat `blocked` — waiting for a person. An unusable review ends the task with its reason instead, so
 // the orchestrator is woken by an outcome and decides what to do.
 test('P6 a review with no readable verdict fails the task, it does not block it', async t => {

@@ -20,6 +20,42 @@ test('watchdog row fields lastActivityAt/lastProgressAt are absolute timestamps,
   assert.deepEqual(rows[0].verdicts, ['silent']);
 });
 
+// Found live: a worker died at 01:16:11, its fallback started at
+// 01:16:11, and one second later the watchdog escalated it as "stalled for 843 s" — 843 s being the time
+// since the DEAD predecessor started. Both fallbacks in that session were hit, so every recovery attempt
+// was nudged and corrected before it could do anything. The lease is a lineage budget on purpose; how long
+// a worker has been quiet is about that worker, so it is measured from the attempt's own start.
+test('a fallback attempt is not stale because the task it replaced was', () => {
+  const t0 = Date.parse('2026-09-23T01:02:09.000Z'); // the predecessor's start
+  const t1 = Date.parse('2026-09-23T01:16:11.000Z'); // it fails; the fallback starts the same second
+  const events = [
+    {kind: 'task.submitted', task: 'dead', time: new Date(t0).toISOString(), deadline: null},
+    {kind: 'task.started', task: 'dead', time: new Date(t0).toISOString(), attempt: 1},
+    {kind: 'task.failed', task: 'dead', time: new Date(t1).toISOString(), reason: 'worker_runtime'},
+    {kind: 'task.submitted', task: 'fresh', time: new Date(t1).toISOString(), deadline: null, replaces: 'dead'},
+    {kind: 'task.started', task: 'fresh', time: new Date(t1).toISOString(), attempt: 1},
+  ];
+  const cfg = {silence: 300000, stall: 600000, defaultDeadlineMs: 900000, ceilingMs: 3600000};
+  const rows = watchdog(events, t1 + 2000, {activity: new Map([['fresh', {at: t1 + 2000}]]), watchdog: cfg});
+  const fresh = rows.find(row => row.task === 'fresh');
+  assert.equal(fresh, undefined, 'two seconds old with live activity: nothing to say about it');
+
+  // and when it really does go quiet, the clock that fires is its own
+  const later = watchdog(events, t1 + 700000, {activity: new Map(), watchdog: cfg});
+  const quiet = later.find(row => row.task === 'fresh');
+  assert.equal(quiet.verdicts.includes('stalled'), false, 'never stale on the predecessor\'s account');
+  assert.equal(quiet.verdicts.includes('silent'), true, 'its own 5 minutes of silence, measured from t1');
+  assert.equal(quiet.lastProgressAt, t1, 'measured from its own start, not the lineage root\'s');
+
+  // A fresh attempt is owed a full lease (Daniel, 2026-09-22). Live, this fallback launched with 58 s
+  // left of the lineage's lease — the predecessor had burned 14 of the 15 minutes — so it could only fail.
+  // The lease runs from THIS attempt's start; the ceiling still bounds the whole lineage, and the loop
+  // guard is what stops a job buying more time by failing over and over.
+  assert.equal(quiet.startedAt, t0, 'the lineage is still what elapsed and the ceiling are measured from');
+  assert.equal(quiet.ceilingAt, t0 + 3600000);
+  assert.equal(quiet.deadlineAt, t1 + 900000, 'a full 15 minutes of its own, not the 58 s that were left');
+});
+
 test('peers folds joined, native and left by peer name, later rows winning', () => {
   const events = [
     {kind: 'peer.joined', from: 'worker:parse', time: 't1', role: 'worker', adapter: 'claude', profile: 'default'},

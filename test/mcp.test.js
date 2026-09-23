@@ -89,3 +89,26 @@ test('M5 a huge task still answers in a screenful: the view is what bounds it', 
   assert.equal(JSON.stringify(got.result).length < 4000, true, `answer is ${JSON.stringify(got.result).length} characters`);
   assert.match(got.result.content[0].text, /190 more/);
 });
+
+// The other half of the same gap (live): the orchestrator called `task_get`, got the cut summary, and
+// had no option to ask for the rest. `full: true` is that option — the bounded view stays the default so a
+// listing never floods a turn, and one deliberate call returns the verdict whole.
+test('M6 task_get can be asked for the whole report, and says so in its schema', async () => {
+  const long = `## FINAL REVIEW REPORT\n**Outcome: FAIL**\n${'detail '.repeat(900)}END`;
+  const asked = [];
+  const s = createMcpServer({ops: {}, version: '0', views: {
+    taskView: (task, options = {}) => { asked.push(options); return {...view, summary: 'cut at twelve hundred…', ...(options.report ? {report: long} : {})}; },
+  }});
+  const bounded = await call(s, 'task_get', {task: 'land'});
+  assert.deepEqual(asked.at(-1), {report: false}, 'the default asks for the bounded view');
+  assert.equal('report' in bounded.result.structuredContent, false);
+
+  const whole = await call(s, 'task_get', {task: 'land', full: true});
+  assert.deepEqual(asked.at(-1), {report: true});
+  assert.equal(whole.result.structuredContent.report, long, 'the verdict arrives whole');
+  assert.match(whole.result.content[0].text, /END$/, 'and the text rendering carries it too, not the cut summary');
+
+  const tool = s.tools.find(t => t.name === 'task_get');
+  assert.equal('full' in tool.inputSchema.properties, true, 'a caller can only use what the schema names');
+  assert.match(tool.inputSchema.properties.full.description ?? '', /report|verdict/i);
+});

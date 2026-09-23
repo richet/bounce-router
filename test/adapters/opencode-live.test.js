@@ -365,15 +365,28 @@ test('any worker may reach a path outside the project folder, as a cloud worker 
 // Observed live: a worker said "I'll execute this task systematically…", did tool work for six
 // minutes, went silent, and that opening sentence became the task's completion (Jev caught it via
 // empty_diff, one wasted round). Text before tool work is not an answer to the orders.
-test('text the worker said BEFORE its tool work is not its answer: a turn that ends with tool calls and no text after them has no answer', async t => {
-  const {cwd, dir} = setup(t, {FAKE_OC_SCENARIO: 'opener-then-silence'});
+// Then found live: this is the commonest way a local worker ends. Both
+// `worker_runtime` failures in that session were qwen3.6-35b ending a clean turn with tool work done and
+// nothing said after it — 6 and 14 minutes of work discarded, with ZERO conclusion attempts, because the
+// ask fired only for a step cap, a repeat-stall or a lease end. Having no answer is the reason TO ask.
+test('a turn that ends with tool calls and no text after them is asked, once, for its answer', async t => {
+  const {cwd, dir} = setup(t, {FAKE_OC_SCENARIO: 'opener-then-silence', FAKE_OC_CONCLUDE: 'answer'});
   const adapter = createOpencodeLive({});
   const events = await drain(adapter, await adapter.launch({peer: 'worker:o', profile: profileFor({policy: 'read-only'}), cwd, dir, orders: 'do it'}));
-  assert.deepEqual(events.at(-1), {kind: 'result', status: 'failed', recoverable: true, text: 'no answer: the worker said nothing after its last tool call'});
   assert.equal(events.some(e => e.kind === 'assistant' && e.text.startsWith('I will execute')), true, 'the opener is still shown');
+  assert.equal(events.at(-1).status, 'completed');
+  assert.match(events.at(-1).text, /^FAIL: the boundary is off by one/, 'the answer is what it said when asked, never the opener');
+  assert.equal(events.some(e => e.kind === 'diagnostic' && /ended without an answer/.test(e.text)), true, 'and it says why it asked');
 });
 
-// Found live (ACE 12ca0d9f, 2026-09-22): a reviewer hit opencode's step cap; opencode injected
+test('when the worker will not answer even then, the turn fails and the next AI may try', async t => {
+  const {cwd, dir} = setup(t, {FAKE_OC_SCENARIO: 'opener-then-silence'}); // no FAKE_OC_CONCLUDE: silent when asked
+  const adapter = createOpencodeLive({});
+  const events = await drain(adapter, await adapter.launch({peer: 'worker:o2', profile: profileFor({policy: 'read-only'}), cwd, dir, orders: 'do it'}));
+  assert.deepEqual(events.at(-1), {kind: 'result', status: 'failed', recoverable: true, text: 'no answer: the worker said nothing after its last tool call'});
+});
+
+// Found live: a reviewer hit opencode's step cap; opencode injected
 // "CRITICAL - MAXIMUM STEPS REACHED … Respond with text only", and bounce recorded THAT as the
 // worker's answer — the review was blocked as an unreadable verdict after 24 minutes. The notice is
 // opencode talking, not the worker: the same session is asked once, tools off, for its real answer,

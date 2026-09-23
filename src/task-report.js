@@ -17,8 +17,11 @@ export function formatTaskView(view) {
     rows.push(...view.findings.shown.map(f => `  ${[f.severity, f.file && `${f.file}${f.line ? `:${f.line}` : ''}`, f.title].filter(Boolean).join(' ')}`));
     if (view.findings.more) rows.push(`  … ${view.findings.more} more`);
   }
-  if (view.summary) rows.push('summary:', `  ${view.summary}`);
+  if (!view.report && view.summary) rows.push('summary:', `  ${view.summary}`);
   if (view.journal) rows.push(`journal: ${view.journal.path} · rows ${view.journal.fromSeq}–${view.journal.toSeq} of this task`);
+  // Last, and unindented: a verdict puts its conclusion at the end, so nothing follows it that would push
+  // that conclusion out of view or invite it to be read as part of the report.
+  if (view.report) rows.push('report:', view.report);
   return rows.join('\n');
 }
 

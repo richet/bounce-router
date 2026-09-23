@@ -117,7 +117,7 @@ test('between local models of one tier, the one the agent\'s own list names play
   assert.deepEqual([routed.agent, routed.ai], ['reviewer', 'lmstudio/dense-27b']);
 });
 
-// Found live (ACE 12ca0d9f, 2026-09-22): the reviewer's own model (the 27B, tier strongest) had been
+// Found live: the reviewer's own model (the 27B, tier strongest) had been
 // unloaded, the only loaded local was tier mid, and all three reviews went to the cloud. A model the
 // agent's file names is offered even when it is not loaded — loaded ones still rank first, and a model
 // nobody named stays out until it is loaded, so the machine's big models are never picked by surprise.

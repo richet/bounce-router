@@ -1,4 +1,4 @@
-import {toolText} from './transcript.js';
+import {toolText, commandLine} from './transcript.js';
 
 const describe = value => typeof value === 'string' ? value : JSON.stringify(value ?? '');
 
@@ -30,7 +30,7 @@ export default {
       else if (item.type === 'dynamic_tool_call') add('tool', `${item.tool ?? 'Tool'} · ${item.success === true ? 'accepted' : item.success === false ? 'rejected' : item.status ?? 'completed'}`);
       else if (item.type !== 'reasoning') add('tool', item.command ? toolText(item.command, item.aggregatedOutput ?? item.aggregated_output ?? '') : item);
     }
-    if (raw.type === 'item.started' && item?.command) add('progress', `Running · ${describe(item.command).split('\n')[0]}`);
+    if (raw.type === 'item.started' && item?.command) add('progress', `Running · ${commandLine(describe(item.command))}`);
     if (raw.type === 'error' || raw.type === 'turn.failed') add('error', raw.error?.message ?? raw.message ?? raw.error ?? raw);
     if (raw.type === 'turn.completed') {
       add('usage', raw.usage, {usage: raw.usage});

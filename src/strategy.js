@@ -49,7 +49,7 @@ export const defaultStrategy = {
     const v = verdicts[0];
     if (v.verdict === 'accept') return {action: 'accept'};
     // An unreadable verdict from a reviewer that RAN used to block the task, which needs a human. Found
-    // live (ACE 12ca0d9f): the reviewer hit its step cap, its notice failed to parse, and the task sat
+    // live: the reviewer hit its step cap, its notice failed to parse, and the task sat
     // blocked. That fails instead, so the orchestrator is woken by an outcome and decides. A review that
     // never produced anything — launch failed, cancelled, or still before any worker ran (prelaunch) — is
     // an infrastructure problem, not a verdict, and still escalates exactly as before.

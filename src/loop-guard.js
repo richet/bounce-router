@@ -1,5 +1,5 @@
-// Bounce guards loops inside a turn — a repeated tool call, empty steps, silence. Found live (ACE session
-// c70dbb61, 2026-09-22): ten reviewer tasks in two hours, the same scope on the same local model, each one
+// Bounce guards loops inside a turn — a repeated tool call, empty steps, silence. Found live: ten
+// reviewer tasks in two hours, the same scope on the same local model, each one
 // killed at its 60-minute ceiling and immediately replaced. Nothing counted that, and the orchestrator could
 // not: it sees one outcome per handoff, never the pattern. This is the guard one level up — the same job,
 // failing the same way, is stopped rather than run again.

@@ -1,5 +1,5 @@
 // Where the campaign is, derived from the log (docs/plans/orchestrator-memory.md). The orchestrator's own
-// state note says what it decided and why; this says what happened. Found live (ACE c70dbb61): ten reviewer
+// state note says what it decided and why; this says what happened. Found live: ten reviewer
 // tasks in two hours, the same job failing the same way — invisible turn by turn, obvious here.
 import {sameJob} from './loop-guard.js';
 

@@ -214,15 +214,26 @@ export function watchdog(events, now, {activity = new Map(), watchdog: cfg} = {}
       : events.filter(e => e.kind === 'task.started' && e.task === root);
     if (!startedRows.length) continue;
     const startedAt = Date.parse(reviewing ? startedRows.at(-1).time : startedRows[0].time);
+    const ownStart = events.filter(e => e.kind === 'task.started' && e.task === t.id).at(-1);
     const submitted = events.find(e => e.kind === 'task.submitted' && e.task === root);
-    // The deadline is a lease (docs/plans/task-leases.md): each `task.lease.renewed` in the lineage
-    // adds one more lease, and none reaches past the ceiling, measured from the lineage's first start.
+    // The deadline is a lease (docs/plans/task-leases.md): each `task.lease.renewed` adds one more, and
+    // none reaches past the ceiling. Two different clocks, deliberately: the CEILING is the lineage's
+    // wall-clock bound, measured from its first start; the LEASE belongs to the attempt running now and
+    // is measured from its own start. Found live: a fallback launched with 58 s of the lease
+    // left because its predecessor had burned 14 of the 15 minutes, so it could only fail. A fresh
+    // attempt is owed a full lease; the ceiling and the loop guard are what stop a job buying time by
+    // failing over and over (Daniel, 2026-09-22).
     const leaseMs = submitted?.deadline ?? cfg.defaultDeadlineMs;
-    const renewals = events.filter(e => e.kind === 'task.lease.renewed' && (reviewing ? e.stage === 'review' && e.task === t.id : !e.stage && taskView[e.task] && lineageRoot(e.task) === root)).length;
+    const leaseFrom = reviewing ? startedAt : Date.parse((ownStart ?? startedRows[0]).time);
+    const renewals = events.filter(e => e.kind === 'task.lease.renewed' && e.task === t.id && (reviewing ? e.stage === 'review' : !e.stage)).length;
     const ceilingAt = startedAt + Math.max(cfg.ceilingMs ?? leaseMs, leaseMs);
-    const leaseStartAt = Math.min(startedAt + leaseMs * renewals, ceilingAt);
-    const deadlineAt = Math.min(startedAt + leaseMs * (renewals + 1), ceilingAt);
-    let progressAt = Date.parse(startedRows.at(-1).time);
+    const leaseStartAt = Math.min(leaseFrom + leaseMs * renewals, ceilingAt);
+    const deadlineAt = Math.min(leaseFrom + leaseMs * (renewals + 1), ceilingAt);
+    // Liveness is about THIS worker, so it is measured from this attempt's own start — never the
+    // lineage's. Found live: a fallback launched the second its predecessor died was escalated
+    // as "stalled for 843 s" one second later, because the root's start seeded its progress clock. Only
+    // the ceiling above spans the lineage; this and the lease both belong to the attempt.
+    let progressAt = Date.parse((reviewing ? startedRows.at(-1) : ownStart ?? startedRows.at(-1)).time);
     for (const e of events) {
       if (e.task !== t.id) continue;
       if (e.kind === 'task.milestone' || e.kind === 'task.usage' || e.kind === 'task.blocked') progressAt = Math.max(progressAt, Date.parse(e.time));

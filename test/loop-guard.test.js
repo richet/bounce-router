@@ -1,4 +1,4 @@
-// The loop nobody was watching (ACE session c70dbb61, 2026-09-22): ten reviewer tasks in two hours, the same
+// The loop nobody was watching (live): ten reviewer tasks in two hours, the same
 // scope on the same local model every time, each killed at its 60-minute ceiling and immediately replaced.
 // Bounce guards loops inside a turn — a repeated tool call, empty steps, silence — and had nothing that
 // noticed the SYSTEM repeating itself. The orchestrator could not notice either: it sees one outcome per

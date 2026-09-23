@@ -1,4 +1,4 @@
-// Task leases (docs/plans/task-leases.md). Found live (ACE session 55ee73b9): every reviewer on the
+// Task leases (docs/plans/task-leases.md). Found live: every reviewer on the
 // local 27B was killed by its deadline while still working — its last step 11 to 84 s before the
 // kill — and the orchestrator answered each kill by shrinking the next deadline. A deadline is now a
 // lease: renewed while the worker makes progress, up to a ceiling; a worker that stops making
@@ -186,7 +186,7 @@ test('L8 the worker pane shows a renewal and a conclusion request', () => {
   assert.deepEqual(workerThread(events, 't').slice(1).map(row => row.text), ['lease 1 renewed', 'lease 2 renewed · Jev: on_track', 'asked for its conclusion · no progress']);
 });
 
-// A completion review is a worker turn too (found live, ACE 12ca0d9f: a 24-minute review nothing was
+// A completion review is a worker turn too (found live: a 24-minute review nothing was
 // watching, which then hit OpenCode's step cap and returned its notice instead of a verdict). It gets
 // its own lease, measured from `review.started`, on the same rules.
 test('L9 a review is leased like a turn: renewed while it works, asked to conclude at the ceiling', async t => {

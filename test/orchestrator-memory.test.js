@@ -11,7 +11,7 @@ import {handoff} from '../src/core.js';
 const at = (m, rest) => ({time: `2026-09-22T20:${String(m).padStart(2, '0')}:00.000Z`, ...rest});
 const ORDERS = 'Review locking and journaling in src/workspaces.';
 const campaign = [
-  at(16, {kind: 'user', text: 'review P2 in ace'}),
+  at(16, {kind: 'user', text: 'review the locking work'}),
   at(19, {kind: 'plan.submitted', phase: 'p2-verdicts', chunks: [{id: 'lock'}, {id: 'docker'}, {id: 'cli'}]}),
   at(19, {kind: 'plan.accepted', plan: 'p2-verdicts', chunks: 3}),
   at(37, {kind: 'task.submitted', task: 'r1', profile: 'reviewer', orders: ORDERS}),

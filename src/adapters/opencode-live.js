@@ -29,6 +29,7 @@ const CONCLUDE_STEPS = 2;
 // Why a turn ended with nothing from the worker. One path, one prompt (docs/plans/answer-contract.md).
 const CAP_PROMPT = concludeAsk('your step budget is spent');
 const CONCLUDE_PROMPT = concludeAsk('you repeated the same call with nothing new');
+const SILENT_PROMPT = concludeAsk('your turn ended without an answer');
 const READS = new Set(['read', 'grep']); // listing files (glob) is not reading material
 const CHANGES = new Set(['write', 'edit', 'apply_patch', 'bash']);
 // Observed live (qwen3-coder-30b-a3b via LM Studio): the model answers, but every step is reported as
@@ -156,6 +157,9 @@ export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HE
       const answer = createAnswer();
       const repeats = new Map();
       let stepActed = false, emptySteps = 0, concluded = false, reads = 0, stalled = false, capped = false;
+      // `stepActed` is per step and resets at every step boundary; `didWork` never resets — it answers
+      // "did this worker do anything at all", which is what decides whether there is an answer worth asking for.
+      let didWork = false;
       const plain = text => String(text).replace(/\x1b\[[0-9;]*m/g, '').replace(/^[!\s]+/, '').trim();
       let stepOpenedAt = null, pending = null;
       const source = handle.live.events[Symbol.asyncIterator]();
@@ -184,10 +188,15 @@ export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HE
           // a failure of the runtime rather than of the task, so the next AI in the chain may try.
           // Bounce asked for the conclusion (conclude() below: a lease ended), or the loop guard stopped a
           // worker that had read something. Either way the same session is asked once, tools off.
-          const ask = handle.concludeWith ?? (capped ? CAP_PROMPT : stalled && reads > 0 ? CONCLUDE_PROMPT : null);
+          // A clean turn that did work and said nothing after its last tool call has no answer — and that
+          // is itself the reason to ask for one. Found live: both local-worker failures were
+          // this shape, 6 and 14 minutes of work thrown away without the question ever being put.
+          const unanswered = event.code === 0 && answer.value === null && didWork;
+          const ask = handle.concludeWith ?? (capped ? CAP_PROMPT : stalled && reads > 0 ? CONCLUDE_PROMPT : unanswered ? SILENT_PROMPT : null);
           if (ask !== null && !handle.conclude && handle.sessionId) {
             yield {kind: 'diagnostic', text: handle.concludeWith !== undefined ? `asked, tools off, for its conclusion: ${ask}`
               : capped ? 'opencode stopped at its step cap; asked once, tools off, for its answer'
+              : unanswered && !stalled ? 'the turn ended without an answer; asked once, tools off, for it'
               : `stalled after reading ${reads} file${reads === 1 ? '' : 's'}; asked once, tools off, for its conclusion`};
             const again = start({profile: handle.profile, session: handle.sessionId, stdin: ask, cwd: handle.cwd, dir: handle.dir, conclude: true});
             handle.child = again.child; handle.pid = again.pid; // cancel() must reach the turn that is running now
@@ -218,7 +227,7 @@ export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HE
             const {speaker, text} = classifyText('opencode', part.text);
             if (speaker === SPEAKER.runtime) { capped = /step/i.test(text) || capped; stepActed = true; yield {kind: 'diagnostic', text: `opencode: ${text}`}; continue; }
             answer.said(speaker, text);
-            stepActed = true;
+            stepActed = true; didWork = true;
             yield {kind: 'assistant', speaker, text};
           }
         } else if (raw.type === 'tool_use') {
@@ -232,7 +241,7 @@ export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HE
           // An answer is text said AFTER the worker's last tool call. Observed live: a worker's opening
           // sentence ("I'll execute this systematically…"), six silent minutes of tool work, then the turn
           // ended — and that opener became the task's completion. It was a plan, not an answer.
-          if (status === 'completed' || status === 'error') answer.tooled();
+          if (status === 'completed' || status === 'error') { answer.tooled(); didWork = true; }
           if (status === 'completed' && READS.has(part.tool)) reads++;
           if (status === 'completed' && CHANGES.has(part.tool)) repeats.clear(); // the world changed: re-reading is legitimate
           else if (status === 'completed' || status === 'error') {

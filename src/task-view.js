@@ -1,5 +1,5 @@
 // What a task is doing and what it has produced, in a screenful (docs/plans/bridge-interface.md).
-// Found live (session c70dbb61): with no read verb, the orchestrator ran `tail -n 20` on its own journal and
+// Found live: with no read verb, the orchestrator ran `tail -n 20` on its own journal and
 // 143 KB of raw JSON went into the chat, the journal and its own next context packet. These views are the
 // answer to that question, bounded by construction: capped lists with a count of the rest, cut text, and a
 // POINTER to the journal rather than its contents. Pure — the same fold src/reducers.js gives the TUI.
@@ -19,7 +19,10 @@ const findingLine = row => row.finding
   : {severity: null, file: null, line: null, title: cut(String(row.text ?? '').replace(/^FINDING:\s*/, ''), TITLE_MAX)};
 
 // One task: null when bounce never saw it (never an empty shape that reads as "nothing happened").
-export function taskView(events, task, {now = Date.now(), journal = null} = {}) {
+// `report: true` is the one deliberate way to the whole verdict. Found live: a 12 KB FAIL report
+// was cut mid-word at SUMMARY_MAX and the orchestrator had no way to ask for the rest — and its orders forbid
+// reading the journal, so nothing could reach it. The bounded summary stays exactly as it was, beside it.
+export function taskView(events, task, {now = Date.now(), journal = null, report = false} = {}) {
   const state = taskStates(events)[task];
   if (!state) return null;
   const submitted = events.find(e => e.kind === 'task.submitted' && e.task === task);
@@ -44,6 +47,8 @@ export function taskView(events, task, {now = Date.now(), journal = null} = {}) 
     milestones,
     findings: {shown: findings.slice(-FINDINGS_SHOWN).map(findingLine), total: findings.length, more: Math.max(0, findings.length - FINDINGS_SHOWN)},
     summary: cut(terminal?.summary ?? terminal?.text ?? state.summary, SUMMARY_MAX) || null,
+    // Whole and unreflowed when asked for: a verdict's last line is where it puts its conclusion.
+    ...(report ? {report: (terminal?.summary ?? terminal?.text ?? state.summary ?? null)} : {}),
     reason: terminal?.reason ?? null,
     blocker: blocked ? cut(blocked.text, TEXT_MAX) : null,
     // The raw material, named — never carried. Whoever wants it reads it themselves.

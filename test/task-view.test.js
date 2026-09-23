@@ -1,4 +1,4 @@
-// The read the orchestrator never had (docs/plans/bridge-interface.md). Found live (session c70dbb61): with
+// The read the orchestrator never had (docs/plans/bridge-interface.md). Found live: with
 // no way to ask "what did this task produce", it ran `tail -n 20 journal.jsonl` and 143 KB of raw JSON went
 // into the chat. These views answer the same question in a screenful, and hand back a POINTER to the journal
 // instead of its contents. Pure: events in, view out — the same fold the TUI renders from.
@@ -72,4 +72,30 @@ test('V4 the list is what is live, newest last, one line each', () => {
   assert.deepEqual(live.map(row => [row.task, row.state, row.profile]), [['land', 'reviewing', 'integrator'], ['probe', 'running', 'reviewer']]);
   assert.equal(live[0].doing, 'suite green', 'its last milestone, so the line says what it is on');
   assert.deepEqual(taskList(two, {now, all: true}).map(row => row.task), ['land', 'probe', 'old']);
+});
+
+// Found live: a local reviewer produced a 12 KB FAIL verdict with a blocker and a
+// working repro; the orchestrator got it cut mid-word at 1,200 characters — "* **Expected**: The system should
+// detec…" — then spent six minutes trying `task_get`, four shapes of `bounce wait`, and two --help pages before
+// concluding "the bridge exposes only a shortened summary and no full-report option", and started re-reading the
+// source itself. Its own orders forbid reading the journal, so BOTH doors were shut. The bounded view stays the
+// default; asking for the report is the one deliberate way through.
+test('T8 the full report is reachable on request, while the default view stays bounded', () => {
+  const verdict = `## FINAL REVIEW REPORT\n\n**Outcome: FAIL**\n\n${'blocker detail '.repeat(400)}END-OF-REPORT`;
+  const events = [
+    at(1, {kind: 'task.submitted', seq: 1, task: 'rev', profile: 'reviewer', orders: 'review locking', deadline: 900000}),
+    at(2, {kind: 'task.started', seq: 2, task: 'rev', requested: 'qwen3.6-35b-a3b-mlx'}),
+    at(6, {kind: 'task.completed', seq: 3, task: 'rev', summary: verdict}),
+  ];
+  assert.equal(verdict.length > 5000, true, 'the live one was 12 KB');
+
+  const bounded = taskView(events, 'rev', {now: Date.parse('2026-09-22T20:10:00.000Z')});
+  assert.equal(bounded.summary.length <= 1200, true, `default view is ${bounded.summary.length} characters`);
+  assert.match(bounded.summary, /…$/, 'and it says it was cut');
+  assert.equal('report' in bounded, false, 'the whole text is not carried unless asked for');
+
+  const full = taskView(events, 'rev', {now: Date.parse('2026-09-22T20:10:00.000Z'), report: true});
+  assert.equal(full.report, verdict, 'asked for, the verdict arrives whole — not cut, not reflowed');
+  assert.match(full.report, /END-OF-REPORT$/, 'including its last line, which is where a verdict puts its conclusion');
+  assert.equal(full.summary.length <= 1200, true, 'the bounded summary is still there beside it');
 });

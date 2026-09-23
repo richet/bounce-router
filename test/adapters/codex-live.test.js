@@ -625,7 +625,7 @@ for (const mode of ['launch', 'turn']) test(`a codex worker limited at ${mode} f
   assert.equal(claude.calls.launch, 1);
 });
 
-// Found live (ACE 12ca0d9f, 2026-09-22): codex's own tracing went to stderr and every line landed in the
+// Found live: codex's own tracing went to stderr and every line landed in the
 // transcript — 23 copies of an `rmcp::transport` MCP error the user cannot act on from here. Its tracing
 // is counted and summarised once; anything else it says on stderr still comes through untouched.
 test('X9 codex tracing on stderr is summarised, not repeated; real stderr still shows', async t => {

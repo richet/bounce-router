@@ -615,6 +615,12 @@ test('O2 orchestrator single-provider: the orchestrator submits over the bridge,
   const skillLine = orders.split('\n').find(line => line.startsWith('Skill: '));
   assert.equal(fs.existsSync(skillLine.slice('Skill: '.length)), true);
   assert.equal(orders.includes('BOUNCE_BUS_TOKEN_FILE='), true);
+  // Found live: a reviewer's 12 KB FAIL verdict reached the orchestrator cut at
+  // 1,200 characters. It tried task_get, four shapes of `bounce wait` and two --help pages, concluded the
+  // bridge had no full-report option, and began re-reading the source itself. The option now exists; the
+  // orders are where it learns that, since the same orders forbid reading the journal.
+  assert.equal(orders.includes('`task_get` with `full: true` (or `bounce task <id> --report`)'), true,
+    'the orders name the one way to read a finished report in full');
   // The stated capability is the bus's own allowlist (src/bus.js PEER_KINDS), verbatim.
   assert.equal(orders.includes('You may publish only: task.submitted, task.accepted, task.milestone, task.blocked, task.input_required, task.usage, task.activity, message.'), true);
   // steps is refused-without when the completion reviewer is a verifier, so the brief has to name it.

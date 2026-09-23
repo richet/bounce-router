@@ -157,7 +157,7 @@ test('a completed task that is sent back for rework stays on the rail, running i
   assert.equal(projection.snapshot().panes.some(p => p.task === T), false);
 });
 
-// Found live (ACE 12ca0d9f, 2026-09-22): an integrator's completion review ran for 22 minutes while its
+// Found live: an integrator's completion review ran for 22 minutes while its
 // pane said `completed` — a reviewer was working and nothing in the UI said so. A task under review is
 // `reviewing` until the review answers, and the reviewer's own rows are its activity.
 test('a task under completion review reads as reviewing, with the reviewer named and its activity shown', () => {

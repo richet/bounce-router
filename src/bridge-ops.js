@@ -3,7 +3,7 @@
 // a skin that translates argv or a tool call into one of them and its result back out. A transport holds no
 // default, no limit, no policy and no error text: a capability a transport needs is a verb here first.
 //
-// Found live (session c70dbb61): with no read verb, the orchestrator read its own journal with `tail` and
+// Found live: with no read verb, the orchestrator read its own journal with `tail` and
 // `jq`, and 143 KB of raw JSON landed in the chat, the journal and its own next context packet.
 import fs from 'node:fs';
 import {connectBus} from './bus.js';

@@ -25,7 +25,9 @@ const TOOLS = [
   {name: 'state', description: 'Write where the campaign is, in your own words: the phase, what is done, what is next, and why you changed course. One living note — each call replaces the last, and it is the first thing you are given when you wake.',
     inputSchema: {type: 'object', properties: {text: {type: 'string'}}, required: ['text']}},
   {name: 'task_get', description: 'One task: state, the AI playing it, lease and elapsed, its last milestones, its findings, its summary or review verdict. Bounded — never the journal itself.',
-    inputSchema: {type: 'object', properties: {task: {type: 'string'}}, required: ['task']}},
+    inputSchema: {type: 'object', properties: {task: {type: 'string'},
+      full: {type: 'boolean', description: 'Return the finished report/verdict whole instead of the cut summary. Use it once a task is done and you need its findings in full; the default stays bounded so a check never floods your turn.'}},
+      required: ['task']}},
   {name: 'tasks_list', description: 'Every task that is still live (or all of them), one line each.',
     inputSchema: {type: 'object', properties: {all: {type: 'boolean'}}, required: []}},
 ];
@@ -64,7 +66,7 @@ export function createMcpServer({ops, views, version = '0'}) {
     }
     if (name === 'task_get') {
       if (typeof args.task !== 'string' || !args.task) return fail('task_get needs a `task` id');
-      const view = views.taskView(args.task);
+      const view = views.taskView(args.task, {report: args.full === true});
       return view ? ok(formatTaskView(view), view) : fail(`no such task: ${args.task}`);
     }
     if (name === 'tasks_list') {

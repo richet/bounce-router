@@ -23,7 +23,7 @@ const SIZE_FIELDS = ['lines', 'probes', 'minutes'];
 // five seconds later (observed live, four times in one task), which only teaches you to ignore it.
 // No MILESTONE for ten minutes is still a stall, whatever the worker prints.
 // concludeGrace: how long a worker asked for its conclusion has to give it. Five minutes, not two: one
-// step of the local 27B at 77k tokens of context took up to three minutes of prefill (ACE, 2026-09-22).
+// step of the local 27B at 77k tokens of context took up to three minutes of prefill (live).
 // concludeCap: the most a conclusion that keeps showing activity is waited for. Found live: a 27B was
 // still generating its answer 284 s into a fixed 300 s grace, and a whole 60 min review was lost.
 export const WATCHDOG_DEFAULTS = {interval: 5000, silence: 300_000, stall: 600_000, grace: 120_000, concludeGrace: 300_000, concludeCap: 900_000};

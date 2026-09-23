@@ -59,7 +59,7 @@ async function main() {
   const {values, positionals} = parseArgs({allowPositionals: true, options: {
     image: {type: 'string', multiple: true}, cwd: {type: 'string'}, resume: {type: 'string'}, provider: {type: 'string'}, model: {type: 'string'},
     mode: {type: 'string'}, json: {type: 'boolean'}, verify: {type: 'boolean'}, help: {type: 'boolean', short: 'h'}, version: {type: 'boolean', short: 'v'},
-    check: {type: 'boolean'}, scope: {type: 'string'}, force: {type: 'boolean'}, list: {type: 'boolean'}, all: {type: 'boolean'}, session: {type: 'string'},
+    check: {type: 'boolean'}, scope: {type: 'string'}, force: {type: 'boolean'}, list: {type: 'boolean'}, all: {type: 'boolean'}, session: {type: 'string'}, report: {type: 'boolean'},
     save: {type: 'boolean'}, 'allow-network': {type: 'boolean'},
   }});
   if (values.help) return console.log(helpText(process.stdout.columns || 100));
@@ -250,7 +250,7 @@ async function main() {
     const target = new Session(process.cwd(), {root, id});
     const journal = path.join(root, 'sessions', id, 'journal.jsonl');
     if (positionals[1]) {
-      const view = taskView(target.events, positionals[1], {journal});
+      const view = taskView(target.events, positionals[1], {journal, report: Boolean(values.report)});
       if (!view) throw new Error(`Unknown task: ${positionals[1]}`);
       return console.log(values.json ? JSON.stringify(view, null, 2) : formatTaskView(view));
     }

@@ -243,6 +243,10 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     'End every turn by writing where the campaign is — the `state` tool, or `bounce publish --event \'{"kind":"state","text":"…"}\'`. It is one living note you rewrite each turn, not a log: the phase, what is done, what is next, and why you changed course. It is the first thing you are given when you wake, so write it for a reader who has nothing else. Keep it under 2000 characters; bounce tells you when it is too long and never cuts it for you.',
     'A task killed at its ceiling or for silence is not to be resubmitted unchanged: change the scope or the AI first. Bounce refuses a third identical attempt (task.failed, reason repeat), and each handoff tells you when a job has failed the same way before.',
     'To see what a task is doing or what it produced, ask `task_get` (or `bounce task <id>`), and `tasks_list` (or `bounce tasks`) for everything live. Never read a session journal with tail, cat, jq or grep: it is the raw log, it is what bounce already summarised for you, and one read of it has put 143 KB into a turn.',
+    // Found live: the summary is cut at 1,200 characters, and with the journal forbidden the
+    // orchestrator had no way to the rest of a 12 KB verdict — it hunted, gave up, and started redoing the
+    // reviewer's work. The way exists now, so the orders are where it is named.
+    'That view is bounded on purpose, so its summary is cut. When a task has finished and you need its verdict whole — every finding, its repro and its observed output — ask `task_get` with `full: true` (or `bounce task <id> --report`). That is the one way to the full text, and the reason you never need the journal.',
     'Example — submit one task, then end your turn:',
     `    bounce publish --event '{"kind":"task.submitted","parent":null,"profile":"${defaultTarget(profiles, orchestrator, {routingOn})}","orders":"<goal, owned paths, acceptance, how to verify>","deadline":${taskLimits(settings).minutes * 60000}}'`,
     '`bounce wait` is for a short wait only, at most 120 seconds, when the very next step depends on an outcome you expect within it:',

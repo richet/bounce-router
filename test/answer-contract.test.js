@@ -8,7 +8,7 @@ import {SPEAKER, classifyText, createAnswer} from '../src/adapters/live-common.j
 test('A1 who is speaking: the worker, its thinking, or the runtime', () => {
   // the worker, plainly
   assert.deepEqual(classifyText('opencode', '  FAIL: the boundary is off by one  '), {speaker: SPEAKER.worker, text: 'FAIL: the boundary is off by one'});
-  // opencode's own step-cap notice (ACE 12ca0d9f: it became a review's verdict and blocked the task)
+  // opencode's own step-cap notice (live: it became a review's verdict and blocked the task)
   const cap = '</think>\n\nCRITICAL - MAXIMUM STEPS REACHED\n\nThe maximum number of steps allowed for this task has been reached. Tools are disabled until next user input.';
   assert.equal(classifyText('opencode', cap).speaker, SPEAKER.runtime);
   // opencode refusing a path is the runtime too
