@@ -17,6 +17,7 @@ const HANDOFF_KINDS = new Set(['task.completed', 'task.accepted', 'task.failed',
 const PARKED = new Set(['blocked', 'input_required']);
 const HANDOFF_TEXT_MAX = 2000; // per task: a final report summary or failure text, never a transcript
 const HANDOFF_DELAY_MS = 1000; // several tasks ending together become one wake-up turn
+const DEAD_END_PROMPT = 'Your last turn dispatched nothing and nothing of yours is running, so no outcome can arrive and bounce cannot wake you again. Check whether a submission of yours was refused (the refusal says why), then either dispatch the work or tell the user plainly what is blocking it and what you need. Do not end this turn expecting an outcome that nothing will produce.';
 const WAKE_PROMPT = 'Continue your orders. The worker outcomes above were not returned by any wait of yours and have not been reported to the user: synthesize them now (what each task produced, what failed and why, what remains). If a task you still need is listed as running, wait on it with `bounce wait` before reporting. Do not re-run finished work.';
 
 // A task is the orchestrator's when the root of its `replaces` lineage was submitted by the
@@ -119,7 +120,17 @@ export function createMainService({session, adapters, profile, settings, profile
       return;
     }
     // Whatever ended during the turn without being returned by one of its waits wakes it now.
-    if (pendingHandoffs().length) arm();
+    if (pendingHandoffs().length) { arm(); return; }
+    // A turn that ends with nothing running and no outcome owed is a dead end: no row will ever arrive,
+    // so no wake can ever fire. Found live: a turn ended saying bounce would "resume the campaign with the
+    // verdict" after its only submit had been refused. The user is told in their own transcript, and the
+    // orchestrator is woken once to see it — once, never a loop: a wake that itself dispatches nothing
+    // ends here quietly, because by then the orchestrator has been told and it is the user's move.
+    if (!run.wake && !anythingRunning() && planAwaitingDispatch()) {
+      session.append({kind: 'status', text: 'That turn dispatched nothing and nothing is running, so no outcome can arrive. Waking the orchestrator once to look; after that it is your move.'});
+      deadEndNudge = true;
+      arm();
+    }
   }
   async function execute(run, params) {
     const tried = new Set();
@@ -247,6 +258,21 @@ export function createMainService({session, adapters, profile, settings, profile
     }
     return [...byTask.values()].filter(row => !seen(row));
   }
+  // A plan bounce accepted, with nothing dispatched since. That is the shape of the dead end worth
+  // acting on: the orchestrator got its go-ahead and then ended the turn without submitting a chunk —
+  // usually because a submit was refused. An ordinary turn that dispatches nothing (a question answered,
+  // a campaign finished) is not this, and must not be nudged.
+  function planAwaitingDispatch() {
+    const accepted = session.events.findLast(row => row.kind === 'plan.accepted');
+    if (!accepted) return false;
+    const dispatched = session.events.findLast(row => row.kind === 'task.submitted');
+    return !dispatched || dispatched.seq < accepted.seq;
+  }
+  // Any task of the orchestrator's that could still produce an outcome.
+  function anythingRunning() {
+    const view = tasks(session.events);
+    return Object.values(view).some(t => !TERMINAL.has(t.state) && orchestratorsTask(session, view, t.id));
+  }
   function start(params, {wake}) {
     if (closed) return {accepted: false, reason: 'daemon_closed'};
     if (current) return {accepted: false, reason: current.unverified ? 'termination_unverified' : 'busy'};
@@ -293,13 +319,15 @@ export function createMainService({session, adapters, profile, settings, profile
   // happened?". Coalesced over a short window; a user prompt that lands first wins (start()
   // gives it the same block) and the timer finds nothing left to do. Classic mode never
   // constructs this service (reload.js), so nothing here can fire outside orchestrator mode.
-  let wakeTimer = null, wakeRetried = false;
+  let wakeTimer = null, wakeRetried = false, deadEndNudge = false;
   function wake() {
     wakeTimer = null;
     if (closed || current) return;
     const ended = pendingHandoffs();
-    if (!ended.length) return;
-    const result = start({text: WAKE_PROMPT}, {wake: true});
+    if (!ended.length && !deadEndNudge) return;
+    const nudging = !ended.length && deadEndNudge;
+    deadEndNudge = false;
+    const result = start({text: nudging ? DEAD_END_PROMPT : WAKE_PROMPT}, {wake: true});
     if (!result.accepted && result.reason !== 'busy') session.append({kind: 'status', text: `Worker outcomes not handed to the orchestrator: ${result.reason}; they ride on the next prompt`});
   }
   // The timer is ref'd on purpose: a pending wake-up is work the daemon owes, not something to

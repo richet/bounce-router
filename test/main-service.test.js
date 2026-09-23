@@ -723,3 +723,30 @@ test('an outcome is handed over only by a wake turn that completed, not one that
   await started;
   assert.match(f.promptOf(f.calls.at(-1)), /P2 majors fixed/, 'an interrupted wake does not consume the outcome');
 });
+
+// Found live: the orchestrator ended a turn having dispatched nothing — its submit had been refused — and
+// said "bounce is evaluating it and will resume the campaign with the verdict". Nothing was running, so no
+// outcome could ever arrive and no wake could ever fire. A turn that ends with no work and no pending
+// outcome is a dead end: the user is told, and the orchestrator is woken ONCE to notice it itself.
+test('a turn that ends with nothing running and nothing pending is a dead end: said once, woken once', async t => {
+  const f = wakeFixture(t);
+  // The shape that failed live: bounce accepted the plan, then the turn ended without dispatching a chunk
+  // because the submit was refused. An ordinary turn that dispatches nothing is NOT this and is not nudged.
+  const started = nextEvent(f.main, 'main.started');
+  f.main.run({id: 'first', text: 'plan it'});
+  await started;
+  f.session.append({kind: 'plan.submitted', phase: 'rework', chunks: [{id: 'repair'}], from: 'orchestrator'});
+  f.session.append({kind: 'plan.accepted', plan: 'rework', chunks: 1, from: 'bounce'});
+  await f.finishTurn('I submitted the plan; bounce will resume the campaign with the verdict.');
+  const said = f.session.events.filter(e => e.kind === 'status' && /dispatched nothing/i.test(e.text ?? ''));
+  assert.equal(said.length, 1, 'the user is told, in their own transcript');
+  const woken = await nextEvent(f.main, 'main.starting');
+  assert.equal(woken.handoff, true);
+  await nextEvent(f.main, 'main.started');
+  assert.match(f.promptOf(f.calls.at(-1)), /dispatched nothing/i, 'and the orchestrator is told what happened');
+
+  // ...and if that turn also dispatches nothing, it is not woken again: one nudge, never a loop.
+  await f.finishTurn('Still nothing to do.');
+  await f.quiet(60);
+  assert.equal(f.session.events.filter(e => e.kind === 'main.starting').length, 2, 'no second nudge');
+});
