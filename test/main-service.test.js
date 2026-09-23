@@ -644,3 +644,82 @@ test('a limited launch without process ownership cannot authorize another writer
   assert.equal(f.main.run({text: 'another writer'}).reason, 'termination_unverified');
   assert.equal(f.calls.some(c => c[0] === 'codex'), false);
 });
+
+// Found live, three sessions, the most common way the orchestrator goes quiet: a worker exits and its
+// task parks in `input_required` or `blocked`. Those states are in no terminal set, no handoff kind and
+// no watchdog branch, so nothing wakes the orchestrator, nothing settles a parent and no deadline ever
+// fires — and the row itself holds a question addressed to the owner. Each occurrence ended only when
+// the user cancelled, after 40 minutes, 89 minutes, and one that simply ran out of journal.
+test('a task that parks asking for input wakes the orchestrator, carrying the question', async t => {
+  const f = wakeFixture(t);
+  await f.settle();
+  f.submit('df6d627f');
+  const woken = nextEvent(f.main, 'main.starting');
+  f.session.append({kind: 'task.attempt.ended', task: 'df6d627f', attempt: 1});
+  f.session.append({kind: 'task.input_required', task: 'df6d627f', from: 'worker:df6d627f',
+    text: 'Rework round 1 blocked on owner authorisation: the unmet criterion needs a decision.'});
+  assert.equal((await woken).handoff, true, 'the orchestrator is woken, not left waiting on a dead worker');
+  const started = await nextEvent(f.main, 'main.started');
+  const prompt = f.promptOf(f.calls.at(-1));
+  assert.match(prompt, /df6d627f/);
+  assert.match(prompt, /Rework round 1 blocked on owner authorisation/, 'the question reaches it verbatim');
+  assert.equal(started !== undefined, true);
+});
+
+test('a task blocked after its worker exits wakes the orchestrator too', async t => {
+  const f = wakeFixture(t);
+  await f.settle();
+  f.submit('09a56f5c');
+  const woken = nextEvent(f.main, 'main.starting');
+  f.session.append({kind: 'task.attempt.ended', task: '09a56f5c', attempt: 1});
+  f.session.append({kind: 'task.blocked', task: '09a56f5c', from: 'worker:09a56f5c', text: 'unreadable review verdict'});
+  assert.equal((await woken).handoff, true);
+  await nextEvent(f.main, 'main.started');
+  assert.match(f.promptOf(f.calls.at(-1)), /unreadable review verdict/);
+});
+
+// The child's news travels up only while an ancestor is still alive to carry it. Found live: the
+// orchestrator named an already-accepted task as the parent, so the chain was dead on arrival and the
+// child's completion woke nobody.
+test('a task whose whole parent chain has already ended wakes the orchestrator itself', async t => {
+  const f = wakeFixture(t);
+  await f.settle();
+  f.submit('4109832f');
+  // The parent's own end is its own wake: let that turn happen and finish, so the service is idle and
+  // the next wake can only be the child's.
+  const parentWoke = nextEvent(f.main, 'main.starting');
+  f.session.append({kind: 'task.completed', task: '4109832f', summary: 'builder done', from: 'worker:4109832f'});
+  f.session.append({kind: 'task.accepted', task: '4109832f', stage: 'completion', from: 'bounce'});
+  await parentWoke;
+  await nextEvent(f.main, 'main.started');
+  await f.finishTurn('Builder accepted; following up.');
+  f.submit('ccec5ed4', {parent: '4109832f'});
+  const woken = nextEvent(f.main, 'main.starting');
+  f.session.append({kind: 'task.completed', task: 'ccec5ed4', summary: 'the 9 baseline failures are fixed', from: 'worker:ccec5ed4'});
+  assert.equal((await woken).handoff, true, 'a dead parent cannot carry the news, so the child carries it');
+  await nextEvent(f.main, 'main.started');
+  assert.match(f.promptOf(f.calls.at(-1)), /the 9 baseline failures are fixed/);
+});
+
+// A handoff counted as delivered the moment its turn STARTED. Found live: a wake turn that produced
+// nothing (a vendor resume that returned zero turns) still marked the outcome handed over, so it was
+// never re-offered. That specific vendor case is fixed in the adapter; this closes the general hole —
+// a wake turn that did not complete has not told the orchestrator anything.
+test('an outcome is handed over only by a wake turn that completed, not one that was interrupted', async t => {
+  const f = wakeFixture(t);
+  await f.settle();
+  f.submit('8302c5f5');
+  const woken = nextEvent(f.main, 'main.starting');
+  f.session.append({kind: 'task.completed', task: '8302c5f5', summary: 'P2 majors fixed', from: 'worker:8302c5f5'});
+  const request = (await woken).requestId;
+  await nextEvent(f.main, 'main.started');
+  const ended = nextEvent(f.main, 'main.terminal');
+  await f.main.cancel({id: request});           // the wake turn is interrupted before it says anything
+  await ended;
+
+  // The next turn must still carry that outcome: nothing has told the orchestrator about it.
+  const started = nextEvent(f.main, 'main.started');
+  f.main.run({id: 'after', text: 'carry on'});
+  await started;
+  assert.match(f.promptOf(f.calls.at(-1)), /P2 majors fixed/, 'an interrupted wake does not consume the outcome');
+});

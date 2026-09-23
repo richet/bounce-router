@@ -209,3 +209,31 @@ test('L9 a review is leased like a turn: renewed while it works, asked to conclu
   assert.deepEqual(session.events.filter(e => e.kind === 'task.concluding' && e.task === row.task).map(e => [e.stage, e.reason]), [['review', 'ceiling']]);
   assert.equal(prompts.length, 1, 'the reviewer itself was asked, not the worker');
 });
+
+// L10: the backstop for a task nobody answers. A parked task (blocked, or asking its owner a question)
+// has no worker left — its process exited — so nothing will change it on its own. Waking the orchestrator
+// lets it act; this ends the wait when nobody does, as a deadline rather than a silent forever.
+test('L10 a parked task nobody answers ends at its lease, as a deadline and not a user cancellation', async t => {
+  const session = setup(t);
+  let now = 0;
+  const adapter = fakeAdapter(() => [{kind: 'blocked', text: 'needs owner authorisation'}, {kind: 'result', status: 'completed', text: 'parked'}]);
+  const scheduler = createScheduler({session, adapters: {A: adapter}, clock: () => now, limits: {minutes: 1, ceiling: 3}, watchdog,
+    profiles: {b: {adapter: 'A', model: 'w', mode: 'yolo', fallback: []}}});
+  t.after(() => scheduler.close());
+  const row = scheduler.submit({parent: null, profile: 'b', orders: 'ask', deadline: null});
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'blocked');
+  const parkedAt = now;
+
+  now = parkedAt + 2 * MIN; await scheduler.tick();
+  assert.equal(scheduler.tasks()[row.task].state, 'blocked', 'inside its lease it is simply waiting');
+  assert.equal(session.events.some(e => e.kind === 'task.deadline' && e.task === row.task), false);
+
+  now = parkedAt + 3 * MIN + 1000; await scheduler.tick();
+  const deadline = await waitFor(() => session.events.find(e => e.kind === 'task.deadline' && e.task === row.task));
+  assert.equal(deadline.reason, 'unanswered');
+  assert.match(deadline.text, /needs owner authorisation/, 'the deadline says what went unanswered');
+  const cancelled = session.events.find(e => e.kind === 'task.cancelled' && e.task === row.task);
+  assert.equal(cancelled?.reason, 'deadline', 'bounce\'s decision, never recorded as the user\'s');
+  assert.equal(session.events.some(e => e.kind === 'policy.escalated' && e.task === row.task && e.reason === 'deadline'), true,
+    'and whoever submitted it is told');
+});

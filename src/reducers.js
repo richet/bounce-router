@@ -203,7 +203,18 @@ export function watchdog(events, now, {activity = new Map(), watchdog: cfg} = {}
   };
   const result = [];
   for (const t of Object.values(taskView)) {
-    if (t.state === 'blocked') { result.push({task: t.id, verdicts: ['blocked']}); continue; }
+    // A parked task — blocked, or asking its owner a question — has no worker left to watch: its process
+    // has exited, so no later row will change it on its own. It gets a lease all the same, measured from
+    // the moment it parked, so a wait nobody answers ends as a deadline instead of sitting forever.
+    if (t.state === 'blocked' || t.state === 'input_required') {
+      const parked = [...events].reverse().find(e => e.task === t.id && (e.kind === 'task.blocked' || e.kind === 'task.input_required'));
+      const parkedAt = parked ? Date.parse(parked.time) : null;
+      const verdicts = t.state === 'blocked' ? ['blocked'] : [];
+      const parkMs = cfg.ceilingMs ?? cfg.defaultDeadlineMs;
+      if (parkedAt !== null && parkMs && now - parkedAt > parkMs) verdicts.push('unanswered');
+      if (verdicts.length) result.push({task: t.id, stage: 'parked', parkedAt, verdicts});
+      continue;
+    }
     // A completion review is a worker turn too, with its own lease from `review.started` — the worker's
     // own elapsed time is not the reviewer's budget. Found live: a 24-minute review nothing was watching.
     const reviewing = t.state === 'reviewing';
