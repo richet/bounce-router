@@ -203,16 +203,48 @@ export function watchdog(events, now, {activity = new Map(), watchdog: cfg} = {}
   };
   const result = [];
   for (const t of Object.values(taskView)) {
-    if (t.state === 'blocked') { result.push({task: t.id, verdicts: ['blocked']}); continue; }
-    if (t.state !== 'running') continue;
+    // A parked task — blocked, or asking its owner a question — has no worker left to watch: its process
+    // has exited, so no later row will change it on its own. It gets a lease all the same, measured from
+    // the moment it parked, so a wait nobody answers ends as a deadline instead of sitting forever.
+    if (t.state === 'blocked' || t.state === 'input_required') {
+      const parked = [...events].reverse().find(e => e.task === t.id && (e.kind === 'task.blocked' || e.kind === 'task.input_required'));
+      const parkedAt = parked ? Date.parse(parked.time) : null;
+      const verdicts = t.state === 'blocked' ? ['blocked'] : [];
+      const parkMs = cfg.ceilingMs ?? cfg.defaultDeadlineMs;
+      if (parkedAt !== null && parkMs && now - parkedAt > parkMs) verdicts.push('unanswered');
+      if (verdicts.length) result.push({task: t.id, stage: 'parked', parkedAt, verdicts});
+      continue;
+    }
+    // A completion review is a worker turn too, with its own lease from `review.started` — the worker's
+    // own elapsed time is not the reviewer's budget. Found live: a 24-minute review nothing was watching.
+    const reviewing = t.state === 'reviewing';
+    if (t.state !== 'running' && !reviewing) continue;
     const root = lineageRoot(t.id);
-    const startedRows = events.filter(e => e.kind === 'task.started' && e.task === root);
+    const startedRows = reviewing
+      ? events.filter(e => e.kind === 'review.started' && e.task === t.id)
+      : events.filter(e => e.kind === 'task.started' && e.task === root);
     if (!startedRows.length) continue;
-    const startedAt = Date.parse(startedRows[0].time);
+    const startedAt = Date.parse(reviewing ? startedRows.at(-1).time : startedRows[0].time);
+    const ownStart = events.filter(e => e.kind === 'task.started' && e.task === t.id).at(-1);
     const submitted = events.find(e => e.kind === 'task.submitted' && e.task === root);
-    const deadlineMs = submitted?.deadline ?? cfg.defaultDeadlineMs;
-    const deadlineAt = startedAt + deadlineMs;
-    let progressAt = Date.parse(startedRows.at(-1).time);
+    // The deadline is a lease (docs/plans/task-leases.md): each `task.lease.renewed` adds one more, and
+    // none reaches past the ceiling. Two different clocks, deliberately: the CEILING is the lineage's
+    // wall-clock bound, measured from its first start; the LEASE belongs to the attempt running now and
+    // is measured from its own start. Found live: a fallback launched with 58 s of the lease
+    // left because its predecessor had burned 14 of the 15 minutes, so it could only fail. A fresh
+    // attempt is owed a full lease; the ceiling and the loop guard are what stop a job buying time by
+    // failing over and over (Daniel, 2026-09-22).
+    const leaseMs = submitted?.deadline ?? cfg.defaultDeadlineMs;
+    const leaseFrom = reviewing ? startedAt : Date.parse((ownStart ?? startedRows[0]).time);
+    const renewals = events.filter(e => e.kind === 'task.lease.renewed' && e.task === t.id && (reviewing ? e.stage === 'review' : !e.stage)).length;
+    const ceilingAt = startedAt + Math.max(cfg.ceilingMs ?? leaseMs, leaseMs);
+    const leaseStartAt = Math.min(leaseFrom + leaseMs * renewals, ceilingAt);
+    const deadlineAt = Math.min(leaseFrom + leaseMs * (renewals + 1), ceilingAt);
+    // Liveness is about THIS worker, so it is measured from this attempt's own start — never the
+    // lineage's. Found live: a fallback launched the second its predecessor died was escalated
+    // as "stalled for 843 s" one second later, because the root's start seeded its progress clock. Only
+    // the ceiling above spans the lineage; this and the lease both belong to the attempt.
+    let progressAt = Date.parse((reviewing ? startedRows.at(-1) : ownStart ?? startedRows.at(-1)).time);
     for (const e of events) {
       if (e.task !== t.id) continue;
       if (e.kind === 'task.milestone' || e.kind === 'task.usage' || e.kind === 'task.blocked') progressAt = Math.max(progressAt, Date.parse(e.time));
@@ -238,7 +270,7 @@ export function watchdog(events, now, {activity = new Map(), watchdog: cfg} = {}
     // F4/A7: absolute timestamps (a moment), never durations — lastActivityAt/lastProgressAt.
     // The policy that consumes this row (scheduler tick()) is the one place that turns them
     // into elapsed ms, under the duration names, inside its own evidence object.
-    if (verdicts.length) result.push({task: t.id, startedAt, deadlineAt, elapsed, lastActivityAt: activityAt, lastProgressAt: progressAt, expectUntil, verdicts});
+    if (verdicts.length) result.push({task: t.id, stage: reviewing ? 'review' : 'turn', startedAt, deadlineAt, leaseMs, leaseStartAt, renewals, ceilingAt, elapsed, lastActivityAt: activityAt, lastProgressAt: progressAt, expectUntil, verdicts});
   }
   return result;
 }

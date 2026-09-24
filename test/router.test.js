@@ -299,3 +299,63 @@ test('a persisted loaded-only load policy — the old default — migrates to on
   assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(file, 'utf8')).local.endpoints.lmstudio, 'loadPolicy'), false);
   assert.deepEqual(config(root).migratedProfiles, []);
 });
+
+// Found live: the orchestrator ran `tail -n 20` on its own journal and the
+// whole 143 KB of raw JSON came back as one tool row — into the chat, the journal and its own next packet.
+// A tool row keeps the command and the head of its output; the rest is counted, not carried.
+// Found live on screen: the orchestrator's `bounce publish --event '{…}'` printed its
+// whole escaped-JSON orders twice — once as `Running ·` when the command started, once as the tool row when
+// it finished. The command is as unbounded as its output was.
+// The orchestrator dispatches by shelling `bounce publish --event '<json>'`, so a whole brief — kind,
+// profile and 3 KB of orders — used to land on screen as escaped JSON, twice per task (Daniel, 2026-09-22:
+// "look at that json", "fold it too.. if I want to see it I can go to the agents view"). The orders reach
+// the worker and the journal either way; the chat says what the call was.
+test('a bounce event is folded to what it is, not the escaped JSON it was typed as', () => {
+  const orders = 'Implement the two independently reproduced P2 locking/journaling majors. ' + 'x'.repeat(3000);
+  const command = `/bin/zsh -lc "bounce publish --event '{\\"kind\\":\\"task.submitted\\",\\"profile\\":\\"integrator\\",\\"orders\\":\\"${orders}\\"}'"`;
+  const started = normalize('codex', {type: 'item.started', item: {type: 'command_execution', command}})[0];
+  assert.equal(started.kind, 'progress');
+  assert.equal(started.text, 'Running · bounce publish · task.submitted · integrator');
+  const finished = normalize('codex', {type: 'item.completed', item: {type: 'command_execution', command, aggregated_output: 'ok'}})[0];
+  assert.equal(finished.text, 'bounce publish · task.submitted · integrator\nok');
+  const waiting = `bounce publish --event '{"kind":"message","to":"worker:land","text":"${'y'.repeat(900)}"}'`;
+  assert.equal(normalize('codex', {type: 'item.completed', item: {type: 'command_execution', command: waiting, aggregated_output: ''}})[0].text,
+    'bounce publish · message · worker:land');
+
+  // The shape taken verbatim from a live session, which the first version of this fold did NOT handle: one
+  // command, quoted two different ways — `\\"kind\\"` at the head, plain `"depends_on"` at the tail —
+  // because the orchestrator switches quoting context mid-line. JSON.parse fails on it either way, so
+  // the fold reads the two fields it needs instead, and tolerates both.
+  // The orders prose carries its own quote — `Inspect … and \\"…\\" before acting` — escaped exactly the
+  // way the field delimiters are, so unescaping the line closes the string early and JSON.parse dies at
+  // the orders. This is the character that defeated the first fold; without it a fixture parses cleanly
+  // and proves nothing.
+  const prose = `Continue the patch. Inspect the current files and \\"the evidence dir\\" before acting. ${'o'.repeat(2300)}`;
+  const mixed = `/bin/zsh -lc "bounce publish --event '{\\"kind\\":\\"task.submitted\\",\\"parent\\":null,\\"profile\\":\\"integrator\\",\\"orders\\":\\"${prose}\\",\\"owned_paths\\":[\\"src/**\\"],"depends_on":[],"deadline":1800000}'"'"`;
+  assert.equal(mixed.length > 2400, true, 'the real one was 2,692 characters');
+  assert.equal(normalize('codex', {type: 'item.started', item: {type: 'command_execution', command: mixed}})[0].text,
+    'Running · bounce publish · task.submitted · integrator');
+});
+
+test('any other long command is cut in the middle, in both rows it appears in', () => {
+  const command = `rg -n "${'pattern|'.repeat(400)}" src`;
+  const started = normalize('codex', {type: 'item.started', item: {type: 'command_execution', command}})[0];
+  assert.equal(started.text.length < 260, true, `progress row is ${started.text.length} characters`);
+  assert.match(started.text, /^Running · rg -n/);
+  const finished = normalize('codex', {type: 'item.completed', item: {type: 'command_execution', command, aggregated_output: 'ok'}})[0];
+  assert.equal(finished.text.length < 300, true, `tool row is ${finished.text.length} characters`);
+  assert.match(finished.text, /…/, 'the middle of a long command is dropped, not the whole row');
+  assert.match(finished.text, /\nok$/, 'its output still follows');
+});
+
+test('a tool row carries the command and a bounded head of its output, never the whole dump', () => {
+  const output = Array.from({length: 4000}, (_, i) => `line ${i} of json noise`).join('\n');
+  const row = normalize('codex', {type: 'item.completed', item: {type: 'command_execution', command: 'tail -n 20 journal.jsonl', aggregated_output: output}})[0];
+  assert.equal(row.kind, 'tool');
+  assert.equal(row.text.startsWith('tail -n 20 journal.jsonl\nline 0 of json noise'), true, 'the command and the start of what it printed');
+  assert.equal(row.text.length < 4500, true, `kept ${row.text.length} characters`);
+  assert.match(row.text, /\n… \+\d+ more lines \(\d+ KB\) not shown$/);
+  // a small output is untouched
+  const small = normalize('codex', {type: 'item.completed', item: {type: 'command_execution', command: 'echo hi', aggregated_output: 'hi'}})[0];
+  assert.equal(small.text, 'echo hi\nhi');
+});

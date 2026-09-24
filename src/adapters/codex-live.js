@@ -100,8 +100,16 @@ const request = (handle, {method, params}) => new Promise((resolve, reject) => {
   }
 });
 
+// codex logs its own tracing to stderr (timestamp, level, module path) — MCP transport errors, config
+// warnings. Found live (2026-09-22): 23 identical `rmcp::transport` lines in one session's transcript,
+// none of them actionable from bounce. They are counted and summarised once per turn; anything else
+// codex writes to stderr still comes through line by line.
+const ANSI = /\x1b\[[0-9;]*m/g;
+export const vendorTracing = text => /^\s*\d{4}-\d\d-\d\dT[\d:.]+Z\s+(TRACE|DEBUG|INFO|WARN|ERROR)\s+[\w]+(::[\w]+)+/.test(String(text ?? '').replace(ANSI, ''));
+
 function permissionsFor(profile = {}, peer) {
-  const effective = profile.policy === 'read-only' ? 'read-only' : profile.mode === 'plan' ? 'plan' : 'yolo';
+  // probe runs commands and writes nothing: exactly what codex's read-only sandbox enforces.
+  const effective = profile.policy === 'read-only' || profile.policy === 'probe' ? 'read-only' : profile.mode === 'plan' ? 'plan' : 'yolo';
   const dynamicTools = reportGrant(profile, peer) ? {dynamicTools: [REPORT_TOOL_SPEC]} : {};
   if (effective === 'yolo') {
     return {thread: {approvalPolicy: 'never', sandbox: 'danger-full-access', ...dynamicTools},
@@ -251,7 +259,11 @@ async function pump(handle, source) {
       if (event.text.length <= MAX_LINE) receive(handle, event.text);
       continue;
     }
-    if (event.kind === 'diagnostic') { handle.stream.push(event); continue; }
+    if (event.kind === 'diagnostic') {
+      if (vendorTracing(event.text)) { handle.tracing = (handle.tracing ?? 0) + 1; continue; }
+      handle.stream.push({...event, text: String(event.text).replace(ANSI, '')});
+      continue;
+    }
     if (event.kind === 'error') {
       handle.launchError = Object.assign(new Error(event.text), {code: event.code});
       handle.stream.push({kind: 'error', code: event.code, text: event.text});
@@ -264,6 +276,10 @@ async function pump(handle, source) {
     }
     terminalEvent = true;
     break;
+  }
+  if (handle.tracing) {
+    handle.stream.push({kind: 'diagnostic', text: `codex logged ${handle.tracing} tracing line${handle.tracing === 1 ? '' : 's'} on stderr (its own ~/.codex/config.toml); hidden here`});
+    handle.tracing = 0;
   }
   if (!terminalEvent && !handle.cancelled && !handle.resulted) {
     handle.resulted = true;
@@ -319,7 +335,7 @@ export function createCodexLive({spawn = spawnProcess, kill = process.kill, conn
 
   return {
     name: 'codex',
-    capabilities: () => ({live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'], executionPolicies: ['read-only', 'plan', 'yolo'], quota: 'query'}),
+    capabilities: () => ({live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'], executionPolicies: ['read-only', 'probe', 'plan', 'yolo'], quota: 'query'}),
 
     async launch({peer, profile, orders = '', cwd, dir, userImages = []}) {
       const handle = await connect({profile, peer, cwd, dir});

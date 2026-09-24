@@ -143,7 +143,7 @@ test('P4 error messages, one case each', () => {
   assert.throws(() => validateOrchestration({...base, profiles: {main: {adapter: 'claude', mode: 'sideways'}}}),
     {message: 'profile main: mode must be yolo or plan'});
   assert.throws(() => validateOrchestration({...base, profiles: {main: {adapter: 'claude', policy: 'delete'}}}),
-    {message: 'profile main: policy must be write or read-only'});
+    {message: 'profile main: policy must be write, read-only or probe'});
   assert.throws(() => validateOrchestration({...base, profiles: {main: {adapter: 'claude'}, build: {adapter: 'claude', fallback: ['ghost']}}}),
     {message: 'profile build: fallback must list known profiles'});
   // Phase 8 §4: the role vocabulary is free-form now (any non-empty label except the reserved

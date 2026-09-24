@@ -115,11 +115,22 @@ export async function gatherLocalStatus({settings, verify = false, model: reques
   const roleTable = roles?.size && settings.operation === 'orchestrator' ? (await import('./agents.js')).agentTable(roles, settings) : [];
   // A "local worker" is an agent with a local AI in its chain — read off the same table.
   const workers = roleTable.filter(row => !row.error).flatMap(row => row.backends.filter(ref => ref.endsWith('(via opencode)')).slice(0, 1).map(ref => ({name: row.name, model: ref.replace(' (via opencode)', ''), policy: row.policy})));
-  return {catalogs, binary, installed, workers, loaded: loaded.length, bridge: verified, problem, note, roles: roleTable};
+  // What each endpoint is set to run at once, so the status can say what raising it costs.
+  const concurrency = Object.entries(local.endpoints ?? {}).map(([endpoint, settings]) => ({
+    endpoint, maxConcurrent: settings.maxConcurrent ?? 1, slotsPerModel: settings.slotsPerModel ?? 1}));
+  return {catalogs, binary, installed, workers, loaded: loaded.length, bridge: verified, problem, note, roles: roleTable, concurrency};
 }
 
-export function formatLocalStatus({catalogs, binary, installed = true, workers, bridge, problem, note, roles = []}, {verifyHint, setupHint} = {}) {
+export function formatLocalStatus({catalogs, binary, installed = true, workers, bridge, problem, note, roles = [], concurrency = []}, {verifyHint, setupHint} = {}) {
   const lines = [];
+  // One GPU serves every local worker: running more at once gets no more work done, it only makes each
+  // task wait longer — and a task that waits longer is a task that dies on its lease. Measured at a 95K
+  // prompt: total prefill flat at ~1,450 tok/s across 1, 2 and 4 in flight, wall time ×1.0, ×2.1, ×4.3.
+  for (const row of concurrency) {
+    if (row.maxConcurrent > 1) lines.push(`Note: ${row.endpoint} runs ${row.maxConcurrent} local workers at once. The machine gets no faster — one GPU serves them all — so each task takes about ${row.maxConcurrent}× as long and is likelier to hit its lease. One at a time is the default.`);
+    if (row.slotsPerModel > 1) lines.push(`Note: ${row.endpoint} gives each model ${row.slotsPerModel} slots. Same trade as above: no faster overall, ${row.slotsPerModel}× the latency per task.`);
+  }
+  if (lines.length) lines.push('');
   if (problem) lines.push(`NOT READY (${problem.stage}): ${problem.text}`, `  → ${problem.next}`, '');
   else if (note) lines.push(note, '');
   for (const catalog of catalogs) {

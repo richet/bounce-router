@@ -40,11 +40,17 @@ function endpointConfig(id, input) {
   // minutes for an endpoint slot while its own model sat idle.
   if (input.slotsPerModel !== undefined && (!Number.isInteger(input.slotsPerModel) || input.slotsPerModel < 1)) throw error(`Endpoint ${id} slotsPerModel must be a positive integer`);
   if (input.contextTokens !== undefined && (!Number.isInteger(input.contextTokens) || input.contextTokens < 4096)) throw error(`Endpoint ${id} contextTokens must be a whole number of tokens, at least 4096`);
+  // The memory gate (src/resources.js): the reserve kept free beside a model's weights, how long a task
+  // may wait for memory before its submitter is told, and how often the gate looks again.
+  if (input.reserveGb !== undefined && (!Number.isFinite(input.reserveGb) || input.reserveGb < 0)) throw error(`Endpoint ${id} reserveGb must be a non-negative number of gigabytes`);
+  if (input.waitMinutes !== undefined && (!Number.isInteger(input.waitMinutes) || input.waitMinutes < 1)) throw error(`Endpoint ${id} waitMinutes must be a positive whole number of minutes`);
+  if (input.pollMs !== undefined && (!Number.isInteger(input.pollMs) || input.pollMs < 1)) throw error(`Endpoint ${id} pollMs must be a positive integer`);
   const normalized = {backend: 'lmstudio', url: parsed.href.replace(/\/$/, ''), loadPolicy: input.loadPolicy ?? DEFAULT_ENDPOINT.loadPolicy, maxConcurrent: input.maxConcurrent ?? DEFAULT_ENDPOINT.maxConcurrent};
   if (input.apiKeyEnv) normalized.apiKeyEnv = input.apiKeyEnv;
   if (input.trusted) normalized.trusted = true;
   if (input.contextTokens !== undefined) normalized.contextTokens = input.contextTokens;
   if (input.slotsPerModel !== undefined) normalized.slotsPerModel = input.slotsPerModel;
+  for (const key of ['reserveGb', 'waitMinutes', 'pollMs']) if (input[key] !== undefined) normalized[key] = input[key];
   return normalized;
 }
 
@@ -169,7 +175,10 @@ function parseModels(payload, version, endpoint, overrides) {
     const serverTools = typeof row.capabilities?.trained_for_tool_use === 'boolean' ? row.capabilities.trained_for_tool_use : null;
     const tools = override.tools ?? serverTools;
     const context = override.context ?? positive(row.max_context_length ?? row.context_length);
-    return {id, ref: `${endpoint}/${id}`, label: typeof row.display_name === 'string' ? row.display_name : id, type: modelType(row.type), instances, context: context ?? null, tools, capabilitySource: override.tools !== undefined ? 'user' : serverTools !== null ? 'server' : 'unknown', ready: hasInstances ? instances.length > 0 : null};
+    // size and ttl: what src/resources.js needs to know whether a model can be loaded beside the rest.
+    const size = positive(Number(row.size_bytes));
+    const ttl = hasInstances ? positive(Number(row.loaded_instances[0]?.remaining_ttl_seconds)) : null;
+    return {id, ref: `${endpoint}/${id}`, label: typeof row.display_name === 'string' ? row.display_name : id, type: modelType(row.type), instances, context: context ?? null, tools, capabilitySource: override.tools !== undefined ? 'user' : serverTools !== null ? 'server' : 'unknown', ready: hasInstances ? instances.length > 0 : null, size: size ?? null, ttl};
   }).filter(Boolean);
 }
 
@@ -253,16 +262,18 @@ export function switchLocal(settings, on) {
   return on ? 'Local models: on · agents may run on the models LM Studio serves' : 'Local models: off · agents skip their local AIs and run on the rest of their list';
 }
 
-// The local models Jev may pick as the AI of an `auto` agent. Loaded, tool-capable models; only
-// when nothing is loaded are downloaded ones offered (choosing one costs a load). Each is described
+// Every tool-capable local model, loaded ones first. Which of them an agent is offered is decided in
+// src/jev.js (`offerable`: loaded, or named by the agent's own list). Each is described
 // by its roster note (`<endpoint>/<model>` in roster-notes.json) or, with none, conservatively.
 export function localCandidates(catalogs = [], notes = {}) {
   const usable = catalogs.flatMap(catalog => (catalog.models ?? []).filter(model => model.type !== 'embedding' && model.tools !== false && (model.ready === true || model.ready === false))
     .map(model => { const name = `${catalog.endpoint}/${model.id}`; const note = notes[name] ?? {};
-      return {name, endpoint: catalog.endpoint, model: model.id, loaded: model.ready === true, context: model.instances?.[0]?.context ?? model.context ?? null,
+      return {name, endpoint: catalog.endpoint, model: model.id, loaded: model.ready === true, size: model.size ?? null, context: model.instances?.[0]?.context ?? model.context ?? null,
         tier: ['cheapest', 'mid', 'strongest'].includes(note.tier) ? note.tier : 'cheapest', capabilities: note.capabilities || 'unknown local model: single-file reading only'}; }));
-  const loaded = usable.filter(item => item.loaded);
-  return loaded.length ? loaded : usable;
+  // Loaded first, then the rest: which of these Jev is actually offered is decided per agent in
+  // src/jev.js (loaded, or named by the agent's own `models:`), so a big downloaded model nobody
+  // asked for never enters the running.
+  return [...usable.filter(item => item.loaded), ...usable.filter(item => !item.loaded)];
 }
 
 export function resolveLocalModel({local, profile, catalogs, requirements = {}, override} = {}) {

@@ -10,7 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {Session} from '../src/core.js';
 import {createScheduler, WATCHDOG_DEFAULTS} from '../src/scheduler.js';
-import {taskLimits, breakdownOrders, TASK_MINUTES} from '../src/reload.js';
+import {taskLimits, breakdownOrders, TASK_MINUTES, TASK_CEILING_MINUTES} from '../src/reload.js';
 import {progressRow} from '../src/tui/status.js';
 import {conversationEvents} from '../src/tui/transcript.js';
 import {createFormatter} from '../src/format.js';
@@ -18,34 +18,41 @@ import {fakeAdapter} from './helpers/fake-adapter.js';
 
 const waitFor = async fn => { const start = Date.now(); for (;;) { const value = fn(); if (value) return value; if (Date.now() - start > 8000) throw new Error('timed out'); await new Promise(r => setTimeout(r, 10)); } };
 
-test('a task asked to run longer than the cap is refused before it launches, and the refusal says how to split it', async t => {
+test('a task asked to run longer than the ceiling is refused before it launches; one longer than the lease runs', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-chunk-')));
   t.after(() => fs.rmSync(root, {recursive: true, force: true}));
   const session = new Session(root, {root});
   const worker = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done'}]);
   const profiles = {build: {adapter: 'worker', model: 'w', mode: 'yolo', fallback: [], role: 'builder', policy: 'write'}};
-  const scheduler = createScheduler({session, adapters: {worker}, profiles, limits: {minutes: 15}});
+  const scheduler = createScheduler({session, adapters: {worker}, profiles, limits: taskLimits({})});
   t.after(() => scheduler.close());
-  const big = scheduler.submit({parent: null, profile: 'build', orders: 'finish P2', deadline: 40 * 60000});
+  const big = scheduler.submit({parent: null, profile: 'build', orders: 'finish P2', deadline: 90 * 60000});
   const refused = await waitFor(() => session.events.find(e => e.kind === 'task.failed' && e.task === big.task));
-  assert.deepEqual([refused.reason, refused.text], ['size', 'a 40-minute task exceeds the 15-minute cap: split it into phases in sequence (depends_on), each phase made of chunks that run in parallel on disjoint paths, none longer than 15 minutes']);
+  assert.deepEqual([refused.reason, refused.text], ['size', 'a 90-minute task exceeds the 60-minute ceiling: give it at most 60 minutes; bounce renews its lease while it makes progress']);
   assert.equal(worker.calls.launch, 0);
-  const chunk = scheduler.submit({parent: null, profile: 'build', orders: 'fix the exclude', deadline: 15 * 60000});
+  const chunk = scheduler.submit({parent: null, profile: 'build', orders: 'review the tree', deadline: 40 * 60000});
   await waitFor(() => scheduler.tasks()[chunk.task]?.state === 'completed');
   assert.equal(worker.calls.launch, 1);
 });
 
-test('the cap is 15 minutes unless the config says otherwise, and ORDERS teaches the breakdown with that number in it', () => {
-  assert.equal(TASK_MINUTES, 15);
-  assert.deepEqual(taskLimits({}), {minutes: 15});
-  assert.deepEqual(taskLimits({taskMinutes: 30}), {minutes: 30});
+test('the lease is 15 minutes and the ceiling 60 unless the config says otherwise, and ORDERS sizes by scope, not minutes', () => {
+  assert.deepEqual([TASK_MINUTES, TASK_CEILING_MINUTES], [15, 60]);
+  assert.deepEqual(taskLimits({}), {minutes: 15, ceiling: 60});
+  assert.deepEqual(taskLimits({taskMinutes: 30}), {minutes: 30, ceiling: 60});
+  assert.deepEqual(taskLimits({taskMinutes: 90}), {minutes: 90, ceiling: 90});
+  assert.deepEqual(taskLimits({taskMinutes: 10, taskCeilingMinutes: 45}), {minutes: 10, ceiling: 45});
   for (const bad of [0, -5, 1.5, '20', 999]) assert.throws(() => taskLimits({taskMinutes: bad}), /taskMinutes must be a whole number of minutes from 1 to 240/);
-  const lines = breakdownOrders(15, {jevOn: true});
+  for (const bad of [0, 1.5, '20', 999]) assert.throws(() => taskLimits({taskCeilingMinutes: bad}), /^Error: taskCeilingMinutes must be a whole number of minutes from 1 to 240, and at least taskMinutes$/);
+  assert.throws(() => taskLimits({taskMinutes: 30, taskCeilingMinutes: 20}), /taskCeilingMinutes must be a whole number of minutes from 1 to 240, and at least taskMinutes/);
+  const lines = breakdownOrders(15, {jevOn: true, ceiling: 60});
   assert.equal(lines[0], 'Break big work down: phases in sequence, each phase made of chunks that run in parallel.');
+  assert.equal(lines[1], 'A task runs under a 15-minute lease that bounce renews while the worker makes progress, up to a 60-minute ceiling; a deadline over the ceiling is refused (task.failed, reason size) before anything runs. Size a chunk by scope (one owner, one acceptance), not by minutes: long work is normal.');
   const text = lines.join('\n');
-  for (const part of ['No task may be given more than 15 minutes', 'a deadline over that is refused (task.failed, reason size)', 'depends_on', 'disjoint owned paths', 'Review each phase before the next one starts', 'never hand one worker the whole job'])
+  for (const part of ['depends_on', 'disjoint owned paths', 'Review each phase before the next one starts', 'never hand one worker the whole job',
+    'A chunk that stops making progress or reaches the ceiling is asked for its conclusion and reported as is: resubmit what is left with that progress in its orders, or drop it.'])
     assert.equal(text.includes(part), true, part);
-  assert.equal(breakdownOrders(30).join('\n').includes('more than 30 minutes'), true);
+  for (const gone of ['No task may be given more than', 'split what is left', 'do not extend it', 'smaller']) assert.equal(text.includes(gone), false, gone);
+  assert.equal(breakdownOrders(15, {ceiling: 60}).join('\n').includes('a deadline over the ceiling, and'), true);
 });
 
 test('the stall alarm does not fire on a test run: silence means five minutes, and no milestone for ten is still a stall', () => {

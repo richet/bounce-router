@@ -36,8 +36,8 @@ test('discovers v1 metadata, keeps embeddings, and sends env auth without catalo
   assert.equal(calls[0][0], 'http://127.0.0.1:1234/api/v1/models');
   assert.equal(calls[0][1].Authorization, 'Bearer secret');
   assert.deepEqual(result[0].models, [
-    {id: 'org/model', ref: 'office/org/model', label: 'org/model', type: 'llm', instances: [{id: 'one', context: 4096, parallel: 2}], context: 8192, tools: true, capabilitySource: 'server', ready: true},
-    {id: 'embed', ref: 'office/embed', label: 'embed', type: 'embedding', instances: [], context: 2048, tools: null, capabilitySource: 'unknown', ready: false},
+    {id: 'org/model', ref: 'office/org/model', label: 'org/model', type: 'llm', instances: [{id: 'one', context: 4096, parallel: 2}], context: 8192, tools: true, capabilitySource: 'server', ready: true, size: null, ttl: null},
+    {id: 'embed', ref: 'office/embed', label: 'embed', type: 'embedding', instances: [], context: 2048, tools: null, capabilitySource: 'unknown', ready: false, size: null, ttl: null},
   ]);
   assert.doesNotMatch(JSON.stringify(result), /secret/);
 });
@@ -49,7 +49,7 @@ test('falls back only for unsupported native versions and represents old metadat
     return paths.length === 1 ? response({}, 404) : response({data: [{id: 'old', type: 'llm', state: 'loaded', max_context_length: 1000}]});
   }});
   assert.deepEqual(paths, ['/api/v1/models', '/api/v0/models']);
-  assert.deepEqual(result[0].models[0], {id: 'old', ref: 'a/old', label: 'old', type: 'llm', instances: [], context: 1000, tools: null, capabilitySource: 'unknown', ready: null});
+  assert.deepEqual(result[0].models[0], {id: 'old', ref: 'a/old', label: 'old', type: 'llm', instances: [], context: 1000, tools: null, capabilitySource: 'unknown', ready: null, size: null, ttl: null});
   let count = 0;
   const auth = await discoverLocalModels(local({b: {backend: 'lmstudio', url: 'http://127.0.0.1:1236'}}), {maxAge: 0, fetchImpl: async () => { count++; return response({}, 401); }});
   assert.equal(count, 1); assert.match(auth[0].error, /authentication/i);

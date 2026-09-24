@@ -102,13 +102,19 @@ export function homeSessionWarning(cwd, home = os.homedir()) {
   return `This session is in your home folder (${path.resolve(home)}): every worker runs, reads and edits from here, not inside a project. Quit and start bounce from the project folder.`;
 }
 
-// How long ONE task may be given (config.json `taskMinutes`). The scheduler refuses a longer
-// deadline, and the orders say so up front, so big work arrives already broken down.
+// How long ONE task runs before bounce looks at it (config.json `taskMinutes`): a lease, renewed
+// while the worker makes progress, up to `taskCeilingMinutes`. Found live: a hard 15-minute cap
+// killed every local reviewer mid-review, and the orchestrator answered by shrinking the next one.
+// The ceiling is the only size limit: a longer deadline is refused before anything runs.
 export const TASK_MINUTES = 15;
+export const TASK_CEILING_MINUTES = 60;
+const wholeMinutes = value => Number.isInteger(value) && value >= 1 && value <= 240;
 export function taskLimits(settings = {}) {
   const minutes = settings.taskMinutes ?? TASK_MINUTES;
-  if (!Number.isInteger(minutes) || minutes < 1 || minutes > 240) throw new Error('taskMinutes must be a whole number of minutes from 1 to 240');
-  return {minutes};
+  if (!wholeMinutes(minutes)) throw new Error('taskMinutes must be a whole number of minutes from 1 to 240');
+  const ceiling = settings.taskCeilingMinutes ?? Math.max(TASK_CEILING_MINUTES, minutes);
+  if (!wholeMinutes(ceiling) || ceiling < minutes) throw new Error('taskCeilingMinutes must be a whole number of minutes from 1 to 240, and at least taskMinutes');
+  return {minutes, ceiling};
 }
 // Who a task is submitted to. Found live: with Jev on, local on and every agent on `auto`, the
 // orchestrator sent every task to a cloud profile by name — which skips Jev and the local models.
@@ -128,24 +134,52 @@ export function choosingOrders({agents = false, routingOn = false, localOn = fal
     routingOn ? 'Do not pick a tier or a model yourself: for an agent or `auto`, Jev weighs the orders and picks the AI per task.'
       : 'An agent runs on the AIs in the order its file lists them; naming a profile skips that list.',
     'Once you have dispatched a task, end your turn: say in a line what you dispatched and what comes next, then stop. bounce wakes you with each outcome as your next turn (a `handoff` row), so nothing is lost. Do not hold your turn open in `bounce wait` while workers run — a turn held open keeps its whole context live and idle (observed: 74% of a 35-minute turn spent waiting), and do not investigate the same question yourself in parallel — that spends the worker\'s whole slot for nothing. If you must take the work back, cancel the task first.',
-    ...(localOn ? ['Local models are part of the normal path, not a special request: an agent runs on a local model when one fits the task, at no cost — do not wait for the user to ask for them, and do not route around them by naming a cloud profile.'] : []),
+    ...(localOn ? ['Local models are part of the normal path, not a special request: an agent runs on a local model when one fits the task, at no cost — do not wait for the user to ask for them, and do not route around them by naming a cloud profile.',
+      'They are bounded by this machine\'s memory: bounce loads what fits, unloads an idle model to make room, and waits when nothing fits (it tells you if a task waits too long). While the machine is swapping it will not run a local worker at all: that task goes to the agent\'s next AI. You never manage memory yourself.'] : []),
     ''];
 }
 
 // The breakdown the orchestrator is held to, in its standing orders.
-export const breakdownOrders = (minutes, {jevOn = false} = {}) => [
+// Whose task is this, for the bus grant? A task the orchestrator submitted, or a replacement bounce made
+// for one — a fallback is submitted `from: bounce`, but the work is still the orchestrator's and it must be
+// able to submit under it. Found live: a rework under a fallback replacement was refused `-32001
+// unauthorized` on both transports, and the campaign stopped with the fix already written. Cycle-guarded.
+// Every task the orchestrator owns, for seeding its bus grant at startup. The grant is otherwise built
+// empty and widened only by rows arriving live, so a restart disowned everything from before it — and a
+// submit parented under earlier work was refused. Finished tasks are included: they can still be parents.
+export function orchestratorTasks(events) {
+  const owned = [];
+  for (const e of events) if (e.kind === 'task.submitted' && orchestratorOwns(events, e.task)) owned.push(e.task);
+  return owned;
+}
+
+export function orchestratorOwns(events, task) {
+  const seen = new Set();
+  let id = task;
+  while (id && !seen.has(id)) {
+    seen.add(id);
+    const row = events.find(e => e.kind === 'task.submitted' && e.task === id);
+    if (!row) return false;
+    if (row.from === 'orchestrator') return true;
+    id = row.replaces;
+  }
+  return false;
+}
+
+export const breakdownOrders = (minutes, {jevOn = false, ceiling = Math.max(TASK_CEILING_MINUTES, minutes)} = {}) => [
   'Break big work down: phases in sequence, each phase made of chunks that run in parallel.',
-  `No task may be given more than ${minutes} minutes: a deadline over that is refused (task.failed, reason size) before anything runs.`,
+  `A task runs under a ${minutes}-minute lease that bounce renews while the worker makes progress, up to a ${ceiling}-minute ceiling; a deadline over the ceiling is refused (task.failed, reason size) before anything runs. Size a chunk by scope (one owner, one acceptance), not by minutes: long work is normal.`,
   'However large the request, never hand one worker the whole job. Plan the phases first; within a phase submit every chunk whose',
   'owned paths are disjoint at once, so they run in parallel; give a task that needs another\'s result depends_on with its task id, so',
   'phases run in sequence without you polling. Each chunk gets disjoint owned paths, its own acceptance and how to verify it.',
   'Before dispatching a phase, submit its plan and read the answer:',
   `    bounce publish --event '{"kind":"plan.submitted","phase":"<phase name>","chunks":[{"id":"<short id>","profile":"<agent>","orders":"<goal, acceptance, how to verify>","owns":["<path or glob>"],"depends_on":["<chunk id>"],"deadline":${minutes * 60000}}]}'`,
-  `${jevOn ? 'Jev judges each chunk — phase-sized, no acceptance, overlapping paths, hidden dependency — and bounce' : 'bounce checks each chunk for overlapping owned paths and a deadline over the cap, and'} answers with plan.accepted`,
+  `${jevOn ? 'Jev judges each chunk — phase-sized, no acceptance, overlapping paths, hidden dependency — and bounce' : 'bounce checks each chunk for overlapping owned paths and a deadline over the ceiling, and'} answers with plan.accepted`,
   'or plan.rejected (findings per chunk, with the fix). Fix a rejected plan and submit it again; submit the chunks of an accepted one',
   'with the same `owns` and `depends_on`.',
+  'A review of a whole phase, or of more than one risk area, is heavy: split it into one reviewer per area (for example locking and journaling, ownership, the CLI), each with the verification commands for its area. Reviewers probe: they run commands but cannot change the tree.',
   'Review each phase before the next one starts: read what the chunks produced, integrate, run the gate, then submit the next',
-  'phase. A chunk that runs out of time is reported as is — split what is left; do not extend it.', ''];
+  'phase. A chunk that stops making progress or reaches the ceiling is asked for its conclusion and reported as is: resubmit what is left with that progress in its orders, or drop it.', ''];
 
 export function buildProfiles(settings) {
   return {main: {adapter: settings.order[0], mode: settings.mode, fallback: settings.order.slice(1)}};
@@ -231,6 +265,14 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     '',
     ...choosingOrders({agents: Object.entries(profiles).some(isAgentHead), routingOn, localOn: (() => { try { return normalizeLocalSettings(settings.local).enabled && adapterNames.includes('opencode'); } catch { return false; } })()}),
     'Submit work with `bounce publish --event <json>`; its outcome reaches you as a handoff when you end your turn.',
+    'When bounce\'s MCP tools are available to you (submit, wait, report, task_get, tasks_list), use them instead of these commands: the answers come back structured and bounded. The commands stay as the fallback.',
+    'End every turn by writing where the campaign is — the `state` tool, or `bounce publish --event \'{"kind":"state","text":"…"}\'`. It is one living note you rewrite each turn, not a log: the phase, what is done, what is next, and why you changed course. It is the first thing you are given when you wake, so write it for a reader who has nothing else. Keep it under 2000 characters; bounce tells you when it is too long and never cuts it for you.',
+    'A task killed at its ceiling or for silence is not to be resubmitted unchanged: change the scope or the AI first. Bounce refuses a third identical attempt (task.failed, reason repeat), and each handoff tells you when a job has failed the same way before.',
+    'To see what a task is doing or what it produced, ask `task_get` (or `bounce task <id>`), and `tasks_list` (or `bounce tasks`) for everything live. Never read a session journal with tail, cat, jq or grep: it is the raw log, it is what bounce already summarised for you, and one read of it has put 143 KB into a turn.',
+    // Found live: the summary is cut at 1,200 characters, and with the journal forbidden the
+    // orchestrator had no way to the rest of a 12 KB verdict — it hunted, gave up, and started redoing the
+    // reviewer's work. The way exists now, so the orders are where it is named.
+    'That view is bounded on purpose, so its summary is cut. When a task has finished and you need its verdict whole — every finding, its repro and its observed output — ask `task_get` with `full: true` (or `bounce task <id> --report`). That is the one way to the full text, and the reason you never need the journal.',
     'Example — submit one task, then end your turn:',
     `    bounce publish --event '{"kind":"task.submitted","parent":null,"profile":"${defaultTarget(profiles, orchestrator, {routingOn})}","orders":"<goal, owned paths, acceptance, how to verify>","deadline":${taskLimits(settings).minutes * 60000}}'`,
     '`bounce wait` is for a short wait only, at most 120 seconds, when the very next step depends on an outcome you expect within it:',
@@ -251,7 +293,7 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     'with reason `user`, or task.rejected mean stop and report that reason to the user. A refusal is such a task.failed row — read it before retrying.',
     'Terminal rows: task.completed, task.failed, task.cancelled, task.rejected. Steer a running worker with',
     `    bounce publish --event '{"kind":"message","to":"worker:<task id>","text":"..."}'`, '',
-    ...breakdownOrders(taskLimits(settings).minutes, {jevOn: Boolean(jev?.enabled)}),
+    ...breakdownOrders(taskLimits(settings).minutes, {jevOn: Boolean(jev?.enabled), ceiling: taskLimits(settings).ceiling}),
     'Progress is a durable contract, not a heartbeat. Publish task.milestone with task, phase, text, next, and evidence',
     'after initial inspection, every phase change, and before completion. Phases: inspect, plan, implement, test,',
     'verify, review, document, done. `text` says what changed, `next` says what happens next, and `evidence` names',
@@ -395,7 +437,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // orchestrator grant (canSubmit, its own context, no tasks — never the user grant), its profile
   // to run on, and a standing brief on disk; classic mode reaches none of this.
   const orchestratorProfile = orchestrating ? orchestration.profiles[orchestration.orchestrator] : null;
-  const orchestratorGrant = orchestrating ? bus.grant({peer: 'orchestrator', canSubmit: true, tasks: [], context: session.id}) : null;
+  const orchestratorGrant = orchestrating ? bus.grant({peer: 'orchestrator', canSubmit: true, tasks: orchestratorTasks(session.events), context: session.id}) : null;
   // A read-only home or similar must not take the session down: the ORDERS.md pointer would
   // simply dangle, same as before this skill existed. Silence is the wrong answer for the
   // outcomes that leave the pointer dangling or the skill stale, though — those are said out
@@ -434,7 +476,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // scheduler stays unaware of the bus; token paths are daemon-side state, never journaled.
   const workerTokens = new Map(); // peer -> token file, for the life of that worker's grant
   const grantsUnsubscribe = !orchestrating ? () => {} : session.subscribe(row => {
-    if (row.kind === 'task.submitted' && row.from === 'orchestrator') bus.extendGrant('orchestrator', [row.task]);
+    if (row.kind === 'task.submitted' && orchestratorOwns(session.events, row.task)) bus.extendGrant('orchestrator', [row.task]);
     else if (row.kind === 'task.started') {
       const peer = `worker:${row.task}`;
       workerTokens.set(peer, bus.grant({peer, tasks: [row.task], context: row.context,

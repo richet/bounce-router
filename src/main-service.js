@@ -3,13 +3,21 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {handoff} from './core.js';
+import {failedAttempts} from './loop-guard.js';
 import {imagePaths, saveImages, providerInput} from './images.js';
 import {cooldowns, tasks, TERMINAL} from './reducers.js';
 
 // The rows that end a task for the orchestrator's purposes (mirrors bus.js's TASK_TERMINAL).
-const HANDOFF_KINDS = new Set(['task.completed', 'task.accepted', 'task.failed', 'task.cancelled', 'task.deadline', 'task.rejected']);
+// `blocked` and `input_required` are here because a parked task is news, not a resting state: its worker
+// has exited, so no later row will change it, no watchdog covers it (reducers.js skips both) and no parent
+// settles on it. Found live in three sessions — 40 minutes, 89 minutes, and one that simply ran out of
+// journal — each ended only by the user cancelling. The row itself carries the question that was waiting.
+const HANDOFF_KINDS = new Set(['task.completed', 'task.accepted', 'task.failed', 'task.cancelled', 'task.deadline', 'task.rejected',
+  'task.blocked', 'task.input_required']);
+const PARKED = new Set(['blocked', 'input_required']);
 const HANDOFF_TEXT_MAX = 2000; // per task: a final report summary or failure text, never a transcript
 const HANDOFF_DELAY_MS = 1000; // several tasks ending together become one wake-up turn
+const DEAD_END_PROMPT = 'Your last turn dispatched nothing and nothing of yours is running, so no outcome can arrive and bounce cannot wake you again. Check whether a submission of yours was refused (the refusal says why), then either dispatch the work or tell the user plainly what is blocking it and what you need. Do not end this turn expecting an outcome that nothing will produce.';
 const WAKE_PROMPT = 'Continue your orders. The worker outcomes above were not returned by any wait of yours and have not been reported to the user: synthesize them now (what each task produced, what failed and why, what remains). If a task you still need is listed as running, wait on it with `bounce wait` before reporting. Do not re-run finished work.';
 
 // A task is the orchestrator's when the root of its `replaces` lineage was submitted by the
@@ -21,6 +29,20 @@ function orchestratorsTask(session, view, id) {
   return session.events.find(e => e.kind === 'task.submitted' && e.task === id)?.from === 'orchestrator';
 }
 const replaced = (session, id) => session.events.some(e => e.kind === 'task.submitted' && e.replaces === id && e.task !== id);
+
+// A child's outcome travels up only while an ancestor is still alive to carry it. Found live: the
+// orchestrator named an already-accepted task as the parent, so the chain was terminal on arrival and two
+// finished tasks woke nobody. Cycle-guarded, like the replaces walk above it.
+function carriedByAncestor(view, id) {
+  const seen = new Set();
+  let parent = view[id]?.parent;
+  while (parent && view[parent] && !seen.has(parent)) {
+    if (!TERMINAL.has(view[parent].state)) return true;
+    seen.add(parent);
+    parent = view[parent].parent;
+  }
+  return false;
+}
 
 // The wake-up block: one entry per task whose end the orchestrator has not been handed, with
 // the terminal row's outcome — the final report summary (task.reported, folded by the scheduler
@@ -34,6 +56,11 @@ export function handoffBlock(session, ended) {
     const outcome = row.summary ?? row.text ?? (Array.isArray(row.questions) && row.questions.length ? row.questions.join('; ') : null) ?? t.summary ?? t.error ?? '';
     lines.push(`- task ${row.task} · profile ${t.profile ?? '?'} · ${row.kind}${row.reason ? ` · reason: ${row.reason}` : ''}${t.replaces ? ` · replaces ${t.replaces}` : ''}`);
     if (outcome) lines.push(`  ${String(outcome).slice(0, HANDOFF_TEXT_MAX).replace(/\n/g, '\n  ')}`);
+    // You see one outcome at a time; bounce sees the pattern. Found live: ten identical reviewer tasks,
+    // each killed at its ceiling and resubmitted, because no single handoff showed the repetition.
+    const submitted = session.events.find(e => e.kind === 'task.submitted' && e.task === row.task);
+    const earlier = submitted ? failedAttempts(session.events.filter(e => e.task !== row.task), submitted) : [];
+    if (earlier.length) lines.push(`  this job has now failed ${earlier.length + 1} times the same way (${[...earlier.map(a => a.reason), row.reason ?? row.kind].join(', ')}): change the scope or the AI before asking again — bounce refuses a third identical attempt.`);
   }
   lines.push(running.length ? `Still running: ${running.map(t => `${t.id} (${t.profile}, ${t.state})`).join(', ')}` : 'No other task of yours is still running.');
   return lines.join('\n');
@@ -93,7 +120,17 @@ export function createMainService({session, adapters, profile, settings, profile
       return;
     }
     // Whatever ended during the turn without being returned by one of its waits wakes it now.
-    if (pendingHandoffs().length) arm();
+    if (pendingHandoffs().length) { arm(); return; }
+    // A turn that ends with nothing running and no outcome owed is a dead end: no row will ever arrive,
+    // so no wake can ever fire. Found live: a turn ended saying bounce would "resume the campaign with the
+    // verdict" after its only submit had been refused. The user is told in their own transcript, and the
+    // orchestrator is woken once to see it — once, never a loop: a wake that itself dispatches nothing
+    // ends here quietly, because by then the orchestrator has been told and it is the user's move.
+    if (!run.wake && !anythingRunning() && planAwaitingDispatch()) {
+      session.append({kind: 'status', text: 'That turn dispatched nothing and nothing is running, so no outcome can arrive. Waking the orchestrator once to look; after that it is your move.'});
+      deadEndNudge = true;
+      arm();
+    }
   }
   async function execute(run, params) {
     const tried = new Set();
@@ -205,7 +242,10 @@ export function createMainService({session, adapters, profile, settings, profile
   // an outcome yet: its replacement's end is.
   function pendingHandoffs() {
     const view = tasks(session.events);
-    const started = new Set(session.events.filter(event => event.kind === 'main.started').map(event => event.requestId));
+    // Delivered means the wake turn REPORTED, not that it started: a wake that was interrupted, or that
+    // returned nothing, told the orchestrator nothing and its outcomes are still owed.
+    const finished = new Set(session.events.filter(event => event.kind === 'main.terminal' && event.status === 'completed').map(event => event.requestId));
+    const started = new Set(session.events.filter(event => event.kind === 'main.started' && finished.has(event.requestId)).map(event => event.requestId));
     const byHand = row => row.from === 'orchestrator' || row.from === 'user';
     const seen = row => session.events.some(e => (e.kind === 'wait.served' && e.task === row.task && (!(e.served < row.seq) || byHand(row)))
       || (e.kind === 'handoff' && started.has(e.requestId) && e.seq > row.seq && e.tasks?.includes(row.task)));
@@ -213,10 +253,25 @@ export function createMainService({session, adapters, profile, settings, profile
     for (const row of session.events) {
       if (!HANDOFF_KINDS.has(row.kind)) continue;
       const t = view[row.task];
-      if (!t || t.parent || !TERMINAL.has(t.state) || replaced(session, row.task) || !orchestratorsTask(session, view, row.task)) continue;
+      if (!t || carriedByAncestor(view, row.task) || !(TERMINAL.has(t.state) || PARKED.has(t.state)) || replaced(session, row.task) || !orchestratorsTask(session, view, row.task)) continue;
       byTask.set(row.task, row);
     }
     return [...byTask.values()].filter(row => !seen(row));
+  }
+  // A plan bounce accepted, with nothing dispatched since. That is the shape of the dead end worth
+  // acting on: the orchestrator got its go-ahead and then ended the turn without submitting a chunk —
+  // usually because a submit was refused. An ordinary turn that dispatches nothing (a question answered,
+  // a campaign finished) is not this, and must not be nudged.
+  function planAwaitingDispatch() {
+    const accepted = session.events.findLast(row => row.kind === 'plan.accepted');
+    if (!accepted) return false;
+    const dispatched = session.events.findLast(row => row.kind === 'task.submitted');
+    return !dispatched || dispatched.seq < accepted.seq;
+  }
+  // Any task of the orchestrator's that could still produce an outcome.
+  function anythingRunning() {
+    const view = tasks(session.events);
+    return Object.values(view).some(t => !TERMINAL.has(t.state) && orchestratorsTask(session, view, t.id));
   }
   function start(params, {wake}) {
     if (closed) return {accepted: false, reason: 'daemon_closed'};
@@ -264,13 +319,15 @@ export function createMainService({session, adapters, profile, settings, profile
   // happened?". Coalesced over a short window; a user prompt that lands first wins (start()
   // gives it the same block) and the timer finds nothing left to do. Classic mode never
   // constructs this service (reload.js), so nothing here can fire outside orchestrator mode.
-  let wakeTimer = null, wakeRetried = false;
+  let wakeTimer = null, wakeRetried = false, deadEndNudge = false;
   function wake() {
     wakeTimer = null;
     if (closed || current) return;
     const ended = pendingHandoffs();
-    if (!ended.length) return;
-    const result = start({text: WAKE_PROMPT}, {wake: true});
+    if (!ended.length && !deadEndNudge) return;
+    const nudging = !ended.length && deadEndNudge;
+    deadEndNudge = false;
+    const result = start({text: nudging ? DEAD_END_PROMPT : WAKE_PROMPT}, {wake: true});
     if (!result.accepted && result.reason !== 'busy') session.append({kind: 'status', text: `Worker outcomes not handed to the orchestrator: ${result.reason}; they ride on the next prompt`});
   }
   // The timer is ref'd on purpose: a pending wake-up is work the daemon owes, not something to

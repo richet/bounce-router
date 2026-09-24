@@ -42,7 +42,8 @@ export function agentMetadata(text) {
   if (fields.name === 'orchestrator') throw new Error('orchestrator is reserved; it is derived from the session, never declared as a role');
   if (!fields.description) throw new Error('frontmatter needs a description');
   const policy = fields.policy ?? 'write';
-  if (!['read-only', 'write'].includes(policy)) throw new Error('policy must be read-only or write');
+  // probe: reads and runs commands, never changes the tree (docs/plans/probing-reviewer.md).
+  if (!['read-only', 'probe', 'write'].includes(policy)) throw new Error('policy must be read-only, probe or write');
   let maxSteps;
   if (fields.maxSteps !== undefined) {
     maxSteps = Number(fields.maxSteps);
@@ -135,7 +136,8 @@ export function handAIsToJev(roles, {orchestrator = 'main'} = {}) {
   return changed;
 }
 
-export const readOnlyRoles = roles => new Set([...roles.values()].filter(role => !role.error && role.policy === 'read-only').map(role => role.name));
+// Roles that cannot change anything: read-only, or probe (runs commands, writes nothing).
+export const readOnlyRoles = roles => new Set([...roles.values()].filter(role => !role.error && ['read-only', 'probe'].includes(role.policy)).map(role => role.name));
 
 // What every entry point calls. It never writes: the shipped agents are layered in from the skill.
 export function rolesFor(root, {cwd} = {}) {

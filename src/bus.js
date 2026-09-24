@@ -9,7 +9,7 @@ import crypto from 'node:crypto';
 
 // Peers publish from a positive allowlist: everything a session, the scheduler or the daemon writes is refused regardless of `from`,
 // because handoff() folds user/note rows into every later prompt and Router reads cooldown rows.
-const PEER_KINDS = new Set(['plan.submitted', 'task.submitted', 'task.milestone', 'task.blocked', 'task.input_required', 'task.usage', 'task.activity', 'message', 'task.accepted', 'agents.defined']);
+const PEER_KINDS = new Set(['plan.submitted', 'task.submitted', 'task.milestone', 'task.blocked', 'task.input_required', 'task.usage', 'task.activity', 'message', 'task.accepted', 'agents.defined', 'state']);
 const USER_ONLY_PREFIX = 'control.';
 // The scheduler alone owns task lifecycle transitions; a peer may report progress
 // (milestone/blocked/input_required/usage/activity), ask for work (submitted) or

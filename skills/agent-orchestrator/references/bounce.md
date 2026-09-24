@@ -57,13 +57,19 @@ ask for `/local setup` or `/local activate` — never substitute a cloud worker.
 
 The bridge is already in your environment as `BOUNCE_BUS` and `BOUNCE_BUS_TOKEN_FILE`.
 
+Prefer bounce's MCP tools when your client has them (`submit`, `wait`, `report`, `task_get`, `tasks_list`):
+they take and return structured values, and `task_get` answers "what did this task produce" in a screenful.
+The commands below are the same verbs and remain the fallback. Never read a session's `journal.jsonl`
+yourself — it is the raw log, and bounce already summarises it for you.
+
 Submit a task, then wait for it:
 
     bounce publish --event '{"kind":"task.submitted","parent":null,"profile":"<name>","orders":"<the brief>","deadline":3600000}'
     bounce wait --match '{"kind":"task.completed","task":"<task id from the publish reply>"}' --timeout 3600
 
 Fields: `parent` (null for a root task), `profile` (a name from the roster), `orders` (the
-brief — the six parts from the skill go here, as text), `deadline` (ms, optional),
+brief — the six parts from the skill go here, as text), `deadline` (ms, optional: the task's
+lease, renewed while the worker makes progress, up to the 60-minute ceiling — long work is normal),
 `depends_on` (task ids, optional), `review` (`{"prelaunch": <profile>, "completion":
 <profile>}`, optional, review-role profiles only), `steps` (the verification steps, as text).
 

@@ -156,3 +156,25 @@ test('a completed task that is sent back for rework stays on the rail, running i
   projection.ingest({id: '7', time: '2026-09-22T05:50:00.000Z', kind: 'task.accepted', task: T});
   assert.equal(projection.snapshot().panes.some(p => p.task === T), false);
 });
+
+// Found live: an integrator's completion review ran for 22 minutes while its
+// pane said `completed` — a reviewer was working and nothing in the UI said so. A task under review is
+// `reviewing` until the review answers, and the reviewer's own rows are its activity.
+test('a task under completion review reads as reviewing, with the reviewer named and its activity shown', () => {
+  const projection = createWorkspaceProjection();
+  projection.replay([
+    {kind: 'task.submitted', id: '1', seq: 1, task: 'land', profile: 'integrator', review: {completion: 'reviewer'}},
+    {kind: 'task.started', id: '2', seq: 2, task: 'land', attempt: 1},
+    {kind: 'task.completed', id: '3', seq: 3, task: 'land', summary: 'landed it'},
+    {kind: 'review.started', id: '4', seq: 4, task: 'land', stage: 'completion', round: 1, profile: 'reviewer'},
+    {kind: 'task.activity', id: '5', seq: 5, task: 'land', text: 'reading the diff', from: 'review:land'},
+  ]);
+  const pane = projection.snapshot().panes.find(p => p.task === 'land');
+  assert.equal(pane.state, 'reviewing');
+  assert.equal(pane.reviewer, 'reviewer');
+  assert.equal(pane.activity.at(-1), 'reading the diff');
+  // the verdict ends it: accepted is terminal again, and the pane leaves
+  projection.ingest({kind: 'review.finished', id: '6', seq: 6, task: 'land', stage: 'completion', verdict: 'accept'});
+  projection.ingest({kind: 'task.accepted', id: '7', seq: 7, task: 'land', stage: 'completion'});
+  assert.deepEqual(projection.paneIds(), ['orchestrator']);
+});

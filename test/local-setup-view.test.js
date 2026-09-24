@@ -165,3 +165,22 @@ test('local status shows each agent and who may play it, and reports a broken ag
   assert.match(text, /^  builder · write · skill · claude\/sonnet, lmstudio\/auto \(via opencode\)$/m);
   assert.match(text, /^  broken · INVALID: frontmatter needs a description$/m);
 });
+
+// One GPU serves every local worker, so concurrency buys no throughput — only latency, and latency is
+// what kills a task against its lease. Measured on an M5 Max at a 95K-token prompt: total prefill held at
+// ~1,450 tok/s whether 1, 2 or 4 requests were in flight (1,512 → 1,432 → 1,392), while wall time scaled
+// ×1.0, ×2.1, ×4.3 and a request decoding behind others' prefill fell to 0.9 tok/s. The default is one;
+// raising it is allowed and says what it costs.
+test('more than one local worker is allowed, and warned about', () => {
+  const base = {catalogs: [{endpoint: 'lmstudio', models: []}], binary: '/bin/opencode', workers: [], bridge: null, problem: null};
+  const one = formatLocalStatus({...base, concurrency: [{endpoint: 'lmstudio', maxConcurrent: 1, slotsPerModel: 1}]}, {}).join('\n');
+  assert.equal(/slower|warn/i.test(one), false, 'the default says nothing');
+
+  const four = formatLocalStatus({...base, concurrency: [{endpoint: 'lmstudio', maxConcurrent: 4, slotsPerModel: 1}]}, {}).join('\n');
+  assert.match(four, /lmstudio runs 4 local workers at once/);
+  assert.match(four, /no faster|not faster/i, 'it says the machine gets no more work done');
+  assert.match(four, /4×|4x/, 'and names what each task pays');
+
+  const slots = formatLocalStatus({...base, concurrency: [{endpoint: 'lmstudio', maxConcurrent: 1, slotsPerModel: 3}]}, {}).join('\n');
+  assert.match(slots, /3 slots/, 'slots per model are the same trade');
+});

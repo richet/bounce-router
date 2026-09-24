@@ -27,7 +27,10 @@ function resolveStrategy(spec) {
 // Phase 7 execution-policy ladder (docs/local-orchestration.md "Permissions", CONTRACT.md §1):
 // least to most privileged. `write` exists for adapters to declare and future profiles to
 // request; no current bounce profile produces it.
-export const POLICY_RANK = {'read-only': 0, plan: 1, write: 2, yolo: 3};
+export const POLICY_RANK = {'read-only': 0, probe: 1, plan: 2, write: 3, yolo: 4};
+// Who can enforce `probe` (run commands, write nothing): codex's read-only sandbox, and a local worker
+// run under sandbox-exec. claude and muse cannot run commands without also being able to write.
+export const PROBE_ADAPTERS = new Set(['codex', 'opencode']);
 
 // The shipped worker roster: one builder per model the cloud vendors expose in the `/model`
 // picker, each described in src/model-catalog.js so `profile: "auto"` can route between them
@@ -91,6 +94,7 @@ export const LOCAL_ADAPTERS = new Set(['opencode']);
 // agent as "more privileged" — observed live as a failed local task with no fallback.
 export function effectivePolicy(profile) {
   if (profile.policy === 'read-only') return 'read-only';
+  if (profile.policy === 'probe') return 'probe';
   if (profile.mode === 'plan') return 'plan';
   return 'yolo';
 }
@@ -136,7 +140,7 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
     if (typeof role !== 'string' || !role) throw new Error(`profile ${name}: role must be a non-empty string`);
     if (name === orchestrator) role = 'orchestrator';
     const policy = raw.policy ?? (raw.adapter === 'typesafe' || readOnly.has(role) ? 'read-only' : 'write');
-    if (!['write', 'read-only'].includes(policy)) throw new Error(`profile ${name}: policy must be write or read-only`);
+    if (!['write', 'read-only', 'probe'].includes(policy)) throw new Error(`profile ${name}: policy must be write, read-only or probe`);
     // A decision model (typesafe) has no tools: it can only ever be a read-only reviewer.
     if (raw.adapter === 'typesafe' && policy === 'write') throw new Error(`profile ${name}: typesafe must be read-only`);
     // A shipped fallback that points at a profile the user dropped is skipped, not an error;
@@ -191,7 +195,9 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
     backends.forEach(({provider, model}, index) => {
       const name = chain[index];
       const mode = settings.mode;
-      const policy = agent.policy ?? 'write';
+      // An AI that cannot enforce `probe` plays the agent read-only: less privilege, never more, so the
+      // agent stays available (the shipped reviewer names no AI and claude plays it first by default).
+      const policy = agent.policy === 'probe' && !PROBE_ADAPTERS.has(isLocal(provider) ? 'opencode' : provider) ? 'read-only' : agent.policy ?? 'write';
       const base = {derived: true, adapter: isLocal(provider) ? 'opencode' : provider, model, mode, policy,
         fallback: chain.slice(index + 1, index + 2), role: agent.name, executables: {...(settings.executables ?? {})},
         agent: {name: agent.name, description: agent.description, policy, prompt: agent.prompt, ...(agent.maxSteps ? {maxSteps: agent.maxSteps} : {})}};

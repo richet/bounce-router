@@ -212,6 +212,14 @@ test('X2b read-only policy wins over yolo mode in App Server thread and turn set
   });
 });
 
+test('X2c a probe worker gets the read-only sandbox: it runs commands, the OS refuses writes', async t => {
+  const h = harness(t);
+  const handle = await h.launch({orders: 'probe it', profile: {mode: 'yolo', policy: 'probe'}});
+  await take(h.adapter.events(handle), 1);
+  assert.deepEqual(h.methods('thread/start')[0].params, {approvalPolicy: 'on-request', sandbox: 'read-only'});
+  assert.equal(h.adapter.capabilities().executionPolicies.includes('probe'), true);
+});
+
 test('X3 a mid-turn deliver waits: the second turn/start follows the first turn/completed', async t => {
   const h = harness(t, {delay: 120});
   const handle = await h.launch({orders: 'first'});
@@ -321,7 +329,7 @@ test('X6 the reader ignores malformed, null, oversized and unmatched lines', asy
   assert.deepEqual(rows[3], {kind: 'result', status: 'completed', text: 'survivor'});
   assert.equal(handle.threadId, 't-9'); // the forged id resolved nothing
   assert.deepEqual(adapter.capabilities(),
-    {live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'], executionPolicies: ['read-only', 'plan', 'yolo'], quota: 'query'});
+    {live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'], executionPolicies: ['read-only', 'probe', 'plan', 'yolo'], quota: 'query'});
 });
 
 test('the vendor process sees no bus keys, is detached, and gets the task cwd', async t => {
@@ -615,4 +623,15 @@ for (const mode of ['launch', 'turn']) test(`a codex worker limited at ${mode} f
   assert.equal(retry.profile, 'build_claude');
   await waitFor(() => scheduler.tasks()[retry.task]?.state === 'completed', 'fallback completion');
   assert.equal(claude.calls.launch, 1);
+});
+
+// Found live: codex's own tracing went to stderr and every line landed in the
+// transcript — 23 copies of an `rmcp::transport` MCP error the user cannot act on from here. Its tracing
+// is counted and summarised once; anything else it says on stderr still comes through untouched.
+test('X9 codex tracing on stderr is summarised, not repeated; real stderr still shows', async t => {
+  const {vendorTracing} = await import('../../src/adapters/codex-live.js');
+  assert.equal(vendorTracing('\u001b[2m2026-09-22T17:40:53.830094Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mrmcp::transport::worker\u001b[0m: worker quit with fatal: Transport channel closed'), true);
+  assert.equal(vendorTracing('2026-09-22T17:40:53Z  WARN codex_core::config: two servers need OAuth'), true);
+  assert.equal(vendorTracing('error: could not find codex home'), false, 'a plain message is not tracing');
+  assert.equal(vendorTracing(''), false);
 });

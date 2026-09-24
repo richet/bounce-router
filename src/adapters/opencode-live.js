@@ -1,5 +1,7 @@
+import fs from 'node:fs';
+import os from 'node:os';
 import {resolveExecutable} from '../executable.js';
-import {spawnLive, vendorEnv, verifiedCancel, appendPending, readPending, takePending, TEXT_MAX} from './live-common.js';
+import {spawnLive, vendorEnv, verifiedCancel, appendPending, readPending, takePending, TEXT_MAX, SPEAKER, classifyText, createAnswer, concludeAsk} from './live-common.js';
 
 // The OpenCode peer, driven the way claude and codex are: one `opencode run` process per turn, in
 // the user's own tree. The prompt goes in on stdin, JSON event lines come out on stdout, the
@@ -24,7 +26,10 @@ const REPEAT_LIMIT = 4;
 // session with every tool off and a two-step cap: state your conclusion from what you have. An
 // answer is the task's result (still reviewed like any other); silence leaves the failure as it was.
 const CONCLUDE_STEPS = 2;
-const CONCLUDE_PROMPT = 'Your tools are off. You repeated the same call with nothing new; you have already read what you need. From what you have read, give your final answer now, in full, as the orders asked. If you cannot, say what is missing.';
+// Why a turn ended with nothing from the worker. One path, one prompt (docs/plans/answer-contract.md).
+const CAP_PROMPT = concludeAsk('your step budget is spent');
+const CONCLUDE_PROMPT = concludeAsk('you repeated the same call with nothing new');
+const SILENT_PROMPT = concludeAsk('your turn ended without an answer');
 const READS = new Set(['read', 'grep']); // listing files (glob) is not reading material
 const CHANGES = new Set(['write', 'edit', 'apply_patch', 'bash']);
 // Observed live (qwen3-coder-30b-a3b via LM Studio): the model answers, but every step is reported as
@@ -32,6 +37,13 @@ const CHANGES = new Set(['write', 'edit', 'apply_patch', 'bash']);
 // the step cap. A step with no tool call and no new text is empty; this many in a row ends the turn —
 // as the answer it already gave, or as no progress if it never gave one.
 const EMPTY_STEP_LIMIT = 2;
+// `run --format json` prints nothing while a step generates. Measured (review-quality benchmark,
+// 2026-09-22): one 27B step ran past 6 minutes writing its review, and a silence watchdog killed a
+// working model. While a step is open the adapter says so every HEARTBEAT_MS; after STEP_BEAT_CAP_MS on
+// one step it stops, so a step that never ends still goes silent and the watchdog still catches it.
+const HEARTBEAT_MS = 30_000;
+const STEP_BEAT_CAP_MS = 15 * 60_000;
+const BEAT = Symbol('beat');
 
 // The policy tier becomes the agent's tools map — the same ladder the vendor CLIs get as flags.
 // A read-only or plan worker has no tool that can change anything; write/yolo edit and run
@@ -40,9 +52,25 @@ const READ_TOOLS = ['read', 'grep', 'glob'];
 const WRITE_TOOLS = ['write', 'edit', 'apply_patch', 'bash'];
 // No todo list either: it gave a stuck model something to do forever instead of answering.
 const NEVER_TOOLS = ['todowrite', 'task', 'websearch', 'webfetch', 'skill', 'question', 'invalid'];
+// A probe worker reads and runs commands (bash) but gets no editing tool; the sandbox below makes
+// sure bash cannot write the project either.
 export function toolsFor(policy) {
   const writes = policy === 'write' || policy === 'yolo';
-  return Object.fromEntries([...READ_TOOLS.map(tool => [tool, true]), ...WRITE_TOOLS.map(tool => [tool, writes]), ...NEVER_TOOLS.map(tool => [tool, false])]);
+  return Object.fromEntries([...READ_TOOLS.map(tool => [tool, true]), ...WRITE_TOOLS.map(tool => [tool, writes || (policy === 'probe' && tool === 'bash')]), ...NEVER_TOOLS.map(tool => [tool, false])]);
+}
+
+// The OS-level fence for a probe worker (docs/plans/probing-reviewer.md): macOS sandbox-exec around the
+// whole opencode process. Writes are refused everywhere except the temp dirs and opencode's own state,
+// and refused in the project even when it sits under a temp dir (the last matching rule wins). The
+// network reaches only localhost: the model endpoint and opencode's own in-process server. A Unix
+// socket (Docker's) is not a network address and stays refused.
+export function probeSandbox(cwd, home = os.homedir()) {
+  const q = p => JSON.stringify(String(p));
+  const writable = ['/private/tmp', '/private/var/folders', `${home}/.local/share/opencode`, `${home}/.local/state/opencode`, `${home}/.cache/opencode`, `${home}/.config/opencode`];
+  return ['(version 1)', '(allow default)', '(deny file-write*)',
+    `(allow file-write* ${writable.map(p => `(subpath ${q(p)})`).join(' ')} (literal "/dev/null") (literal "/dev/zero") (subpath "/dev/fd") (regex #"^/dev/tty") (regex #"^/dev/ptmx"))`,
+    `(deny file-write* (subpath ${q(cwd)}))`,
+    '(deny network*)', '(allow network* (local ip "localhost:*"))', '(allow network-outbound (remote ip "localhost:*"))'].join('');
 }
 // Everything this adapter takes on faith from the opencode binary, in one place, so a test can hold
 // the installed binary to it (test/opencode-contract.test.js). Verified against 1.18.31 — a version
@@ -57,7 +85,7 @@ export const CONTRACT = {
 };
 
 const effectiveTier = (profile = {}) =>
-  profile.policy === 'read-only' ? 'read-only' : profile.mode === 'plan' ? 'plan' : profile.policy === 'write' ? 'write' : 'yolo';
+  profile.policy === 'read-only' ? 'read-only' : profile.policy === 'probe' ? 'probe' : profile.mode === 'plan' ? 'plan' : profile.policy === 'write' ? 'write' : 'yolo';
 
 // CONTRACT §5: {input, cache_read, cache_write, output}, integers only, absent keys absent.
 export const mapUsage = raw => {
@@ -75,7 +103,7 @@ const CREDENTIAL = /(_API_KEY|_AUTH_TOKEN|_ACCESS_TOKEN|_SECRET|_SECRET_KEY)$|^(
 export const scrubCredentials = (env, keep = []) =>
   Object.fromEntries(Object.entries(env).filter(([key]) => keep.includes(key) || !CREDENTIAL.test(key)));
 
-export function createOpencodeLive({kill = process.kill, spawn} = {}) {
+export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HEARTBEAT_MS, stepBeatCapMs = STEP_BEAT_CAP_MS} = {}) {
   const pendingPath = dir => `${dir}/pending.jsonl`;
 
   const start = ({profile = {}, session = null, stdin, cwd, dir, conclude = false}) => {
@@ -105,8 +133,10 @@ export function createOpencodeLive({kill = process.kill, spawn} = {}) {
       // rejected it and ended the turn. A worker's instructions are its agent file and its orders.
       OPENCODE_DISABLE_CLAUDE_CODE: '1', OPENCODE_DISABLE_CLAUDE_CODE_PROMPT: '1', OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: '1',
       OPENCODE_DISABLE_EXTERNAL_SKILLS: '1'};
-    const live = spawnLive({executable, args, cwd, env, stdin, ...(spawn ? {spawn} : {})});
-    return {live, child: live.child, pid: live.child.pid, args, dir, cwd, sessionId: session, tools: config.agent[name].tools, agent: name, profile, conclude};
+    const fenced = effectiveTier(profile) === 'probe';
+    const spawned = fenced ? {executable: '/usr/bin/sandbox-exec', args: ['-p', probeSandbox(fs.realpathSync(cwd)), executable, ...args]} : {executable, args};
+    const live = spawnLive({...spawned, cwd, env, stdin, ...(spawn ? {spawn} : {})});
+    return {live, child: live.child, pid: live.child.pid, args: spawned.args, dir, cwd, sessionId: session, tools: config.agent[name].tools, agent: name, profile, conclude};
   };
 
   return {
@@ -123,11 +153,26 @@ export function createOpencodeLive({kill = process.kill, spawn} = {}) {
 
     // Never throws: every terminal condition of the process becomes an event and ends the stream.
     async *events(handle) {
-      let announced = false, lastText = null, lastError = null, tail = '', refused = null;
+      let announced = false, lastError = null, tail = '', refused = null;
+      const answer = createAnswer();
       const repeats = new Map();
-      let stepActed = false, emptySteps = 0, concluded = false, reads = 0, stalled = false, textAfterTools = false;
+      let stepActed = false, emptySteps = 0, concluded = false, reads = 0, stalled = false, capped = false;
+      // `stepActed` is per step and resets at every step boundary; `didWork` never resets — it answers
+      // "did this worker do anything at all", which is what decides whether there is an answer worth asking for.
+      let didWork = false;
       const plain = text => String(text).replace(/\x1b\[[0-9;]*m/g, '').replace(/^[!\s]+/, '').trim();
-      for await (const event of handle.live.events) {
+      let stepOpenedAt = null, pending = null;
+      const source = handle.live.events[Symbol.asyncIterator]();
+      try { for (;;) {
+        pending ??= source.next();
+        let timer = null;
+        const beating = stepOpenedAt !== null && Date.now() - stepOpenedAt < stepBeatCapMs;
+        const next = beating ? await Promise.race([pending, new Promise(resolve => { timer = setTimeout(() => resolve(BEAT), heartbeatMs); })]) : await pending;
+        clearTimeout(timer);
+        if (next === BEAT) { yield {kind: 'activity', text: `generating · step open ${Math.round((Date.now() - stepOpenedAt) / 1000)} s`}; continue; }
+        pending = null;
+        if (next.done) break;
+        const event = next.value;
         if (event.kind === 'diagnostic') {
           const text = plain(event.text);
           tail = `${tail}\n${text}`.slice(-2000);
@@ -141,17 +186,28 @@ export function createOpencodeLive({kill = process.kill, spawn} = {}) {
         if (event.kind === 'exit') {
           // Exit IS the turn ending. A clean exit with text is the worker's answer; anything else is
           // a failure of the runtime rather than of the task, so the next AI in the chain may try.
-          if (stalled && reads > 0 && !handle.conclude && handle.sessionId) {
-            yield {kind: 'diagnostic', text: `stalled after reading ${reads} file${reads === 1 ? '' : 's'}; asked once, tools off, for its conclusion`};
-            const again = start({profile: handle.profile, session: handle.sessionId, stdin: CONCLUDE_PROMPT, cwd: handle.cwd, dir: handle.dir, conclude: true});
+          // Bounce asked for the conclusion (conclude() below: a lease ended), or the loop guard stopped a
+          // worker that had read something. Either way the same session is asked once, tools off.
+          // A clean turn that did work and said nothing after its last tool call has no answer — and that
+          // is itself the reason to ask for one. Found live: both local-worker failures were
+          // this shape, 6 and 14 minutes of work thrown away without the question ever being put.
+          const unanswered = event.code === 0 && answer.value === null && didWork;
+          const ask = handle.concludeWith ?? (capped ? CAP_PROMPT : stalled && reads > 0 ? CONCLUDE_PROMPT : unanswered ? SILENT_PROMPT : null);
+          if (ask !== null && !handle.conclude && handle.sessionId) {
+            yield {kind: 'diagnostic', text: handle.concludeWith !== undefined ? `asked, tools off, for its conclusion: ${ask}`
+              : capped ? 'opencode stopped at its step cap; asked once, tools off, for its answer'
+              : unanswered && !stalled ? 'the turn ended without an answer; asked once, tools off, for it'
+              : `stalled after reading ${reads} file${reads === 1 ? '' : 's'}; asked once, tools off, for its conclusion`};
+            const again = start({profile: handle.profile, session: handle.sessionId, stdin: ask, cwd: handle.cwd, dir: handle.dir, conclude: true});
             handle.child = again.child; handle.pid = again.pid; // cancel() must reach the turn that is running now
-            let answer = null;
-            for await (const e of this.events(again)) { if (e.kind === 'result') { answer = e.status === 'completed' ? e.text : null; break; } if (e.kind !== 'result') yield e; }
-            if (answer !== null) { yield {kind: 'diagnostic', text: 'the conclusion turn answered: that answer is the result'}; yield {kind: 'result', status: 'completed', text: answer}; return; }
+            let concludedAnswer = null;
+            for await (const e of this.events(again)) { if (e.kind === 'result') { concludedAnswer = e.status === 'completed' ? e.text : null; break; } if (e.kind !== 'result') yield e; }
+            if (concludedAnswer !== null) { yield {kind: 'diagnostic', text: 'the conclusion turn answered: that answer is the result'}; yield {kind: 'result', status: 'completed', text: concludedAnswer}; return; }
             yield {kind: 'diagnostic', text: 'the conclusion turn gave no answer'};
+            if (capped && !lastError) lastError = 'step cap reached without an answer';
           }
-          if ((event.code === 0 || concluded) && lastText !== null && !lastError && !textAfterTools) lastError = 'no answer: the worker said nothing after its last tool call';
-          if ((event.code === 0 || concluded) && lastText !== null && !lastError) yield {kind: 'result', status: 'completed', text: lastText};
+          if ((event.code === 0 || concluded) && answer.spoken !== null && !lastError && answer.value === null) lastError = 'no answer: the worker said nothing after its last tool call';
+          if ((event.code === 0 || concluded) && answer.value !== null && !lastError) yield {kind: 'result', status: 'completed', text: answer.value};
           else yield {kind: 'result', status: 'failed', recoverable: true,
             text: lastError ?? (event.code === 0 ? (refused ? `opencode stopped the turn: ${refused}` : 'opencode finished without an answer') : `opencode exited ${event.signal ?? event.code}: ${tail.trim().split('\n').at(-1) ?? ''}`.trim())};
           return;
@@ -167,15 +223,25 @@ export function createOpencodeLive({kill = process.kill, spawn} = {}) {
           // The answer is the last text that SAYS something. Observed live: a model wrote its whole
           // report and then one more step holding only a closing code fence, and that fence became
           // the task's result. Text with no letter or digit is shown, never taken as the answer.
-          if (part.text.trim()) { const said = part.text.trim(); if (/[\p{L}\p{N}]/u.test(said)) { lastText = said; textAfterTools = true; } stepActed = true; yield {kind: 'assistant', text: said}; }
+          if (part.text.trim()) {
+            const {speaker, text} = classifyText('opencode', part.text);
+            if (speaker === SPEAKER.runtime) { capped = /step/i.test(text) || capped; stepActed = true; yield {kind: 'diagnostic', text: `opencode: ${text}`}; continue; }
+            answer.said(speaker, text);
+            stepActed = true; didWork = true;
+            yield {kind: 'assistant', speaker, text};
+          }
         } else if (raw.type === 'tool_use') {
           const status = part.state?.status ?? '';
           stepActed = true;
-          yield {kind: 'activity', text: `${part.tool ?? 'tool'} ${status}`.trim()};
+          // A finished call names its target, so bounce can tell new work from repeated work at a lease end.
+          const input = part.state?.input ?? {};
+          const target = input.filePath ?? input.path ?? input.pattern ?? input.command ?? JSON.stringify(input);
+          yield {kind: 'activity', text: `${part.tool ?? 'tool'} ${status}`.trim(),
+            ...(status === 'completed' || status === 'error' ? {call: `${part.tool ?? 'tool'} ${target}`.slice(0, 300), change: CHANGES.has(part.tool)} : {})};
           // An answer is text said AFTER the worker's last tool call. Observed live: a worker's opening
           // sentence ("I'll execute this systematically…"), six silent minutes of tool work, then the turn
           // ended — and that opener became the task's completion. It was a plan, not an answer.
-          if (status === 'completed' || status === 'error') textAfterTools = false;
+          if (status === 'completed' || status === 'error') { answer.tooled(); didWork = true; }
           if (status === 'completed' && READS.has(part.tool)) reads++;
           if (status === 'completed' && CHANGES.has(part.tool)) repeats.clear(); // the world changed: re-reading is legitimate
           else if (status === 'completed' || status === 'error') {
@@ -190,23 +256,25 @@ export function createOpencodeLive({kill = process.kill, spawn} = {}) {
           }
           if (status === 'error') yield {kind: 'diagnostic', text: `${part.tool ?? 'tool'}: ${String(part.state?.error ?? part.state?.output ?? 'failed').slice(0, 500)}`};
         } else if (raw.type === 'step_finish') {
+          stepOpenedAt = null;
           const usage = mapUsage(part.tokens);
           if (Object.keys(usage).length) yield {kind: 'usage', usage};
           emptySteps = stepActed ? 0 : emptySteps + 1;
           stepActed = false;
           if (emptySteps >= EMPTY_STEP_LIMIT && !concluded && !lastError) {
-            if (lastText !== null) concluded = true; // it already answered: that answer is the result
+            if (answer.value !== null) concluded = true; // it already answered: that answer is the result
             else lastError = `no progress: ${EMPTY_STEP_LIMIT} empty steps and no answer`;
             yield {kind: 'diagnostic', text: concluded ? `ended the turn after ${EMPTY_STEP_LIMIT} empty steps; the worker had already answered` : lastError};
             void verifiedCancel(handle.child, {kill});
           }
         } else if (raw.type === 'step_start') {
+          stepOpenedAt = Date.now();
           yield {kind: 'activity', text: ''};
         } else if (raw.type === 'error') {
           lastError = String(raw.error?.data?.message ?? raw.error?.message ?? raw.error?.name ?? 'opencode error').slice(0, 1000);
           yield {kind: 'diagnostic', text: lastError};
         }
-      }
+      } } finally { void source.return?.(); } // as for-await did: the process stream is closed on every exit
     },
 
     // `run` has no steer verb: a message for a running worker waits for the turn to end and rides
@@ -222,8 +290,16 @@ export function createOpencodeLive({kill = process.kill, spawn} = {}) {
       return verifiedCancel(handle.child, {kill});
     },
 
+    // Bounce's request for the final answer (a lease ended: ceiling, no progress, stuck). `run` has no
+    // steer verb, so the running turn is stopped and events() asks the same session, tools off, with
+    // this prompt; its answer is the result.
+    async conclude(handle, {prompt = CONCLUDE_PROMPT} = {}) {
+      handle.concludeWith = String(prompt);
+      return verifiedCancel(handle.child, {kill});
+    },
+
     capabilities() {
-      return {live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'], executionPolicies: ['read-only', 'plan', 'write', 'yolo'], quota: 'stream'};
+      return {live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'], executionPolicies: ['read-only', 'probe', 'plan', 'write', 'yolo'], quota: 'stream'};
     },
 
     pending: dir => readPending(pendingPath(dir)),

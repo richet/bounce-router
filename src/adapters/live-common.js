@@ -3,6 +3,7 @@ import {createInterface} from 'node:readline';
 import fs from 'node:fs';
 import path from 'node:path';
 import {limitPattern} from '../providers.js';
+export {toolText, TOOL_OUTPUT_MAX} from './transcript.js';
 
 // Shared by every live adapter: a vendor process must never block on an undrained pipe, never
 // throw out of band, never see the bus, and always be cancellable within a bound.
@@ -100,6 +101,50 @@ export function appendPending(file, text) {
 }
 export function takePending(file) { const texts = readPending(file); try { fs.truncateSync(file, 0); } catch {} return texts; }
 // Peer-supplied text that lands inside a prompt template must not be able to forge the template's line structure.
+// ---- who is speaking, and what the worker's answer is (docs/plans/answer-contract.md) -------------
+// One stream carries three voices: the worker, its own thinking, and the runtime (the CLI's notices and
+// refusals). Found live: opencode's "MAXIMUM STEPS REACHED" notice became a review's verdict and blocked
+// the task; a stray `</think>` reached another answer. Every adapter classifies here, once, and the
+// vendors that mark their own stream are believed over any pattern.
+export const SPEAKER = {worker: 'worker', thinking: 'thinking', runtime: 'runtime'};
+export const RUNTIME_VOICE = {
+  opencode: [/MAXIMUM STEPS REACHED/i, /maximum number of steps allowed/i, /auto.?rejecting/i],
+  codex: [/^codex app-server\b/i],
+  claude: [/^\[system\]/i],
+  muse: [],
+};
+const THINK_BLOCK = /<think>[\s\S]*?<\/think>/g;
+const STRAY_THINK = /^\s*<\/?think>/;
+export function classifyText(vendor, text, {marked = null} = {}) {
+  const raw = String(text ?? '');
+  if (marked === SPEAKER.thinking || marked === SPEAKER.runtime) return {speaker: marked, text: raw.trim()};
+  const stripped = raw.replace(THINK_BLOCK, '').replace(STRAY_THINK, '').trim();
+  if (!stripped) return {speaker: raw.trim() ? SPEAKER.thinking : SPEAKER.worker, text: raw.trim()};
+  if ((RUNTIME_VOICE[vendor] ?? []).some(pattern => pattern.test(stripped))) return {speaker: SPEAKER.runtime, text: stripped};
+  return {speaker: SPEAKER.worker, text: stripped};
+}
+
+// One prompt for every turn that ended with nothing from the worker — a loop, a spent step budget, a
+// lease end, the ceiling. The reason is named; the instruction never changes.
+export const concludeAsk = why => `Stop using tools and give your final answer now, in full, as the orders asked (${why}). Say what is unfinished.`;
+
+// The worker's answer: the last thing IT said, said after its last tool call. An opener before six minutes
+// of tool work is not an answer (observed live), and text with no letter or digit says nothing.
+export function createAnswer() {
+  let spoken = null, afterTools = true;
+  return {
+    said(speaker, text) {
+      if (speaker !== SPEAKER.worker) return false;
+      const value = String(text ?? '').trim();
+      if (!value || !/[\p{L}\p{N}]/u.test(value)) return false;
+      spoken = value; afterTools = true; return true;
+    },
+    tooled() { afterTools = false; },
+    get value() { return afterTools ? spoken : null; },
+    get spoken() { return spoken; },
+  };
+}
+
 export const promptSafe = text => String(text).replace(/[\r\n]+/g, ' ').slice(0, 1000);
 
 export async function verifiedCancel(child, {kill = process.kill, termWait = 1500, killWait = 1500} = {}) {

@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {fingerprint, validate} from '../src/reload.js';
+import {fingerprint, validate, orchestratorOwns, orchestratorTasks} from '../src/reload.js';
 test('reload detects added and modified source but ignores journals', t => {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'bounce-reload-'));
   t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
@@ -64,4 +64,46 @@ test('supervisor installs only after child exits and resumes session on success 
     });
     assert.equal(launches, 2);
   }
+});
+
+// Found live: a builder failed, bounce submitted its fallback replacement (from `bounce`, not from the
+// orchestrator), and the orchestrator's bus grant was never widened to include it — the grant is extended
+// only for rows it submitted itself. When the reviewer then failed the work and the orchestrator submitted
+// the rework under that replacement, the bus refused it `-32001 unauthorized` on both transports. The
+// orchestrator stopped rather than bypass bounce, and the campaign stalled with the fix already written.
+test('a replacement bounce made for the orchestrator\'s task is still the orchestrator\'s task', () => {
+  const events = [
+    {kind: 'task.submitted', task: 'own', from: 'orchestrator', parent: null},
+    {kind: 'task.submitted', task: 'fallback', from: 'bounce', replaces: 'own', parent: null},
+    {kind: 'task.submitted', task: 'second', from: 'bounce', replaces: 'fallback', parent: null},
+    {kind: 'task.submitted', task: 'theirs', from: 'user', parent: null},
+    {kind: 'task.submitted', task: 'theirFallback', from: 'bounce', replaces: 'theirs', parent: null},
+  ];
+  assert.equal(orchestratorOwns(events, 'own'), true);
+  assert.equal(orchestratorOwns(events, 'fallback'), true, 'the replacement it never typed is still its work');
+  assert.equal(orchestratorOwns(events, 'second'), true, 'and a replacement of a replacement');
+  assert.equal(orchestratorOwns(events, 'theirs'), false, "someone else's task is not widened into its grant");
+  assert.equal(orchestratorOwns(events, 'theirFallback'), false);
+  assert.equal(orchestratorOwns(events, 'unknown'), false);
+  // a cycle must not hang the walk
+  const cyclic = [{kind: 'task.submitted', task: 'a', from: 'bounce', replaces: 'b'}, {kind: 'task.submitted', task: 'b', from: 'bounce', replaces: 'a'}];
+  assert.equal(orchestratorOwns(cyclic, 'a'), false);
+});
+
+// The grant is built fresh on every start and widened only by rows that arrive live, so after a restart
+// the orchestrator owned nothing from before it. Found live: it restarted, tried to submit a rework under
+// a task from an earlier turn, and the bus refused `-32001 unauthorized` — the fix for fallback ownership
+// was already running and could not help, because the task predated the process.
+test('the grant is seeded from the journal, so a restart does not disown the work', () => {
+  const events = [
+    {kind: 'task.submitted', task: 'own', from: 'orchestrator'},
+    {kind: 'task.submitted', task: 'fallback', from: 'bounce', replaces: 'own'},
+    {kind: 'task.completed', task: 'own'},
+    {kind: 'task.submitted', task: 'theirs', from: 'user'},
+    {kind: 'task.submitted', task: 'child', from: 'orchestrator', parent: 'own'},
+  ];
+  const seeded = orchestratorTasks(events);
+  assert.deepEqual(seeded.sort(), ['child', 'fallback', 'own'], 'including a finished one: it may still be parented under');
+  assert.equal(seeded.includes('theirs'), false);
+  assert.deepEqual(orchestratorTasks([]), []);
 });

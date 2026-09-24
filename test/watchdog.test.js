@@ -207,7 +207,7 @@ test('W5 duplicate alerts: many ticks inside the window add exactly one correcti
   assert.equal(escalated[1].reason, 'silent');
 });
 
-test('W6 hard deadline despite activity: cancels at the deadline regardless, state stays timed_out', async t => {
+test('W6 an explicit deadline is a lease too: activity through it renews it, and no activity in the next one asks for the conclusion', async t => {
   const {session} = setup(t);
   let now = 0;
   const clock = () => now;
@@ -217,34 +217,22 @@ test('W6 hard deadline despite activity: cancels at the deadline regardless, sta
   const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: 30000});
   await waitFor(() => scheduler.tasks()[row.task]?.state === 'running');
 
-  for (let t2 = 5000; t2 <= 25000; t2 += 5000) {
+  for (let t2 = 5000; t2 <= 30000; t2 += 5000) {
     now = t2;
     session.publish({kind: 'task.activity', task: row.task, text: 'ping', from: `worker:${row.task}`, context: row.context, time: new Date(now).toISOString()});
     await scheduler.tick();
   }
-  now = 29000;
-  await scheduler.tick();
-  assert.equal(session.events.some(e => e.kind === 'task.deadline' && e.task === row.task), false);
+  assert.deepEqual(session.events.filter(e => e.kind === 'task.lease.renewed' && e.task === row.task).map(e => [e.lease, e.until]), [[1, 60000]]);
+  assert.equal(session.events.some(e => (e.kind === 'task.deadline' || e.kind === 'task.concluding') && e.task === row.task), false);
+  assert.equal(adapter.calls.cancel, 0);
 
-  now = 30000;
+  now = 60000;
   await scheduler.tick();
-  const kinds = session.events.filter(e => e.task === row.task).map(e => e.kind);
-  assert.equal(kinds.includes('task.deadline'), true);
-  assert.equal(kinds.includes('task.cancelled'), true);
-  assert.equal(kinds.indexOf('task.deadline') < kinds.indexOf('task.cancelled'), true);
-  assert.equal(adapter.calls.cancel, 1);
-  assert.equal(scheduler.tasks()[row.task].state, 'timed_out');
-  // A deadline is bounce's decision, never the user's, and the orchestrator is told so it can decide
-  // what to do with the partial work (found live: the cancel was journaled as reason `user`, the
-  // orders say a user cancellation is final, and the orchestrator stopped the whole run).
-  assert.equal(session.events.find(e => e.kind === 'task.cancelled' && e.task === row.task).reason, 'deadline');
-  const escalated = session.events.find(e => e.kind === 'policy.escalated' && e.task === row.task);
-  assert.deepEqual([escalated.reason, escalated.to], ['deadline', 'user']);
-  assert.equal(escalated.text, 'A ran out of its 30 s deadline at 30 s with the work unfinished. Its partial progress is in the journal: resubmit what is left as a smaller task, or drop it.');
+  assert.deepEqual(session.events.filter(e => e.kind === 'task.concluding' && e.task === row.task).map(e => e.reason), ['no_progress']);
   assert.equal(session.events.some(e => e.kind === 'policy.fallback.skipped' && e.task === row.task && e.reason === 'explicit_cancellation'), false, 'a deadline is not an explicit cancellation');
 });
 
-test('W7 deadline default: null deadline falls back to limits.minutes', async t => {
+test('W7 deadline default: a null deadline runs under limits.minutes as its lease', async t => {
   const {session} = setup(t);
   let now = 0;
   const clock = () => now;
@@ -256,11 +244,11 @@ test('W7 deadline default: null deadline falls back to limits.minutes', async t 
 
   now = 59000;
   await scheduler.tick();
-  assert.equal(session.events.some(e => e.kind === 'task.deadline' && e.task === row.task), false);
+  assert.equal(session.events.some(e => e.kind === 'task.concluding' && e.task === row.task), false);
 
   now = 60000;
   await scheduler.tick();
-  assert.equal(session.events.some(e => e.kind === 'task.deadline' && e.task === row.task), true);
+  assert.equal(session.events.some(e => e.kind === 'task.concluding' && e.task === row.task), true);
 });
 
 test('W8 simultaneous reservations: two children back to back reserve exactly once, the gate opens to exactly one launch', async t => {

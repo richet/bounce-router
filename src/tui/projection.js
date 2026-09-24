@@ -120,6 +120,10 @@ export function createWorkspaceProjection({activityLimit = 400, transcriptLimit 
       task.updatedAt = event.time ?? task.updatedAt;
     }
     if (event.kind === 'task.delivered') task.delivery = event.tier ?? task.delivery;
+    // A completion review is a worker still working: found live (2026-09-22) a 22-minute review whose
+    // pane said `completed`, so nothing in the UI showed that anyone was on it.
+    if (event.kind === 'review.started') { task.state = 'reviewing'; task.reviewer = event.profile ?? task.reviewer ?? null; task.updatedAt = event.time ?? task.updatedAt; return true; }
+    if (event.kind === 'review.finished') { task.state = 'completed'; task.updatedAt = event.time ?? task.updatedAt; return true; }
     if (event.kind === 'task.recovery') task.recovery = taskText(event) || event.reason || task.recovery;
     // `completed` is not the end while a review may still send the task back: the pane leaves on
     // acceptance, failure or cancellation, or on completion with no review pending.
