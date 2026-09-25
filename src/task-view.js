@@ -80,9 +80,22 @@ export function taskView(events, task, {now = Date.now(), journal = null, report
     : mine.find(event => event.kind === 'task.output' && event.seq === invalid.outputSeq) ?? lastOf(events, task, 'task.output');
   const reviewGate = gateView(events, task, result);
   const seqs = mine.map(e => e.seq).filter(Number.isFinite);
+  // §8 (docs/plans/in-place-tasks.md): the task ran in the real checkout, so the view names
+  // what consent authorized that — the cited user message (first 80 chars) and Jev's verdict
+  // when there was one, exactly as bounce shows any other decision.
+  const inPlaceRow = submitted?.inPlace ? submitted : null;
+  const jevDecided = lastOf(events, task, 'jev.decided');
+  const jevSkipped = lastOf(events, task, 'jev.skipped');
+  const inPlace = inPlaceRow ? {
+    authorizedBy: inPlaceRow.inPlace.authorizedBy,
+    message: cut(events.find(e => e.kind === 'user' && e.seq === inPlaceRow.inPlace.authorizedBy)?.text, 80),
+    jev: jevDecided ? {verdict: jevDecided.verdict, confidence: jevDecided.confidence ?? null}
+      : jevSkipped ? {verdict: 'skipped', reason: jevSkipped.reason ?? null} : null,
+  } : null;
   return {
     task, state: state.state, profile: state.profile ?? null, ai: started?.requested ?? null,
     orders: cut(submitted?.orders, TEXT_MAX),
+    inPlace,
     elapsed: started ? minutes(now - Date.parse(started.time)) : null,
     lease: leaseRow ? {renewals: leaseRow.renewals, minutes: Math.round(leaseRow.leaseMs / 60000)} : null,
     rounds: state.rounds ?? 0,

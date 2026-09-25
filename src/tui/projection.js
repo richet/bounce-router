@@ -65,6 +65,9 @@ export function createWorkspaceProjection({activityLimit = 400, transcriptLimit 
       state: 'queued',
       activity: [],
       ...(event.replaces ? {recovery: `replacement for ${event.replaces}`} : {}),
+      // §8: the pane names an in-place task so the user sees it is running in the real
+      // checkout, not a copy — the daemon side of "in place" the task view also carries.
+      ...(event.inPlace ? {inPlace: true} : {}),
     };
     tasks.set(event.task, task);
     renderPanes.push(task);

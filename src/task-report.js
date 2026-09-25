@@ -4,8 +4,9 @@ const line = (label, value) => value === null || value === undefined || value ==
 
 export function formatTaskView(view) {
   const rows = [
-    `${view.task} · ${view.state}${view.profile ? ` · ${view.profile}` : ''}${view.ai ? ` (${view.ai})` : ''}${view.elapsed ? ` · ${view.elapsed}` : ''}`,
+    `${view.task} · ${view.state}${view.profile ? ` · ${view.profile}` : ''}${view.ai ? ` (${view.ai})` : ''}${view.elapsed ? ` · ${view.elapsed}` : ''}${view.inPlace ? ' · in place' : ''}`,
     line('orders', view.orders),
+    view.inPlace ? `in place: authorized by "${view.inPlace.message}"${view.inPlace.jev ? ` · jev ${view.inPlace.jev.verdict}` : ''}` : null,
     view.lease ? `lease: ${view.lease.minutes} min${view.lease.renewals ? ` · renewed ${view.lease.renewals}×` : ''}` : null,
     view.reviewer ? `review: ${view.reviewer}${view.verdict ? ` · ${view.verdict.verdict}` : ' · running'}` : null,
     line('blocked', view.blocker),

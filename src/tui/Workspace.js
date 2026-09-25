@@ -124,7 +124,7 @@ export function createWorkspace(React, Ink) {
     }, row.text || ' ')));
   }
   function Pane({pane, selected, x, y, width, height, scroll = 0, now = Date.now(), onScrollClamp}) {
-    const title = pane.kind === 'orchestrator' ? 'orchestrator' : `${String(pane.profile).split('@')[0]} · ${pane.task.slice(0, 8)}${pane.model ? ` · ${shortModel(pane.model)}` : ''}`;
+    const title = pane.kind === 'orchestrator' ? 'orchestrator' : `${String(pane.profile).split('@')[0]} · ${pane.task.slice(0, 8)}${pane.model ? ` · ${shortModel(pane.model)}` : ''}${pane.inPlace ? ' · in place' : ''}`;
     // A blocked/input_required pane leads with why, not with whatever prose (often stale success
     // text from an earlier milestone) happens to sit in pane.text — see src/tui/projection.js,
     // which keeps the blocker in its own field so a later milestone can't clobber it.
