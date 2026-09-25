@@ -12,13 +12,15 @@ const report = {op: 'final', outcome: 'completed', phase: 'audit', text: 'Read s
 const settle = (session, task) => new Promise(resolve => {
   const off = session.subscribe(row => { if (row.task === task && ['task.accepted', 'task.blocked', 'task.failed'].includes(row.kind)) {off(); resolve(row);} });
 });
-for (const accepts of [true, false]) test(`uncertain completion review retries the candidate without another analyst start (${accepts ? 'accepted' : 'blocked'})`, {timeout: 4000}, async t => {
+// Reversed 2026-09-25: an unconfident Jev answer is accepted with its lean as advice (see
+// jev-review.test.js) — no identical re-ask; the review stays bound to the reported candidate.
+test('an uncertain completion review accepts the candidate with advice, without another analyst start or a re-ask', {timeout: 4000}, async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-review-recovery-'));
   const session = new Session(root, {root});
   const requests = [];
   const critic = createTypesafeLive({readKey: () => ({key: 'test'}), readSettings: () => ({enabled: true, review: true, confidence: 0.8}), fetchImpl: async (_, options) => {
     requests.push(JSON.parse(options.body));
-    return {ok: true, json: async () => ({answers: {decision: {choice: requests.length > 1 && accepts ? 'accept' : 'rework', confidence: requests.length > 1 && accepts ? 0.95 : 0.63}}})};
+    return {ok: true, json: async () => ({answers: {decision: {choice: 'rework', confidence: 0.63}}})};
   }});
   const worker = fakeAdapter(() => [{kind: 'result', status: 'completed', text: JSON.stringify(report)}]);
   const scheduler = createScheduler({session, adapters: {worker, typesafe: critic}, profiles: {analyst: {adapter: 'worker', role: 'analyst', policy: 'read-only'}, critic: {adapter: 'typesafe', policy: 'read-only'}}, requireFinalReport: true, watchdog: {interval: null}});
@@ -26,18 +28,14 @@ for (const accepts of [true, false]) test(`uncertain completion review retries t
   const ended = settle(session, 'audit');
   scheduler.submit({task: 'audit', profile: 'analyst', orders: 'Read source only; a separate verifier owns execution.', requires: ['read'], review: {completion: 'critic'}});
   const result = await ended;
-  assert.equal(requests.length, 2);
-  assert.equal(result.kind, accepts ? 'task.accepted' : 'task.blocked');
+  assert.equal(requests.length, 1);
+  assert.equal(result.kind, 'task.accepted');
+  assert.match(result.advice, /^Jev leaned rework/);
   assert.equal(session.events.filter(e => e.kind === 'task.started').length, 1);
-  assert.deepEqual(requests[0].state.report, requests[1].state.report);
   const finished = session.events.filter(e => e.kind === 'review.finished');
-  assert.equal(finished.length, 2);
+  assert.equal(finished.length, 1);
   assert.equal(finished[0].candidateSeq, session.events.find(e => e.kind === 'task.reported').seq);
-  assert.equal(finished[0].candidateDigest, finished[1].candidateDigest);
-  if (!accepts) {
-    assert.equal(session.events.find(e => e.kind === 'review.blocked').candidateSeq, finished[0].candidateSeq);
-    assert.throws(() => scheduler.submit({profile: 'analyst', retryOf: 'audit', orders: 'Repeat source audit'}), /review.*candidate/i);
-  }
+  assert.equal(session.events.some(e => e.kind === 'review.reasked' || e.kind === 'task.blocked'), false);
 });
 
 test('a completed report naming unfinished work is preserved and blocked without a report-only continuation', {timeout: 3000}, async t => {

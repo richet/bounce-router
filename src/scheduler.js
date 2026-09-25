@@ -1581,8 +1581,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       return;
     }
     // accept
-    if (stage === 'completion' && !publishArtifact(task, {kind: 'task.accepted', task, stage, by: reviewFrom(task), ...(intent.advice ? {advice: intent.advice} : {}), context})) return;
-    append({kind: 'task.accepted', task, stage, by: reviewFrom(task), context});
+    const accepted = {kind: 'task.accepted', task, stage, by: reviewFrom(task), ...(intent.advice ? {advice: intent.advice} : {}), context};
+    if (stage === 'completion' && !publishArtifact(task, accepted)) return;
+    append(accepted);
     if (stage === 'prelaunch') {
       if (availableStarts(root) < 1) return escalateBudget(task, context);
       await launchWorker(row);
