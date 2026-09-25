@@ -386,6 +386,11 @@ async function main() {
     process.exit(process.exitCode ?? 0);
   }
   let attachedTurn = remoteMain && ['running', 'starting', 'blocked'].includes(session.main?.state);
+  // True from the moment Enter sends a prompt while an attached (daemon-started) turn is current
+  // until that keyboard turn settles: main-service.js queues the prompt server-side, so it has
+  // no requestId of its own yet here, but scheduleRender still must not treat the attached turn
+  // ending as this view going idle while its own reply is still waiting to start.
+  let waitingOnQueuedTurn = false;
   let input = '', inputCursor = 0, verticalColumn = null, busy = attachedTurn, suspended = false, scroll = 0, historyIndex = -1;
   let suggestion = null; // the main worker's proposed next step, offered in the prompt; never sent on its own
   const pendingTurns = [];
@@ -738,10 +743,17 @@ async function main() {
     }
     if (attachedTurn && ['main.terminal', 'main.blocked'].includes(event?.kind)) {
       attachedTurn = false;
-      busy = false;
-      notice = event.text || `Turn ${event.status ?? 'blocked'}.`;
-      // The answer is the turn's last assistant row, never this row's text (that is a failure reason).
-      suggestion = event.kind === 'main.terminal' && event.status === 'completed' && !input ? suggestionFrom(lastAnswer(session.events)) : null;
+      if (waitingOnQueuedTurn) {
+        // Our own reply is already sent (through the normal keyboard path — see the Enter
+        // handler) and main-service.js has it queued: this event only ends the FOREIGN turn we
+        // were attached to, not ours. Stay busy; the keyboard turn's own resolution reports it.
+        notice = 'Queued · runs when the current turn ends';
+      } else {
+        notice = event.text || `Turn ${event.status ?? 'blocked'}.`;
+        // The answer is the turn's last assistant row, never this row's text (that is a failure reason).
+        suggestion = event.kind === 'main.terminal' && event.status === 'completed' && !input ? suggestionFrom(lastAnswer(session.events)) : null;
+        busy = false;
+      }
     }
     if (event?.kind === 'progress') progress = clean(event.text);
     terminal?.ingest(event);
@@ -1074,8 +1086,12 @@ async function main() {
         void refreshQuota(settings, {root, store: quotas, cwd: session.cwd}).then(render, () => {});
         if (dev && result === 'completed' && fingerprint() !== loadedFingerprint) await restart();
       }
-    } catch (e) {notice = e.message; if (!input) { input = text; inputCursor = input.length; }}
+    } catch (e) {
+      notice = e.message;
+      if (!input) { input = text; inputCursor = input.length; }
+    }
     finally {
+      waitingOnQueuedTurn = false;
       if (!ownsTurn) { render(); return; }
       clearInterval(activityTimer); activityTimer = null; progress = '';
       const next = pendingTurns.shift();
@@ -1183,13 +1199,24 @@ async function main() {
           notice = `/${decision.command} cannot change the session while a turn is active · cancel it first`;
         } else if (decision.action === 'run-command') {
           void submit(text, {parsedCommand: decision, ownsTurn: false});
-        } else if (decision.action === 'queue-turn') {
-          if (attachedTurn) { notice = 'Existing turn is active · use /btw to steer it, or wait before starting a new prompt'; render(); return; }
+        } else if (decision.action === 'queue-turn' && (!attachedTurn || waitingOnQueuedTurn)) {
+          // Either this view already owns the turn that is running, or it already sent its own
+          // reply behind the attached turn (waitingOnQueuedTurn) and a further prompt must wait
+          // its turn too — the daemon client can only track one request in flight at a time.
+          // Queued locally, drained once the in-flight turn ends (the keyboard turn's own finally
+          // below).
           pendingTurns.push(text); historyIndex = -1;
           notice = `Queued · ${pendingTurns.length} turn${pendingTurns.length === 1 ? '' : 's'} waiting`;
         } else {
+          // A fresh turn, or the FIRST prompt typed while an attached (daemon-started) turn is
+          // current and this view has not sent its own reply yet: send it through the normal
+          // keyboard turn path right now (U5a: the only place a main turn starts). main-service.js
+          // queues a USER prompt server-side when it lands while a run is current, so this is
+          // never lost and never races the foreign turn for the daemon's slot.
+          if (attachedTurn) waitingOnQueuedTurn = true;
           busy = true;
           void submit(text, {parsedCommand: decision.kind === 'turn' ? decision : null});
+          if (attachedTurn) notice = 'Queued · runs when the current turn ends';
         }
       }
     }
@@ -1201,7 +1228,22 @@ async function main() {
     else if (key.name === 'delete') ({input, cursor: inputCursor} = (key.ctrl || key.meta) ? deleteWordForward(input, inputCursor) : deleteForward(input, inputCursor));
     else if (key.ctrl && key.name === 'u') { input = ''; inputCursor = 0; }
     else if (key.name === 'tab') {const i = settings.order.indexOf(selected()); router.select(settings.order[(i + 1) % settings.order.length]);}
-    else if (key.name === 'up' && !input.includes('\n')) {if (!localSetup) {historyIndex = Math.min(history.length - 1, historyIndex + 1); input = history[history.length - 1 - historyIndex] || ''; inputCursor = input.length;}}
+    else if (key.name === 'up' && !input.includes('\n')) {
+      const ownQueued = remoteMain && !input ? reducers.queuedPrompts(session.events) : [];
+      if (ownQueued.length) {
+        // Like Claude Code: Up on an empty input pulls the most recent still-queued prompt back
+        // for editing instead of recalling history. This only withdraws a queued prompt; it never
+        // starts a turn, so it needs no new submission call site (CONTRACT U5a).
+        const latest = ownQueued.at(-1);
+        void Promise.resolve(router.withdraw(latest.requestId)).then(result => {
+          if (result.withdrawn) { input = result.text; inputCursor = input.length; notice = 'Pulled back for editing · Enter resends, clear to cancel'; }
+          else notice = 'already started — cannot withdraw';
+          render();
+        }).catch(error => { notice = error.message; render(); });
+      } else if (!localSetup) {
+        historyIndex = Math.min(history.length - 1, historyIndex + 1); input = history[history.length - 1 - historyIndex] || ''; inputCursor = input.length;
+      }
+    }
     else if (key.name === 'down' && !input.includes('\n')) {if (!localSetup) {historyIndex = Math.max(-1, historyIndex - 1); input = historyIndex < 0 ? '' : history[history.length - 1 - historyIndex]; inputCursor = input.length;}}
     else if (str && !key.ctrl && !key.meta && !['left','right','home','end','delete','escape'].includes(key.name)) ({input, cursor: inputCursor} = insertText(input, inputCursor, clean(str).replace(/\n/g, ' ')));
     if (input !== beforeInput) {completionIndex = 0; menuDismissed = false;}

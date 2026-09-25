@@ -27,7 +27,7 @@ export function hostSession({session, child, main = null}) {
       session.active = msg.provider;
     } else if (msg.type?.startsWith('main.')) {
       const method = msg.type.slice('main.'.length);
-      const fn = ['run', 'deliver', 'cancel'].includes(method) ? main?.[method] : null;
+      const fn = ['run', 'deliver', 'cancel', 'withdraw'].includes(method) ? main?.[method] : null;
       if (typeof fn !== 'function') {
         child.send({type: 'main.error', seq: msg.seq, message: 'main provider is unavailable'});
         return;
@@ -98,6 +98,7 @@ export function createRemoteSession(channel) {
       runMain: params => callMain('run', params),
       deliverMain: params => callMain('deliver', params),
       cancelMain: params => callMain('cancel', params),
+      withdrawMain: params => callMain('withdraw', params),
       main: {state: 'unknown', currentTurnId: null},
       flush,
       lock() {}, unlock() {},

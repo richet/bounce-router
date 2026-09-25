@@ -12,6 +12,22 @@ export function peers(events) {
   return result;
 }
 
+// Queued `user` prompts (main-service.js's server-side FIFO of prompts that arrived while a run
+// was current) still waiting to start: neither dispatched (a later main.requested/main.started
+// for the same requestId) nor withdrawn (main.withdrawn). Only the keyboard submit path ever
+// journals a `user` row, so every one found here belongs to this session's own user — never a
+// worker or an automatic wake, which use different kinds. Mirrors main-service.js's own
+// restart-rebuild fold, so the view can answer "what's still queued" without asking the daemon.
+export function queuedPrompts(events) {
+  const dispatched = new Set(), withdrawn = new Set();
+  for (const e of events) {
+    if (e.requestId && ['main.requested', 'main.started'].includes(e.kind)) dispatched.add(e.requestId);
+    if (e.requestId && e.kind === 'main.withdrawn') withdrawn.add(e.requestId);
+  }
+  return events.filter(e => e.kind === 'user' && e.queued && e.requestId
+    && !dispatched.has(e.requestId) && !withdrawn.has(e.requestId));
+}
+
 // TERMINAL is the one definition shared with src/scheduler.js (imported from here, never
 // redefined): completed/failed/cancelled/timed_out end a task with no review pending;
 // accepted/rejected end one that went through review policy.

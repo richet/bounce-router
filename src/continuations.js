@@ -68,6 +68,10 @@ function taskActions(events) {
   const byTask = new Map();
   for (const row of events) {
     if (!OUTCOME_KINDS.has(row.kind)) continue;
+    // What the orchestrator did itself is not news to hand back to it, and it settles the task's
+    // earlier outcomes. Observed live (159f4746): its own override accept kept re-waking it with the
+    // same task every turn. (A user's action still is news to the orchestrator.)
+    if (row.from === 'orchestrator') { byTask.delete(row.task); continue; }
     const task = view[row.task];
     const campaign = task?.campaignId ? campaignView[task.campaignId] : null;
     if (!task || carriedByAncestor(view, row.task) || !(TERMINAL.has(task.state) || PARKED.has(task.state))

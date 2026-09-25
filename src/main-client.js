@@ -28,6 +28,10 @@ export function createMainClient(session, settings, {selection = null} = {}) {
         if (event.kind === 'main.terminal' && event.requestId === id) {
           resolve(event.status === 'interrupted' ? 'cancelled' : event.status);
         }
+        // A queued prompt withdrawn before it ran (cli.js's Up-arrow handling) never reaches
+        // main.terminal — settle the same call the same way, so `activeRequest` frees and a
+        // resend is not refused as "already active".
+        if (event.kind === 'main.withdrawn' && event.requestId === id) resolve('withdrawn');
       });
       try {
         const ack = await session.runMain({id, text, files, provider, model, mode: settings.mode, routing: {order: [...settings.order], models: {...settings.models}}, ...(typed ? {typed} : {})});
@@ -44,6 +48,9 @@ export function createMainClient(session, settings, {selection = null} = {}) {
     },
     cancel() {
       return session.cancelMain({id: activeRequest, reason: 'user'});
+    },
+    withdraw(id) {
+      return session.withdrawMain({id});
     },
   };
 }

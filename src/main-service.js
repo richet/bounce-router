@@ -109,6 +109,9 @@ export function createMainService({session, adapters, profile, settings, profile
   const lastCancellation = session.events.findLast(event => event.kind === 'main.cancelled');
   const lastManualRequest = session.events.findLast(event => event.kind === 'main.requested' && !event.wake);
   let current = null, closed = false, blockedState = null;
+  // A FIFO of USER prompts (wake:false) that arrived while a run was current — see start() and
+  // drainQueue() below.
+  const queuedPrompts = [], queuedIds = new Set();
   let autoWakeSuppressed = Boolean(lastCancellation && (!lastManualRequest || lastCancellation.seq > lastManualRequest.seq));
   const unfinishedExecution = session.events.findLast(event => {
     if (!['main.starting', 'main.started'].includes(event.kind)) return false;
@@ -129,6 +132,30 @@ export function createMainService({session, adapters, profile, settings, profile
     && !session.events.some(event => event.seq > previousSafetyBlock.seq && event.kind === 'main.requested')) {
     current = {id: previousSafetyBlock.requestId, turnId: previousSafetyBlock.turnId, unverified: true, orphaned: true, finished: true};
     blockedState = {reason: previousSafetyBlock.reason, requestId: previousSafetyBlock.requestId};
+  }
+  // Rebuild the in-memory queue (queuedPrompts/queuedIds, declared above) from queued `user` rows
+  // that never got dispatched — a daemon restart while a prompt was queued (start() above). A row
+  // counts as dispatched once a later main.requested or main.started carries its requestId, exactly
+  // what drainQueue()'s call to start() journals; a row withdrawn by the user (withdraw() below)
+  // before the restart is skipped the same way. That makes this idempotent across restarts. Older
+  // journals whose queued rows predate `requestId` can't be safely matched back to a run and are
+  // left as transcript-only entries — never invented, never replayed twice. Draining itself happens
+  // in the queueMicrotask below, after this constructor finishes, same as a live queued prompt: it
+  // still waits behind the `current`/`blockedState` fences above (an orphaned run, say) exactly as
+  // start() would.
+  for (const row of session.events) {
+    if (row.kind !== 'user' || !row.queued || !row.requestId) continue;
+    if (queuedIds.has(row.requestId)) continue;
+    const dispatched = session.events.some(event => event.seq > row.seq
+      && ['main.requested', 'main.started'].includes(event.kind) && event.requestId === row.requestId);
+    if (dispatched) continue;
+    const withdrawn = session.events.some(event => event.seq > row.seq
+      && event.kind === 'main.withdrawn' && event.requestId === row.requestId);
+    if (withdrawn) continue;
+    queuedIds.add(row.requestId);
+    queuedPrompts.push({id: row.requestId, text: row.text, savedImages: row.images ?? [],
+      ...(row.typed ? {typed: row.typed} : {}), ...(row.provider ? {provider: row.provider} : {}),
+      ...(row.model ? {model: row.model} : {}), ...(row.mode ? {mode: row.mode} : {}), ...(row.routing ? {routing: row.routing} : {})});
   }
   const state = () => ({state: current?.unverified || blockedState ? 'blocked' : current ? current.handle ? 'running' : 'starting' : 'idle',
     provider: selection.provider, model: selection.model, mode: selection.mode, policy: selection.policy, currentTurnId: current?.turnId ?? null, requestId: current?.id ?? null});
@@ -190,16 +217,29 @@ export function createMainService({session, adapters, profile, settings, profile
     ];
     const committed = session.commit(rows, {ref: `main-terminal:${run.id}`, version: 2});
     notify(committed.filter(row => row.kind.startsWith('main.')));
-    if (!suppressReconcile && status !== 'interrupted' && !run.userCancelled) reconcile();
+    // suppressReconcile marks the internal watchdog-recovery finish, whose caller starts the
+    // retry itself right after this returns — draining the queue here would steal that slot.
+    if (suppressReconcile) return;
+    // A prompt queued while this run was current (start() below) always goes out next, ahead of
+    // any automatic wake for outcomes still pending — a typed prompt is never raced by a
+    // synthetic one, queued or not. This also frees a prompt queued behind a run that ended
+    // cancelled: cancellation is not a reason to lose it.
+    if (drainQueue()) return;
+    if (status !== 'interrupted' && !run.userCancelled) reconcile();
   }
   function block(run, reason, text, extra = {}) {
     if (run.finished) return;
     stopWatchdog(run);
     run.unverified = reason === 'termination_uncertain' || reason === 'orphaned';
     run.finished = true;
-    if (current === run && !run.unverified) current = null;
+    const cleared = current === run && !run.unverified;
+    if (cleared) current = null;
     blockedState = {reason, requestId: run.id, ...extra};
     emit({kind: 'main.blocked', requestId: run.id, turnId: run.turnId, state: 'blocked', reason, text, ...extra});
+    // Same as finish(): a run ending in main.blocked still frees the daemon for a queued prompt,
+    // unless termination itself is unverified (run.unverified) — then `current` stays held and
+    // starting anything, queued or not, would race the unverified process.
+    if (cleared) drainQueue();
   }
   function armWatchdog(run, stage) {
     stopWatchdog(run);
@@ -373,9 +413,9 @@ export function createMainService({session, adapters, profile, settings, profile
     }
     return blocks.join('\n');
   }
-  function start(params, {wake, forceFresh = false} = {}) {
+  function start(params, {wake, forceFresh = false, fromQueue = false} = {}) {
     if (closed) return {accepted: false, reason: 'daemon_closed'};
-    if (current) return {accepted: false, reason: current.unverified ? 'termination_unverified' : 'busy'};
+    if (current && (wake || current.unverified)) return {accepted: false, reason: current.unverified ? 'termination_unverified' : 'busy'};
     if (blockedState && ['termination_uncertain', 'orphaned'].includes(blockedState.reason)) return {accepted: false, reason: 'termination_unverified'};
     if (Object.values(tasks(session.events)).some(t => t.state === 'blocked' && session.events.findLast(e => e.task === t.id && e.kind === 'task.blocked')?.reason === 'orphaned')) return {accepted: false, reason: 'termination_unverified'};
     if (typeof params?.text !== 'string' || !params.text.trim()) return {accepted: false, reason: 'empty_prompt'};
@@ -428,6 +468,15 @@ export function createMainService({session, adapters, profile, settings, profile
     session.active = provider;
     run.done = Promise.resolve().then(() => execute(run, {...params}));
     return {accepted: true, requestId: run.id, state: 'started'};
+  }
+  // Called by finish()/block() once `current` frees up: the oldest queued USER prompt, if any,
+  // starts right here — before those callers decide whether to reconcile/arm an automatic wake.
+  function drainQueue() {
+    if (closed || current || !queuedPrompts.length) return false;
+    const item = queuedPrompts.shift();
+    queuedIds.delete(item.id);
+    start(item, {wake: false, fromQueue: true});
+    return true;
   }
   // Wake-up on a terminal row: the daemon owns the main agent, so when it is idle and a task it
   // submitted ends, the daemon starts the next turn itself — the user never has to ask "what
@@ -548,6 +597,21 @@ export function createMainService({session, adapters, profile, settings, profile
         {failure: {code: 'cancel_failed', stage: run.started ? 'running' : 'startup'}});
       return {accepted: true, ...stopped};
     },
+    // Only a prompt still sitting in the queue (never handed to execute()) can be pulled back —
+    // once it is dispatched (main.requested/main.started), withdrawing it would race the run it
+    // already started. `id` is the requestId the prompt was queued under (start()'s `id`, same
+    // one the TUI already holds from its own submit).
+    withdraw({id} = {}) {
+      const index = queuedPrompts.findIndex(item => item.id === id);
+      if (index === -1) {
+        const queuedRow = session.events.findLast(event => event.kind === 'user' && event.queued && event.requestId === id);
+        return {withdrawn: false, reason: queuedRow ? 'started' : 'not_queued'};
+      }
+      const [item] = queuedPrompts.splice(index, 1);
+      queuedIds.delete(id);
+      session.append({kind: 'main.withdrawn', from: 'user', requestId: id, text: item.text});
+      return {withdrawn: true, text: item.text};
+    },
     async close() {
       closed = true;
       unsubscribeRoster();
@@ -580,6 +644,9 @@ export function createMainService({session, adapters, profile, settings, profile
       if (!result.accepted && result.reason !== 'nothing_pending') reconcile();
       return;
     }
+    // A queue rebuilt from the journal (above) drains exactly like a live one: ahead of any
+    // automatic wake, one item now, the rest chained through finish()/block() as each turn ends.
+    if (drainQueue()) return;
     reconcile();
   });
   return service;
