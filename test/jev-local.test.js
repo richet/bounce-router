@@ -13,14 +13,14 @@ import {Session} from '../src/core.js';
 import {createScheduler} from '../src/scheduler.js';
 import {createOpencodeLive} from '../src/adapters/opencode-live.js';
 import {createTypesafeLive} from '../src/adapters/typesafe-live.js';
-import {createJevDecisions, jevReviewerProfile, VERDICT_CHECKS} from '../src/jev.js';
+import {createJevDecisions, jevReviewerProfile, REPORT_VERDICT_CHECKS} from '../src/jev.js';
 import {validateOrchestration} from '../src/profiles.js';
 
 const helper = fileURLToPath(new URL('./helpers/fake-opencode.js', import.meta.url));
 const waitFor = async (fn, timeout = 8000) => { const start = Date.now(); for (;;) { const value = fn(); if (value) return value; if (Date.now() - start > timeout) throw new Error('timed out waiting for condition'); await new Promise(r => setTimeout(r, 10)); } };
 const okResponse = body => ({ok: true, status: 200, headers: {get: () => null}, json: async () => body, text: async () => JSON.stringify(body)});
 const verdict = (choice, confidence, nouls = {}) => ({answers: {decision: {type: 'choice', choice, probabilities: {accept: choice === 'accept' ? confidence : 1 - confidence, rework: choice === 'rework' ? confidence : 1 - confidence}, confidence},
-  ...Object.fromEntries(Object.keys(VERDICT_CHECKS).map(name => [name, {type: 'noul', noul: nouls[name] ?? 0.05}]))}});
+  ...Object.fromEntries(Object.keys(REPORT_VERDICT_CHECKS).map(name => [name, {type: 'noul', noul: nouls[name] ?? 0.05}]))}});
 
 test('a local agent\'s answer is what Jev judges; a confident rework resumes the SAME opencode session, and the second answer is accepted', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-jev-local-')));
@@ -42,26 +42,26 @@ test('a local agent\'s answer is what Jev judges; a confident rework resumes the
   const typesafe = createTypesafeLive({readKey: () => ({key: 'ts-test-key', source: 'file'}), readSettings: () => settings, git: async args => args[0] === 'rev-parse' ? 'true\n' : '',
     fetchImpl: async (url, options) => { calls.push(JSON.parse(options.body)); return okResponse(++round === 1 ? verdict('rework', 0.93, {remaining_work: 0.9}) : verdict('accept', 0.96)); }});
   const jev = createJevDecisions({adapter: typesafe, readSettings: () => settings});
-  const scheduler = createScheduler({session, adapters: {opencode: createOpencodeLive({}), typesafe}, profiles, jev, localResolver, requireFinalReport: true, gitHead: () => null});
+  const scheduler = createScheduler({...hostless, session, adapters: {opencode: createOpencodeLive({}), typesafe}, profiles, jev, localResolver, requireFinalReport: true, gitHead: () => null});
   t.after(() => scheduler.close());
 
   const row = scheduler.submit({parent: null, profile: 'analyst', orders: 'scout the repo', deadline: null});
   assert.equal(row.review.completion, 'jev', 'a task submitted to an agent is Jev-reviewed like any other root task');
   await waitFor(() => scheduler.tasks()[row.task]?.state === 'accepted');
 
-  // 1. The local worker's answer was synthesized into the completion, and THAT is what Jev judged.
+  // 1. The local worker's validated envelope becomes the completion report Jev judges.
   const completions = session.events.filter(e => e.kind === 'task.completed' && e.task === row.task);
   assert.equal(completions.length, 2);
-  assert.deepEqual(completions.map(e => e.synthesized), [true, true]);
-  assert.equal(completions[0].summary, 'echo: scout the repo');
+  assert.deepEqual(completions.map(e => e.synthesized), [undefined, undefined]);
+  assert.equal(completions[0].summary, 'completed scout the repo');
   assert.equal(calls.length, 2);
   assert.equal(calls[0].state.orders, 'scout the repo');
-  assert.equal(calls[0].state.report.summary, 'echo: scout the repo', 'with no structured report, the synthesized answer is the report Jev reads');
-  assert.equal(session.events.some(e => e.kind === 'task.report_requested'), false, 'no report-chasing continuation for a local worker');
+  assert.equal(calls[0].state.report.summary, 'completed scout the repo', 'Jev reads the validated local final report');
+  assert.equal(session.events.some(e => e.kind === 'task.report_requested'), false, 'a valid final envelope needs no continuation');
 
   // 2. A confident rework resumed the same worker in the same opencode session, with the findings.
   assert.deepEqual(session.events.filter(e => e.kind === 'jev.verdict').map(e => [e.verdict, e.confidence]), [['rework', 0.93], ['accept', 0.96]]);
-  assert.deepEqual(session.events.find(e => e.kind === 'task.rework').findings, [VERDICT_CHECKS.remaining_work.fix]);
+  assert.deepEqual(session.events.find(e => e.kind === 'task.rework').findings, [REPORT_VERDICT_CHECKS.remaining_work.fix]);
   const lines = fs.readFileSync(log, 'utf8').split('\n');
   const argvs = lines.filter(line => line.startsWith('ARGV ')).map(line => JSON.parse(line.slice(5)));
   const prompts = lines.filter(line => line.startsWith('PROMPT ')).map(line => JSON.parse(line.slice(7)));
@@ -71,17 +71,19 @@ test('a local agent\'s answer is what Jev judges; a confident rework resumes the
   assert.deepEqual(argvs[1].slice(-2), ['-s', native.sessionId], 'the rework is `opencode run -s <the first turn\'s session>`');
   assert.deepEqual([argvs[0][argvs[0].indexOf('--agent') + 1], argvs[1][argvs[1].indexOf('--agent') + 1]], ['analyst', 'analyst'], 'both turns ran AS the agent');
   assert.match(prompts[1], /Rework round 1:\n- /);
-  assert.equal(completions[1].summary.startsWith('echo: '), true);
+  assert.match(completions[1].summary, /^completed Rework round 1:/);
 
   // 3. Accepted by the Jev review; the key never reached the journal.
-  assert.equal(session.events.at(-1).kind, 'task.accepted');
-  assert.equal(session.events.at(-1).by, `review:${row.task}`);
+  const accepted = session.events.findLast(e => e.kind === 'task.accepted');
+  assert.equal(accepted.by, `review:${row.task}`);
+  assert.equal(session.events.at(-1).kind, 'orchestration.action.settled');
   assert.equal(fs.readFileSync(session.file, 'utf8').includes('ts-test-key'), false);
 });
 
 // ---------------------------------------------------------------- Phase 1: Jev picks the JOB for `auto`
 import {routingQuestions, decideRoute, agentHeads} from '../src/jev.js';
 import {fakeAdapter} from './helpers/fake-adapter.js';
+import {hostless} from './helpers/local-fakes.js';
 
 // A roster the way the daemon builds it: plain profiles (one AI each) plus two agents' derived chains.
 const agent = (name, policy, description) => ({name, description, policy, prompt: `You are the ${name}.`});
@@ -145,7 +147,7 @@ test('scheduler: `auto` routed to a job runs on that agent\'s chain and the jour
     return {answers: {agent: {choice: 'reviewer', confidence: 0.91, probabilities: {reviewer: 0.91, builder: 0.04, none: 0.05}}, profile: {choice: 'build', confidence: 0.6}, needs_write: {noul: 0.05}, needs_shell: {noul: 0.1}}, model: 'jev-1.13.0', latencyMs: 12}; }}});
   const profiles = {...composed, reviewer: {...composed.reviewer, adapter: 'claude'}};
   const claude = worker('claude'), codex = worker('codex');
-  const scheduler = createScheduler({session, adapters: {claude, codex}, profiles, jev, gitHead: () => null});
+  const scheduler = createScheduler({...hostless, session, adapters: {claude, codex}, profiles, jev, gitHead: () => null});
   t.after(() => scheduler.close());
   const row = scheduler.submit({parent: null, profile: 'auto', orders: 'Review the diff on this branch for defects. Do not change anything.', deadline: null});
   await waitFor(() => ['completed', 'accepted', 'failed'].includes(scheduler.tasks()[row.task]?.state));

@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {Session} from '../src/core.js';
 import {createScheduler} from '../src/scheduler.js';
+import {hostless} from './helpers/local-fakes.js';
 
 async function fixture(t) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'bounce-oc-lifecycle-'));
@@ -32,7 +33,7 @@ test('explicit cancellation during opencode launch cannot start fallback', async
       entered(); signal.addEventListener('abort', () => reject(Object.assign(new Error('backend_unavailable'), {code: 'backend_unavailable'})), {once: true});
     }), async *events() {}, cancel: async () => ({verified: true})};
   const cloud = {...adapter, launch: async () => {fallbacks++; return {};}};
-  const scheduler = createScheduler({session, adapters: {opencode: adapter, cloud}, watchdog: {interval: null},
+  const scheduler = createScheduler({...hostless, session, adapters: {opencode: adapter, cloud}, watchdog: {interval: null},
     localResolver: {resolve: async ({profile}) => profile}, profiles: {
       worker: {adapter: 'opencode', backend: 'lmstudio', policy: 'read-only', mode: 'plan', localOnly: false, fallback: ['cloud']},
       cloud: {adapter: 'cloud', policy: 'read-only', mode: 'plan', fallback: []},
@@ -58,7 +59,7 @@ test('explicit cancellation during pending opencode review ends the task without
     entered(); signal.addEventListener('abort', () => reject(Object.assign(new Error('backend_unavailable'), {code: 'backend_unavailable'})), {once: true});
   }), async *events() {}, cancel: async () => ({verified: true})};
   const worker = {...opencode, launch: async () => {launches++; return {};}};
-  const scheduler = createScheduler({session, adapters: {opencode, worker}, profiles: {
+  const scheduler = createScheduler({...hostless, session, adapters: {opencode, worker}, profiles: {
     worker: {adapter: 'worker', policy: 'read-only', mode: 'plan'}, critic: {adapter: 'opencode', backend: 'lmstudio', policy: 'read-only', mode: 'plan', role: 'critic'},
   }, localResolver: {resolve: async ({profile}) => profile}, watchdog: {interval: null}});
   t.after(() => scheduler.close());

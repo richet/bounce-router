@@ -6,6 +6,7 @@ import path from 'node:path';
 import {Session} from '../src/core.js';
 import {createScheduler} from '../src/scheduler.js';
 import {createLocalResolver} from '../src/local-resolve.js';
+import {hostless} from './helpers/local-fakes.js';
 
 function event(session, predicate) {
   const current = session.events.find(predicate);
@@ -43,7 +44,7 @@ test('a local dispatch resolves its model visibly, is cancellable while resolvin
         {id: 'model', ref: 'lmstudio/model', type: 'llm', tools: true, ready: true, instances: [{id: 'loaded', context: 8192}]}]}];
     }});
   const profiles = {worker: {adapter: 'opencode', backend: 'lmstudio', endpoint: 'lmstudio', model: 'auto', mode: 'yolo', policy: 'read-only', fallback: []}};
-  const scheduler = createScheduler({session, adapters: {opencode: adapter}, profiles, localResolver, requireFinalReport: true,
+  const scheduler = createScheduler({...hostless, session, adapters: {opencode: adapter}, profiles, localResolver, requireFinalReport: true,
     localSettings: {endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234', maxConcurrent: 2}}}});
   t.after(async () => {await scheduler.stop(); scheduler.close();});
   const first = scheduler.submit({profile: 'worker', orders: 'read'});
