@@ -100,7 +100,10 @@ test('the cited message rides first, and only user messages since the prior in-p
 test('inPlaceQuestions/decideInPlace: a confident choice at or above the bar resolves; below it, unresolved', () => {
   const {questions, state} = inPlaceQuestions({citedText: 'commit it', messages: ['commit it'], orders: 'git commit'});
   assert.equal(state.cited_message, 'commit it');
-  assert.ok(questions.risk.criteria.exceeds);
+  assert.equal(
+    questions.risk.criteria.exceeds,
+    'The cited user message asks for a narrower step than these orders carry out (for example it asked to commit, but the orders also push or open a PR).',
+  );
   assert.deepEqual(decideInPlace({risk: {choice: 'authorized', confidence: 0.85}}, {confidence: 0.8}),
     {verdict: 'authorized', choice: 'authorized', confidence: 0.85, threshold: 0.8, probabilities: {}});
   assert.equal(decideInPlace({risk: {choice: 'exceeds', confidence: 0.5}}, {confidence: 0.8}).verdict, 'unresolved');
