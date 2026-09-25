@@ -8,16 +8,7 @@ import {createScheduler} from '../src/scheduler.js';
 import {fakeAdapter} from './helpers/fake-adapter.js';
 import {takeCheckpoint} from '../src/checkpoint.js';
 import {hostless} from './helpers/local-fakes.js';
-
-const waitFor = async (predicate, timeout = 1_000) => {
-  const until = Date.now() + timeout;
-  for (;;) {
-    const value = predicate();
-    if (value) return value;
-    if (Date.now() >= until) throw new Error('timed out');
-    await new Promise(resolve => setTimeout(resolve, 10));
-  }
-};
+import {waitFor, tmpSession, teardown} from './helpers/wait.js';
 
 const local = (role, model = 'm') => ({adapter: 'opencode', backend: 'lmstudio', endpoint: 'lmstudio', model, mode: 'yolo', policy: 'write', fallback: [], role, agent: {name: role, description: 'x', policy: 'write', prompt: 'x'}, derived: true, localOptions: {}});
 const reviewerOn = model => ({...local('reviewer', model), policy: 'read-only', agent: {...local('reviewer', model).agent, policy: 'read-only'}});
@@ -25,12 +16,6 @@ const passResolver = {resolve: async ({profile}) => ({...profile, providerID: 'l
 const endpoints = (extra = {}) => ({endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234', maxConcurrent: 1, ...extra}}});
 const slotMilestone = (session, task) => session.events.some(row => row.task === task && row.kind === 'task.milestone' && /local slot/.test(row.text));
 const releases = (session, task) => session.events.filter(row => row.kind === 'task.slot.released' && row.task === task);
-// The directory is removed after the scheduler using it has stopped (after-hooks run in order).
-function tmpSession(prefix) {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
-  return {root, session: new Session(root, {root})};
-}
-const teardown = (t, scheduler, root) => t.after(async () => { await scheduler.stop(); scheduler.close(); fs.rmSync(root, {recursive: true, force: true}); });
 // A started `{never: true}` worker the test ends later with a result of its choosing.
 function endable(adapter) {
   const started = new Map();
@@ -70,14 +55,14 @@ for (const [name, firstResult, releasedState] of [
   t.after(async () => { await scheduler.stop(); scheduler.close(); fs.rmSync(root, {recursive: true, force: true}); });
 
   const firstTask = scheduler.submit({parent: null, profile: 'worker', orders: 'first', deadline: null});
-  await waitFor(() => launched.length === 1);
+  await waitFor(() => launched.length === 1, {timeout: 1000});
   const second = scheduler.submit({parent: null, profile: 'worker', orders: 'second', deadline: null});
-  await waitFor(() => session.events.some(row => row.task === second.task && row.kind === 'task.milestone' && /local slot/.test(row.text)));
+  await waitFor(() => session.events.some(row => row.task === second.task && row.kind === 'task.milestone' && /local slot/.test(row.text)), {timeout: 1000});
 
   first.resolve([firstResult]);
-  await waitFor(() => session.events.some(row => row.task === firstTask.task && row.kind === releasedState));
-  const released = await waitFor(() => session.events.find(row => row.task === firstTask.task && row.kind === 'task.slot.released'));
-  await waitFor(() => launched.includes('second'));
+  await waitFor(() => session.events.some(row => row.task === firstTask.task && row.kind === releasedState), {timeout: 1000});
+  const released = await waitFor(() => session.events.find(row => row.task === firstTask.task && row.kind === 'task.slot.released'), {timeout: 1000});
+  await waitFor(() => launched.includes('second'), {timeout: 1000});
   assert.equal(session.events.some(row => row.kind === 'orchestration.action.requested'
     && row.actionId === `dispatch:${second.task}:${released.seq}`), true);
 });
@@ -95,12 +80,12 @@ test('a launch failure gives its local slot to a queued worker exactly once', {t
     gitHead: () => null, localSettings: endpoints()});
   teardown(t, scheduler, root);
   const first = scheduler.submit({parent: null, profile: 'worker', orders: 'first', deadline: null});
-  await waitFor(() => launched.length === 1);
+  await waitFor(() => launched.length === 1, {timeout: 1000});
   const second = scheduler.submit({parent: null, profile: 'worker', orders: 'second', deadline: null});
-  await waitFor(() => slotMilestone(session, second.task));
+  await waitFor(() => slotMilestone(session, second.task), {timeout: 1000});
   gate.resolve();
-  await waitFor(() => session.events.some(row => row.task === first.task && row.kind === 'task.failed'));
-  await waitFor(() => launched.includes('second'));
+  await waitFor(() => session.events.some(row => row.task === first.task && row.kind === 'task.failed'), {timeout: 1000});
+  await waitFor(() => launched.includes('second'), {timeout: 1000});
   const released = releases(session, first.task);
   assert.deepEqual(released.map(row => row.stage), ['launch']);
   assert.equal(session.events.some(row => row.kind === 'orchestration.action.requested' && row.actionId === `dispatch:${second.task}:${released[0].seq}`), true);
@@ -121,9 +106,9 @@ test('cancelling a worker still in local admission gives its slot to a queued wo
   const first = scheduler.submit({parent: null, profile: 'held', orders: 'first', deadline: null});
   await held.promise;
   const second = scheduler.submit({parent: null, profile: 'worker', orders: 'second', deadline: null});
-  await waitFor(() => slotMilestone(session, second.task));
+  await waitFor(() => slotMilestone(session, second.task), {timeout: 1000});
   await scheduler.cancel(first.task);
-  await waitFor(() => launched.includes('second'));
+  await waitFor(() => launched.includes('second'), {timeout: 1000});
   assert.deepEqual(launched, ['second']);
   assert.equal(session.events.filter(row => row.task === first.task && row.kind === 'task.cancelled').length, 1);
   assert.deepEqual(releases(session, first.task).map(row => row.stage), ['launch']);
@@ -141,13 +126,13 @@ test('a worker cancelled while its launch is pending gives its slot back once th
     gitHead: () => null, localSettings: endpoints()});
   teardown(t, scheduler, root);
   const first = scheduler.submit({parent: null, profile: 'worker', orders: 'first', deadline: null});
-  await waitFor(() => launched.length === 1);
+  await waitFor(() => launched.length === 1, {timeout: 1000});
   const second = scheduler.submit({parent: null, profile: 'worker', orders: 'second', deadline: null});
-  await waitFor(() => slotMilestone(session, second.task));
+  await waitFor(() => slotMilestone(session, second.task), {timeout: 1000});
   await scheduler.cancel(first.task);
   gate.resolve();
-  await waitFor(() => session.events.some(row => row.task === first.task && row.kind === 'task.cancelled'));
-  await waitFor(() => launched.includes('second'));
+  await waitFor(() => session.events.some(row => row.task === first.task && row.kind === 'task.cancelled'), {timeout: 1000});
+  await waitFor(() => launched.includes('second'), {timeout: 1000});
   assert.equal(adapter.calls.cancel, 1);
   assert.equal(releases(session, first.task).length, 1);
 });
@@ -161,15 +146,15 @@ test('an adopted worker holds its slot until its stream ends, then releases it o
     gitHead: () => null, localSettings: endpoints()});
   teardown(t, scheduler, root);
   const firstTask = scheduler.submit({parent: null, profile: 'worker', orders: 'first', deadline: null});
-  await waitFor(() => launched.length === 1);
+  await waitFor(() => launched.length === 1, {timeout: 1000});
   const second = scheduler.submit({parent: null, profile: 'worker', orders: 'second', deadline: null});
-  await waitFor(() => slotMilestone(session, second.task));
-  await waitFor(() => session.events.some(row => row.task === firstTask.task && row.kind === 'task.started'));
+  await waitFor(() => slotMilestone(session, second.task), {timeout: 1000});
+  await waitFor(() => session.events.some(row => row.task === firstTask.task && row.kind === 'task.started'), {timeout: 1000});
   await new Promise(resolve => setTimeout(resolve, 50));
   assert.equal(releases(session, firstTask.task).length, 0);
   assert.deepEqual(launched, ['first']);
   workers.end('first', {kind: 'result', status: 'completed', text: 'done'});
-  await waitFor(() => launched.includes('second'));
+  await waitFor(() => launched.includes('second'), {timeout: 1000});
   assert.deepEqual(releases(session, firstTask.task).map(row => row.stage), [undefined]);
 });
 
@@ -192,8 +177,8 @@ test('a failed report-only resume releases its slot once, after the worker handl
   const firstTask = scheduler.submit({parent: null, profile: 'worker', orders: 'first', deadline: null});
   const second = scheduler.submit({parent: null, profile: 'worker', orders: 'second', deadline: null});
   await gate.promise; off();
-  await waitFor(() => session.events.some(row => row.task === firstTask.task && row.kind === 'task.blocked'));
-  await waitFor(() => launched.includes('second'));
+  await waitFor(() => session.events.some(row => row.task === firstTask.task && row.kind === 'task.blocked'), {timeout: 1000});
+  await waitFor(() => launched.includes('second'), {timeout: 1000});
   assert.equal(slotMilestone(session, second.task), true);
   assert.equal(adapter.calls.resume, 1);
   assert.equal(session.events.findLast(row => row.task === firstTask.task && row.kind === 'task.blocked').reason, 'report_repair_unavailable');
@@ -214,13 +199,13 @@ test('local prelaunch reviews obey the endpoint slot limit', {timeout: 3_000}, a
   const first = scheduler.submit({parent: null, profile: 'worker', orders: 'first', deadline: null, review: {prelaunch: 'reviewer', completion: 'reviewer'}});
   const second = scheduler.submit({parent: null, profile: 'worker', orders: 'second', deadline: null, review: {prelaunch: 'reviewer', completion: 'reviewer'}});
   // The second task waits either at the dispatch gate or at review admission; never beside the first.
-  await waitFor(() => launched.length === 1);
-  await waitFor(() => slotMilestone(session, second.task) || session.events.some(row => row.task === second.task && row.kind === 'review.started'));
+  await waitFor(() => launched.length === 1, {timeout: 1000});
+  await waitFor(() => slotMilestone(session, second.task) || session.events.some(row => row.task === second.task && row.kind === 'review.started'), {timeout: 1000});
   await new Promise(resolve => setTimeout(resolve, 80));
   assert.deepEqual(launched, [`review:${first.task}`]);
   firstReview.resolve([{kind: 'result', status: 'completed', text: '{"verdict":"reject"}'}]);
-  await waitFor(() => session.events.some(row => row.task === first.task && row.kind === 'task.rejected'));
-  await waitFor(() => launched.length === 2);
+  await waitFor(() => session.events.some(row => row.task === first.task && row.kind === 'task.rejected'), {timeout: 1000});
+  await waitFor(() => launched.length === 2, {timeout: 1000});
   assert.deepEqual(launched, [`review:${first.task}`, `review:${second.task}`]);
   assert.deepEqual(releases(session, first.task).map(row => row.stage), ['review']);
 });
@@ -239,18 +224,18 @@ test('a completion review waiting for a model slot is cancellable and leaves no 
     localResolver: passResolver, gitHead: () => null, localSettings: endpoints({maxConcurrent: 2, slotsPerModel: 1})});
   teardown(t, scheduler, root);
   const busy = scheduler.submit({parent: null, profile: 'busy', orders: 'busy', deadline: null});
-  await waitFor(() => session.events.some(row => row.task === busy.task && row.kind === 'task.started'));
+  await waitFor(() => session.events.some(row => row.task === busy.task && row.kind === 'task.started'), {timeout: 1000});
   const first = scheduler.submit({parent: null, profile: 'worker', orders: 'first', deadline: null, review: {completion: 'reviewer'}});
-  await waitFor(() => session.events.some(row => row.task === first.task && row.kind === 'review.started'));
+  await waitFor(() => session.events.some(row => row.task === first.task && row.kind === 'review.started'), {timeout: 1000});
   await new Promise(resolve => setTimeout(resolve, 50));
   assert.equal(launched.some(peer => peer.startsWith('review:')), false);
   await scheduler.cancel(first.task);
-  await waitFor(() => session.events.some(row => row.task === first.task && row.kind === 'task.cancelled'));
+  await waitFor(() => session.events.some(row => row.task === first.task && row.kind === 'task.cancelled'), {timeout: 1000});
   assert.equal(launched.some(peer => peer.startsWith('review:')), false);
   // The abandoned admission neither launched nor holds the slot: the busy worker's end releases the only one.
   assert.deepEqual(releases(session, first.task).map(row => row.stage), [undefined]);
   workers.end('busy', {kind: 'result', status: 'completed', text: 'done'});
-  await waitFor(() => releases(session, busy.task).length === 1);
+  await waitFor(() => releases(session, busy.task).length === 1, {timeout: 1000});
   await new Promise(resolve => setTimeout(resolve, 50));
   assert.equal(launched.some(peer => peer.startsWith('review:')), false);
 });
@@ -265,7 +250,7 @@ test('queued local work is dispatched once each after a daemon restart', {timeou
   const first = before.submit({parent: null, profile: 'worker', orders: 'first', deadline: null});
   await held.promise;
   const second = before.submit({parent: null, profile: 'worker', orders: 'second', deadline: null});
-  await waitFor(() => slotMilestone(session, second.task));
+  await waitFor(() => slotMilestone(session, second.task), {timeout: 1000});
   before.close();
 
   const reopened = new Session(root, {root, id: session.id});
@@ -275,7 +260,7 @@ test('queued local work is dispatched once each after a daemon restart', {timeou
     gitHead: () => null, localSettings: endpoints()});
   teardown(t, after, root);
   await after.reconcile();
-  await waitFor(() => reopened.events.some(row => row.task === second.task && row.kind === 'task.completed'));
+  await waitFor(() => reopened.events.some(row => row.task === second.task && row.kind === 'task.completed'), {timeout: 1000});
   await new Promise(resolve => setTimeout(resolve, 50));
   assert.deepEqual(launched.sort(), ['first', 'second']);
   assert.equal(reopened.events.some(row => row.task === first.task && row.kind === 'task.completed'), true);
@@ -300,7 +285,7 @@ test('a dispatch interrupted during its checkpoint is launched once after a rest
     checkpointRunner: async () => { await new Promise(resolve => setTimeout(resolve, 30)); return {status: 0, stdout: ''}; }});
   teardown(t, after, root);
   await after.reconcile();
-  await waitFor(() => reopened.events.some(e => e.task === row.task && e.kind === 'task.completed'));
+  await waitFor(() => reopened.events.some(e => e.task === row.task && e.kind === 'task.completed'), {timeout: 1000});
   await new Promise(resolve => setTimeout(resolve, 100));
   assert.equal(adapter.calls.launch, 1);
   assert.equal(reopened.events.filter(e => e.task === row.task && e.kind === 'task.started').length, 1);
@@ -329,17 +314,17 @@ function pressureScenario(t, {deadline = null} = {}) {
 
 test('a report repair that meets memory pressure waits for it to ease, then completes', {timeout: 3_000}, async t => {
   const {session, row, adapter, ease} = pressureScenario(t);
-  await waitFor(() => session.events.some(e => e.task === row.task && e.kind === 'task.milestone' && /^Waiting for warning memory pressure to ease before repairing the report on lmstudio$/.test(e.text)));
+  await waitFor(() => session.events.some(e => e.task === row.task && e.kind === 'task.milestone' && /^Waiting for warning memory pressure to ease before repairing the report on lmstudio$/.test(e.text)), {timeout: 1000});
   assert.equal(adapter.calls.resume, 0);
   ease();
-  await waitFor(() => session.events.some(e => e.task === row.task && e.kind === 'task.completed'));
+  await waitFor(() => session.events.some(e => e.task === row.task && e.kind === 'task.completed'), {timeout: 1000});
   assert.equal(session.events.some(e => e.task === row.task && e.kind === 'task.failed'), false);
   assert.equal(adapter.calls.resume, 1);
 });
 
 test('a report repair that never gets to run blocks with the answer the worker already gave', {timeout: 3_000}, async t => {
   const {session, row, adapter} = pressureScenario(t, {deadline: 400});
-  const blocked = await waitFor(() => session.events.find(e => e.task === row.task && e.kind === 'task.blocked'), 2_500);
+  const blocked = await waitFor(() => session.events.find(e => e.task === row.task && e.kind === 'task.blocked'), {timeout: 2_500});
   const output = session.events.find(e => e.task === row.task && e.kind === 'task.output');
   assert.equal(blocked.reason, 'report_repair_unavailable');
   assert.match(blocked.text, new RegExp(`^The worker answered \\(${output.chars} chars, output seq ${output.seq}\\): "\\*\\*Verdict: FAIL\\*\\*`));

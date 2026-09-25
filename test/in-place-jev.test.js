@@ -6,29 +6,11 @@
 // `.settings()` and `.inPlace(...)`) stands in for the real TypeSafe HTTP call.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-import {Session} from '../src/core.js';
 import {createScheduler} from '../src/scheduler.js';
 import {fakeAdapter} from './helpers/fake-adapter.js';
 import {decideInPlace, inPlaceQuestions} from '../src/jev.js';
+import {waitFor, tmpSession, teardown} from './helpers/wait.js';
 
-const waitFor = async (predicate, timeout = 2_000) => {
-  const until = Date.now() + timeout;
-  for (;;) {
-    const value = predicate();
-    if (value) return value;
-    if (Date.now() >= until) throw new Error('timed out');
-    await new Promise(resolve => setTimeout(resolve, 10));
-  }
-};
-
-function tmpSession(prefix) {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
-  return {root, session: new Session(root, {root})};
-}
-const teardown = (t, scheduler, root) => t.after(async () => { await scheduler.stop(); scheduler.close(); fs.rmSync(root, {recursive: true, force: true}); });
 const writer = {adapter: 'worker', model: 'w', mode: 'yolo', fallback: [], role: 'builder', policy: 'write'};
 
 function submitInPlace(scheduler, session, orders, text = 'commit it') {
