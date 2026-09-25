@@ -1085,7 +1085,9 @@ async function main() {
         history.push(text); historyIndex = -1; scroll = 0;
         const expanded = text.startsWith('/') ? expandVendorCommand(text, vendorOptions()) : null;
         notice = expanded ? `Running /${expanded.name} (${expanded.origin}) · Esc or Ctrl+C cancels the agent process group` : 'Running · Esc or Ctrl+C cancels the agent process group';
-        render(); const result = await router.run((remoteMain ? '' : orchestratorBrief) + withAsides(expanded?.prompt ?? text, asides.splice(0)), [], expanded ? {typed: text} : {}); notice = `Turn ${result}. Session saved.`;
+        render(); const result = await router.run((remoteMain ? '' : orchestratorBrief) + withAsides(expanded?.prompt ?? text, asides.splice(0)), [], expanded ? {typed: text} : {});
+        // A queued send the user pulled back (Up) settles as 'withdrawn': the withdraw's own notice stands.
+        if (result !== 'withdrawn') notice = `Turn ${result}. Session saved.`;
         suggestion = result === 'completed' && !input ? suggestionFrom(lastAnswer(session.events)) : null;
         void refreshQuota(settings, {root, store: quotas, cwd: session.cwd}).then(render, () => {});
         if (dev && result === 'completed' && fingerprint() !== loadedFingerprint) await restart();

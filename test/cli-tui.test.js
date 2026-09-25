@@ -314,7 +314,9 @@ test('Up on an empty input withdraws this view\'s own queued prompt for editing;
       calls.push(['withdraw', params]);
       if (!queuedItem || queuedItem.id !== params.id) return {withdrawn: false, reason: 'not_queued'};
       const item = queuedItem; queuedItem = null;
-      session.append({kind: 'main.withdrawn', from: 'user', requestId: item.id, text: item.text});
+      // The row lands after the reply — the order that lost under load: the queued send, settled by
+      // this row, overwrote "Pulled back for editing" with "Turn withdrawn. Session saved.".
+      setTimeout(() => session.append({kind: 'main.withdrawn', from: 'user', requestId: item.id, text: item.text}), 100);
       return {withdrawn: true, text: item.text};
     },
     async deliver(params) { calls.push(['deliver', params]); return {state: 'acknowledged', tier: 'live'}; },
@@ -368,10 +370,13 @@ test('Up on an empty input withdraws this view\'s own queued prompt for editing;
   child.stdin.write('\x1b[A');
   await waitFor(() => calls.some(([kind]) => kind === 'withdraw'));
   assert.deepEqual(calls.find(([kind]) => kind === 'withdraw')[1], {id: sent.id});
+  await waitFor(() => session.events.some(row => row.kind === 'main.withdrawn'));
   const withdrawnRow = session.events.findLast(row => row.kind === 'main.withdrawn');
   assert.equal(withdrawnRow.requestId, sent.id);
   assert.equal(withdrawnRow.text, 'queued reply text');
   await waitFor(() => output.includes('Pulled back for editing'));
+  await new Promise(resolve => setTimeout(resolve, 300));
+  assert.doesNotMatch(output, /Turn withdrawn/, 'the settled queued send must not replace the pulled-back notice');
 
   // The attached turn ends: the withdrawn prompt is not dispatched — no extra run() call.
   attached = false;
