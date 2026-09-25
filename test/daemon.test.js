@@ -658,8 +658,8 @@ test('O2 orchestrator single-provider: the orchestrator submits over the bridge,
   // The input prefill (Tab, Enter) needs the answer to state its next prompt; nothing else asked for it.
   assert.equal(orders.includes('end the answer with one line `Next: <the prompt, as the user would type it>`'), true, 'the orchestrator is asked for the prefill line');
   // Found live (session 159f4746): the orchestrator offered to commit, then sent the commit to workers seven
-  // times — each found a copy with no .git. Until workers get git, the orders have to say so.
-  assert.equal(orders.includes('Workers run in copies of the repository without .git, so a worker cannot commit, push or open a PR yet. When the user asks for one, say so once and propose the split (paths and one-line messages) instead of dispatching git work that cannot succeed.'), true, 'the orchestrator knows a worker cannot do git work yet');
+  // times — each found a copy with no .git. Docs/plans/in-place-tasks.md: an in-place task is now the way.
+  assert.equal(orders.includes('Workers run in copies of the repository: only an in-place task (task.submitted with `inPlace: {authorizedBy: <seq>}`) runs in the real checkout, for a version-control or other real-folder step (commit, push, open a PR) the user\'s own message asked for. Cite that message\'s seq and keep the orders to exactly what it asked — push and PR only when it asked for them. A refusal names what exceeded the request.'), true, 'the orchestrator knows how to use an in-place task');
   // No `jev` block in config.json: the brief is exactly today's — no auto roster line, no Jev
   // sentence, and the synthetic reviewer is neither a submit target nor the example's profile.
   assert.equal(orders.includes('auto →'), false);
