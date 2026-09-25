@@ -136,16 +136,8 @@ export function createMainService({session, adapters, profile, settings, profile
     current = {id: previousSafetyBlock.requestId, turnId: previousSafetyBlock.turnId, unverified: true, orphaned: true, finished: true};
     blockedState = {reason: previousSafetyBlock.reason, requestId: previousSafetyBlock.requestId};
   }
-  // Rebuild the in-memory queue (queuedPrompts/queuedIds, declared above) from queued `user` rows
-  // that never got dispatched — a daemon restart while a prompt was queued (start() above). A row
-  // counts as dispatched once a later main.requested or main.started carries its requestId, exactly
-  // what drainQueue()'s call to start() journals; a row withdrawn by the user (withdraw() below)
-  // before the restart is skipped the same way. That makes this idempotent across restarts. Older
-  // journals whose queued rows predate `requestId` can't be safely matched back to a run and are
-  // left as transcript-only entries — never invented, never replayed twice. Draining itself happens
-  // in the queueMicrotask below, after this constructor finishes, same as a live queued prompt: it
-  // still waits behind the `current`/`blockedState` fences above (an orphaned run, say) exactly as
-  // start() would.
+  // Rebuild the in-memory queue from queued `user` rows never dispatched before a daemon restart.
+  // A row counts as dispatched once a later main.requested/started carries its requestId; older rows without one are left as transcript-only.
   for (const row of session.events) {
     if (row.kind !== 'user' || !row.queued || !row.requestId) continue;
     if (queuedIds.has(row.requestId)) continue;
@@ -438,11 +430,8 @@ export function createMainService({session, adapters, profile, settings, profile
     // genuine new session's very first typed/queued prompt fires onFirstUserPrompt.
     const isFirstPrompt = !wake && !session.events.some(e => e.kind === 'user');
     if (current) {
-      // A USER prompt (wake:false) landing while a run is current: queued instead of refused.
-      // Its `user` row is journaled right away, so it shows in the transcript immediately even
-      // though its turn has not started; finish()/block() above dispatch it — back through this
-      // same function, `fromQueue: true` — the instant the current run frees up, ahead of any
-      // automatic wake. `id` is stable across a resend so a retry never queues a second copy.
+      // A user prompt landing while a run is current is queued instead of refused; `id` is
+      // stable across a resend so a retry never queues a second copy.
       const id = params.id ?? randomUUID();
       if (queuedIds.has(id)) return {accepted: true, queued: true, requestId: id};
       queuedIds.add(id);

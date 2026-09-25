@@ -49,12 +49,8 @@ export function quotaSnapshot(provider, raw) {
 }
 
 // --- Claude's between-turn /usage query -----------------------------------
-// `claude -p "/usage" --output-format json` is a LOCAL command (num_turns 0, zero cost/tokens,
-// `local_command: "usage"`, ~2s wall) — it answers without spending a turn. Its `result` string
-// is prose with embedded lines like:
-//   "Current session: 8% used · resets Sep 25 at 11:49am (America/Mexico_City)"
-//   "Current week (all models): 6% used · resets Oct 1 at 10:59pm (America/Mexico_City)"
-//   "Current week (Fable): 0% used · resets Oct 1 at 11pm (America/Mexico_City)"
+// `claude -p "/usage" --output-format json` is a LOCAL command (zero cost/tokens) whose `result`
+// string is prose, e.g. "Current session: 8% used · resets Sep 25 at 11:49am (America/Mexico_City)".
 const USAGE_LINE = /^Current (session|week)(?: \(([^)]+)\))?: (\d+(?:\.\d+)?)% used · resets (\w+) (\d{1,2}) at (\d{1,2})(?::(\d{2}))?(am|pm) \(([^)]+)\)$/;
 const MONTHS = {Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11};
 // Given a wall-clock reading in an IANA zone, its UTC epoch — no year, so month/day/hour/minute
@@ -131,12 +127,8 @@ export const quotaQueries = {
 };
 export const quotaUnavailable = provider => quotaQueries[provider] ? `${provider} reported no quota`
   : `${provider} does not report quota`;
-// One /usage (or app-server) spawn per provider per throttle window: readings a fraction of a
-// second apart (a redraw storm, a burst of refreshQuota calls) reuse the last result instead of
-// spawning again.
-// Module-level by default so throttling actually holds across the calls a real process makes
-// (refreshQuota, /quota, the sidebar timer); `cache` is only ever overridden by a test wanting a
-// fresh one so runs don't bleed into each other.
+// One /usage spawn per provider per throttle window; readings a fraction of a second apart
+// (a redraw storm) reuse the last result. `cache` defaults to module-level so real callers share it; tests override it.
 const throttled = new Map();
 export async function readQuota(provider, executable = provider, {spawn, timeout = 15000, cwd, now = Date.now(), cache = throttled} = {}) {
   const query = quotaQueries[provider];
@@ -163,11 +155,8 @@ export function loadQuota(root) {
 // marker (compactAge, STALE_READING_MS) never falls more than this far behind the true age of
 // the last real read.
 const TIME_REFRESH_MS = 60000;
-// Percentages repeat many times per turn. The store always holds the latest reading; only a
-// changed reading — or an unchanged one whose stored time has gone stale — is written to disk,
-// and only then does a redraw get asked for. A write merges with disk first: another process
-// (the daemon, a second TUI, `bounce quota`) may hold a fresher reading for a DIFFERENT provider
-// than this call has, and blindly overwriting the whole store would throw that away.
+// Only a changed (or gone-stale) reading is written to disk, and a write merges with disk first
+// so another process's fresher reading for a different provider is never overwritten.
 export function recordQuota(store, root, snapshot) {
   if (!snapshot?.provider) return false;
   const previous = store[snapshot.provider];

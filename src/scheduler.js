@@ -126,11 +126,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   function campaignActive(task, id = submittedRow(task)?.campaignId) {
     return !id || campaigns(session.events)[id]?.state === 'active';
   }
-  // The one in-place task presently `running`, if any (§6, §5): held while true, its lock.
-  // The one in-place task presently holding the lock, if any: `running` in the ordinary case, or
-  // (restart replay, §5 "restart during an in-place task keeps the lock semantics") blocked
-  // `orphaned` — its worker's termination is unverified, so the lock stays held until a human
-  // resolves it, exactly like the ordinary "queued integrations still wait" case.
+  // The in-place task presently holding the lock, if any: `running`, or `blocked`/`orphaned`
+  // after a restart whose worker termination is unverified — the lock stays held until a human resolves it.
   const inPlaceRunning = () => Object.values(reducers.tasks(session.events)).find(t => submittedRow(t.id)?.inPlace
     && (t.state === 'running' || (t.state === 'blocked' && session.events.findLast(e => e.task === t.id && e.kind === 'task.blocked')?.reason === 'orphaned'))) ?? null;
   const integrationInFlight = () => [...actionState(session.events).values()].some(a => a.type === 'integrate' && a.status === 'started');
@@ -1189,13 +1186,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     finally { clearTimeout(reportTimer); }
   }
 
-  // T3c: a message answering a worker's OWN blocked/input-required state — it asked a question or
-  // reported unfinished work — resumes that same worker instead of sitting queued forever (the only
-  // thing that ever folded a queued message in before this was a REVIEW-triggered rework round).
-  // Never a review gate (REVIEW_GATE_REASONS / applyEscalate's intent.reason), never an infra/
-  // termination signal, ownership/integration failure, or report-repair dead end: those still need a
-  // human decision on the review/verdict, not the worker resumed with a reply. `report_incomplete` is
-  // included: the worker's own claim that work remains is exactly the shape a message answers.
+  // T3c: a message answering a worker's OWN blocked/input-required state resumes that worker
+  // directly instead of sitting queued forever; a review gate or infra/termination reason still needs a human verdict.
   const RESUMABLE_BLOCK_REASONS = new Set(['worker_blocked', 'report_incomplete']);
   function ownBlockResumable(task) {
     const t = reducers.tasks(session.events)[task];
@@ -1212,13 +1204,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       text: `A message answering task ${task}'s blocked/input-required state could not resume its worker (${reason}); the message stays queued until a rework round or resubmission.`});
   }
 
-  // One resume per blocked task, ever in flight: `resumingBlocked` is claimed synchronously, before
-  // this function's first await, so a second message processed in the very next microtask (see the
-  // `message` subscriber below) always observes the claim and does nothing — never a second resume.
-  // The claiming call defers its own read of `deliveryTails` behind a microtask (queueMicrotask in
-  // the subscriber) so that every message appended in the same synchronous burst has already been
-  // enqueued for delivery — and thus is included in whichever delivery tail we end up awaiting —
-  // before we read it: two messages back to back fold into the one resume this function makes.
+  // `resumingBlocked` is claimed synchronously before the first await, so a second message in the
+  // next microtask observes the claim and folds into this one resume instead of starting a second.
   const resumingBlocked = new Set();
   async function resumeOnMessage(task, context) {
     if (handles.has(task) || resumingBlocked.has(task) || !ownBlockResumable(task)) return;
@@ -1234,11 +1221,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       if (!adapter?.resume || !native) { blockedResumeUnavailable(task, 'no resumable native session', context); return; }
       if (deadline !== null && deadline <= clock()) { blockedResumeUnavailable(task, 'task deadline has passed', context); return; }
       if (!(api.roundsUsed(task) < api.roundsCap(task))) { blockedResumeUnavailable(task, 'no round budget remains', context); return; }
-      // Same reservation a rework round makes (§ applyVerdictIntent): this IS a rework round in
-      // substance — another turn on the same worker, admitted the same way (admitAttempt inside
-      // resumeWorker, admitLocal for a local backend) — just triggered by a message instead of a
-      // review verdict. `starts`/report-repair's budget does not fit: nothing here is a fresh
-      // attempt or a formatting-only retry of an already-rejected final report.
+      // This IS a rework round in substance — another turn on the same worker, triggered by a
+      // message instead of a review verdict — so it reserves the same budget applyVerdictIntent does.
       const root = budgetRootOf(task, reducers.tasks(session.events));
       const round = api.roundsUsed(task) + 1;
       append({kind: 'budget.reserved', task, root, amount: {rounds: 1}, context});
@@ -1743,11 +1727,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         return;
       }
       inPlaceWaiters.delete(task);
-      // §2: Jev's risk check, when enabled — the structural (cited-row) check already
-      // admitted this task at submit time; this is the model's read of what the user's own
-      // words actually cover. Off, unconfident or unavailable: the structural check alone
-      // decided, and jev.skipped says why — the same fallback pattern every other Jev
-      // decision uses (judgeLease/judgePlan).
+      // Jev's risk check, when enabled, layers on top of the structural (cited-row) admission
+      // already done at submit time; off/unconfident/unavailable falls back to that check with a jev.skipped row.
       const judged = jev ? await jev.inPlace(inPlaceRiskInputs(row)) : {verdict: 'unresolved', reason: 'jev unavailable', confidence: 0, probabilities: {}, model: null};
       if (judged.verdict === 'exceeds' || judged.verdict === 'unrelated') {
         append({kind: 'task.failed', task, reason: judged.verdict === 'exceeds' ? 'in_place_exceeds_request' : 'in_place_unrelated',
@@ -2200,11 +2181,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const launched = session.events.some(e => e.task === action.task && ['task.launch.requested', 'task.started', 'review.started'].includes(e.kind));
     return state === 'queued' && !launched ? 'retry' : 'blocked';
   }, gate: action => {
-    // §5: an integrate action never runs while an in-place task holds the lock. It stays
-    // 'requested' (never 'started', so `reconcile`'s retry-count cap above never sees it) until
-    // wakeInPlace() calls effects.reconcile() again once the lock clears — in its original
-    // order, since a synchronous reconcile() loop runs each action's synchronous handler body
-    // to completion before the next iteration even starts.
+    // An integrate action never runs while an in-place task holds the lock; it stays 'requested'
+    // (never 'started', so the retry cap above never sees it) until wakeInPlace() reconciles again.
     if (action.type !== 'integrate' || !inPlaceRunning()) return true;
     if (!integrationWaiting.has(action.actionId)) {
       integrationWaiting.add(action.actionId);
