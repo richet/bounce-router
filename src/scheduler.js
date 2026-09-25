@@ -105,12 +105,13 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // What the machine can run: one reader, the LM Studio catalog, and the one command that frees memory.
   resources = createResources(), localFleet = ({signal} = {}) => discoverLocalModels(localSettings, {signal, maxAge: 2000}),
   unloadLocal = async name => { execFileSync('lms', ['unload', String(name).split('/').slice(1).join('/')], {timeout: 60000}); },
-  sessionMode = 'yolo', depthCap = 1, checkpointRunner, limits: suppliedLimits = {}, strict = false, requireFinalReport = false, reportGrant = null, clock = () => Date.now(), watchdog: suppliedWatchdog = {}, strategy = defaultStrategy, jev = null, gitHead = defaultGitHead}) {
+  sessionMode = 'yolo', depthCap = 1, checkpointRunner, limits: suppliedLimits = {}, strict = false, requireFinalReport = false, reportGrant = null, clock = () => Date.now(), watchdog: suppliedWatchdog = {}, strategy = defaultStrategy, jev = null, gitHead = defaultGitHead, maxConcurrentCloud = 3}) {
   // Sizing limits (lines/probes/minutes) gate dispatch ONLY when the caller configures them: a
   // task's declared size is otherwise informational. The old built-in 150/6/15 defaults refused
   // real orchestrations (a 400-line brief) with no way to see why — a shallow rule, removed.
   const limits = {rounds: 2, ...suppliedLimits};
   if (!isPositiveInt(limits.rounds) || (limits.attempts !== undefined && !isPositiveInt(limits.attempts)) || SIZE_FIELDS.some(field => limits[field] !== undefined && !isPositiveInt(limits[field])) || (limits.ceiling !== undefined && !isPositiveInt(limits.ceiling))) throw new Error('malformed: limits');
+  if (!isPositiveInt(maxConcurrentCloud)) throw new Error('malformed: maxConcurrentCloud');
   // The deadline is a lease renewed while the worker makes progress; the ceiling is the hard stop.
   const ceilingMs = (limits.ceiling ?? Math.max(DEFAULT_CEILING_MINUTES, limits.minutes ?? DEFAULT_DEADLINE_MINUTES)) * 60000;
   const watchdogConfig = {...WATCHDOG_DEFAULTS, ...suppliedWatchdog};
@@ -185,6 +186,18 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       && (model === null || localModelOf(task) === model)),
     ...[...reviews.entries()].filter(([, entry]) => entry.local === endpoint
       && (model === null || entry.model === model)).map(([peer]) => peer),
+  ]).size;
+  // Cloud workers (claude/codex/muse) have no per-endpoint config the way local does — one
+  // machine-wide ceiling (`maxConcurrentCloud`) instead, counted the same way localRunning counts
+  // a local endpoint: a live handle or a launch still in flight. Jev/typesafe decisions are never
+  // workers and are not in this set (typesafe is not a CLOUD_ADAPTERS member); an in-place task
+  // counts here exactly like any other task, by the adapter it actually runs on.
+  const CLOUD_ADAPTERS = new Set(['claude', 'codex', 'muse']);
+  const cloudAdapterOf = task => { const p = profiles[reducers.tasks(session.events)[task]?.profile]; return p && CLOUD_ADAPTERS.has(p.adapter) ? p.adapter : null; };
+  const cloudRunning = () => new Set([
+    ...[...handles.entries()].filter(([, entry]) => entry.cloud).map(([task]) => task),
+    ...[...launchingAttempts.keys()].filter(task => cloudAdapterOf(task)),
+    ...[...reviews.entries()].filter(([, entry]) => entry.cloud).map(([peer]) => peer),
   ]).size;
   const launchingAttempts = new Map(); // task -> {attempt, reports}; grants exist before task.started
   const resolvedLocalProfiles = new Map();
@@ -299,8 +312,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (!launching) return null;
     launchingAttempts.delete(task);
     const endpoint = localEndpointOf(task);
-    if (!endpoint || !verified || closed || handles.has(task)) return launching;
-    const released = append({kind: 'task.slot.released', task, attempt: launching.attempt, endpoint, stage: 'launch', context});
+    const cloud = !endpoint && Boolean(cloudAdapterOf(task));
+    if ((!endpoint && !cloud) || !verified || closed || handles.has(task)) return launching;
+    const released = append({kind: 'task.slot.released', task, attempt: launching.attempt, stage: 'launch', context, ...(endpoint ? {endpoint} : {cloud: true})});
     if (slotWaiters.size) queueMicrotask(() => wakeSlotWaiters(released.seq));
     return launching;
   }
@@ -995,9 +1009,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const entry = handles.get(task);
     if (entry?.handle !== handle) return;
     handles.delete(task);
-    if (!entry.local || closed) return;
+    if ((!entry.local && !entry.cloud) || closed) return;
     const released = append({kind: 'task.slot.released', task,
-      attempt: reducers.tasks(session.events)[task]?.attempt, endpoint: entry.local, context});
+      attempt: reducers.tasks(session.events)[task]?.attempt, context, ...(entry.local ? {endpoint: entry.local} : {cloud: true})});
     if (slotWaiters.size) queueMicrotask(() => wakeSlotWaiters(released.seq));
   }
 
@@ -1093,14 +1107,14 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // The task may have been cancelled (or otherwise gone terminal) while launch() was
     // pending: don't adopt it as live, just shut down the now-unwanted process.
     if (launchingAttempts.get(task)?.cancelReason || reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) {
-      handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : {})});
+      handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : CLOUD_ADAPTERS.has(profile.adapter) ? {cloud: true} : {})});
       const reason = launchingAttempts.get(task)?.cancelReason ?? 'user';
       launchingAttempts.delete(task);
       // Nothing consumes this handle's events, so its slot is given back here once it is stopped.
       if (await cancelOne(task, reducers.tasks(session.events), reason)) dropHandle(task, handle, context);
       return;
     }
-    handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : {})});
+    handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : CLOUD_ADAPTERS.has(profile.adapter) ? {cloud: true} : {})});
     append({kind: 'peer.joined', name: workerFrom(task), role: 'worker', adapter: profile.adapter, profile: row.profile, from: workerFrom(task), context});
       append({kind: 'task.started', task, attempt, requested: profile.model ?? '', ...(attempt === 1 && jevReviewed(row) ? {head: gitHead(session.cwd)} : {}), from: workerFrom(task), context});
     for (const staged of launchingAttempts.get(task)?.reports ?? []) report({task, attempt, report: staged.payload, from: staged.from, context: staged.context});
@@ -1191,14 +1205,14 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // A throwing resume (the branch above) journals none of this — nothing was delivered.
     for (const m of pending) append({kind: 'task.delivered', task, tier: 'next-turn', message: m.id, text: `rework round ${round}`, from: 'bounce', context});
     if (launchingAttempts.get(task)?.cancelReason || reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) {
-      handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : {})});
+      handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : CLOUD_ADAPTERS.has(profile.adapter) ? {cloud: true} : {})});
       const reason = launchingAttempts.get(task)?.cancelReason ?? 'user';
       launchingAttempts.delete(task);
       // Nothing consumes this handle's events, so its slot is given back here once it is stopped.
       if (await cancelOne(task, reducers.tasks(session.events), reason)) dropHandle(task, handle, context);
       return;
     }
-    handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : {})});
+    handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : CLOUD_ADAPTERS.has(profile.adapter) ? {cloud: true} : {})});
     append({kind: 'task.started', task, attempt, resumed: true, ...(reportOnly ? {purpose: 'report'} : {}), requested: profile.model ?? '', from: workerFrom(task), context});
     for (const staged of launchingAttempts.get(task)?.reports ?? []) report({task, attempt, report: staged.payload, from: staged.from, context: staged.context});
     launchingAttempts.delete(task);
@@ -1744,6 +1758,16 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         : onModel >= perModel ? `Waiting for a local slot on ${endpoint} for ${profile.model}: ${onModel} of ${perModel} in use` : null;
       if (full) {
         if (!slotWaiters.has(task)) append({kind: 'task.milestone', task, phase: 'queued', text: full, next: 'dispatch when a local turn ends', context});
+        slotWaiters.add(task);
+        return;
+      }
+      slotWaiters.delete(task);
+    }
+    if (CLOUD_ADAPTERS.has(profile.adapter)) {
+      const running = cloudRunning();
+      const full = running >= maxConcurrentCloud ? `Waiting for a cloud slot: ${running} of ${maxConcurrentCloud} in use` : null;
+      if (full) {
+        if (!slotWaiters.has(task)) append({kind: 'task.milestone', task, phase: 'queued', text: full, next: 'dispatch when a cloud turn ends', context});
         slotWaiters.add(task);
         return;
       }

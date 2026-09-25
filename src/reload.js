@@ -481,7 +481,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // `strategy:` setting resolved by validateOrchestration (default: defaultStrategy) applies.
   let bus;
   const reportTokens = new Map();
-  const scheduler = createScheduler({session, adapters, profiles, localSettings: settings.local, sessionMode: settings.mode, strict: orchestration.strict, limits: taskLimits(settings),
+  const scheduler = createScheduler({session, adapters, profiles, localSettings: settings.local, sessionMode: settings.mode, strict: orchestration.strict, limits: taskLimits(settings), maxConcurrentCloud: settings.maxConcurrentCloud,
     requireFinalReport: orchestrating, reportGrant: ({task, attempt, context}) => {
       if (!orchestrating || !bus) return null;
       const peer = `report:${task}:${attempt}`;

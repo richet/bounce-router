@@ -86,7 +86,7 @@ const rawConnect = async (bus, t) => {
 };
 
 test('legacy: importing src/bus.js does not change Session exports or defaults()', () => {
-  const before = ['order', 'mode', 'models', 'cooldownMinutes', 'contextChars', 'executables', 'skills', 'sidebar'];
+  const before = ['order', 'mode', 'models', 'cooldownMinutes', 'contextChars', 'executables', 'skills', 'sidebar', 'maxConcurrentCloud'];
   assert.deepEqual(Object.keys(defaults()).sort(), before.sort());
   assert.deepEqual(Object.keys(core).sort(), ['LIVE_KINDS', 'Router', 'Session', 'config', 'dataRoot', 'defaults', 'gitSnapshot', 'handoff', 'migrateSettings', 'pidAlive', 'readJournal', 'saveJSON'].sort());
 });

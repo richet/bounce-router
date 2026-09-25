@@ -17,7 +17,7 @@ export function dataRoot() {
   if (!fs.existsSync(root) && fs.existsSync(legacy)) fs.renameSync(legacy, root);
   return root;
 }
-export const defaults = () => ({order: ['claude', 'codex', 'muse'], mode: 'yolo', models: {}, cooldownMinutes: 30, contextChars: 48000, executables: {}, skills: {scope: 'user', autoSync: true}, sidebar: true});
+export const defaults = () => ({order: ['claude', 'codex', 'muse'], mode: 'yolo', models: {}, cooldownMinutes: 30, contextChars: 48000, executables: {}, skills: {scope: 'user', autoSync: true}, sidebar: true, maxConcurrentCloud: 3});
 // Kinds folded in memory only: never journaled, delivered straight to onEvent.
 export const LIVE_KINDS = new Set(['progress', 'task.activity', 'tool.started', 'tool.finished']);
 export function pidAlive(pid) {
@@ -154,6 +154,9 @@ export function config(root = dataRoot()) {
   if (value.taskMinutes !== undefined && (!Number.isInteger(value.taskMinutes) || value.taskMinutes < 1 || value.taskMinutes > 240)) throw new Error('taskMinutes must be a whole number of minutes from 1 to 240');
   if (value.taskCeilingMinutes !== undefined && (!Number.isInteger(value.taskCeilingMinutes) || value.taskCeilingMinutes < 1 || value.taskCeilingMinutes > 240 || value.taskCeilingMinutes < (value.taskMinutes ?? 15))) throw new Error('taskCeilingMinutes must be a whole number of minutes from 1 to 240, and at least taskMinutes');
   if (!Number.isFinite(value.contextChars) || value.contextChars < 4000 || value.contextChars > 200000) throw new Error('contextChars must be between 4000 and 200000');
+  // Cloud workers (claude/codex/muse) have no per-endpoint slot config the way local does — this is
+  // their one ceiling, machine-wide, distinct from a local endpoint's own maxConcurrent.
+  if (!Number.isInteger(value.maxConcurrentCloud) || value.maxConcurrentCloud < 1) throw new Error('maxConcurrentCloud must be a positive integer');
   if (!Number.isFinite(value.cooldownMinutes) || value.cooldownMinutes < 0) throw new Error('Invalid cooldownMinutes');
   // A partial skills block keeps the defaults for the fields it leaves out.
   value.skills = {...defaults().skills, ...(value.skills && typeof value.skills === 'object' ? value.skills : {})};

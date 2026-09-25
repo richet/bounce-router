@@ -118,10 +118,12 @@ export async function gatherLocalStatus({settings, verify = false, model: reques
   // What each endpoint is set to run at once, so the status can say what raising it costs.
   const concurrency = Object.entries(local.endpoints ?? {}).map(([endpoint, settings]) => ({
     endpoint, maxConcurrent: settings.maxConcurrent ?? 1, slotsPerModel: settings.slotsPerModel ?? 1}));
-  return {catalogs, binary, installed, workers, loaded: loaded.length, bridge: verified, problem, note, roles: roleTable, concurrency};
+  // Cloud workers (claude/codex/muse) share one machine-wide cap instead of a per-endpoint one.
+  const maxConcurrentCloud = settings.maxConcurrentCloud ?? 3;
+  return {catalogs, binary, installed, workers, loaded: loaded.length, bridge: verified, problem, note, roles: roleTable, concurrency, maxConcurrentCloud};
 }
 
-export function formatLocalStatus({catalogs, binary, installed = true, workers, bridge, problem, note, roles = [], concurrency = []}, {verifyHint, setupHint} = {}) {
+export function formatLocalStatus({catalogs, binary, installed = true, workers, bridge, problem, note, roles = [], concurrency = [], maxConcurrentCloud}, {verifyHint, setupHint} = {}) {
   const lines = [];
   // One GPU serves every local worker: running more at once gets no more work done, it only makes each
   // task wait longer — and a task that waits longer is a task that dies on its lease. Measured at a 95K
@@ -162,5 +164,7 @@ export function formatLocalStatus({catalogs, binary, installed = true, workers, 
   lines.push('', workers.length
     ? `Agents a local model may play: ${workers.map(worker => `${worker.name} (${worker.model}, ${worker.policy})`).join(', ')}`
     : `No agent has a local model yet${setupHint ? ` — ${setupHint}` : ''}`);
+  // Cloud (claude/codex/muse) runs on its own machine-wide cap, independent of local's endpoint caps.
+  if (Number.isInteger(maxConcurrentCloud)) lines.push(`Cloud workers: up to ${maxConcurrentCloud} at once (config maxConcurrentCloud).`);
   return lines;
 }
