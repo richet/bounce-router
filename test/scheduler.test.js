@@ -4,14 +4,26 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {Session} from '../src/core.js';
-import {createScheduler} from '../src/scheduler.js';
+import {createScheduler as createSchedulerImpl} from '../src/scheduler.js';
+const schedulers = new WeakMap();
+const createScheduler = options => {
+  const scheduler = createSchedulerImpl(options);
+  schedulers.get(options.session)?.add(scheduler);
+  return scheduler;
+};
 import {validateReport} from '../src/reporting.js';
 import {fakeAdapter} from './helpers/fake-adapter.js';
 
 const setup = t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-scheduler-'));
-  t?.after(() => fs.rmSync(root, {recursive: true, force: true}));
-  return {root, session: new Session(root, {root})};
+  const session = new Session(root, {root});
+  const owned = new Set(); schedulers.set(session, owned);
+  t?.after(async () => {
+    for (const scheduler of owned) scheduler.close();
+    await new Promise(resolve => setImmediate(resolve));
+    fs.rmSync(root, {recursive: true, force: true});
+  });
+  return {root, session};
 };
 
 // Dispatch runs async (after adapter.launch), so tests poll the log for a condition
@@ -38,8 +50,8 @@ test('S1 happy path: dispatch, milestone, usage, completion, budget debit, worke
   const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null, budget: {starts: 3}});
   await waitFor(() => scheduler.tasks()[row.task]?.state === 'completed');
 
-  const kinds = session.events.filter(e => e.task === row.task || e.kind === 'peer.joined').map(e => e.kind);
-  assert.deepEqual(kinds, ['task.submitted', 'budget.reserved', 'peer.joined', 'task.started', 'task.milestone', 'task.usage', 'task.completed']);
+  const kinds = session.events.filter(e => (e.task === row.task || e.kind === 'peer.joined') && !e.kind.startsWith('orchestration.') && !['task.attempt.ended', 'task.cancel.requested', 'task.workspace', 'task.launch.requested', 'task.artifact', 'task.integration.requested', 'task.integrated'].includes(e.kind)).map(e => e.kind);
+  assert.deepEqual(kinds, ['task.submitted', 'budget.reserved', 'peer.joined', 'task.started', 'task.milestone', 'task.usage', 'task.output', 'task.completed']);
   assert.equal(scheduler.tasks()[row.task].state, 'completed');
   assert.equal(scheduler.tasks()[row.task].summary, 'done');
   assert.equal(scheduler.budgets().roots[row.task].remaining.starts, 2);
@@ -61,13 +73,17 @@ test('final report is staged until the provider terminal outcome', async t => {
   assert.equal(session.events.some(e => e.kind === 'task.completed'), false);
 });
 
-test('a clean worker exit without final report requests it once then fails incomplete_report', async t => {
+// A report that cannot be repaired (here: no resumable session) blocks on the answer the worker gave,
+// quoted, so the orchestrator decides on it instead of reading "failed" as "nothing came back".
+test('a clean worker exit without final report requests it once, then blocks on the answer it gave', async t => {
   const {session} = setup(t);
   const adapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'opening intention'}]);
   const scheduler = createScheduler({session, adapters: {A: adapter}, profiles: {A: {adapter: 'A', mode: 'yolo', fallback: []}}, requireFinalReport: true});
   const submitted = scheduler.submit({parent: null, profile: 'A', orders: 'inspect'});
-  await waitFor(() => scheduler.tasks()[submitted.task]?.state === 'failed');
-  assert.equal(scheduler.tasks()[submitted.task].reason, 'incomplete_report');
+  await waitFor(() => scheduler.tasks()[submitted.task]?.state === 'blocked');
+  const blocked = session.events.findLast(e => e.kind === 'task.blocked' && e.task === submitted.task);
+  assert.equal(blocked.reason, 'report_repair_unavailable');
+  assert.match(blocked.text, /^The worker answered \(17 chars, output seq \d+\): "opening intention"\. Its report could not be repaired: missing_report, and no resumable session/);
   assert.equal(session.events.filter(e => e.kind === 'task.report_requested' && e.task === submitted.task).length, 1);
   assert.equal(session.events.some(e => e.kind === 'task.completed' && e.task === submitted.task), false);
 });
@@ -166,6 +182,10 @@ test('S6 depth: grandchild exceeds depth cap of 1', async t => {
   await waitFor(() => scheduler.tasks()[grandchild.task]?.state === 'failed');
 
   assert.equal(scheduler.tasks()[grandchild.task].reason, 'depth');
+  // Observed live (3c7e7d25 seq 894/948): "use retryOf" sent the orchestrator to retry the refused task,
+  // which inherits the same parent and is refused again; the refusal names what works.
+  assert.equal(session.events.findLast(e => e.kind === 'task.failed' && e.task === grandchild.task).text,
+    `delegation under ${child.task.slice(0, 8)} exceeds depth cap 1; continue the work with retryOf ${child.task} (its job, at an allowed depth), or submit it as a new root task (parent null, no retryOf)`);
 });
 
 // The refusal names the field: a worker reads it off `bounce report`'s one line and corrects
@@ -175,7 +195,12 @@ test('a report missing a required field is refused by field name', () => {
   assert.equal(validateReport({op: 'milestone', text: 'x', next: 'y'}), 'phase (required string)');
   assert.equal(validateReport({op: 'milestone', phase: 'inspect', text: 42, next: 'y'}), 'text (required string)');
   assert.equal(validateReport({op: 'milestone', phase: 'inspect', text: 'x', next: 'y'}), null);
-  assert.equal(validateReport({op: 'nope', phase: 'inspect', text: 'x', next: 'y'}), 'op');
+  assert.equal(validateReport({op: 'nope', phase: 'inspect', text: 'x', next: 'y'}), 'op (milestone, blocked, input_required or final)');
+  // Observed live: a final report without `outcome` was refused as "final", and the worker could not tell what to fix.
+  const final = {op: 'final', phase: 'done', text: 'x', next: 'none', summary: 'Reviewed the locking area.'};
+  assert.equal(validateReport(final), 'outcome (a final report needs completed, failed, blocked or input_required)');
+  assert.equal(validateReport({...final, outcome: 'completed', summary: undefined}), 'summary (required string for a final report)');
+  assert.equal(validateReport({...final, outcome: 'completed'}), null);
 });
 
 test('S7 malformed submissions throw and publish nothing', async t => {
@@ -473,7 +498,7 @@ test('close() unsubscribes: a task.submitted after close() dispatches nothing', 
   const row = scheduler.submit({parent: null, profile: 'A', orders: 'x', deadline: null});
   await new Promise(resolve => setTimeout(resolve, 30));
 
-  assert.equal(session.events.filter(e => e.task === row.task).length, 1); // only the task.submitted row itself
+  assert.deepEqual(session.events.filter(e => e.task === row.task).map(e => e.kind), ['task.submitted', 'orchestration.action.requested']); // durable intent remains pending for the next scheduler
   assert.equal(adapter.calls.launch, 0);
 });
 
@@ -947,9 +972,37 @@ test('S-role: a non-opencode worker receives its role prompt ahead of the orders
   const a = scheduler.submit({parent: null, profile: 'cloud', orders: 'review the tree'});
   const b = scheduler.submit({parent: null, profile: 'local', orders: 'review the tree'});
   await waitFor(() => seen.fake !== undefined && seen.opencode !== undefined, {timeout: 4000});
-  assert.equal(seen.fake, 'You are the reviewer.\n\n---\n\nreview the tree');
+  // Both are yolo (write-rank) workers in an isolated copy, so their orders now carry the appended
+  // working-copy paragraph (src/scheduler.js inWorkingCopy) after the role-prompt/orders text.
+  const workingCopyParagraph = /\n\nYour working copy is .+: it is a copy of the project, and only changes made there are your work\. Writes to the original checkout .+ are refused\.$/;
+  assert.equal(seen.fake.startsWith('You are the reviewer.\n\n---\n\nreview the tree'), true, seen.fake);
+  assert.match(seen.fake, workingCopyParagraph);
   // opencode gets the agent natively, so no role prompt; a local worker is told its answer is its report.
-  assert.equal(seen.opencode.startsWith('review the tree\n\nYour final answer is your report:'), true, seen.opencode);
+  assert.equal(seen.opencode.startsWith('review the tree\n\nFinish with one standalone JSON object'), true, seen.opencode);
+  assert.match(seen.opencode, workingCopyParagraph);
   assert.equal(seen.opencode.includes('You are'), false);
   await scheduler.cancel(a.task); await scheduler.cancel(b.task);
+});
+
+// Found live: a builder was submitted and failed in the same second with `depth exceeds cap 1` — no
+// elapsed, no milestone — which on the rail reads as a task queued forever. The refusal is right (only the
+// orchestrator opens tasks); what was wrong is that it never said a WORKER had tried to delegate.
+test('excess delegation names its parent and recommends a logical retry', async t => {
+  const {session} = setup(t);
+  const adapter = fakeAdapter(() => ({never: true}));
+  const scheduler = createScheduler({session, adapters: {fake: adapter}, depthCap: 1,
+    profiles: {A: {adapter: 'fake', model: 'x', mode: 'yolo', fallback: []}}});
+  t.after(() => scheduler.close());
+  // The cap allows the orchestrator's own task and one level under it; the refusal is the level below that,
+  // which is a WORKER opening work of its own.
+  const root = scheduler.submit({parent: null, profile: 'A', orders: 'build it', deadline: null});
+  await waitFor(() => scheduler.tasks()[root.task]?.state === 'running');
+  const child = scheduler.submit({parent: root.task, profile: 'A', orders: 'its own piece', deadline: null});
+  await waitFor(() => scheduler.tasks()[child.task]?.state === 'running');
+  const grandchild = scheduler.submit({parent: child.task, profile: 'A', orders: 'sub-task', deadline: null});
+  const failed = await waitFor(() => session.events.find(e => e.kind === 'task.failed' && e.task === grandchild.task));
+  assert.equal(failed.reason, 'depth');
+  assert.match(failed.text, /depth cap/i, 'it identifies the actual depth refusal');
+  assert.match(failed.text, /retryOf/i, 'it tells the orchestrator how to continue existing work');
+  assert.match(failed.text, new RegExp(child.task.slice(0, 8)), 'and under which task');
 });

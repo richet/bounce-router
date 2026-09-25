@@ -4,7 +4,7 @@
 // 1.18.31 (`step_start`, `tool_use`, `text`, `step_finish`, each carrying `sessionID`), and exits.
 // It is a printer of observed shapes, not a second implementation of OpenCode.
 //
-// FAKE_OC_SCENARIO  ok (default) | fail (stderr + exit 1) | notext (steps, no text, exit 0)
+// FAKE_OC_SCENARIO  ok (default: valid final envelope) | prose (old arbitrary prose) | fail (stderr + exit 1) | notext (steps, no text, exit 0)
 //                   | denied (a tool call rejected, then text) | refused (real behaviour: stderr notice,
 //                   the rejected call, no text, exit 0) | hold (stay alive until signalled)
 //                   | empty / empty-notext (answer or not, then empty `tool-calls` steps forever)
@@ -46,9 +46,19 @@ process.stdin.on('end', () => {
   // the conclusion turn bounce asks for after a stall or at a lease end — answer, or say nothing,
   // whatever the scenario the first turn played (a held turn is concluded too).
   const cfg = process.env.OPENCODE_CONFIG_CONTENT ? JSON.parse(process.env.OPENCODE_CONFIG_CONTENT) : {};
-  const agentName = flag('--agent'); const toolsOff = agentName && cfg.agent?.[agentName]?.tools && Object.values(cfg.agent[agentName].tools).every(v => v === false);
+  const agentName = flag('--agent'); const toolsOff = agentName && cfg.agent?.[agentName]?.tools
+    && Object.entries(cfg.agent[agentName].tools).filter(([name]) => name !== 'bounce_report').every(([, enabled]) => enabled === false);
   if (flag('-s') && toolsOff) {
     if (process.env.FAKE_OC_CONCLUDE === 'answer') emit('text', {type: 'text', text: `FAIL: the boundary is off by one (conclusion for ${prompt.slice(0, 20)})`});
+    // Observed live (reviewer 9b02e5ce): the conclusion is posted only as an acknowledged milestone report.
+    if (process.env.FAKE_OC_CONCLUDE === 'milestone' || process.env.FAKE_OC_CONCLUDE === 'rejected') {
+      const accepted = process.env.FAKE_OC_CONCLUDE === 'milestone';
+      emit('tool_use', {type: 'tool', tool: 'bounce_report', state: {status: accepted ? 'completed' : 'error',
+        input: {op: 'milestone', phase: 'verify', text: 'Mutation test complete: removing the realPath check at create.ts:156 makes the line 327 test fail with definition_changed.', next: 'Forged-marker check'},
+        ...(accepted ? {output: 'report accepted (seq 41)'} : {error: 'malformed report: next (required string)'})}});
+    }
+    // Observed live (reviewer 25126fda): the model titles its real summary after opencode's notice.
+    if (process.env.FAKE_OC_CONCLUDE === 'capsummary') emit('text', {type: 'text', text: '\n</think>\n\n## Maximum Steps Reached - Final Summary\n\n### Work Completed\n1. Baseline: 148 passed, 1 failed.\n2. Concurrent stale-lock reclaim: both callers fail with operation_busy.\n\n### Remaining Tasks\n1. Re-run the corrupt-tail probes.'});
     emit('step_finish', {type: 'step-finish', reason: 'stop', tokens: usage});
     return process.exit(0);
   }
@@ -72,6 +82,13 @@ process.stdin.on('end', () => {
     emit('step_finish', {type: 'step-finish', reason: 'tool-calls', tokens: usage});
     emit('step_start', {type: 'step-start'});
     emit('tool_use', {type: 'tool', tool: 'read', state: {status: 'completed', input: {filePath: 'b.js'}, output: 'y'}});
+    emit('step_finish', {type: 'step-finish', reason: 'stop', tokens: usage});
+    return process.exit(0);
+  }
+  if (['report-final', 'report-rejected', 'report-milestone'].includes(scenario)) {
+    const op = scenario === 'report-milestone' ? 'milestone' : 'final';
+    const output = scenario === 'report-rejected' ? 'report rejected' : 'report accepted (seq 24)';
+    emit('tool_use', {type: 'tool', tool: 'bounce_report', state: {status: 'completed', input: {op}, output}});
     emit('step_finish', {type: 'step-finish', reason: 'stop', tokens: usage});
     return process.exit(0);
   }
@@ -100,8 +117,11 @@ process.stdin.on('end', () => {
     }
     if (scenario === 'denied') emit('tool_use', {type: 'tool', tool: 'read', state: {status: 'error', input: {filePath: '/etc/hosts'}, error: 'The user rejected permission to use this specific tool call.'}});
     else emit('tool_use', {type: 'tool', tool: 'read', state: {status: 'completed', input: {filePath: 'note.txt'}, output: 'ok'}});
-    // The echo is the ORDERS line only: bounce appends a report line to a local worker's prompt.
-    if (scenario !== 'notext') emit('text', {type: 'text', text: `echo: ${prompt.split('\n\n')[0]}`});
+    // Local completion requires the same validated final envelope as any other worker. `prose`
+    // intentionally preserves the former fixture shape so callers can prove it is refused.
+    const orders = prompt.split('\n\n')[0];
+    if (scenario === 'prose' || (scenario !== 'notext' && !prompt.includes('matching the bounce report final schema'))) emit('text', {type: 'text', text: `echo: ${orders}`});
+    else if (scenario !== 'notext') emit('text', {type: 'text', text: JSON.stringify({op: 'final', phase: 'complete', text: `completed ${orders}`, next: '', evidence: [], outcome: 'completed', summary: `completed ${orders}`, remaining: ''})});
     // Observed live (qwen3-coder-30b): the whole report, then one more step whose only text is a
     // stray closing code fence.
     if (scenario === 'fence') { emit('step_finish', {type: 'step-finish', reason: 'tool-calls', tokens: usage}); emit('step_start', {type: 'step-start'}); emit('text', {type: 'text', text: '```'}); }

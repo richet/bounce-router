@@ -1,11 +1,12 @@
 import {spawn as spawnProcess} from 'node:child_process';
 import fs from 'node:fs';
+import path from 'node:path';
 import codex from './codex.js';
 import {connectBus} from '../bus.js';
 import {resolveExecutable} from '../executable.js';
 import {limitPattern} from '../providers.js';
 import {spawnLive, vendorEnv, verifiedCancel, reportGrant, makeStream, TEXT_MAX} from './live-common.js';
-import {validateReport} from '../reporting.js';
+import {REPORT_SCHEMA, validateReport} from '../reporting.js';
 import {version} from '../update.js';
 
 // The Codex peer: one long-lived `codex app-server` process per worker, driven over stdio
@@ -54,12 +55,7 @@ const REPORT_TOOL = 'bounce_report';
 const REPORT_TOOL_SPEC = {
   type: 'function', name: REPORT_TOOL,
   description: 'Publish a progress or final report for this assigned worker attempt.',
-  inputSchema: {type: 'object', properties: {
-    op: {enum: ['milestone', 'blocked', 'input_required', 'final']},
-    outcome: {enum: ['completed', 'failed', 'blocked', 'input_required']},
-    phase: {type: 'string'}, text: {type: 'string'}, next: {type: 'string'}, summary: {type: 'string'},
-    evidence: {type: 'array', items: {type: 'string'}}, remaining: {type: 'string'},
-  }, required: ['op', 'phase', 'text', 'next']},
+  inputSchema: REPORT_SCHEMA,
 };
 
 // A server that never answers must not hold cancel() open: every outcome here is a resolution.
@@ -107,13 +103,20 @@ const request = (handle, {method, params}) => new Promise((resolve, reject) => {
 const ANSI = /\x1b\[[0-9;]*m/g;
 export const vendorTracing = text => /^\s*\d{4}-\d\d-\d\dT[\d:.]+Z\s+(TRACE|DEBUG|INFO|WARN|ERROR)\s+[\w]+(::[\w]+)+/.test(String(text ?? '').replace(ANSI, ''));
 
-function permissionsFor(profile = {}, peer) {
+function permissionsFor(profile = {}, peer, cwd) {
   // probe runs commands and writes nothing: exactly what codex's read-only sandbox enforces.
   const effective = profile.policy === 'read-only' || profile.policy === 'probe' ? 'read-only' : profile.mode === 'plan' ? 'plan' : 'yolo';
   const dynamicTools = reportGrant(profile, peer) ? {dynamicTools: [REPORT_TOOL_SPEC]} : {};
   if (effective === 'yolo') {
     return {thread: {approvalPolicy: 'never', sandbox: 'danger-full-access', ...dynamicTools},
       turn: {approvalPolicy: 'never', sandboxPolicy: {type: 'dangerFullAccess'}}};
+  }
+  if (profile.policy === 'probe' && profile.probeSource) {
+    const isolated = fs.realpathSync(cwd);
+    const source = fs.realpathSync(profile.probeSource);
+    if (source === isolated || source.startsWith(`${isolated}${path.sep}`) || isolated.startsWith(`${source}${path.sep}`)) throw new Error('probeSource must be separate from cwd');
+    return {thread: {approvalPolicy: 'never', sandbox: 'workspace-write', ...dynamicTools},
+      turn: {approvalPolicy: 'never', sandboxPolicy: {type: 'workspaceWrite', writableRoots: [isolated], excludeSlashTmp: true, excludeTmpdirEnvVar: true}}};
   }
   return {thread: {approvalPolicy: 'on-request', sandbox: 'read-only', ...dynamicTools},
     turn: {approvalPolicy: 'on-request', sandboxPolicy: {type: 'readOnly'}}};
@@ -306,13 +309,19 @@ export function createCodexLive({spawn = spawnProcess, kill = process.kill, conn
     const executable = resolveExecutable('codex', profile.executables?.codex);
     // keepStdin: requests are written for the life of the peer, so the pipe is never ended early.
     const report = reportGrant(profile, peer);
+    const permissions = permissionsFor(profile, peer, cwd);
+    const env = vendorEnv(process.env, profile.orchestratorEnv);
+    if (profile.policy === 'probe' && profile.probeSource) {
+      env.TMPDIR = path.join(fs.realpathSync(cwd), '.probe-tmp');
+      fs.mkdirSync(env.TMPDIR, {recursive: true, mode: 0o700});
+    }
     // dynamicTools is negotiated through initialize.capabilities.experimentalApi. The grant itself
     // is intentionally never inherited by the child environment.
     const live = spawnLive({executable, args: ['app-server'], cwd,
-      env: vendorEnv(process.env, profile.orchestratorEnv), keepStdin: true, spawn});
+      env, keepStdin: true, spawn});
     const handle = {provider: 'codex', peer, child: live.child, pid: live.child.pid, cwd, dir,
       task: report ? peer.slice('worker:'.length) : null, report, connectBus: connectBusImpl, model: profile.model ?? null,
-      permissions: permissionsFor(profile, peer), threadId: null, queue: [], pending: new Map(), nextId: 1,
+      permissions, threadId: null, queue: [], pending: new Map(), nextId: 1,
       reportCalls: new Set(), running: false, exited: false, cancelled: false, resulted: false, lastAssistant: null, lastError: null, turnId: null, stream: makeStream(), stop: () => stop(handle)};
     handle.requestTimeoutMs = requestTimeoutMs;
     handle.setTimeout = setTimeoutImpl;

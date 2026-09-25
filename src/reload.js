@@ -391,7 +391,7 @@ async function legacySupervise(args, {spawnChild, updateInstall, resume = null})
       const interrupt = () => {}; // Foreground process group delivers Ctrl+C to the child too.
       process.on('SIGTERM',terminate); process.on('SIGINT',interrupt);
       child.on('message', message => {if (message?.type === 'restart') {request = message.state; update = message.update === true;}});
-      child.once('error', error => {console.error(error.message);});
+      child.on('error', error => {console.error(error.message);});
       child.once('close', (code,signal) => {
         process.off('SIGTERM',terminate); process.off('SIGINT',interrupt);
         resolve({code:code ?? (signal ? 130 : 1),request,update});
@@ -710,7 +710,10 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
           else if (message.action === 'cancel' && message.task) scheduler.cancel(message.task).catch(() => {});
         }
       });
-      child.once('error', error => { console.error(error.message); });
+      // Every write to a child that already exited (IPC send, stdin) emits its own EPIPE 'error';
+      // `once` handled the first and let the second crash the daemon mid-teardown, leaving
+      // daemon.json behind after `bounce stop` (observed under a loaded full test run).
+      child.on('error', error => { console.error(error.message); });
       child.once('close', (code, signal) => {
         currentChild = null;
         host.detach();
