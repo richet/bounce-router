@@ -361,8 +361,8 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     'the concrete file, command, test result, or artifact. Publish task.blocked immediately when progress stops.',
     'Every task.* row you publish needs `task` (an id from your own publish replies): without it the bus refuses',
     `    bounce publish --event '{"kind":"task.milestone","task":"<task id>","phase":"inspect","text":"…","next":"…","evidence":["…"]}'`, '',
-    'You may publish only: task.submitted, task.accepted, task.milestone, task.blocked, task.input_required, task.usage, task.activity, message.',
-    'A task blocked at an unconfident review gate (reason review_not_accepted, review_uncertain or review_unavailable) waits for your decision: check the work yourself, then publish task.accepted with `text` naming what you checked and why, or send it back or resubmit. A confident review verdict, and work its worker reported unfinished, cannot be accepted by hand.',
+    'You may publish only: task.submitted, task.accepted, task.rework, task.milestone, task.blocked, task.input_required, task.usage, task.activity, message.',
+    'A task blocked at an unconfident review gate (reason review_not_accepted, review_uncertain or review_unavailable) waits for your decision: check the work yourself, then either publish task.accepted with `text` naming what you checked and why, or publish task.rework with `text` naming what must be fixed (resumes the same worker for one more rework round), or resubmit. A confident review verdict, and work its worker reported unfinished, cannot be accepted or sent back by hand.',
     'When a worker is blocked or asks for input because it needs a decision, answer it by publishing a message to worker:<task id>: the same worker resumes with your answer. Do not re-dispatch the job as new work for that.',
     '`bounce agents set` journals agents.defined for you.',
     'A Codex worker calls its scoped `bounce_report` tool; other workers use `bounce report --report <json>`. Reports require op (milestone, blocked,',
@@ -489,7 +489,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
       reportTokens.set(peer, true);
       return {BOUNCE_REPORT_BUS: bus.path, BOUNCE_REPORT_TOKEN_FILE: grant.file};
     }, strategy: strategyOverride ?? orchestration.strategy, jev});
-  bus = await createBus({session, dir: session.dir, validate: scheduler.validate, prepare: scheduler.prepare, report: scheduler.report, accept: scheduler.acceptOverride});
+  bus = await createBus({session, dir: session.dir, validate: scheduler.validate, prepare: scheduler.prepare, report: scheduler.report, accept: scheduler.acceptOverride, rework: scheduler.reworkOverride, reworkAvailable: scheduler.roundsAvailable});
   const userGrant = bus.grant({peer: 'user', canSubmit: true, tasks: [], context: session.id});
   // daemon.json is written AFTER the SIGTERM/SIGINT handlers are installed (below), never here:
   // it is the daemon's discovery record, so the moment it exists a `stop`/SIGTERM can arrive, and
