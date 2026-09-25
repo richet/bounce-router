@@ -80,14 +80,15 @@ test('a message answering a worker\'s own blocked outcome resumes it, and a late
 test('a task blocked at an unconfident review gate does not resume on a message', async t => {
   const {session} = setup(t);
   const workerAdapter = fakeAdapter(() => [{kind: 'native', sessionId: 'native-2'}, {kind: 'result', status: 'completed', text: 'done'}]);
-  const lean = JSON.stringify({verdict: 'unavailable', findings: [], confidence: 0.3, threshold: 0.8, choice: 'rework',
-    probabilities: {rework: 0.7, accept: 0.3}, fired: ['unbacked_tests'], leanFindings: ['Paste the test output.'], source: 'jev'});
-  const criticAdapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: lean}]);
+  // No choice/threshold at all: the review produced nothing, so the gate is review_unavailable
+  // (a below-bar lean, by contrast, is now accepted with advice — see jev-review.test.js).
+  const unavailable = JSON.stringify({verdict: 'unavailable', reason: 'no confident verdict', source: 'jev'});
+  const criticAdapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: unavailable}]);
   const scheduler = createScheduler({session, adapters: {worker: workerAdapter, critic: criticAdapter}, profiles: {A: worker(), C: critic()}, watchdog: {interval: null}});
   const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null, review: {completion: 'C'}});
   await waitFor(() => scheduler.tasks()[row.task]?.state === 'blocked');
   const blocked = session.events.findLast(e => e.kind === 'task.blocked' && e.task === row.task);
-  assert.equal(blocked.reason, 'review_not_accepted');
+  assert.equal(blocked.reason, 'review_unavailable');
 
   session.append({kind: 'message', to: `worker:${row.task}`, text: 'go ahead and accept it', from: 'user'});
   await waitFor(() => session.events.some(e => e.kind === 'task.delivered'));

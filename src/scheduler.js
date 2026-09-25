@@ -1567,7 +1567,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       return;
     }
     // accept
-    if (stage === 'completion' && !publishArtifact(task, {kind: 'task.accepted', task, stage, by: reviewFrom(task), context})) return;
+    if (stage === 'completion' && !publishArtifact(task, {kind: 'task.accepted', task, stage, by: reviewFrom(task), ...(intent.advice ? {advice: intent.advice} : {}), context})) return;
     append({kind: 'task.accepted', task, stage, by: reviewFrom(task), context});
     if (stage === 'prelaunch') {
       if (availableStarts(root) < 1) return escalateBudget(task, context);

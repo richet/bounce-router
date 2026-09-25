@@ -43,16 +43,18 @@ test('an override accept integrates the isolated work into the checkout before t
   const cwd = path.join(root, 'project'); fs.mkdirSync(path.join(cwd, 'src'), {recursive: true}); fs.writeFileSync(path.join(cwd, 'src', 'a.js'), 'old\n');
   const session = new Session(cwd, {root});
   const worker = fakeAdapter(({cwd: work}) => { fs.writeFileSync(path.join(work, 'src', 'a.js'), 'new\n'); return [{kind: 'result', status: 'completed', text: 'done'}]; });
-  const lean = JSON.stringify({verdict: 'unavailable', findings: [], confidence: 0.3, threshold: 0.8, choice: 'rework', probabilities: {rework: 0.7, accept: 0.3}, fired: ['unbacked_tests'], leanFindings: ['Paste the test output.'], source: 'jev'});
-  const critic = fakeAdapter(() => [{kind: 'result', status: 'completed', text: lean}]);
+  // No choice/threshold at all: the review produced nothing, so the gate is review_unavailable
+  // (a below-bar lean, by contrast, is now accepted with advice — see jev-review.test.js).
+  const unavailable = JSON.stringify({verdict: 'unavailable', reason: 'no confident verdict', source: 'jev'});
+  const critic = fakeAdapter(() => [{kind: 'result', status: 'completed', text: unavailable}]);
   const scheduler = createScheduler({session, adapters: {worker, critic}, profiles: {builder: {adapter: 'worker', policy: 'write'}, critic: {adapter: 'critic', policy: 'read-only'}},
     gitHead: () => null, watchdog: {interval: null}});
   t.after(() => { scheduler.close(); fs.rmSync(root, {recursive: true, force: true}); });
   scheduler.submit({task: 'fix', parent: null, profile: 'builder', from: 'orchestrator', owns: ['src/a.js'], requires: ['read', 'exec', 'write'], orders: 'change a', review: {completion: 'critic'}});
   await waitFor(() => tasks(session.events).fix?.state === 'blocked');
-  assert.equal(session.events.findLast(e => e.kind === 'task.blocked' && e.task === 'fix').reason, 'review_not_accepted');
+  assert.equal(session.events.findLast(e => e.kind === 'task.blocked' && e.task === 'fix').reason, 'review_unavailable');
   assert.equal(fs.readFileSync(path.join(cwd, 'src', 'a.js'), 'utf8'), 'old\n');
-  scheduler.acceptOverride({kind: 'task.accepted', task: 'fix', stage: 'completion', by: 'orchestrator', overrides: 'review_not_accepted', text: 'Re-ran the tests myself.'});
+  scheduler.acceptOverride({kind: 'task.accepted', task: 'fix', stage: 'completion', by: 'orchestrator', overrides: 'review_unavailable', text: 'Re-ran the tests myself.'});
   await waitFor(() => tasks(session.events).fix?.state === 'accepted');
   assert.equal(fs.readFileSync(path.join(cwd, 'src', 'a.js'), 'utf8'), 'new\n');
   const integrated = session.events.findIndex(e => e.kind === 'task.integrated' && e.task === 'fix');

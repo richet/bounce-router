@@ -48,9 +48,10 @@ export const defaultStrategy = {
   onReviewVerdict(task, verdicts, view, api) {
     const v = verdicts[0];
     if (v.verdict === 'unavailable') {
-      if (view[task]?.state === 'reviewing' && Number.isFinite(v.confidence) && api.reAsked && !api.reAsked(task)) {
-        return {action: 'rereview', reason: reviewGate(v).reason, text: 'Review the same preserved candidate again. Keep uncertainty explicit; do not invent evidence or request a worker restart.'};
-      }
+      // Jev answered but below its bar: an unconfident answer means today's behaviour (with Jev off, a
+      // completed task is accepted), with the lean attached as advice. Found live (159f4746 61ce01b4):
+      // blocking on it, after an identical re-ask, cost a finished task a gate and an orchestrator turn.
+      if (isJevLean(v)) return {action: 'accept', advice: jevAdvice(v)};
       return reviewGate(v);
     }
     if (v.verdict === 'accept') return {action: 'accept'};
@@ -131,6 +132,15 @@ export function quorumStrategy(n) {
     },
     onTerminal() { return {submit: []}; },
   };
+}
+
+// Jev's own below-threshold answer (it carries its threshold), as opposed to a review that produced no choice.
+const isJevLean = v => (v.choice === 'accept' || v.choice === 'rework') && Number.isFinite(Number(v.threshold));
+function jevAdvice(v) {
+  const p = Number(v.probabilities?.[v.choice]);
+  const fired = Array.isArray(v.fired) && v.fired.length ? `; fired: ${v.fired.join(', ')}` : '';
+  const findings = Array.isArray(v.leanFindings) ? v.leanFindings.map(f => ` ${f}`).join('') : '';
+  return `Jev leaned ${v.choice}${Number.isFinite(p) ? ` (${p.toFixed(2)})` : ''} below the ${v.threshold} confidence bar${fired}.${findings}`;
 }
 
 // A review that answered below its confidence bar still answered. Rework-leaning is a refusal to

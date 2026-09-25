@@ -115,33 +115,29 @@ test('Jev on: a root task with no completion reviewer gets the jev critic; a con
   assert.equal(JSON.parse(fetchCalls[0].options.body).state.report.summary, 'done, tests pass');
 });
 
-// Observed live (session e9353126, task 6f7aabce): Jev leaned rework at 0.67 with confidence 0.35 on
-// both asks and fired a check, and the task was reported as "Required review unavailable: no confident
-// verdict" with no findings. An unconfident lean is still an answer: it stays gated, but says what it was.
-for (const [lean, probabilities, nouls, reason, wording] of [
-  ['rework', {rework: 0.67, accept: 0.33}, {remaining_work: 0.7}, 'review_not_accepted', /^Review did not accept: Jev leaned rework \(0\.67\) below the 0\.8 confidence bar on both asks; fired: remaining_work\./],
-  ['accept', {accept: 0.6, rework: 0.4}, {}, 'review_uncertain', /^Review uncertain: Jev leaned accept \(0\.60\) below the 0\.8 confidence bar on both asks\./],
-]) test(`an unconfident ${lean} lean is gated and reported as what it was, with its findings`, async t => {
+// Reversed 2026-09-25: an unconfident Jev answer is accepted with advice (see jev-review.test.js).
+// Observed live (session e9353126, task 6f7aabce): Jev leaned rework at 0.67 with confidence 0.35 and
+// fired a check; blocking on it (after an identical re-ask) cost a finished task a gate and an
+// orchestrator turn. With Jev off a completed task is accepted, so a lean is accepted too, with advice.
+for (const [lean, probabilities, nouls, wording] of [
+  ['rework', {rework: 0.67, accept: 0.33}, {remaining_work: 0.7}, /^Jev leaned rework \(0\.67\) below the 0\.8 confidence bar; fired: remaining_work\./],
+  ['accept', {accept: 0.6, rework: 0.4}, {}, /^Jev leaned accept \(0\.60\) below the 0\.8 confidence bar\.$/],
+]) test(`an unconfident ${lean} lean is accepted with its findings attached as advice`, async t => {
   const {session} = setup(t);
   const worker = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done'}]);
   const respond = () => ({answers: {decision: {type: 'choice', choice: lean, probabilities, confidence: 0.35}, ...Object.fromEntries(Object.entries(nouls).map(([name, noul]) => [name, {type: 'noul', noul}]))}});
   const {profiles, typesafe, jev} = jevScheduler(session, {settings: {enabled: true}, respond});
   const scheduler = createScheduler({session, adapters: {worker, typesafe}, profiles, jev, gitHead: () => null});
   const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null});
-  await waitFor(() => scheduler.tasks()[row.task]?.state === 'blocked');
-  assert.equal(session.events.some(e => e.kind === 'task.rework' || e.kind === 'task.accepted'), false);
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'accepted');
+  assert.equal(session.events.some(e => e.kind === 'task.blocked' || e.kind === 'review.reasked'), false);
+  assert.equal(session.events.filter(e => e.kind === 'jev.verdict').length, 1, 'asked once');
   const finished = session.events.filter(e => e.kind === 'review.finished').map(e => JSON.parse(e.text));
-  assert.deepEqual(finished.map(v => [v.verdict, v.choice, v.fired]), [['unavailable', lean, Object.keys(nouls)], ['unavailable', lean, Object.keys(nouls)]]);
-  const blocked = session.events.findLast(e => e.kind === 'task.blocked');
-  assert.equal(blocked.reason, reason);
-  assert.match(blocked.text, wording);
-  if (lean === 'rework') assert.equal(blocked.text.includes(VERDICT_CHECKS.remaining_work.fix), true, blocked.text);
-  assert.equal(session.events.findLast(e => e.kind === 'policy.escalated' && e.reason === reason)?.text, blocked.text);
+  assert.deepEqual(finished.map(v => [v.verdict, v.choice, v.fired]), [['unavailable', lean, Object.keys(nouls)]]);
+  const accepted = session.events.findLast(e => e.kind === 'task.accepted' && e.task === row.task);
+  assert.match(accepted.advice, wording);
+  if (lean === 'rework') assert.equal(accepted.advice.includes(VERDICT_CHECKS.remaining_work.fix), true, accepted.advice);
   assert.equal(worker.calls.resume, 0);
-  // The coordinator is told what the review answered, not "unavailable".
-  const handoff = handoffBlock(session, [blocked]);
-  assert.equal(handoff.includes(`review gate: blocked · ${reason} · ${blocked.text.slice(0, 60)}`), true, handoff);
-  assert.equal(/unavailable/i.test(handoff), false, handoff);
 });
 
 test('a review that returned no verdict at all is still reported as unavailable', async t => {
@@ -156,18 +152,21 @@ test('a review that returned no verdict at all is still reported as unavailable'
   assert.match(blocked.text, /^Required review unavailable/);
 });
 
-test('a low-confidence rework blocks rather than synthesizing acceptance', async t => {
+// Reversed 2026-09-25 (Daniel: "much rejection of done tasks… even simpler tasks take long"). Live,
+// 159f4746 task 61ce01b4: a sonnet change whose gate passed was blocked by Jev leaning rework at 0.53 and
+// 0.52 (the identical re-ask), then accepted by hand. An unconfident answer means today's behaviour —
+// with Jev off a completed task is accepted — so it is accepted, with Jev's lean attached as advice.
+test('a low-confidence rework is accepted with Jev\'s lean as advice, not blocked and not re-asked', async t => {
   const {session} = setup(t);
   const worker = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done'}]);
   const {profiles, typesafe, jev} = jevScheduler(session, {settings: {enabled: true}, respond: () => ({answers: answers('rework', 0.55, {remaining_work: 0.7})})});
   const scheduler = createScheduler({session, adapters: {worker, typesafe}, profiles, jev, gitHead: () => null});
   const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null});
-  await waitFor(() => scheduler.tasks()[row.task]?.state === 'blocked');
-  assert.equal(session.events.some(e => e.kind === 'task.rework'), false);
-  const verdict = session.events.find(e => e.kind === 'jev.verdict');
-  assert.equal(verdict.verdict, 'unavailable');
-  assert.equal(verdict.choice, 'rework');
-  assert.match(verdict.text, /chose rework below threshold/);
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'accepted');
+  assert.equal(session.events.some(e => e.kind === 'task.rework' || e.kind === 'task.blocked' || e.kind === 'review.reasked'), false);
+  assert.equal(session.events.filter(e => e.kind === 'jev.verdict').length, 1, 'asked once');
+  const accepted = session.events.findLast(e => e.kind === 'task.accepted' && e.task === row.task);
+  assert.match(accepted.advice, /^Jev leaned rework \(0\.\d+\) below the 0\.8 confidence bar/);
   assert.equal(worker.calls.resume, 0);
 });
 

@@ -26,11 +26,12 @@ const waitFor = async (predicate, timeout = 3000) => {
   }
 };
 
-const lean = JSON.stringify({verdict: 'unavailable', findings: [], confidence: 0.3, threshold: 0.8, choice: 'rework',
-  probabilities: {rework: 0.7, accept: 0.3}, fired: ['unbacked_tests'], leanFindings: ['Paste the test output.'], source: 'jev'});
+// No choice/threshold at all: the review produced nothing, so the gate is review_unavailable
+// (a below-bar lean, by contrast, is now accepted with advice — see jev-review.test.js).
+const lean = JSON.stringify({verdict: 'unavailable', reason: 'no confident verdict', source: 'jev'});
 
-// Wires a real bus + scheduler at an unconfident review gate: a worker completes, a critic leans
-// rework below the confidence bar, the task blocks at review_not_accepted with a preserved native session.
+// Wires a real bus + scheduler at an unconfident review gate: a worker completes, a critic gives no
+// choice at all, the task blocks at review_unavailable with a preserved native session.
 async function setupAtGate(t, {workerScript, budget} = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-rework-override-'));
   t.after(() => fs.rmSync(root, {recursive: true, force: true}));
@@ -47,7 +48,7 @@ async function setupAtGate(t, {workerScript, budget} = {}) {
   scheduler.submit({task: 'fix', parent: null, profile: 'builder', from: 'orchestrator', requires: ['read', 'exec', 'write'], orders: 'change a', review: {completion: 'C'}, ...(budget ? {budget} : {})});
   await waitFor(() => tasks(session.events).fix?.state === 'blocked');
   const blocked = session.events.findLast(e => e.kind === 'task.blocked' && e.task === 'fix');
-  assert.equal(blocked.reason, 'review_not_accepted');
+  assert.equal(blocked.reason, 'review_unavailable');
   return {root, session, scheduler, bus, worker, critic};
 }
 
