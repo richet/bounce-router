@@ -142,3 +142,15 @@ test('task_submit preserves the admitted plan constraints', async () => {
   await call(s, 'task_submit', {profile: 'builder', orders: 'verify', ...constraints});
   for (const [key, value] of Object.entries(constraints)) assert.deepEqual(submitted[key], value, key);
 });
+
+// Found reviewing the in-place build: task_submit neither declared nor forwarded inPlace, so an
+// orchestrator on MCP could never ask for an in-place task.
+test('task_submit declares and forwards inPlace', async () => {
+  let submitted;
+  const s = server({ops: {submit: async event => {submitted = event; return {ok: true, row: event};}}});
+  const list = await s.handle({jsonrpc: '2.0', id: 1, method: 'tools/list'});
+  const schema = list.result.tools.find(tool => tool.name === 'task_submit').inputSchema.properties.inPlace;
+  assert.deepEqual(schema, {type: 'object', properties: {authorizedBy: {type: 'number'}}, required: ['authorizedBy']});
+  await call(s, 'task_submit', {profile: 'builder', orders: 'commit it', requires: ['read', 'exec', 'write'], inPlace: {authorizedBy: 42}});
+  assert.deepEqual(submitted.inPlace, {authorizedBy: 42});
+});
