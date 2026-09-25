@@ -542,6 +542,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const reviewer = jev && profiles[jev.reviewer];
     if (!reviewer || reviewer.adapter !== 'typesafe' || !READONLY_ROLES.has(reviewer.role) || strategy !== defaultStrategy) return spec;
     if (spec.review?.completion) return spec;
+    // An in-place task has no attempt diff for Jev to judge (found live: the verdict fell back to
+    // git, `no_repository` in a plain folder); its report is verified by the orchestrator instead.
+    if (spec.inPlace !== undefined) return spec;
     let settings;
     try { settings = jev.settings(); } catch { return spec; }
     if (!settings?.enabled || !settings.review) return spec;

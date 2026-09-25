@@ -469,3 +469,19 @@ test('a rework whose findings DIFFER from the previous round still runs, up to t
   await waitFor(() => scheduler.tasks()[row.task]?.state === 'accepted');
   assert.equal(turns, 3, 'two reworks with different findings, then accepted');
 });
+
+// Found live (in-place acceptance, non-git folder): an in-place task got the automatic Jev completion
+// reviewer, which has no attempt diff to judge for it and fell back to asking git — `no_repository`,
+// so the task blocked at review_unavailable and needed a hand override. An in-place task's evidence
+// is its report, which the orchestrator verifies; it is not given the automatic diff reviewer.
+test('Jev on: an in-place task is not given the automatic completion reviewer; an ordinary root task still is', async t => {
+  const {session} = setup(t);
+  const worker = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done'}]);
+  const {profiles, typesafe, jev} = jevScheduler(session, {settings: {enabled: true}, respond: () => ({answers: answers('accept', 0.95)})});
+  const scheduler = createScheduler({session, adapters: {worker, typesafe}, profiles, jev, gitHead: () => 'start-sha'});
+  const ordinary = scheduler.submit({parent: null, profile: 'A', orders: 'Own src/x.js', deadline: null});
+  assert.equal(ordinary.review.completion, 'jev');
+  session.append({kind: 'user', text: 'commit it'});
+  const inPlace = scheduler.submit({parent: null, profile: 'A', orders: 'git commit -am done', deadline: null, requires: ['read', 'exec', 'write'], inPlace: true});
+  assert.equal(inPlace.review?.completion, undefined);
+});
