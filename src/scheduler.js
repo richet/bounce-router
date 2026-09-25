@@ -624,12 +624,16 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // send it there (observed live: a heredoc appended to the real file, the copy stayed unchanged and
   // review saw an empty diff). Paths into the checkout are rewritten to the copy, and the adapter fences
   // the checkout itself (`writeFence`).
-  const inWorkingCopy = (text, workspace) => {
+  const toWorkingCopy = (text, workspace) => {
     const source = fs.realpathSync(session.cwd);
     // session.cwd is already resolved; macOS also spells /private/{var,tmp,etc} without the prefix.
     const spellings = [source, source.replace(/^\/private(?=\/(?:var|tmp|etc)\/)/, '')];
-    const rewritten = [...new Set(spellings)].sort((a, b) => b.length - a.length)
+    return [...new Set(spellings)].sort((a, b) => b.length - a.length)
       .reduce((value, root) => value.split(root).join(workspace.cwd), text);
+  };
+  const inWorkingCopy = (text, workspace) => {
+    const source = fs.realpathSync(session.cwd);
+    const rewritten = toWorkingCopy(text, workspace);
     return `${rewritten}\n\nYour working copy is ${workspace.cwd}: it is a copy of the project, and only changes made there are your work. Writes to the original checkout (${source}) are refused.`;
   };
   const workspaces = new Map();
@@ -1042,6 +1046,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       owned = row.inPlace ? null : workspaceFor(task, profile, attempt);
       if (owned?.disposable) profile = {...profile, probeSource: fs.realpathSync(session.cwd)};
       else if (owned) profile = {...profile, writeFence: fs.realpathSync(session.cwd)};
+      // OpenCode takes the agent text as its system prompt, apart from the orders (found live: an agent
+      // file naming the checkout sent a local worker to write there); it points into the copy too.
+      if (owned && profile.agent?.prompt) profile = {...profile, agent: {...profile.agent, prompt: toWorkingCopy(profile.agent.prompt, owned)}};
       append({kind: 'task.launch.requested', task, attempt, executionKey: `${task}:${attempt}`, context});
       handle = await adapter.launch({peer: workerFrom(task), profile, orders: owned?.disposable ? `${workerOrders}\n\n${probeOrders(owned)}` : owned ? inWorkingCopy(workerOrders, owned) : workerOrders, cwd: owned?.cwd ?? session.cwd, dir,
         task, attempt, context, signal: admission?.signal,
@@ -1126,6 +1133,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       owned = row.inPlace ? null : workspaceFor(task, profile, attempt);
       if (owned?.disposable) profile = {...profile, probeSource: fs.realpathSync(session.cwd)};
       else if (owned) profile = {...profile, writeFence: fs.realpathSync(session.cwd)};
+      // OpenCode takes the agent text as its system prompt, apart from the orders (found live: an agent
+      // file naming the checkout sent a local worker to write there); it points into the copy too.
+      if (owned && profile.agent?.prompt) profile = {...profile, agent: {...profile.agent, prompt: toWorkingCopy(profile.agent.prompt, owned)}};
       append({kind: 'task.launch.requested', task, attempt, executionKey: `${task}:${attempt}`, resumed: true, context});
       if (owned?.disposable) message = `${message}\n\n${probeOrders(owned)}`;
       else if (owned) message = inWorkingCopy(message, owned);

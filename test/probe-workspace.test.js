@@ -94,3 +94,22 @@ test('an isolated write worker is sent into its working copy and fenced off the 
   assert.equal(orders.includes(`${real}/docs`), false);
   assert.match(orders, /Your working copy is .+: it is a copy of the project, and only changes made there are your work\. Writes to the original checkout .+ are refused\./);
 });
+
+// Observed live (2026-09-25, 159f4746 task 921f9fe0): ACE's builder agent file says "Project: Ace … at
+// /Users/…/code/ace". OpenCode gets the agent text as its system prompt, apart from the orders, so the
+// path was never rewritten: the local worker wrote to the real checkout, the fence refused, and it spent
+// its turn on workarounds. The agent text points into the working copy too.
+test('an isolated OpenCode worker\'s agent prompt points into its working copy, not the real checkout', {timeout: 4000}, async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-agent-prompt-'));
+  const cwd = path.join(root, 'project'); fs.mkdirSync(path.join(cwd, 'src'), {recursive: true}); fs.writeFileSync(path.join(cwd, 'src', 'a.ts'), 'x');
+  const session = new Session(cwd, {root}); const real = fs.realpathSync(cwd); const seen = [];
+  const adapter = fakeAdapter(({cwd: work, profile}) => { seen.push({work, profile}); return [{kind: 'result', status: 'completed', text: 'done'}]; });
+  const agent = {name: 'builder', prompt: `You are a builder. Project: Ace at ${real}. Tests write under ${real}/tests.`};
+  const scheduler = createScheduler({session, adapters: {opencode: adapter}, profiles: {builder: {adapter: 'opencode', policy: 'write', agent}}, watchdog: {interval: null}});
+  t.after(() => { scheduler.close(); fs.rmSync(root, {recursive: true, force: true}); });
+  scheduler.submit({task: 'edit', profile: 'builder', owns: ['src/a.ts'], requires: ['read', 'exec', 'write'], orders: 'Edit src/a.ts.'});
+  await waitFor(() => seen.length === 1);
+  const [{work, profile}] = seen;
+  assert.equal(profile.agent.prompt, `You are a builder. Project: Ace at ${work}. Tests write under ${work}/tests.`);
+  assert.equal(agent.prompt.includes(real), true, 'the shared agent definition itself is not mutated');
+});
