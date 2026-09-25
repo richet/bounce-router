@@ -103,7 +103,9 @@ test('right status rail stays beside conversation and split panes, never below i
     assert.ok(quota > brand && quota < input);
     assert.ok(lines[quota].indexOf('CLAUDE usage 9%') >= columns - 32);
     assert.match(lines.join('\n'), /CODEX usage 2%/);
-    assert.match(lines.join('\n'), /Session session-/);
+    // sessionId 'session-123' has no explicit name, so the sidebar falls back to its derived
+    // memorable name (src/session-names.js) — no id here, the sidebar is too narrow for it.
+    assert.match(lines.join('\n'), /Session sure-viper/);
     assert.match(lines.join('\n'), /1 prompt queued/);
     assert.ok(lines.length <= 28);
     assert.ok(lines.every(line => stringWidth(line) <= columns));

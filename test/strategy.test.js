@@ -59,12 +59,12 @@ test('S1b self-host: an implicit defaultStrategy scheduler and an explicit one b
     const scheduler = createScheduler(opts);
     const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null, review: {prelaunch: 'C'}});
     await waitFor(() => scheduler.tasks()[row.task]?.state === 'completed');
-    return session.events.filter(e => e.task === row.task || e.kind === 'peer.joined').map(e => e.kind);
+    return session.events.filter(e => (e.task === row.task || e.kind === 'peer.joined') && !e.kind.startsWith('orchestration.') && !['task.workspace', 'task.launch.requested', 'task.attempt.ended', 'task.artifact', 'task.integration.requested', 'task.integrated'].includes(e.kind)).map(e => e.kind);
   };
   const implicit = await runOnce(undefined);
   const explicit = await runOnce(defaultStrategy);
   assert.deepEqual(implicit, explicit);
-  assert.deepEqual(implicit, ['task.submitted', 'budget.reserved', 'review.started', 'review.finished', 'task.accepted', 'budget.reserved', 'peer.joined', 'task.started', 'task.completed']);
+  assert.deepEqual(implicit, ['task.submitted', 'budget.reserved', 'review.started', 'review.finished', 'task.accepted', 'budget.reserved', 'peer.joined', 'task.started', 'task.output', 'task.completed']);
 });
 
 test('S2 no-review: a completion review in config never launches, task completes then accepts by strategy', async t => {

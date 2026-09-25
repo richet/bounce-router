@@ -73,7 +73,7 @@ export function fakeAdapter(script) {
           const fs = await import('node:fs');
           const {connectBus} = await import('../../src/bus.js');
           const client = await connectBus({path: handle.report.BOUNCE_REPORT_BUS, token: fs.readFileSync(handle.report.BOUNCE_REPORT_TOKEN_FILE, 'utf8').trim()});
-          try { await client.report({op: 'final', outcome: 'completed', phase: 'done', text: event.text ?? 'done', next: 'none', summary: event.text ?? 'done', evidence: [], remaining: 'none'}); }
+          try { await client.report({op: 'final', outcome: 'completed', phase: 'done', text: event.text ?? 'done', next: 'none', summary: event.text ?? 'done', evidence: [], remaining: ''}); }
           finally { await client.close(); }
         }
         yield event;

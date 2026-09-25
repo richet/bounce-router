@@ -200,37 +200,70 @@ export const VERDICT_CHECKS = {
   },
 };
 
-export function verdictQuestions() {
+export const REPORT_VERDICT_CHECKS = {
+  assignment_unmet: {
+    instructions: 'The final report does not address the assignment, required deliverables, or acceptance criteria stated in the orders.',
+    fix: 'The report does not show how it addressed the assignment; complete the missing work or explain the concrete blocker.',
+  },
+  unbacked_evidence: {
+    instructions: 'The report claims a conclusion, verification, or result without report text, command output, or listed evidence backing that claim.',
+    fix: 'The report makes claims without evidence; include the command output, observation, or artifact that supports each claim.',
+  },
+  remaining_work: {
+    instructions: 'The report says the assigned analysis is done while work required to complete that analysis remains. Identifying unfinished project phases, defects, or recommended future implementation is a valid audit deliverable, not unfinished analysis.',
+    fix: 'The report says done but names remaining work; finish it or report the assignment as blocked with what is left.',
+  },
+};
+
+const checksFor = state => state?.review_kind === 'report' ? REPORT_VERDICT_CHECKS : VERDICT_CHECKS;
+
+export function verdictQuestions(state = null) {
+  const reportReview = state?.review_kind === 'report';
+  const checks = checksFor(state);
   return {
     decision: {
       type: 'choice',
-      instructions: 'Given the orders, the worker\'s final report and the diff of its changes, should this task be accepted as done or sent back to the same worker for rework?',
+      instructions: reportReview
+        ? 'Given the assignment and the analyst\'s report, should this assignment be accepted as complete or sent back for a better report or further analysis?'
+        : 'Given the orders, the worker\'s final report and the diff of its changes, should this task be accepted as done or sent back to the same worker for rework?',
       criteria: {
-        accept: 'The diff and the report satisfy the orders: scope respected, claims backed by output or files, no material work left undone.',
-        rework: 'Something material is wrong or missing: scope violated, a claim unbacked, an acceptance criterion unmet, or named work remaining.',
+        accept: reportReview
+          ? 'The report addresses the assignment, backs its claims with evidence, and completes the assigned analysis. An audit may correctly identify defects and future project work without implementing it.'
+          : 'The diff and the report satisfy the orders: scope respected, claims backed by output or files, no material work left undone.',
+        rework: reportReview
+          ? 'The report misses the assigned analysis or lacks evidence for material claims. Do not require an analyst to implement the project work identified by the audit.'
+          : 'Something material is wrong or missing: scope violated, a claim unbacked, an acceptance criterion unmet, or named work remaining.',
       },
     },
-    ...Object.fromEntries(Object.entries(VERDICT_CHECKS).map(([name, check]) => [name, {type: 'noul', instructions: check.instructions}])),
+    ...Object.fromEntries(Object.entries(checks).map(([name, check]) => [name, {type: 'noul', instructions: check.instructions}])),
   };
 }
 
-// Pure: `rework` only when the Choice says so with confidence at or above the threshold;
-// anything else (accept, low confidence, an unexpected answer shape) is today's accept.
+// A decision that cannot meet the configured confidence bar is unresolved. It must never be
+// converted into acceptance merely because transport succeeded.
 export function decideVerdict(answers, {confidence = 0.8, state = null} = {}) {
+  const activeChecks = checksFor(state);
   const decision = isObject(answers?.decision) ? answers.decision : {};
   const choice = typeof decision.choice === 'string' ? decision.choice : null;
   const conf = Number.isFinite(Number(decision.confidence)) ? Number(decision.confidence) : 0;
-  const checks = Object.fromEntries(Object.keys(VERDICT_CHECKS).map(name => [name, Number.isFinite(Number(answers?.[name]?.noul)) ? Number(answers[name].noul) : null]));
-  const firedRaw = Object.keys(VERDICT_CHECKS).filter(name => checks[name] !== null && checks[name] >= 0.5);
+  const checks = Object.fromEntries(Object.keys(activeChecks).map(name => [name, Number.isFinite(Number(answers?.[name]?.noul)) ? Number(answers[name].noul) : null]));
+  const firedRaw = Object.keys(activeChecks).filter(name => checks[name] !== null && checks[name] >= 0.5);
   // A check the state itself contradicts is not a finding the worker can act on: `empty_diff` says
   // the diff shows nothing, so when the diff Jev was shown is not empty the check is dropped. A rework
   // that keeps no actionable finding is an accept. (Observed live: a correct change sent back three
   // times on checks it could not satisfy.)
-  const dropped = state && typeof state.diff === 'string' && state.diff.trim() ? firedRaw.filter(name => name === 'empty_diff') : [];
+  const dropped = state?.review_kind !== 'report' && state && typeof state.diff === 'string' && state.diff.trim() ? firedRaw.filter(name => name === 'empty_diff') : [];
   const fired = firedRaw.filter(name => !dropped.includes(name));
-  const rework = choice === 'rework' && conf >= confidence && !(dropped.length && !fired.length);
-  const findings = rework ? (fired.length ? fired.map(name => VERDICT_CHECKS[name].fix) : ['Jev judged the work not ready against the orders; re-read the orders and the report against the diff before resubmitting.']) : [];
-  return {verdict: rework ? 'rework' : 'accept', choice, confidence: conf, threshold: confidence, probabilities: isObject(decision.probabilities) ? decision.probabilities : {}, checks, fired, ...(dropped.length ? {dropped} : {}), findings};
+  const resolved = (choice === 'accept' || choice === 'rework') && conf >= confidence;
+  const rework = resolved && choice === 'rework' && !(dropped.length && !fired.length);
+  const verdict = !resolved ? 'unavailable' : rework ? 'rework' : 'accept';
+  const findings = rework ? (fired.length ? fired.map(name => activeChecks[name].fix) : [state?.review_kind === 'report'
+    ? 'Jev judged the report not ready against the assignment; re-read the assignment and support the report with evidence before resubmitting.'
+    : 'Jev judged the work not ready against the orders; re-read the orders and the report against the diff before resubmitting.']) : [];
+  // An unconfident rework is not sent back, but it is still Jev's answer: its fired checks go with it
+  // so whoever decides sees what Jev objected to instead of "no verdict".
+  const leanFindings = !resolved && choice === 'rework' ? fired.map(name => activeChecks[name].fix) : [];
+  return {verdict, choice, confidence: conf, threshold: confidence, probabilities: isObject(decision.probabilities) ? decision.probabilities : {}, checks, fired, ...(dropped.length ? {dropped} : {}), findings, leanFindings};
 }
 
 // ---- model routing: a Choice over the roster plus Nouls for the access the orders need ----
@@ -489,7 +522,7 @@ const globRe = glob => new RegExp(`^${glob.split('**').map(part => part.split('*
 const pathsOverlap = (a, b) => a === b || globRe(a).test(b) || globRe(b).test(a);
 
 export function planQuestions(plan) {
-  const chunks = (plan?.chunks ?? []).map(c => ({id: c.id, profile: c.profile, orders: String(c.orders ?? '').slice(0, 6000), owns: c.owns ?? [], depends_on: c.depends_on ?? [],
+  const chunks = (plan?.chunks ?? []).map(c => ({id: c.id, profile: c.profile, ...(c.requires !== undefined ? {requires: c.requires} : {}), orders: String(c.orders ?? '').slice(0, 6000), owns: c.owns ?? [], depends_on: c.depends_on ?? [],
     ...(Number.isFinite(c.deadline) ? {deadline_minutes: Math.round(c.deadline / 60000)} : {})}));
   const questions = {};
   for (const c of chunks) for (const [name, check] of Object.entries(PLAN_CHECKS)) questions[`${c.id}.${name}`] = {type: 'noul', instructions: check.instructions(c.id)};
@@ -515,20 +548,22 @@ export function decidePlan(answers, {plan, confidence = 0.8, ceilingMinutes = nu
   return {verdict: findings.length ? 'reject' : 'accept', findings, noted};
 }
 
-// Never throws: with Jev off or failing the plan is accepted with the reason on record, so the gate
-// itself never blocks an orchestrator that plans. Structural findings are still made without Jev.
+// Disabled model review uses explicit structural validation. An enabled but unavailable
+// reviewer cannot manufacture acceptance; preserve structural rejection when already known.
 export async function judgePlan({plan, settings, ask, ceilingMinutes = null, signal} = {}) {
   const s = normalizeJevSettings(settings);
   const structural = decidePlan({}, {plan, confidence: s.confidence, ceilingMinutes});
   const off = reason => ({...structural, reason, model: null});
+  const unavailable = reason => ({...structural, verdict: structural.verdict === 'reject' ? 'reject' : 'unavailable', reason, model: null});
   if (!s.enabled) return off('jev disabled');
-  if (typeof ask !== 'function') return off('routing unavailable');
+  if (typeof ask !== 'function') return unavailable('plan reviewer unavailable');
   const {state, questions} = planQuestions(plan);
   if (!Object.keys(questions).length) return off('no chunks');
   try {
     const result = await ask({state, questions, model: s.model, signal});
+    if (Object.keys(questions).some(name => !Number.isFinite(result.answers?.[name]?.noul))) return unavailable('incomplete plan review');
     return {...decidePlan(result.answers, {plan, confidence: s.confidence, ceilingMinutes}), reason: null, model: result.model, latencyMs: result.latencyMs};
-  } catch (error) { return off(error?.code ?? error?.message ?? 'error'); }
+  } catch (error) { return unavailable(error?.code ?? error?.message ?? 'error'); }
 }
 
 // ---- the lease judge: is a running task still getting somewhere, at the end of its lease? --------
@@ -571,6 +606,54 @@ export async function judgeLease({settings, ask, signal, ...request} = {}) {
   } catch (error) { return none(error?.code ?? error?.message ?? 'error'); }
 }
 
+// ---- the in-place risk check: does the user's own word cover what an in-place task will do? -------
+
+// A Choice, not a Noul: the three outcomes are mutually exclusive readings of the same cited
+// message, and Jev's calibration for a three-way choice (like the plan/lease checks) is what
+// the confidence bar was set against — a Noul per outcome would let two disagree.
+export const INPLACE_CRITERIA = {
+  authorized: 'The cited user message asks for exactly what these orders will do in the real checkout (commit, push, open a PR, or another real-folder step it names).',
+  exceeds: 'The cited user message asks for a narrower step than these orders carry out (for example it asked to commit, but the orders also push or open a PR).',
+  unrelated: 'The cited user message is not about this real-folder step at all.',
+};
+
+export function inPlaceQuestions({citedText = '', messages = [], orders = ''} = {}) {
+  return {
+    state: {cited_message: String(citedText ?? '').slice(0, 4000),
+      other_messages: (Array.isArray(messages) ? messages : []).map(text => String(text ?? '').slice(0, 2000)).slice(0, 50),
+      orders: String(orders ?? '').slice(0, 6000)},
+    questions: {risk: {type: 'choice',
+      instructions: {question: 'Given the cited user message (and the other user messages since the last in-place task, for context), does it authorize an in-place task whose orders are as given?',
+        guidance: 'The cited message is state.cited_message; weigh it first. Pick exceeds only when the orders clearly do more than the cited message asked; pick unrelated only when the cited message is not about this step at all.'},
+      criteria: INPLACE_CRITERIA}},
+  };
+}
+
+// Pure: a verdict only when the choice is one of the criteria at or above the threshold;
+// otherwise 'unresolved' — the caller's structural check decides and journals why (jev.skipped).
+export function decideInPlace(answers, {confidence = 0.8} = {}) {
+  const risk = isObject(answers?.risk) ? answers.risk : {};
+  const conf = Number.isFinite(Number(risk.confidence)) ? Number(risk.confidence) : 0;
+  const choice = typeof risk.choice === 'string' && Object.hasOwn(INPLACE_CRITERIA, risk.choice) ? risk.choice : null;
+  const resolved = choice !== null && conf >= confidence;
+  return {verdict: resolved ? choice : 'unresolved', choice, confidence: conf, threshold: confidence,
+    probabilities: isObject(risk.probabilities) ? risk.probabilities : {}};
+}
+
+// Never throws: off, without a client, or failing, the verdict is 'unresolved' with the reason —
+// the same fallback shape judgeLease/judgePlan use, so the caller's structural check always decides.
+export async function judgeInPlace({citedText, messages, orders, settings, ask, signal} = {}) {
+  const s = normalizeJevSettings(settings);
+  const none = reason => ({verdict: 'unresolved', choice: null, confidence: 0, probabilities: {}, reason, model: null});
+  if (!s.enabled) return none('jev disabled');
+  if (typeof ask !== 'function') return none('jev unavailable');
+  const {state, questions} = inPlaceQuestions({citedText, messages, orders});
+  try {
+    const result = await ask({state, questions, model: s.model, signal});
+    return {...decideInPlace(result.answers, {confidence: s.confidence}), reason: null, model: result.model ?? s.model};
+  } catch (error) { return none(error?.code ?? error?.message ?? 'error'); }
+}
+
 // The read-only critic profile the daemon registers so a root task's `review.completion`
 // can name it. `model: ''` leaves the model to the settings read at verdict time.
 export function jevReviewerProfile(settings = {}) {
@@ -589,6 +672,7 @@ export function createJevDecisions({root = dataRoot(), adapter, readSettings = (
     lease: request => judgeLease({...request, settings: readSettings(), ask: adapter?.ask}),
     routeAI: ({orders, profiles, head, signal}) => routeAgentAI({orders, profiles, head, order: order(), ...(locals ? {locals} : {}), settings: readSettings(), ask: adapter?.ask, ...(notes ? {notes} : {}), signal}),
     route: ({orders, profiles, signal}) => routeTask({orders, profiles, order: order(), ...(locals ? {locals} : {}), settings: readSettings(), ask: adapter?.ask, ...(notes ? {notes} : {}), signal}),
+    inPlace: ({citedText, messages, orders, signal}) => judgeInPlace({citedText, messages, orders, settings: readSettings(), ask: adapter?.ask, signal}),
   };
 }
 

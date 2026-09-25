@@ -4,7 +4,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {createOpencodeLive, toolsFor, mapUsage, scrubCredentials} from '../../src/adapters/opencode-live.js';
+import {spawn, spawnSync} from 'node:child_process';
+import net from 'node:net';
+import {createOpencodeLive, toolsFor, mapUsage, scrubCredentials, probeSandbox, writeFenceSandbox} from '../../src/adapters/opencode-live.js';
 
 // The OpenCode adapter is the claude adapter's twin: one `opencode run` per turn, prompt on stdin,
 // JSON lines out, exit = turn end. The fake prints the event shapes observed from the real binary
@@ -79,7 +81,7 @@ test('a worker with no agent file still gets a named agent carrying its tier, an
   assert.deepEqual(agent.tools, toolsFor('plan'));
 });
 
-test('vendor credentials never reach a local worker; its report grant and the endpoint key do', async t => {
+test('vendor credentials never reach a local worker; only its report MCP server receives the scoped grant', async t => {
   const {cwd, dir, logged} = setup(t, {ANTHROPIC_API_KEY: 'sk-ant', OPENAI_API_KEY: 'sk-oai', MY_LMSTUDIO_KEY: 'lm', BOUNCE_BUS: '/tmp/orchestrator.sock'});
   const adapter = createOpencodeLive({});
   const profile = profileFor({apiKeyEnv: 'MY_LMSTUDIO_KEY', report: {BOUNCE_REPORT_BUS: '/tmp/r.sock', BOUNCE_REPORT_TOKEN_FILE: '/tmp/r.tok'}});
@@ -88,7 +90,14 @@ test('vendor credentials never reach a local worker; its report grant and the en
   assert.equal(keys.includes('ANTHROPIC_API_KEY'), false);
   assert.equal(keys.includes('OPENAI_API_KEY'), false);
   assert.equal(keys.includes('BOUNCE_BUS'), false, 'a worker never inherits the orchestrator bus');
-  assert.deepEqual(keys.filter(key => key.startsWith('BOUNCE_REPORT')), ['BOUNCE_REPORT_BUS', 'BOUNCE_REPORT_TOKEN_FILE']);
+  assert.deepEqual(keys.filter(key => key.startsWith('BOUNCE_REPORT')), []);
+  const config = logged('CONFIG');
+  assert.deepEqual(Object.keys(config.mcp), ['bounce']);
+  assert.deepEqual(config.mcp.bounce.environment, {...profile.report, BOUNCE_REPORT_TASK: 't1'});
+  assert.equal(config.mcp.bounce.type, 'local');
+  assert.equal(config.mcp.bounce.command[0], process.execPath);
+  assert.match(config.mcp.bounce.command[1], /\/mcp-report\.js$/);
+  assert.equal(config.agent['bounce-worker'].tools.bounce_report, true);
   // The user's own Claude Code instructions and skills must never be injected into a worker.
   assert.deepEqual(keys.filter(key => key.startsWith('OPENCODE_DISABLE_')), ['OPENCODE_DISABLE_AUTOUPDATE', 'OPENCODE_DISABLE_CLAUDE_CODE',
     'OPENCODE_DISABLE_CLAUDE_CODE_PROMPT', 'OPENCODE_DISABLE_CLAUDE_CODE_SKILLS', 'OPENCODE_DISABLE_DEFAULT_PLUGINS', 'OPENCODE_DISABLE_EXTERNAL_SKILLS',
@@ -206,6 +215,7 @@ test('a stalled worker that had read material is asked once, tools off, for its 
   const diagnostics = events.filter(e => e.kind === 'diagnostic').map(e => e.text);
   assert.equal(diagnostics.some(text => text.startsWith('no progress: read')), true, 'the stall is still on record');
   assert.equal(diagnostics.some(text => /^stalled after reading \d+ files?; asked once, tools off, for its conclusion$/.test(text)), true, diagnostics.join(' | '));
+  assert.deepEqual(events.find(e => e.kind === 'diagnostic' && /^stalled after reading/.test(e.text)).reason, 'repeated_tools');
   assert.equal(diagnostics.includes('the conclusion turn answered: that answer is the result'), true);
   // the conclusion turn resumed the SAME session with every tool off and a prompt that says why
   const lines = fs.readFileSync(path.join(dir, 'fake.log'), 'utf8').split('\n');
@@ -243,7 +253,8 @@ test('conclude stops the running turn and asks the same session, tools off, with
   const events = await drained;
   assert.equal(events.at(-1).status, 'completed');
   assert.match(events.at(-1).text, /^FAIL: the boundary is off by one \(conclusion for bounce: time is up/);
-  assert.equal(events.some(e => e.kind === 'diagnostic' && e.text === 'asked, tools off, for its conclusion: bounce: time is up (the 60 min ceiling). Give your final answer now.'), true);
+  assert.deepEqual(events.find(e => e.kind === 'diagnostic' && e.text === 'asked, tools off, for its conclusion: bounce: time is up (the 60 min ceiling). Give your final answer now.'),
+    {kind: 'diagnostic', text: 'asked, tools off, for its conclusion: bounce: time is up (the 60 min ceiling). Give your final answer now.', reason: 'watchdog', phase: 'conclusion', toolsDisabled: true});
   assert.throws(() => process.kill(firstPid, 0), {code: 'ESRCH'});
   const lines = fs.readFileSync(path.join(dir, 'fake.log'), 'utf8').split('\n');
   const argvs = lines.filter(l => l.startsWith('ARGV ')).map(l => JSON.parse(l.slice(5)));
@@ -306,6 +317,80 @@ test('a probe worker has read tools and bash, and runs sandboxed: it cannot writ
   const free = await adapter.launch({peer: 'worker:t13', profile: profileFor({}), orders: 'write it', cwd, dir});
   await drain(adapter, free);
   assert.equal(fs.readFileSync(path.join(cwd, 'src/probe-wrote.txt'), 'utf8'), 'x');
+});
+
+test('a probe workspace is writable while its original source remains denied', t => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-probe-workspace-'));
+  const source = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-probe-source-'));
+  t.after(() => { fs.rmSync(workspace, {recursive: true, force: true}); fs.rmSync(source, {recursive: true, force: true}); });
+  const policy = probeSandbox(workspace, '/tmp/home', source);
+  const code = `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(path.join(workspace, 'cache.txt'))}, 'cache'); try { fs.writeFileSync(${JSON.stringify(path.join(source, 'source.txt'))}, 'bad'); process.exit(2); } catch (error) { if (!['EPERM','EACCES'].includes(error.code)) throw error; }`;
+  const result = spawnSync('/usr/bin/sandbox-exec', ['-p', policy, process.execPath, '--input-type=module', '-e', code], {encoding: 'utf8'});
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.readFileSync(path.join(workspace, 'cache.txt'), 'utf8'), 'cache');
+  assert.equal(fs.existsSync(path.join(source, 'source.txt')), false);
+  assert.match(policy, new RegExp(`allow file-write\\*[^]*subpath ${JSON.stringify(fs.realpathSync(workspace)).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+  assert.match(policy, new RegExp(`deny file-write\\* \\(subpath ${JSON.stringify(fs.realpathSync(source)).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+});
+
+test('a report grant opens only its assigned Unix bus socket inside the probe sandbox', async t => {
+  if (process.platform !== 'darwin') return t.skip('macOS sandbox-exec only');
+  const root = fs.mkdtempSync('/private/tmp/oc-report-socket-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const allowed = path.join(root, 'allowed.sock');
+  const forbidden = path.join(root, 'forbidden.sock');
+  const serverA = net.createServer(socket => socket.end());
+  const serverB = net.createServer(socket => socket.end());
+  await Promise.all([new Promise(resolve => serverA.listen(allowed, resolve)), new Promise(resolve => serverB.listen(forbidden, resolve))]);
+  t.after(() => { serverA.close(); serverB.close(); });
+  const policy = probeSandbox(root, '/tmp/home', null, allowed);
+  const code = `const net = require('node:net'); const one = path => new Promise(resolve => { const socket = net.createConnection(path); socket.once('connect', () => { socket.destroy(); resolve('connected'); }); socket.once('error', error => resolve(error.code)); }); (async () => { process.stdout.write(JSON.stringify([await one(process.argv[1]), await one(process.argv[2])])); })();`;
+  const child = spawn('/usr/bin/sandbox-exec', ['-p', policy, process.execPath, '-e', code, allowed, forbidden]);
+  let stdout = '', stderr = '';
+  child.stdout.on('data', chunk => { stdout += chunk; });
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  const exit = await new Promise(resolve => child.once('close', resolve));
+  assert.equal(exit, 0, stderr);
+  assert.deepEqual(JSON.parse(stdout), ['connected', 'EPERM']);
+});
+
+test('the report tool survives a tools-off conclusion and a grant for another task is not injected', async t => {
+  const {cwd, dir} = setup(t, {FAKE_OC_SCENARIO: 'loop', FAKE_OC_CONCLUDE: 'answer'});
+  const adapter = createOpencodeLive({});
+  const grant = {BOUNCE_REPORT_BUS: '/tmp/assigned.sock', BOUNCE_REPORT_TOKEN_FILE: '/tmp/assigned.token', task: 'assigned'};
+  const handle = await adapter.launch({peer: 'worker:assigned', profile: profileFor({policy: 'read-only', report: grant}), orders: 'audit', cwd, dir});
+  await drain(adapter, handle);
+  const configs = fs.readFileSync(path.join(dir, 'fake.log'), 'utf8').split('\n').filter(line => line.startsWith('CONFIG ')).map(line => JSON.parse(line.slice(7)));
+  assert.equal(configs.length, 2);
+  assert.equal(configs[1].agent['bounce-worker'].tools.bounce_report, true);
+  assert.equal(Object.entries(configs[1].agent['bounce-worker'].tools).filter(([name]) => name !== 'bounce_report').every(([, enabled]) => enabled === false), true);
+  assert.deepEqual(Object.keys(configs[1].mcp), ['bounce']);
+  fs.rmSync(path.join(dir, 'fake.log'));
+  await drain(adapter, await adapter.launch({peer: 'worker:other', profile: profileFor({report: grant}), orders: 'x', cwd, dir}));
+  const wrong = fs.readFileSync(path.join(dir, 'fake.log'), 'utf8').split('\n').find(line => line.startsWith('CONFIG '));
+  assert.deepEqual(JSON.parse(wrong.slice(7)).mcp, {});
+});
+
+test('an acknowledged final report tool ends a clean OpenCode turn without a prose answer or extra conclusion', async t => {
+  const {cwd, dir} = setup(t, {FAKE_OC_SCENARIO: 'report-final', FAKE_OC_CONCLUDE: 'answer'});
+  const adapter = createOpencodeLive({});
+  const profile = profileFor({report: {BOUNCE_REPORT_BUS: '/tmp/r.sock', BOUNCE_REPORT_TOKEN_FILE: '/tmp/r.token'}});
+  const events = await drain(adapter, await adapter.launch({peer: 'worker:t1', profile, orders: 'audit', cwd, dir}));
+  assert.deepEqual(events.at(-1), {kind: 'result', status: 'completed', text: 'Final report submitted via bounce_report'});
+  assert.equal(fs.readFileSync(path.join(dir, 'fake.log'), 'utf8').split('\n').filter(line => line.startsWith('ARGV ')).length, 1);
+});
+
+test('a rejected final tool call or a milestone alone still requires a final answer', async t => {
+  const {cwd, dir} = setup(t, {FAKE_OC_SCENARIO: 'report-rejected', FAKE_OC_CONCLUDE: 'silent'});
+  const adapter = createOpencodeLive({});
+  const profile = profileFor({report: {BOUNCE_REPORT_BUS: '/tmp/r.sock', BOUNCE_REPORT_TOKEN_FILE: '/tmp/r.token'}});
+  for (const scenario of ['report-rejected', 'report-milestone']) {
+    process.env.FAKE_OC_SCENARIO = scenario;
+    fs.rmSync(path.join(dir, 'fake.log'), {force: true});
+    const events = await drain(adapter, await adapter.launch({peer: 'worker:t1', profile, orders: 'audit', cwd, dir}));
+    assert.equal(events.at(-1).status, 'failed', scenario);
+    assert.equal(fs.readFileSync(path.join(dir, 'fake.log'), 'utf8').split('\n').filter(line => line.startsWith('ARGV ')).length, 2, scenario);
+  }
 });
 
 // Observed live (qwen3-coder-30b-a3b): the answer arrives at step 2, every step claims `tool-calls`,
@@ -376,7 +461,8 @@ test('a turn that ends with tool calls and no text after them is asked, once, fo
   assert.equal(events.some(e => e.kind === 'assistant' && e.text.startsWith('I will execute')), true, 'the opener is still shown');
   assert.equal(events.at(-1).status, 'completed');
   assert.match(events.at(-1).text, /^FAIL: the boundary is off by one/, 'the answer is what it said when asked, never the opener');
-  assert.equal(events.some(e => e.kind === 'diagnostic' && /ended without an answer/.test(e.text)), true, 'and it says why it asked');
+  assert.deepEqual(events.find(e => e.kind === 'diagnostic' && /ended without an answer/.test(e.text)),
+    {kind: 'diagnostic', text: 'the turn ended without an answer; asked once, tools off, for it', reason: 'missing_answer', phase: 'conclusion', toolsDisabled: true});
 });
 
 test('when the worker will not answer even then, the turn fails and the next AI may try', async t => {
@@ -401,8 +487,31 @@ test('the step-cap notice is not an answer: the worker is asked to conclude, and
   assert.equal(said.some(text => /<\/?think>/.test(text)), false, 'thinking markers are stripped');
   assert.equal(events.at(-1).status, 'completed');
   assert.match(events.at(-1).text, /^FAIL: the boundary is off by one/);
+  assert.equal(events.find(e => e.kind === 'diagnostic' && /step cap; asked once/.test(e.text)).reason, 'step_cap');
   const prompts = fs.readFileSync(path.join(dir, 'fake.log'), 'utf8').split('\n').filter(l => l.startsWith('PROMPT ')).map(l => JSON.parse(l.slice(7)));
   assert.match(prompts[1], /^Stop using tools and give your final answer now, in full, as the orders asked \(your step budget is spent\)\./);
+});
+
+test('a conclusion titled after the step-cap notice is the worker\'s answer, not runtime noise', async t => {
+  const {cwd, dir} = setup(t, {FAKE_OC_SCENARIO: 'stepcap', FAKE_OC_CONCLUDE: 'capsummary'});
+  const adapter = createOpencodeLive({});
+  const handle = await adapter.launch({peer: 'worker:t15', profile: profileFor({policy: 'read-only', agent: {name: 'reviewer', prompt: 'You review.', maxSteps: 40}}), orders: 'review it', cwd, dir});
+  const events = await drain(adapter, handle);
+  assert.equal(events.at(-1).kind, 'result');
+  assert.equal(events.at(-1).status, 'completed');
+  assert.match(events.at(-1).text, /^## Maximum Steps Reached - Final Summary\n\n### Work Completed\n1\. Baseline: 148 passed/);
+  assert.equal(events.some(e => e.kind === 'diagnostic' && /^opencode: ## Maximum Steps Reached/.test(e.text)), false);
+});
+
+test('an acknowledged report in the conclusion turn is what the worker said; a rejected one is not', async t => {
+  for (const [mode, status] of [['milestone', 'completed'], ['rejected', 'failed']]) {
+    const {cwd, dir} = setup(t, {FAKE_OC_SCENARIO: 'stepcap', FAKE_OC_CONCLUDE: mode});
+    const adapter = createOpencodeLive({});
+    const handle = await adapter.launch({peer: 'worker:t16', profile: profileFor({policy: 'read-only', agent: {name: 'reviewer', prompt: 'You review.', maxSteps: 40}}), orders: 'review it', cwd, dir});
+    const events = await drain(adapter, handle);
+    assert.equal(events.at(-1).status, status, mode);
+    if (mode === 'milestone') assert.equal(events.at(-1).text, 'Mutation test complete: removing the realPath check at create.ts:156 makes the line 327 test fail with definition_changed.');
+  }
 });
 
 test('a step cap with no answer at all is a clean failure, not a fake result', async t => {
@@ -411,4 +520,26 @@ test('a step cap with no answer at all is a clean failure, not a fake result', a
   const handle = await adapter.launch({peer: 'worker:t15', profile: profileFor({policy: 'read-only'}), orders: 'review it', cwd, dir});
   const events = await drain(adapter, handle);
   assert.deepEqual([events.at(-1).kind, events.at(-1).status, events.at(-1).text], ['result', 'failed', 'step cap reached without an answer']);
+});
+
+// A write worker edits its isolated copy; the real checkout it was copied from is fenced by the OS, so an
+// absolute path back into it fails loudly instead of silently bypassing integration and review.
+test('a fenced write worker writes its copy and anything else, but not the original checkout', async t => {
+  if (process.platform !== 'darwin') return t.skip('macOS sandbox-exec only');
+  const copy = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-fence-copy-'));
+  const source = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-fence-source-'));
+  t.after(() => { fs.rmSync(copy, {recursive: true, force: true}); fs.rmSync(source, {recursive: true, force: true}); });
+  const policy = writeFenceSandbox(source);
+  const code = `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(path.join(copy, 'edit.txt'))}, 'work'); try { fs.writeFileSync(${JSON.stringify(path.join(source, 'leak.txt'))}, 'bad'); process.exit(2); } catch (error) { if (!['EPERM','EACCES'].includes(error.code)) throw error; }`;
+  const result = spawnSync('/usr/bin/sandbox-exec', ['-p', policy, process.execPath, '--input-type=module', '-e', code], {encoding: 'utf8'});
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.readFileSync(path.join(copy, 'edit.txt'), 'utf8'), 'work');
+  assert.equal(fs.existsSync(path.join(source, 'leak.txt')), false);
+  // the adapter launches a write worker with a fence through sandbox-exec, and it still edits its copy
+  const {cwd, dir} = setup(t, {FAKE_OC_WRITE: 'src/fenced.txt:ok'});
+  const adapter = createOpencodeLive({});
+  const handle = await adapter.launch({peer: 'worker:t17', profile: profileFor({policy: 'write', writeFence: source}), orders: 'write it', cwd, dir});
+  assert.equal(handle.args[0], '-p');
+  await drain(adapter, handle);
+  assert.equal(fs.readFileSync(path.join(cwd, 'src/fenced.txt'), 'utf8'), 'ok');
 });

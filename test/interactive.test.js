@@ -1,3 +1,4 @@
+import {readJournal} from '../src/core.js';
 // Phase 9 — the interactive orchestrator (Model B). These tests exercise supervise()'s
 // interactive-orchestrator path and the steering IPC in-process (real bus + scheduler, fake
 // children). They live in their own file so their in-process daemon apparatus never runs
@@ -62,7 +63,7 @@ test('P9.1 interactive orchestrator: a bare bounce with orchestrator config buil
   assert.equal(childArgs.includes('run'), false, 'the child is interactive — no run positional, so cli.js enters the TUI branch');
   const id = fs.readdirSync(path.join(root, 'sessions'))[0];
   const journal = fs.readFileSync(path.join(root, 'sessions', id, 'journal.jsonl'), 'utf8');
-  const operation = journal.trim().split('\n').map(l => JSON.parse(l)).find(r => r.kind === 'operation');
+  const operation = readJournal(path.join(root, 'sessions', id, 'journal.jsonl')).events.find(r => r.kind === 'operation');
   assert.equal(operation?.operation, 'orchestrator', 'the apparatus ran: an operation row is journaled');
   assert.equal(operation?.orchestrator, 'main');
 });

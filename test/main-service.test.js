@@ -34,6 +34,12 @@ function nextEvent(main, kind) {
   });
 }
 
+// main.started can follow main.starting in the same async execution. Subscribe to both before
+// triggering a turn: awaiting starting and only then subscribing to started races under suite load.
+function nextTurn(main) {
+  return {starting: nextEvent(main, 'main.starting'), started: nextEvent(main, 'main.started')};
+}
+
 for (const provider of ['claude', 'codex', 'muse']) test(`${provider} roster uses generic delivery and is included on resumed orchestrator turns`, async t => {
   const f = fixture(t, provider);
   const started = nextEvent(f.main, 'main.started');
@@ -193,11 +199,11 @@ test('an idle orchestrator is woken with the completed task summary as a new, di
   const f = wakeFixture(t);
   await f.settle();
   f.submit('a2cf5450');
-  const woken = nextEvent(f.main, 'main.starting');
+  const woken = nextTurn(f.main);
   f.session.append({kind: 'task.reported', task: 'a2cf5450', attempt: 1, outcome: 'completed', summary: 'Wrote tasks/jev/jev-facts.md'});
   f.session.append({kind: 'task.completed', task: 'a2cf5450', summary: 'Wrote tasks/jev/jev-facts.md', from: 'worker:a2cf5450'});
-  assert.equal((await woken).handoff, true);
-  await nextEvent(f.main, 'main.started');
+  assert.equal((await woken.starting).handoff, true);
+  await woken.started;
   const prompt = f.promptOf(f.calls.at(-1));
   assert.match(prompt, /task a2cf5450 · profile build · task\.completed/);
   assert.match(prompt, /Wrote tasks\/jev\/jev-facts\.md/);
@@ -221,11 +227,11 @@ test('several tasks ending within the window become one wake-up turn, failures w
   const f = wakeFixture(t, {handoffDelayMs: 30});
   await f.settle();
   f.submit('t-done'); f.submit('t-fail', {profile: 'build_claude'});
-  const woken = nextEvent(f.main, 'main.starting');
+  const woken = nextTurn(f.main);
   f.session.append({kind: 'task.completed', task: 't-done', summary: 'x'.repeat(5000), from: 'worker:t-done'});
   f.session.append({kind: 'task.failed', task: 't-fail', reason: 'reported_failure', text: 'tests red', from: 'worker:t-fail'});
-  await woken;
-  await nextEvent(f.main, 'main.started');
+  await woken.starting;
+  await woken.started;
   assert.equal(f.session.events.filter(e => e.kind === 'main.starting').length, 2);
   const row = f.session.events.findLast(e => e.kind === 'handoff');
   assert.deepEqual(row.tasks, ['t-done', 't-fail']);
@@ -264,19 +270,19 @@ test('a task that ends during a turn and is not returned by one of its waits wak
   f.session.append({kind: 'task.completed', task: 'unwaited', summary: 'ended mid-turn', from: 'worker:unwaited'});
   await f.quiet(40);
   assert.equal(f.session.events.filter(e => e.kind === 'main.starting').length, 2, 'no wake while a turn is running');
-  const woken = nextEvent(f.main, 'main.starting');
+  const woken = nextTurn(f.main);
   await f.finishTurn('Turn over without waiting.');
-  assert.equal((await woken).handoff, true);
+  assert.equal((await woken.starting).handoff, true);
   const row = f.session.events.findLast(e => e.kind === 'handoff');
   assert.deepEqual(row.tasks, ['unwaited']);
   assert.match(row.text, /task unwaited · profile build · task\.completed\n  ended mid-turn/);
-  await nextEvent(f.main, 'main.started');
+  await woken.started;
   await f.finishTurn();
   await f.quiet(40);
   assert.equal(f.session.events.filter(e => e.kind === 'handoff').length, 1, 'delivered once');
 });
 
-test('a terminal row returned by the orchestrator\'s own wait is seen (no wake); one returned to the user grant is not', async t => {
+test('wait delivery is consumed by its successful main turn; an idle socket reply remains pending', async t => {
   const f = wakeFixture(t);
   await f.settle();
   const orchestrator = await f.peer('orchestrator');
@@ -294,20 +300,22 @@ test('a terminal row returned by the orchestrator\'s own wait is seen (no wake);
   const served = f.session.events.filter(e => e.kind === 'wait.served');
   assert.deepEqual(served.map(e => [e.task, e.outcome, e.from]), [['waited', 'task.completed', 'orchestrator']]);
   assert.equal(served[0].served, f.session.events.find(e => e.kind === 'task.completed' && e.task === 'waited').seq);
-  const woken = nextEvent(f.main, 'main.starting');
+  const woken = nextTurn(f.main);
   await f.finishTurn();
-  await woken;
+  await woken.starting;
   const row = f.session.events.findLast(e => e.kind === 'handoff');
   assert.deepEqual(row.tasks, ['theirs-to-wait']);
-  await nextEvent(f.main, 'main.started');
+  await woken.started;
   await f.finishTurn();
-  // Idle now, with a wait answered from the journal: still seen, still no wake.
+  // Idle now: a socket reply is transport evidence, not a main disposition, so it still wakes.
   f.submit('later');
+  const laterWake = nextTurn(f.main);
   f.session.append({kind: 'task.failed', task: 'later', reason: 'reported_failure', text: 'red', from: 'worker:later'});
   assert.equal((await orchestrator.wait({match: {kind: 'task.completed', task: 'later'}, timeout: 5000})).kind, 'task.failed');
-  await f.quiet(40);
-  assert.equal(f.session.events.filter(e => e.kind === 'handoff').length, 1);
-  assert.equal(f.main.state().state, 'idle');
+  await laterWake.starting;
+  await laterWake.started;
+  assert.equal(f.session.events.filter(e => e.kind === 'handoff').length, 2);
+  await f.finishTurn();
 });
 
 test('a task the orchestrator waited on and then accepted itself is not re-announced at its next idle', async t => {
@@ -349,42 +357,30 @@ test('a user-grant accept after the orchestrator\'s wait is not re-announced; on
   assert.equal(f.main.state().state, 'idle');
   // Idle, and the user closes a task the orchestrator was never handed: that is news.
   f.session.append({kind: 'task.completed', task: 'unwaited', summary: 'never waited', from: 'worker:unwaited'});
-  const woken = nextEvent(f.main, 'main.starting');
+  const woken = nextTurn(f.main);
   await user.publish({kind: 'task.accepted', task: 'unwaited', stage: 'completion'});
-  await woken;
-  await nextEvent(f.main, 'main.started');
+  await woken.starting;
+  await woken.started;
   const row = f.session.events.findLast(e => e.kind === 'handoff');
   assert.deepEqual(row.tasks, ['unwaited']);
   assert.match(row.text, /task unwaited · profile build · task\.accepted/);
   await f.finishTurn();
 });
 
-test('a wake-up whose turn fails to launch keeps the outcomes pending: one re-arm, then the next prompt carries them', async t => {
+test('a wake-up whose launch loses process identity blocks instead of risking a second writer', async t => {
   const f = wakeFixture(t, {handoffDelayMs: 20});
   await f.settle();
   f.submit('lost');
-  f.launchErrors.push('codex: usage limit reached', 'codex: usage limit reached');
-  const failed = nextEvent(f.main, 'main.terminal');
+  f.launchErrors.push('codex launch transport lost');
+  const blocked = nextEvent(f.main, 'main.blocked');
   f.session.append({kind: 'task.completed', task: 'lost', summary: 'must not be lost', from: 'worker:lost'});
-  assert.equal((await failed).status, 'failed');
-  const again = nextEvent(f.main, 'main.terminal');
-  assert.equal((await again).status, 'failed');
+  assert.equal((await blocked).reason, 'termination_uncertain');
   await f.quiet(60);
   const attempts = f.session.events.filter(e => e.kind === 'main.starting' && e.handoff);
-  assert.equal(attempts.length, 2, 'one re-arm, no retry loop');
-  assert.equal(f.session.events.filter(e => e.kind === 'main.started').length, 1, 'neither wake-up began');
-  assert.match(f.session.events.findLast(e => e.kind === 'status').text, /ride on the next prompt/);
-  assert.equal(f.main.state().state, 'idle');
-  const started = nextEvent(f.main, 'main.started');
-  assert.equal(f.main.run({id: 'typed', text: 'status?'}).accepted, true);
-  await started;
-  assert.match(f.promptOf(f.calls.at(-1)), /task lost · profile build · task\.completed\n  must not be lost[\s\S]*status\?$/);
-  const rows = f.session.events.filter(e => e.kind === 'handoff');
-  assert.deepEqual(rows.map(r => [r.wake, r.tasks, r.requestId]), [[true, ['lost'], attempts[0].requestId], [true, ['lost'], attempts[1].requestId], [false, ['lost'], 'typed']]);
-  await f.finishTurn();
-  await f.quiet(60);
-  assert.equal(f.session.events.filter(e => e.kind === 'handoff').length, 3, 'delivered by the turn that began');
-  assert.equal(f.main.state().state, 'idle');
+  assert.equal(attempts.length, 1);
+  assert.equal(f.session.events.filter(e => e.kind === 'main.started').length, 1, 'the failed wake never obtained a turn');
+  assert.equal(f.main.state().state, 'blocked');
+  assert.equal(f.main.run({id: 'typed', text: 'status?'}).reason, 'termination_unverified');
 });
 
 test('no wake-up for a child task, a user-submitted task, or a replaced failure', async t => {
@@ -403,14 +399,14 @@ test('no wake-up for a child task, a user-submitted task, or a replaced failure'
   assert.equal(f.session.events.filter(e => e.kind === 'main.starting').length, 1);
   assert.equal(f.session.events.some(e => e.kind === 'handoff'), false);
   // The replacement is the orchestrator's own work: its end wakes, naming what it replaced.
-  const woken = nextEvent(f.main, 'main.starting');
+  const woken = nextTurn(f.main);
   f.session.append({kind: 'task.completed', task: 'limited-two', summary: 'done on claude', from: 'worker:limited-two'});
-  await woken;
+  await woken.starting;
   const row = f.session.events.findLast(e => e.kind === 'handoff');
   assert.deepEqual(row.tasks, ['limited-two']);
   assert.match(row.text, /task limited-two · profile build_claude · task\.completed · replaces limited-one\n  done on claude/);
   assert.match(row.text, /Still running: parent \(build, running\)/);
-  await nextEvent(f.main, 'main.started');
+  await woken.started;
   await f.finishTurn();
 });
 
@@ -421,12 +417,12 @@ test('a completed task awaiting its completion review is not an outcome until it
   f.session.append({kind: 'task.completed', task: 'reviewed', summary: 'draft', from: 'worker:reviewed'});
   await f.quiet(40);
   assert.equal(f.session.events.some(e => e.kind === 'handoff'), false);
-  const woken = nextEvent(f.main, 'main.starting');
+  const woken = nextTurn(f.main);
   f.session.append({kind: 'task.accepted', task: 'reviewed', stage: 'completion', by: 'review:reviewed'});
-  await woken;
+  await woken.starting;
   const row = f.session.events.findLast(e => e.kind === 'handoff');
   assert.match(row.text, /task reviewed · profile build · task\.accepted\n  draft/);
-  await nextEvent(f.main, 'main.started');
+  await woken.started;
   await f.finishTurn();
 });
 
@@ -602,17 +598,23 @@ test('launch rejection retaining a process handle must verify termination before
   assert.equal(f.main.state().state, 'blocked');
 });
 
-test('fallback waits for verified termination even after the limited result arrived', async t => {
+test('fallback waits for verified termination even after the limited result arrived; a user prompt mid-fallback is queued, not refused', async t => {
   let release;
   const barrier = new Promise(resolve => { release = resolve; });
   const f = await failoverFixture(t, {stop: () => barrier});
   const done = f.run();
   while (!f.calls.some(c => c[0] === 'stop-claude')) await new Promise(resolve => setImmediate(resolve));
-  assert.equal(f.main.run({text: 'second writer'}).reason, 'busy');
+  const queued = f.main.run({id: 'second', text: 'second writer'});
+  assert.deepEqual(queued, {accepted: true, queued: true, requestId: 'second'});
+  assert.equal(f.session.events.findLast(e => e.kind === 'user').text, 'second writer');
   assert.equal(f.calls.some(c => c[0] === 'codex'), false);
   release();
   assert.equal((await done).status, 'completed');
   assert.equal(f.calls.some(c => c[0] === 'codex'), true);
+  // The queued prompt is dispatched right after the fallback's turn finishes, not lost.
+  const nextStarted = nextEvent(f.main, 'main.started');
+  await nextStarted;
+  assert.equal(f.main.state().requestId, 'second');
 });
 
 test('daemon reload reads new configured routes while keeping the sticky selection', async t => {
@@ -654,12 +656,12 @@ test('a task that parks asking for input wakes the orchestrator, carrying the qu
   const f = wakeFixture(t);
   await f.settle();
   f.submit('df6d627f');
-  const woken = nextEvent(f.main, 'main.starting');
+  const woken = nextTurn(f.main);
   f.session.append({kind: 'task.attempt.ended', task: 'df6d627f', attempt: 1});
   f.session.append({kind: 'task.input_required', task: 'df6d627f', from: 'worker:df6d627f',
     text: 'Rework round 1 blocked on owner authorisation: the unmet criterion needs a decision.'});
-  assert.equal((await woken).handoff, true, 'the orchestrator is woken, not left waiting on a dead worker');
-  const started = await nextEvent(f.main, 'main.started');
+  assert.equal((await woken.starting).handoff, true, 'the orchestrator is woken, not left waiting on a dead worker');
+  const started = await woken.started;
   const prompt = f.promptOf(f.calls.at(-1));
   assert.match(prompt, /df6d627f/);
   assert.match(prompt, /Rework round 1 blocked on owner authorisation/, 'the question reaches it verbatim');
@@ -670,11 +672,11 @@ test('a task blocked after its worker exits wakes the orchestrator too', async t
   const f = wakeFixture(t);
   await f.settle();
   f.submit('09a56f5c');
-  const woken = nextEvent(f.main, 'main.starting');
+  const woken = nextTurn(f.main);
   f.session.append({kind: 'task.attempt.ended', task: '09a56f5c', attempt: 1});
   f.session.append({kind: 'task.blocked', task: '09a56f5c', from: 'worker:09a56f5c', text: 'unreadable review verdict'});
-  assert.equal((await woken).handoff, true);
-  await nextEvent(f.main, 'main.started');
+  assert.equal((await woken.starting).handoff, true);
+  await woken.started;
   assert.match(f.promptOf(f.calls.at(-1)), /unreadable review verdict/);
 });
 
@@ -687,17 +689,17 @@ test('a task whose whole parent chain has already ended wakes the orchestrator i
   f.submit('4109832f');
   // The parent's own end is its own wake: let that turn happen and finish, so the service is idle and
   // the next wake can only be the child's.
-  const parentWoke = nextEvent(f.main, 'main.starting');
+  const parentWoke = nextTurn(f.main);
   f.session.append({kind: 'task.completed', task: '4109832f', summary: 'builder done', from: 'worker:4109832f'});
   f.session.append({kind: 'task.accepted', task: '4109832f', stage: 'completion', from: 'bounce'});
-  await parentWoke;
-  await nextEvent(f.main, 'main.started');
+  await parentWoke.starting;
+  await parentWoke.started;
   await f.finishTurn('Builder accepted; following up.');
   f.submit('ccec5ed4', {parent: '4109832f'});
-  const woken = nextEvent(f.main, 'main.starting');
+  const woken = nextTurn(f.main);
   f.session.append({kind: 'task.completed', task: 'ccec5ed4', summary: 'the 9 baseline failures are fixed', from: 'worker:ccec5ed4'});
-  assert.equal((await woken).handoff, true, 'a dead parent cannot carry the news, so the child carries it');
-  await nextEvent(f.main, 'main.started');
+  assert.equal((await woken.starting).handoff, true, 'a dead parent cannot carry the news, so the child carries it');
+  await woken.started;
   assert.match(f.promptOf(f.calls.at(-1)), /the 9 baseline failures are fixed/);
 });
 
@@ -709,10 +711,10 @@ test('an outcome is handed over only by a wake turn that completed, not one that
   const f = wakeFixture(t);
   await f.settle();
   f.submit('8302c5f5');
-  const woken = nextEvent(f.main, 'main.starting');
+  const woken = nextTurn(f.main);
   f.session.append({kind: 'task.completed', task: '8302c5f5', summary: 'P2 majors fixed', from: 'worker:8302c5f5'});
-  const request = (await woken).requestId;
-  await nextEvent(f.main, 'main.started');
+  const request = (await woken.starting).requestId;
+  await woken.started;
   const ended = nextEvent(f.main, 'main.terminal');
   await f.main.cancel({id: request});           // the wake turn is interrupted before it says anything
   await ended;
@@ -728,7 +730,7 @@ test('an outcome is handed over only by a wake turn that completed, not one that
 // said "bounce is evaluating it and will resume the campaign with the verdict". Nothing was running, so no
 // outcome could ever arrive and no wake could ever fire. A turn that ends with no work and no pending
 // outcome is a dead end: the user is told, and the orchestrator is woken ONCE to notice it itself.
-test('a turn that ends with nothing running and nothing pending is a dead end: said once, woken once', async t => {
+test('an accepted plan with no dispatch gets two continuations and then a concrete blocker', async t => {
   const f = wakeFixture(t);
   // The shape that failed live: bounce accepted the plan, then the turn ended without dispatching a chunk
   // because the submit was refused. An ordinary turn that dispatches nothing is NOT this and is not nudged.
@@ -737,16 +739,282 @@ test('a turn that ends with nothing running and nothing pending is a dead end: s
   await started;
   f.session.append({kind: 'plan.submitted', phase: 'rework', chunks: [{id: 'repair'}], from: 'orchestrator'});
   f.session.append({kind: 'plan.accepted', plan: 'rework', chunks: 1, from: 'bounce'});
+  const woken = nextTurn(f.main);
   await f.finishTurn('I submitted the plan; bounce will resume the campaign with the verdict.');
-  const said = f.session.events.filter(e => e.kind === 'status' && /dispatched nothing/i.test(e.text ?? ''));
-  assert.equal(said.length, 1, 'the user is told, in their own transcript');
-  const woken = await nextEvent(f.main, 'main.starting');
-  assert.equal(woken.handoff, true);
-  await nextEvent(f.main, 'main.started');
-  assert.match(f.promptOf(f.calls.at(-1)), /dispatched nothing/i, 'and the orchestrator is told what happened');
+  assert.equal((await woken.starting).handoff, true);
+  await woken.started;
+  assert.match(f.promptOf(f.calls.at(-1)), /dispatch 1 approved chunk/i);
 
-  // ...and if that turn also dispatches nothing, it is not woken again: one nudge, never a loop.
+  const secondWake = nextTurn(f.main);
   await f.finishTurn('Still nothing to do.');
-  await f.quiet(60);
-  assert.equal(f.session.events.filter(e => e.kind === 'main.starting').length, 2, 'no second nudge');
+  await secondWake.starting;
+  await secondWake.started;
+  const blocked = nextEvent(f.main, 'main.blocked');
+  await f.finishTurn('Still nothing to do.');
+  assert.equal((await blocked).reason, 'plan_undispatched');
+  assert.equal(f.session.events.filter(e => e.kind === 'main.starting').length, 3, 'initial turn plus two bounded continuations');
+});
+
+// Reproduces the bug from session 159f4746: the daemon wakes the orchestrator on worker outcomes
+// while the user is mid-answer, and the user's reply used to vanish (cli.js dropped it — no `user`
+// row was ever journaled). start() now queues a USER prompt (wake:false) instead of refusing it,
+// journals its `user` row immediately, and dispatches it — through this same start() path, so it
+// carries any still-pending outcomes block exactly as a typed prompt does — the instant the
+// current run frees up, before any automatic wake for outcomes still pending at that point.
+test('a USER prompt arriving while a run is current is queued, journaled at once, and starts before the next automatic wake', async t => {
+  const f = wakeFixture(t);
+  await f.settle();
+  f.submit('task-a');
+  f.submit('task-b');
+  const woken = nextTurn(f.main);
+  f.session.append({kind: 'task.completed', task: 'task-a', summary: 'A done', from: 'worker:task-a'});
+  await woken.starting;
+  await woken.started; // the auto-wake turn for task-a's outcome is now `current`
+
+  // task-b's outcome arrives while that turn is still running: reconcile() cannot arm anything
+  // while a run is current, so it stays pending.
+  f.session.append({kind: 'task.completed', task: 'task-b', summary: 'B done', from: 'worker:task-b'});
+
+  const result = f.main.run({id: 'u1', text: 'no'});
+  assert.deepEqual(result, {accepted: true, queued: true, requestId: 'u1'});
+  assert.equal(f.session.events.filter(e => e.kind === 'user').length, 2, 'the settle turn plus this queued prompt');
+  const queuedRow = f.session.events.findLast(e => e.kind === 'user');
+  assert.equal(queuedRow.text, 'no');
+  assert.equal(queuedRow.queued, true);
+
+  // Re-sending the same id must not queue it twice.
+  const dup = f.main.run({id: 'u1', text: 'no'});
+  assert.deepEqual(dup, {accepted: true, queued: true, requestId: 'u1'});
+  assert.equal(f.session.events.filter(e => e.kind === 'user').length, 2, 'a duplicate id did not journal or queue again');
+
+  const startingCountBefore = f.session.events.filter(e => e.kind === 'main.starting').length;
+  const nextStarting = nextEvent(f.main, 'main.starting');
+  await f.finishTurn('Synthesized A.');
+  const starting = await nextStarting;
+  assert.equal(starting.requestId, 'u1', "the queued prompt starts before task-b's outcome can wake the orchestrator");
+  assert.equal(starting.handoff, undefined, 'u1 started as the queued USER prompt, not as an automatic wake');
+  const requested = f.session.events.findLast(e => e.kind === 'main.requested' && e.requestId === 'u1');
+  assert.equal(requested.wake, false);
+  assert.match(f.promptOf(f.calls.at(-1)), /B done/, "the queued prompt still carries task-b's pending outcome, like a typed prompt does");
+
+  // Past the handoff delay, task-b's outcome — already carried by u1 — never gets a second,
+  // automatic turn of its own: wake()'s own guard finds `current` (u1) set and does nothing.
+  await f.quiet(30);
+  assert.equal(f.session.events.filter(e => e.kind === 'main.starting').length, startingCountBefore + 1, 'no duplicate automatic turn started for the outcome u1 already carries');
+});
+
+// A daemon restart while a prompt is queued used to lose it silently: the journal still showed the
+// `user` row, but nothing ever dispatched it (queuedPrompts was in-memory only). These three tests
+// reopen the same on-disk journal as a brand-new service (a real restart, not the same Session object
+// mid-flight) to prove the queue is rebuilt from journal rows, not reused from memory.
+// main.started fires before the fake adapter's events() generator reaches its second yield (the
+// one that pushes a resolver onto `pending`) — same race noted in wakeFixture's finishTurn.
+async function settleTurn(pending, result) {
+  while (!pending.length) await new Promise(resolve => setImmediate(resolve));
+  pending.shift()(result);
+}
+
+// A true restart, not the same Session object mid-flight: copies the on-disk journal into a fresh
+// root and opens it as a brand-new Session, so the abandoned service (mainA, never closed) cannot
+// race its own delayed writes against the "restarted" one's file.
+function restartSnapshot(t, session) {
+  const restartRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-main-restart-'));
+  t.after(() => fs.rmSync(restartRoot, {recursive: true, force: true}));
+  const dir = path.join(restartRoot, 'sessions', session.id);
+  fs.mkdirSync(dir, {recursive: true});
+  fs.copyFileSync(session.file, path.join(dir, 'journal.jsonl'));
+  return new Session(session.cwd, {root: restartRoot, id: session.id});
+}
+
+function makeQueueAdapter(calls, pending) {
+  return {
+    async launch(args) { calls.push(['launch', args]); return {turnId: `turn-${calls.length}`}; },
+    async resume(args) { calls.push(['resume', args]); return {turnId: `turn-${calls.length}`}; },
+    async *events() {
+      yield {kind: 'native', provider: 'codex', sessionId: 'native-thread'};
+      yield await new Promise(resolve => pending.push(resolve));
+    },
+    async deliver() { return 'live'; },
+    async cancel() { pending.shift()?.({kind: 'result', status: 'interrupted'}); return {verified: true}; },
+  };
+}
+
+test('a queued prompt survives a daemon restart: it starts in the new service before any automatic wake', {timeout: 5000}, async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-main-queue-restart-'));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const sessionA = new Session(root, {root});
+  // mainA is abandoned mid-turn to simulate the crash; disable its watchdog so its dangling
+  // setTimeout doesn't keep this test process alive after the assertions are done.
+  const mainA = createMainService({session: sessionA, adapters: {codex: makeQueueAdapter([], [])},
+    profile: {adapter: 'codex', mode: 'plan'}, settings: {executables: {}}, brief: 'Orders',
+    watchdog: {startupMs: 0, runningMs: 0}});
+  // Both calls land synchronously, before mainA's execute() microtask for 'first' has run: the
+  // journal on disk holds only main.requested('first') and the queued `user` row for 'u1' — no
+  // main.starting yet. This is the daemon dying between accepting a prompt and turning it into a
+  // process, with a prompt already queued behind it.
+  assert.equal(mainA.run({id: 'first', text: 'work'}).accepted, true);
+  assert.deepEqual(mainA.run({id: 'u1', text: 'no'}), {accepted: true, queued: true, requestId: 'u1'});
+  assert.equal(sessionA.events.some(e => e.kind === 'main.starting'), false, 'restart happens before the first run even started');
+  // An outcome pending at restart: if drainQueue() did not win over reconcile()/arm(), this would
+  // otherwise produce a main.wake.scheduled row instead of starting u1 next.
+  sessionA.append({kind: 'task.submitted', task: 't1', parent: null, from: 'orchestrator', profile: 'build', orders: 'go', deadline: null, replaces: null, review: null});
+  sessionA.append({kind: 'task.started', task: 't1', attempt: 1, from: 'worker:t1'});
+  sessionA.append({kind: 'task.completed', task: 't1', summary: 'done', from: 'worker:t1'});
+
+  const sessionB = restartSnapshot(t, sessionA);
+  const callsB = [], pendingB = [];
+  const mainB = createMainService({session: sessionB, adapters: {codex: makeQueueAdapter(callsB, pendingB)},
+    profile: {adapter: 'codex', mode: 'plan'}, settings: {executables: {}}, brief: 'Orders'});
+  t.after(() => mainB.close());
+
+  await nextEvent(mainB, 'main.started'); // the replayed 'first' request starts as before
+  assert.equal(sessionB.events.findLast(e => e.kind === 'main.requested' && e.text === 'work').requestId, 'first');
+
+  const queuedStarting = nextEvent(mainB, 'main.starting');
+  const firstEnded = nextEvent(mainB, 'main.terminal');
+  await settleTurn(pendingB, {kind: 'result', status: 'completed', text: 'Done'});
+  await firstEnded;
+  const starting = await queuedStarting;
+  assert.equal(starting.requestId, 'u1', 'the queued prompt is dispatched next, not a synthetic wake');
+  await nextEvent(mainB, 'main.started');
+  await settleTurn(pendingB, {kind: 'result', status: 'completed', text: 'Done'});
+  await nextEvent(mainB, 'main.terminal');
+
+  assert.equal(sessionB.events.some(e => e.kind === 'main.wake.scheduled'), false, 'the queued prompt pre-empted the automatic wake for t1');
+  const requestedU1 = sessionB.events.findLast(e => e.kind === 'main.requested' && e.requestId === 'u1');
+  assert.equal(requestedU1.text, 'no');
+  assert.equal(requestedU1.wake, false);
+});
+
+test('a queued prompt already dispatched before the restart is not re-run', {timeout: 5000}, async t => {
+  const f = fixture(t);
+  const started = nextEvent(f.main, 'main.started');
+  f.main.run({id: 'first', text: 'work'});
+  await started;
+  assert.deepEqual(f.main.run({id: 'u1', text: 'no'}), {accepted: true, queued: true, requestId: 'u1'});
+
+  const queuedStarted = nextEvent(f.main, 'main.started');
+  const firstEnded = nextEvent(f.main, 'main.terminal');
+  await settleTurn(f.pending, {kind: 'result', status: 'completed', text: 'Done'}); // drains u1
+  await firstEnded;
+  await queuedStarted;
+  const queuedEnded = nextEvent(f.main, 'main.terminal');
+  await settleTurn(f.pending, {kind: 'result', status: 'completed', text: 'Done again'}); // finishes u1 too
+  await queuedEnded;
+  assert.equal(f.main.state().state, 'idle');
+  assert.equal(f.session.events.filter(e => e.kind === 'main.requested' && e.requestId === 'u1').length, 1);
+
+  const sessionB = restartSnapshot(t, f.session);
+  const mainB = createMainService({session: sessionB, adapters: {codex: makeQueueAdapter([], [])},
+    profile: {adapter: 'codex', mode: 'plan'}, settings: {executables: {}}, brief: 'Orders'});
+  t.after(() => mainB.close());
+  await new Promise(resolve => setImmediate(resolve)); // let boot settle
+  assert.equal(sessionB.events.filter(e => e.kind === 'main.requested' && e.requestId === 'u1').length, 1,
+    'the already-dispatched queued prompt is not requeued or re-run on restart');
+  assert.equal(mainB.state().state, 'idle');
+});
+
+test('two queued prompts survive a restart and come back in order', {timeout: 5000}, async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-main-queue-restart-order-'));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const sessionA = new Session(root, {root});
+  // mainA is abandoned mid-turn to simulate the crash; disable its watchdog so its dangling
+  // setTimeout doesn't keep this test process alive after the assertions are done.
+  const mainA = createMainService({session: sessionA, adapters: {codex: makeQueueAdapter([], [])},
+    profile: {adapter: 'codex', mode: 'plan'}, settings: {executables: {}}, brief: 'Orders',
+    watchdog: {startupMs: 0, runningMs: 0}});
+  assert.equal(mainA.run({id: 'first', text: 'work'}).accepted, true);
+  assert.deepEqual(mainA.run({id: 'q1', text: 'one'}), {accepted: true, queued: true, requestId: 'q1'});
+  assert.deepEqual(mainA.run({id: 'q2', text: 'two'}), {accepted: true, queued: true, requestId: 'q2'});
+  assert.equal(sessionA.events.some(e => e.kind === 'main.starting'), false);
+
+  const sessionB = restartSnapshot(t, sessionA);
+  const callsB = [], pendingB = [];
+  const mainB = createMainService({session: sessionB, adapters: {codex: makeQueueAdapter(callsB, pendingB)},
+    profile: {adapter: 'codex', mode: 'plan'}, settings: {executables: {}}, brief: 'Orders'});
+  t.after(() => mainB.close());
+
+  await nextEvent(mainB, 'main.started'); // 'first' replayed and started
+
+  const q1Starting = nextEvent(mainB, 'main.starting');
+  const firstEnded = nextEvent(mainB, 'main.terminal');
+  await settleTurn(pendingB, {kind: 'result', status: 'completed', text: 'done'});
+  await firstEnded;
+  assert.equal((await q1Starting).requestId, 'q1');
+  await nextEvent(mainB, 'main.started');
+
+  const q2Starting = nextEvent(mainB, 'main.starting');
+  const q1Ended = nextEvent(mainB, 'main.terminal');
+  await settleTurn(pendingB, {kind: 'result', status: 'completed', text: 'done'});
+  await q1Ended;
+  assert.equal((await q2Starting).requestId, 'q2');
+  await nextEvent(mainB, 'main.started');
+  await settleTurn(pendingB, {kind: 'result', status: 'completed', text: 'done'}); // clean idle close
+  await nextEvent(mainB, 'main.terminal');
+
+  assert.match(callsB.filter(c => c[0] === 'resume').at(-2)[1].message, /one/);
+  assert.match(callsB.filter(c => c[0] === 'resume').at(-1)[1].message, /two/);
+});
+
+test('withdraw pulls a still-queued prompt out before it starts; it never runs when the current turn ends', {timeout: 5000}, async t => {
+  const f = fixture(t);
+  const started = nextEvent(f.main, 'main.started');
+  f.main.run({id: 'first', text: 'work'});
+  await started;
+  assert.deepEqual(f.main.run({id: 'u1', text: 'never sent'}), {accepted: true, queued: true, requestId: 'u1'});
+
+  const result = f.main.withdraw({id: 'u1'});
+  assert.deepEqual(result, {withdrawn: true, text: 'never sent'});
+  const withdrawnRow = f.session.events.findLast(e => e.kind === 'main.withdrawn');
+  assert.equal(withdrawnRow.requestId, 'u1');
+  assert.equal(withdrawnRow.text, 'never sent');
+  assert.equal(withdrawnRow.from, 'user');
+
+  await new Promise(resolve => setImmediate(resolve));
+  const ended = nextEvent(f.main, 'main.terminal');
+  f.pending.shift()({kind: 'result', status: 'completed', text: 'Done'});
+  await ended;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.main.state().state, 'idle', 'u1 was withdrawn, so the daemon goes idle instead of dispatching it');
+  assert.equal(f.session.events.some(e => e.kind === 'main.requested' && e.requestId === 'u1'), false);
+});
+
+test('withdraw of a prompt already dispatched refuses with reason started; an unknown id refuses with not_queued', async t => {
+  const f = fixture(t);
+  const started = nextEvent(f.main, 'main.started');
+  f.main.run({id: 'first', text: 'work'});
+  await started;
+  assert.deepEqual(f.main.run({id: 'u1', text: 'no'}), {accepted: true, queued: true, requestId: 'u1'});
+
+  await new Promise(resolve => setImmediate(resolve));
+  const queuedStarted = nextEvent(f.main, 'main.started');
+  const firstEnded = nextEvent(f.main, 'main.terminal');
+  f.pending.shift()({kind: 'result', status: 'completed', text: 'Done'});
+  await firstEnded;
+  await queuedStarted; // u1 is now dispatched, not queued
+
+  assert.deepEqual(f.main.withdraw({id: 'u1'}), {withdrawn: false, reason: 'started'});
+  assert.deepEqual(f.main.withdraw({id: 'no-such-id'}), {withdrawn: false, reason: 'not_queued'});
+  assert.equal(f.session.events.some(e => e.kind === 'main.withdrawn'), false);
+});
+
+test('a withdrawn prompt is skipped by the restart rebuild, not re-queued', {timeout: 5000}, async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-main-withdraw-restart-'));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const sessionA = new Session(root, {root});
+  const mainA = createMainService({session: sessionA, adapters: {codex: makeQueueAdapter([], [])},
+    profile: {adapter: 'codex', mode: 'plan'}, settings: {executables: {}}, brief: 'Orders',
+    watchdog: {startupMs: 0, runningMs: 0}});
+  assert.equal(mainA.run({id: 'first', text: 'work'}).accepted, true);
+  assert.deepEqual(mainA.run({id: 'q1', text: 'one'}), {accepted: true, queued: true, requestId: 'q1'});
+  assert.deepEqual(mainA.withdraw({id: 'q1'}), {withdrawn: true, text: 'one'});
+
+  const sessionB = restartSnapshot(t, sessionA);
+  const mainB = createMainService({session: sessionB, adapters: {codex: makeQueueAdapter([], [])},
+    profile: {adapter: 'codex', mode: 'plan'}, settings: {executables: {}}, brief: 'Orders'});
+  t.after(() => mainB.close());
+  await nextEvent(mainB, 'main.started'); // 'first' replayed and started; no wake, no q1
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(sessionB.events.some(e => e.kind === 'main.requested' && e.requestId === 'q1'), false,
+    'the withdrawn prompt is never dispatched on restart');
 });

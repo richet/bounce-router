@@ -24,6 +24,14 @@ test('normalizes the loopback catalog defaults and rejects unsafe endpoint confi
   assert.throws(() => normalizeLocalSettings({endpoints: {bad: {backend: 'lmstudio', url: 'http://localhost', apiKey: 'secret'}}}), {code: 'INVALID_LOCAL_SETTINGS'});
 });
 
+// Observed: endpoint settings with reserveGb/waitMinutes/pollMs were refused as "unsupported", and the
+// scheduler's fallback then dropped the whole endpoint, maxConcurrent included.
+test('memory-gate settings are accepted and kept with the rest of the endpoint', () => {
+  const settings = normalizeLocalSettings({endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234', maxConcurrent: 2, reserveGb: 8, waitMinutes: 3, pollMs: 50}}});
+  const endpoint = settings.endpoints.lmstudio;
+  assert.deepEqual([endpoint.maxConcurrent, endpoint.reserveGb, endpoint.waitMinutes, endpoint.pollMs], [2, 8, 3, 50]);
+});
+
 test('discovers v1 metadata, keeps embeddings, and sends env auth without cataloguing it', async () => {
   const calls = [];
   const result = await discoverLocalModels(local({office: {backend: 'lmstudio', url: 'http://127.0.0.1:1234', trusted: true, apiKeyEnv: 'LM_TOKEN'}}), {

@@ -7,7 +7,8 @@ import assert from 'node:assert/strict';
 import React from 'react';
 import * as Ink from 'ink';
 import stripAnsi from 'strip-ansi';
-import {SPINNER, glyph, shortModel, quietFor, agentRow, rowColor} from '../src/tui/status.js';
+import {SPINNER, glyph, shortModel, quietFor, agentRow, rowColor, waitingRow} from '../src/tui/status.js';
+import {createWorkspaceProjection} from '../src/tui/projection.js';
 import {createWorkspace} from '../src/tui/Workspace.js';
 
 test('a working state animates with the clock; every other state has one fixed glyph', () => {
@@ -76,4 +77,25 @@ test('rendered: the header and the rail say the main worker is working, on what,
   const open = frame({agentsOpen: true, busy: false, main: {state: 'ready'}});
   assert.equal(open.includes(`${spin} builder · abcdef12 · qwen3-coder-next`), true);
   assert.equal(open.includes('instruct-mlx'), false);
+});
+
+// Observed live (2026-09-25): three finished reviewers blocked at their review gate showed as
+// `! reviewer qwen3.6-35b-a3b` in red, word dropped, identical to a crash. Blocked means someone decides.
+test('a blocked worker keeps its state word, is not coloured as a failure, and says what it waits on', () => {
+  const now = Date.parse('2026-09-25T06:27:00Z');
+  const pane = {profile: 'reviewer', state: 'blocked', model: 'qwen3.6-35b-a3b-mlx', reason: 'review_not_accepted'};
+  assert.equal(agentRow(pane, now, 30), '! reviewer qwen3.6-35… blocked');
+  assert.notEqual(rowColor(pane, now), rowColor({state: 'failed'}, now));
+  assert.equal(waitingRow(pane, 30), "  └ review didn't accept");
+  assert.equal(waitingRow({...pane, reason: 'report_repair_unavailable'}, 30), '  └ report not repaired');
+  assert.equal(waitingRow({...pane, reason: 'something_new'}, 30), '  └ needs a decision');
+  assert.equal(waitingRow({state: 'input_required', reason: null}, 30), '  └ needs your input');
+  assert.equal(waitingRow({state: 'running'}, 30), '');
+  // the reason comes from the task.blocked row, and a new attempt clears it
+  const projection = createWorkspaceProjection();
+  projection.ingest({seq: 1, kind: 'task.submitted', task: 't1', profile: 'reviewer', orders: 'x', time: '2026-09-25T06:20:00Z'});
+  projection.ingest({seq: 2, kind: 'task.blocked', task: 't1', reason: 'review_not_accepted', text: 'Review did not accept', time: '2026-09-25T06:26:41Z'});
+  assert.equal(projection.snapshot().panes.find(p => p.task === 't1').reason, 'review_not_accepted');
+  projection.ingest({seq: 3, kind: 'task.started', task: 't1', attempt: 2, time: '2026-09-25T06:30:00Z'});
+  assert.equal(projection.snapshot().panes.find(p => p.task === 't1').reason, undefined);
 });

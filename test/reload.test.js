@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {fingerprint, validate, orchestratorOwns, orchestratorTasks} from '../src/reload.js';
+import {fingerprint, validate, orchestratorBridgeEnv, orchestratorOwns, orchestratorTasks} from '../src/reload.js';
 test('reload detects added and modified source but ignores journals', t => {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'bounce-reload-'));
   t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
@@ -33,8 +33,14 @@ test('supervisor installs only after child exits and resumes session on success 
   // install/restart loop this test exercises (without this it would read the real ~/.bounce).
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-sv-'));
   const prevHome = process.env.BOUNCE_HOME;
+  const prevSession = process.env.BOUNCE_SESSION;
   process.env.BOUNCE_HOME = home;
-  t.after(() => { if (prevHome === undefined) delete process.env.BOUNCE_HOME; else process.env.BOUNCE_HOME = prevHome; fs.rmSync(home, {recursive: true, force: true}); });
+  process.env.BOUNCE_SESSION = 'smuggled-session';
+  t.after(() => {
+    if (prevHome === undefined) delete process.env.BOUNCE_HOME; else process.env.BOUNCE_HOME = prevHome;
+    if (prevSession === undefined) delete process.env.BOUNCE_SESSION; else process.env.BOUNCE_SESSION = prevSession;
+    fs.rmSync(home, {recursive: true, force: true});
+  });
   const {EventEmitter} = await import('node:events');
   const {supervise} = await import('../src/reload.js');
   for (const fail of [false, true]) {
@@ -47,6 +53,7 @@ test('supervisor installs only after child exits and resumes session on success 
         return 'Updated bounce to 0.1.4.';
       },
       spawnChild: (_exe, _args, options) => {
+        assert.equal(options.env.BOUNCE_SESSION, undefined, 'classic children cannot inherit an orchestrator session');
         const child = new EventEmitter(); child.kill = () => {};
         const first = launches++ === 0;
         if (!first) {
@@ -64,6 +71,21 @@ test('supervisor installs only after child exits and resumes session on success 
     });
     assert.equal(launches, 2);
   }
+});
+
+test('orchestrator bridge identifies its durable session without leaking process configuration', () => {
+  const env = orchestratorBridgeEnv({session: {id: 'session-42'}, bus: {path: '/tmp/bus.sock'},
+    grant: {file: '/tmp/grant'}, profile: {adapter: 'codex', mode: 'plan'}});
+  assert.deepEqual(env, {BOUNCE_BUS: '/tmp/bus.sock', BOUNCE_BUS_TOKEN_FILE: '/tmp/grant', BOUNCE_SESSION: 'session-42',
+    BOUNCE_ROLE: 'orchestrator', BOUNCE_ORCHESTRATOR_PROFILE: JSON.stringify({adapter: 'codex', mode: 'plan'})});
+});
+
+test('standing orders describe durable campaigns, plan correlation, and typed bounded recovery', () => {
+  const text = fs.readFileSync(new URL('../src/reload.js', import.meta.url), 'utf8');
+  for (const part of ['`campaign_start`', '`campaign_extend`', '`campaign_complete`', '`campaign_block`', '`plan_wait`',
+    '`campaignId`', '`gate`', '`planId`', '`chunkId`', 'retryOf rather than parent', 'Recover by the typed failure',
+    'durable campaign enters needs-input']) assert.equal(text.includes(part), true, part);
+  assert.equal(text.includes('or task.rejected mean stop and report that reason to the user'), false);
 });
 
 // Found live: a builder failed, bounce submitted its fallback replacement (from `bounce`, not from the

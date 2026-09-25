@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  JEV_DEFAULT_MODEL, JEV_ENDPOINT, JEV_KEY_ENV, VERDICT_CHECKS,
+  JEV_DEFAULT_MODEL, JEV_ENDPOINT, JEV_KEY_ENV, VERDICT_CHECKS, REPORT_VERDICT_CHECKS,
   normalizeJevSettings, persistedJevSettings, readJevSettings, jevStatusLine, jevSidebarLabel,
   readJevKey, writeJevKey, clearJevKey, retryAfterMs, createJevClient,
   verdictQuestions, decideVerdict, routingFallback, routingQuestions, decideRoute, routeTask, jevReviewerProfile, createJevActivation,
@@ -144,7 +144,16 @@ test('verdict questions: one accept/rework choice plus 4–8 narrow nouls', () =
   assert.deepEqual(nouls.map(([name]) => name), Object.keys(VERDICT_CHECKS));
 });
 
-test('decideVerdict: confident rework reworks with the fired checks as findings; low confidence or accept accepts', () => {
+test('report verdict questions evaluate the assignment and report evidence without diff-only checks', () => {
+  const questions = verdictQuestions({review_kind: 'report', diff: ''});
+  assert.deepEqual(Object.keys(questions), ['decision', 'assignment_unmet', 'unbacked_evidence', 'remaining_work']);
+  assert.deepEqual(Object.keys(REPORT_VERDICT_CHECKS), ['assignment_unmet', 'unbacked_evidence', 'remaining_work']);
+  const rework = decideVerdict({decision: {choice: 'rework', confidence: 0.9}, unbacked_evidence: {noul: 0.9}}, {state: {review_kind: 'report', diff: ''}});
+  assert.deepEqual([rework.verdict, rework.fired, rework.findings], ['rework', ['unbacked_evidence'], [REPORT_VERDICT_CHECKS.unbacked_evidence.fix]]);
+  assert.equal(decideVerdict({decision: {choice: 'accept', confidence: 0.5}}, {state: {review_kind: 'report'}}).verdict, 'unavailable');
+});
+
+test('decideVerdict: confident rework reworks with the fired checks as findings; low confidence is unavailable and accept accepts', () => {
   const answers = {
     decision: {type: 'choice', choice: 'rework', probabilities: {accept: 0.1, rework: 0.9}, confidence: 0.9},
     unbacked_tests: {type: 'noul', noul: 0.93}, remaining_work: {type: 'noul', noul: 0.71}, outside_scope: {type: 'noul', noul: 0.05},
@@ -158,7 +167,7 @@ test('decideVerdict: confident rework reworks with the fired checks as findings;
   assert.equal(rework.checks.empty_diff, null);
 
   const unsure = decideVerdict({...answers, decision: {...answers.decision, confidence: 0.55}}, {confidence: 0.8});
-  assert.equal(unsure.verdict, 'accept');
+  assert.equal(unsure.verdict, 'unavailable');
   assert.equal(unsure.choice, 'rework');
   assert.deepEqual(unsure.findings, []);
 
@@ -166,7 +175,7 @@ test('decideVerdict: confident rework reworks with the fired checks as findings;
   assert.equal(accept.verdict, 'accept');
   // a confident rework with no specific check fired still carries one generic finding
   assert.equal(decideVerdict({decision: {choice: 'rework', confidence: 0.99}}).findings.length, 1);
-  assert.equal(decideVerdict(undefined).verdict, 'accept');
+  assert.equal(decideVerdict(undefined).verdict, 'unavailable');
 });
 
 const roster = {

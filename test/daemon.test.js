@@ -1,3 +1,4 @@
+import {readJournal} from '../src/core.js';
 import './helpers/env.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -9,6 +10,7 @@ import {fileURLToPath} from 'node:url';
 import {supervise, installControlAuthority, pidAlive} from '../src/reload.js';
 import {createTypesafeLive} from '../src/adapters/typesafe-live.js';
 import {socketPathFor, connectBus} from '../src/bus.js';
+import {quotaFile} from '../src/quota.js';
 
 const cliPath = fileURLToPath(new URL('../src/cli.js', import.meta.url));
 const fakeCli = fileURLToPath(new URL('./helpers/fake-cli.js', import.meta.url));
@@ -66,17 +68,22 @@ async function withEnv(vars, fn) {
 // like a backgrounded daemon. Returns once daemon.json is on disk.
 async function runHarnessDaemon(root, kind) {
   writeConfig(root);
-  spawn(process.execPath, [harnessPath, 'run', 'hi', '--json'], {
+  const daemon = spawn(process.execPath, [harnessPath, 'run', 'hi', '--json'], {
     env: bounceEnv(root, {HARNESS_ADAPTER: kind, BOUNCE_DETACHED: '1'}),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  // What the daemon said and how it ended, for a failure message to show instead of a bare boolean.
+  const trail = {stderr: '', exit: null};
+  daemon.stderr.on('data', d => { trail.stderr = (trail.stderr + d).slice(-4000); });
+  daemon.stdout.resume();
+  daemon.once('exit', (code, signal) => { trail.exit = {code, signal}; });
   const id = await waitFor(() => {
     if (!fs.existsSync(path.join(root, 'sessions'))) return null;
     return fs.readdirSync(path.join(root, 'sessions')).find(candidate => fs.existsSync(path.join(root, 'sessions', candidate, 'daemon.json')));
   });
   const dir = path.join(root, 'sessions', id);
   const info = JSON.parse(fs.readFileSync(path.join(dir, 'daemon.json'), 'utf8'));
-  return {id, dir, info};
+  return {id, dir, info, trail};
 }
 
 test('D1 legacy run unchanged: exit 0, route+turn rows, journal seq, no daemon/bus left behind', async t => {
@@ -96,7 +103,7 @@ test('D1 legacy run unchanged: exit 0, route+turn rows, journal seq, no daemon/b
   const ids = fs.readdirSync(sessionsDir);
   assert.equal(ids.length, 1);
   const dir = path.join(sessionsDir, ids[0]);
-  const journal = fs.readFileSync(path.join(dir, 'journal.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l));
+  const journal = readJournal(path.join(dir, 'journal.jsonl')).events;
   assert.deepEqual(journal.map(r => r.seq), journal.map((_, i) => i + 1));
   assert.equal(fs.existsSync(path.join(dir, 'daemon.json')), false);
   assert.equal(fs.existsSync(socketPathFor(dir)), false);
@@ -137,7 +144,7 @@ test('the run child never receives bus/token env vars, so a vendor CLI cannot fo
   assert.equal(probe.token, 'absent');
   const sessionsDir = path.join(root, 'sessions');
   const dir = path.join(sessionsDir, fs.readdirSync(sessionsDir)[0]);
-  const journal = fs.readFileSync(path.join(dir, 'journal.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l));
+  const journal = readJournal(path.join(dir, 'journal.jsonl')).events;
   assert.equal(journal.filter(r => r.kind === 'user').length, 1, 'exactly the one real user row, nothing forged');
 });
 
@@ -417,19 +424,19 @@ test('D3 --detach returns immediately with an id; attach streams then exits when
 test('D4 stop cancels a hanging task, prints control.stopped, exits 0, daemon dies and daemon.json is gone', async t => {
   const root = tmpRoot('bounce-d4-');
   t.after(() => fs.rmSync(root, {recursive: true, force: true}));
-  const {id, dir, info} = await runHarnessDaemon(root, 'hang');
+  const {id, dir, info, trail} = await runHarnessDaemon(root, 'hang');
   const stop = await run(['stop', id], bounceEnv(root), {timeout: 20000});
   assert.equal(stop.code, 0);
   assert.match(stop.stdout, /control\.stopped/);
   assert.match(stop.stdout, /"cancelled"/);
   await waitFor(() => !pidAlive(info.pid));
-  assert.equal(fs.existsSync(path.join(dir, 'daemon.json')), false);
+  assert.equal(fs.existsSync(path.join(dir, 'daemon.json')), false, `daemon ended ${JSON.stringify(trail.exit)} with daemon.json left; stop: ${stop.stdout}${stop.stderr}; daemon stderr: ${trail.stderr}`);
 });
 
 test('D5 stop with unverifiable termination exits 1, lists the unverified id, keeps daemon.json', async t => {
   const root = tmpRoot('bounce-d5-');
   t.after(() => fs.rmSync(root, {recursive: true, force: true}));
-  const {id, dir} = await runHarnessDaemon(root, 'stubborn');
+  const {id, dir, info: started, trail} = await runHarnessDaemon(root, 'stubborn');
   const stop = await run(['stop', id], bounceEnv(root), {timeout: 20000});
   assert.equal(stop.code, 1);
   assert.match(stop.stdout, /unverified/);
@@ -439,8 +446,11 @@ test('D5 stop with unverifiable termination exits 1, lists the unverified id, ke
   const info = await waitFor(() => {
     const value = JSON.parse(fs.readFileSync(path.join(dir, 'daemon.json'), 'utf8'));
     return value.unverified ? value : null;
-  });
+  }).catch(error => { throw new Error(`${error.message}; daemon ended ${JSON.stringify(trail.exit)}; stop: ${stop.stdout}${stop.stderr}; daemon stderr: ${trail.stderr}`); });
   assert.equal(info.unverified.length, 1);
+  // Found in a gate (2026-09-25): the teardown's rmSync hit ENOTEMPTY while the daemon was still
+  // writing its session; wait for it to exit, as D4 and D10 do.
+  await waitFor(() => !pidAlive(started.pid));
 });
 
 // Incident (Phase 3 gate, 2026-09-12): under load the D5 daemon's main child survived the
@@ -522,7 +532,7 @@ function writeOrchestratorConfig(root, {orchestrator = 'main', profiles, order =
 
 async function finalWorkerReport(profile) {
   const client = await connectBus({path: profile.report.BOUNCE_REPORT_BUS, token: fs.readFileSync(profile.report.BOUNCE_REPORT_TOKEN_FILE, 'utf8').trim()});
-  try { await client.report({op: 'final', outcome: 'completed', phase: 'done', text: 'child done', next: 'none', summary: 'child done', evidence: [], remaining: 'none'}); }
+  try { await client.report({op: 'final', outcome: 'completed', phase: 'done', text: 'child done', next: 'none', summary: 'child done', evidence: [], remaining: ''}); }
   finally { await client.close(); }
 }
 
@@ -566,7 +576,7 @@ test('O1 classic: the main child gets no bus, token file, role or profile, and t
   const rows = stdout.trim().split('\n').filter(Boolean).map(l => JSON.parse(l));
   assert.deepEqual(JSON.parse(rows.find(r => r.kind === 'assistant').text), ABSENT_ORCHESTRATOR_ENV);
   const dir = path.join(root, 'sessions', fs.readdirSync(path.join(root, 'sessions'))[0]);
-  const journal = fs.readFileSync(path.join(dir, 'journal.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l));
+  const journal = readJournal(path.join(dir, 'journal.jsonl')).events;
   assert.equal(journal.filter(r => r.kind === 'user').length, 1);
   assert.equal(journal.some(r => r.kind === 'task.submitted'), false);
 });
@@ -589,6 +599,27 @@ test('O7 classic with all four orchestrator env vars pre-set in the parent: the 
   // Classic stayed classic: no orchestrator brief on the prompt, no operation row.
   assert.equal(rows.find(r => r.kind === 'user').text, 'hi');
   assert.equal(rows.some(r => r.kind === 'operation'), false);
+});
+
+// Only the TUI ever called recordQuota from a raw event (src/cli.js); a headless daemon session
+// never opened one, so a worker's quota reporting went unrecorded until the next `bounce quota`.
+test('the daemon records quota from a worker\'s raw rate_limit_event, not only the TUI', async t => {
+  const root = tmpRoot('bounce-quota-daemon-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  writeOrchestratorConfig(root, {profiles: {main: {adapter: 'codex'}, build: {adapter: 'claude'}}});
+  const raw = {type: 'rate_limit_event', rate_limit_info: {unifiedWindows: {five_hour: {utilization: 0.42, resetsAt: 1900000000}}}};
+  const claudeWorker = {
+    async launch({profile}) { return {profile}; },
+    async *events({profile}) {
+      yield {kind: 'raw', raw};
+      await finalWorkerReport(profile);
+      yield {kind: 'result', status: 'completed', text: 'child done'};
+    },
+    async cancel() { return {verified: true}; },
+  };
+  await runOrchestratorSession(root, {adapters: {codex: completingAdapter(), claude: claudeWorker}});
+  const quota = JSON.parse(fs.readFileSync(quotaFile(root), 'utf8'));
+  assert.deepEqual(quota.claude.windows, [{label: '5h', percent: 42, resetsAt: 1900000000000, minutes: 300}]);
 });
 
 test('O2 orchestrator single-provider: the orchestrator submits over the bridge, the worker completes, its wait returns', async t => {
@@ -627,6 +658,11 @@ test('O2 orchestrator single-provider: the orchestrator submits over the bridge,
   assert.equal(orders.includes('steps (the verification steps, as text) — required when the completion reviewer is a verifier profile'), true);
   assert.equal(orders.includes('phase, text, next, and evidence'), true, 'workers receive the durable progress checkpoint contract');
   assert.equal(orders.includes('initial inspection, every phase change, and before completion'), true, 'checkpoint cadence is explicit');
+  // The input prefill (Tab, Enter) needs the answer to state its next prompt; nothing else asked for it.
+  assert.equal(orders.includes('end the answer with one line `Next: <the prompt, as the user would type it>`'), true, 'the orchestrator is asked for the prefill line');
+  // Found live (session 159f4746): the orchestrator offered to commit, then sent the commit to workers seven
+  // times — each found a copy with no .git. Docs/plans/in-place-tasks.md: an in-place task is now the way.
+  assert.equal(orders.includes('Workers run in copies of the repository: only an in-place task (task.submitted with `inPlace: {authorizedBy: <seq>}`) runs in the real checkout, for a version-control or other real-folder step (commit, push, open a PR) the user\'s own message asked for. Cite that message\'s seq (omit authorizedBy to cite the user\'s latest message) and keep the orders to exactly what it asked — push and PR only when it asked for them. A refusal names what exceeded the request.'), true, 'the orchestrator knows how to use an in-place task');
   // No `jev` block in config.json: the brief is exactly today's — no auto roster line, no Jev
   // sentence, and the synthetic reviewer is neither a submit target nor the example's profile.
   assert.equal(orders.includes('auto →'), false);
@@ -636,7 +672,8 @@ test('O2 orchestrator single-provider: the orchestrator submits over the bridge,
   assert.match(orders, /^Who to submit to — the job, not the AI:$/m);
   // The team block: where the roster comes from, which AIs exist here, and how to change it —
   // the orchestrator specialises the shipped defaults through the bridge, never by hand.
-  assert.match(orders, /^Team: analyst, builder, integrator, reviewer ← skill agent-orchestrator$/m);
+  assert.match(orders, /^Team: analyst, builder, debugger, reviewer ← skill agent-orchestrator$/m);
+  assert.equal(orders.includes('debugger to root-cause a failure that resisted a first attempt'), true, 'every shipped job is named in the choosing orders');
   assert.match(orders, /^AIs on this machine: codex, lmstudio\/<loaded model> \(via opencode\)$/m);
   assert.match(orders, /bounce agents set NAME --scope project/);
   assert.match(orders, /references\/team\.md/);

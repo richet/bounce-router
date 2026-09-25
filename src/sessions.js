@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {Session, pidAlive} from './core.js';
 import * as reducers from './reducers.js';
+import {deriveSessionName} from './session-names.js';
 
 // `bounce sessions` rows carry spend recomputed from the log — null for a session with no task rows.
 export function sessionSpend(events) {
@@ -35,7 +36,11 @@ export function listSessions(root) {
       // Which operation mode a session ran under is a fold over its own log, so it survives
       // the daemon that wrote it (daemon.json is removed on a clean exit).
       const operation = s.events.findLast(e => e.kind === 'operation');
-      return [{id, name: reducers.sessionName(s.events), cwd: s.cwd, updated: s.events.at(-1)?.time, live, pid: live ? daemon.pid : undefined,
+      // An explicit /rename is distinct from `name`'s first-prompt fallback: it is what wins a
+      // collision against another session's derived name (see resolveSessionRef below).
+      const explicitName = s.events.findLast(e => e.kind === 'session.renamed' && typeof e.name === 'string' && e.name.trim())?.name.trim() ?? null;
+      return [{id, name: reducers.sessionName(s.events), explicitName, derivedName: deriveSessionName(id),
+        cwd: s.cwd, updated: s.events.at(-1)?.time, live, pid: live ? daemon.pid : undefined,
         operation: operation?.operation ?? 'classic', orchestrator: operation?.orchestrator ?? null,
         prompt: s.events.find(e => e.kind === 'user')?.text?.slice(0, 80) ?? '(empty)',
         spend: sessionSpend(s.events)}];
@@ -45,16 +50,25 @@ export function listSessions(root) {
 }
 
 // A session reference as a person types it: the full id, a name (case-insensitive, must be
-// unique), or a unique id prefix. Anything else is an error that names the alternatives.
+// unique), a derived adjective-noun name, or a unique id prefix. Anything else is an error
+// that names the alternatives.
+//
+// `name` (rename, else first-prompt text) is checked before `derivedName` so an explicit
+// rename always wins a collision against another session's derived name — the derived name
+// is only reached when nothing has claimed it as a real name.
 export function resolveSessionRef(root, ref) {
   const wanted = String(ref ?? '').trim();
   if (!wanted) throw new Error('Which session? Give a name or id (bounce sessions lists them)');
   const rows = listSessions(root);
   if (rows.some(r => r.id === wanted)) return wanted;
   const short = r => r.id.slice(0, 8);
-  const byName = rows.filter(r => r.name && r.name.toLowerCase() === wanted.toLowerCase());
+  const lower = wanted.toLowerCase();
+  const byName = rows.filter(r => r.name && r.name.toLowerCase() === lower);
   if (byName.length === 1) return byName[0].id;
   if (byName.length > 1) throw new Error(`Ambiguous session name "${wanted}": ${byName.map(short).join(', ')} — use the id`);
+  const byDerived = rows.filter(r => r.derivedName.toLowerCase() === lower);
+  if (byDerived.length === 1) return byDerived[0].id;
+  if (byDerived.length > 1) throw new Error(`Ambiguous session name "${wanted}": ${byDerived.map(short).join(', ')} — use the id`);
   const byPrefix = rows.filter(r => r.id.startsWith(wanted));
   if (byPrefix.length === 1) return byPrefix[0].id;
   if (byPrefix.length > 1) throw new Error(`Ambiguous session id "${wanted}": ${byPrefix.map(short).join(', ')}`);
@@ -76,7 +90,7 @@ export function sessionsTable(rows, {now = Date.now()} = {}) {
   if (!rows.length) return ['No sessions yet'];
   const lines = [`  ${'NAME'.padEnd(30)} ${'AGE'.padStart(4)}  ${'MODE'.padEnd(12)} ${'ID'.padEnd(8)}  WORKSPACE`];
   for (const r of rows) {
-    const name = (r.name ?? '(unnamed)').slice(0, 30);
+    const name = (r.name ?? r.derivedName ?? '(unnamed)').slice(0, 30);
     lines.push(`${r.live ? '●' : ' '} ${name.padEnd(30)} ${sessionAge(r.updated, now).padStart(4)}  ${r.operation.padEnd(12)} ${r.id.slice(0, 8)}  ${r.cwd}`);
   }
   return lines;

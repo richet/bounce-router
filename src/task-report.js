@@ -4,8 +4,9 @@ const line = (label, value) => value === null || value === undefined || value ==
 
 export function formatTaskView(view) {
   const rows = [
-    `${view.task} · ${view.state}${view.profile ? ` · ${view.profile}` : ''}${view.ai ? ` (${view.ai})` : ''}${view.elapsed ? ` · ${view.elapsed}` : ''}`,
+    `${view.task} · ${view.state}${view.profile ? ` · ${view.profile}` : ''}${view.ai ? ` (${view.ai})` : ''}${view.elapsed ? ` · ${view.elapsed}` : ''}${view.inPlace ? ' · in place' : ''}`,
     line('orders', view.orders),
+    view.inPlace ? `in place: authorized by "${view.inPlace.message}"${view.inPlace.jev ? ` · jev ${view.inPlace.jev.verdict}` : ''}` : null,
     view.lease ? `lease: ${view.lease.minutes} min${view.lease.renewals ? ` · renewed ${view.lease.renewals}×` : ''}` : null,
     view.reviewer ? `review: ${view.reviewer}${view.verdict ? ` · ${view.verdict.verdict}` : ' · running'}` : null,
     line('blocked', view.blocker),
@@ -18,10 +19,14 @@ export function formatTaskView(view) {
     if (view.findings.more) rows.push(`  … ${view.findings.more} more`);
   }
   if (!view.report && view.summary) rows.push('summary:', `  ${view.summary}`);
+  if (view.reportDiagnostic) rows.push(`report diagnostic: ${view.reportDiagnostic}`);
   if (view.journal) rows.push(`journal: ${view.journal.path} · rows ${view.journal.fromSeq}–${view.journal.toSeq} of this task`);
   // Last, and unindented: a verdict puts its conclusion at the end, so nothing follows it that would push
   // that conclusion out of view or invite it to be read as part of the report.
   if (view.report) rows.push('report:', view.report);
+  if (view.rawOutput !== null && view.rawOutput !== undefined) {
+    rows.push(`unvalidated raw output (${view.reportDiagnostic ?? 'invalid report'}):`, view.rawOutput);
+  }
   return rows.join('\n');
 }
 

@@ -60,3 +60,11 @@ test('the answer of the last turn is its last assistant row, and none for a canc
   assert.equal(lastAnswer([{seq: 1, kind: 'user', text: 'q'}, {seq: 2, kind: 'assistant', text: 'Next: rerun the gate on main'}, {seq: 3, kind: 'turn', text: 'cancelled'}]), null);
   assert.equal(lastAnswer([...events, {seq: 9, kind: 'user', text: 'again'}, {seq: 10, kind: 'assistant', text: 'Next: half done'}, {seq: 11, kind: 'turn', status: 'cancelled'}]), null, 'a cancelled turn offers nothing');
 });
+
+// Observed (2026-09-25): the prefill never appeared because the orchestrator's answers never state a
+// parseable next step ("Say if you want it added"). Its standing orders ask for the one line the
+// input box reads, and that line round-trips.
+test('the Next line the orchestrator is asked for becomes the prefill', () => {
+  const answer = 'The builder fix is in and I checked it.\n- The skill/MCP campaign waits for your approval.\n\nNext: Approve the skill/MCP plan and resume the campaign';
+  assert.equal(suggestionFrom(answer), 'Approve the skill/MCP plan and resume the campaign');
+});

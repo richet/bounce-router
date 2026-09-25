@@ -79,8 +79,8 @@ async function attach(session) {
   return {child, host};
 }
 
-test('Session.prototype surface is untouched by this task', () => {
-  assert.deepEqual(Object.getOwnPropertyNames(Session.prototype), ['constructor', 'append', 'emit', 'subscribe', 'publish', 'lock']);
+test('Session exposes daemon-only commit while remote writes remain individual commands', () => {
+  assert.deepEqual(Object.getOwnPropertyNames(Session.prototype), ['constructor', 'append', 'commit', 'emit', 'subscribe', 'publish', 'lock']);
 });
 
 test('R1 replay: child gets id/context/cwd and the existing rows', async () => {

@@ -423,9 +423,9 @@ test('W13 completion review launch throwing releases the reservation it never co
   await waitFor(() => scheduler.tasks()[row.task]?.state === 'blocked');
 
   // peer.joined carries `name`, not `task` — filtered out here like every other task-scoped test.
-  const kinds = session.events.filter(e => e.task === row.task).map(e => e.kind);
+  const kinds = session.events.filter(e => e.task === row.task && !e.kind.startsWith('orchestration.') && !['task.attempt.ended', 'task.cancel.requested', 'task.workspace', 'task.launch.requested', 'task.artifact'].includes(e.kind)).map(e => e.kind);
   assert.deepEqual(kinds, [
-    'task.submitted', 'budget.reserved', 'task.started', 'task.completed',
+    'task.submitted', 'budget.reserved', 'task.started', 'task.output', 'task.completed',
     'budget.reserved', 'review.started', 'review.finished', 'budget.released', 'policy.escalated', 'task.blocked',
   ]);
   const released = session.events.filter(e => e.kind === 'budget.released' && e.task === row.task);

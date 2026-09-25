@@ -191,8 +191,8 @@ test('E8 completion-review gate: unsupported reviewer policy escalates and block
   const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null, review: {completion: 'C'}});
   await waitFor(() => scheduler.tasks()[row.task]?.state === 'blocked');
 
-  const kinds = session.events.filter(e => e.task === row.task || e.kind === 'peer.joined').map(e => e.kind);
-  assert.deepEqual(kinds, ['task.submitted', 'budget.reserved', 'peer.joined', 'task.started', 'task.completed', 'policy.escalated', 'task.blocked']);
+  const kinds = session.events.filter(e => (e.task === row.task || e.kind === 'peer.joined') && !e.kind.startsWith('orchestration.') && !['task.workspace', 'task.launch.requested', 'task.attempt.ended', 'task.artifact', 'task.integration.requested', 'task.integrated'].includes(e.kind)).map(e => e.kind);
+  assert.deepEqual(kinds, ['task.submitted', 'budget.reserved', 'peer.joined', 'task.started', 'task.output', 'task.completed', 'policy.escalated', 'task.blocked']);
   const escalated = session.events.find(e => e.kind === 'policy.escalated' && e.task === row.task);
   assert.equal(escalated.reason, 'unsupported');
   assert.match(escalated.text, /review/);

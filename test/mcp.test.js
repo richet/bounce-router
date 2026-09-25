@@ -31,10 +31,32 @@ test('M1 it is an MCP server: initialize, then the bridge verbs as tools', async
   assert.deepEqual(init.result.capabilities, {tools: {}});
   assert.equal(await s.handle({jsonrpc: '2.0', method: 'notifications/initialized'}), null, 'a notification is answered with nothing');
   const list = await s.handle({jsonrpc: '2.0', id: 2, method: 'tools/list'});
-  assert.deepEqual(list.result.tools.map(tool => tool.name).sort(), ['report', 'state', 'submit', 'task_get', 'tasks_list', 'wait']);
+  assert.deepEqual(list.result.tools.map(tool => tool.name).sort(), ['campaign_block', 'campaign_complete', 'campaign_extend', 'campaign_get', 'campaign_pause', 'campaign_resume', 'campaign_start', 'plan_wait', 'report', 'state', 'submit', 'task_get', 'task_submit', 'tasks_list', 'wait']);
   const submit = list.result.tools.find(tool => tool.name === 'submit');
   assert.equal(submit.inputSchema.required.includes('event'), true);
   assert.match(submit.description, /task\.submitted|plan\.submitted/);
+  const taskSubmit = list.result.tools.find(tool => tool.name === 'task_submit');
+  assert.equal(taskSubmit.inputSchema.required.includes('requires'), true);
+  assert.deepEqual(taskSubmit.inputSchema.properties.requires.items.enum, ['read', 'exec', 'write']);
+});
+
+test('M7 campaign commands and plan waits carry typed identities', async () => {
+  const submitted = [];
+  const s = server({ops: {
+    submit: async event => { submitted.push(event); return {ok: true, row: {kind: event.kind, campaignId: event.campaignId ?? 'new-campaign', seq: 8}}; },
+    wait: async match => ({ok: true, row: {kind: 'plan.rejected', plan: match.plan, phase: 'implement', seq: 9}}),
+  }, views: {campaign: id => id === 'c1' ? {id, state: 'active', remaining: ['review']} : null}});
+  const started = await call(s, 'campaign_start', {objective: 'land reliability', required: ['tests'], campaignId: 'c1'});
+  assert.equal(started.result.structuredContent.kind, 'campaign.start');
+  assert.deepEqual(submitted.at(-1), {kind: 'campaign.start', campaignId: 'c1', objective: 'land reliability', required: ['tests'], reason: undefined});
+  const got = await call(s, 'campaign_get', {campaignId: 'c1'});
+  assert.deepEqual(got.result.structuredContent, {id: 'c1', state: 'active', remaining: ['review']});
+  const waited = await call(s, 'plan_wait', {plan: 'p1', seconds: 1, afterSeq: 4});
+  assert.deepEqual(waited.result.structuredContent, {waiting: false, row: {kind: 'plan.rejected', plan: 'p1', phase: 'implement', seq: 9}});
+  await call(s, 'task_submit', {profile: 'builder', orders: 'fix', requires: ['read', 'exec'], jobId: 'j1', retryOf: 'older', campaignId: 'c1', gate: 'bridge', planId: 'p1', chunkId: 'ch1'});
+  assert.deepEqual(submitted.at(-1), {kind: 'task.submitted', task: undefined, profile: 'builder', orders: 'fix', requires: ['read', 'exec'], parent: null, jobId: 'j1', retryOf: 'older', campaignId: 'c1', gate: 'bridge', planId: 'p1', chunkId: 'ch1'});
+  await call(s, 'task_submit', {profile: 'builder', orders: 'legacy'});
+  assert.equal(submitted.at(-1).requires, undefined);
 });
 
 test('M2 a tool call is a verb call, and the answer is structured, not text to parse', async () => {
@@ -111,4 +133,25 @@ test('M6 task_get can be asked for the whole report, and says so in its schema',
   const tool = s.tools.find(t => t.name === 'task_get');
   assert.equal('full' in tool.inputSchema.properties, true, 'a caller can only use what the schema names');
   assert.match(tool.inputSchema.properties.full.description ?? '', /report|verdict/i);
+});
+
+test('task_submit preserves the admitted plan constraints', async () => {
+  let submitted;
+  const s = server({ops: {submit: async event => {submitted = event; return {ok: true, row: event};}}});
+  const constraints = {requires: ['read', 'exec'], owns: ['src/a.js'], depends_on: ['earlier'], deadline: 60000, review: {completion: 'critic'}, steps: 'node --test', risk: 'logic', size: {lines: 1, probes: 1, minutes: 1}, checkpoint: {head: 'abc'}};
+  await call(s, 'task_submit', {profile: 'builder', orders: 'verify', ...constraints});
+  for (const [key, value] of Object.entries(constraints)) assert.deepEqual(submitted[key], value, key);
+});
+
+// Found reviewing the in-place build: task_submit neither declared nor forwarded inPlace, so an
+// orchestrator on MCP could never ask for an in-place task.
+test('task_submit declares and forwards inPlace', async () => {
+  let submitted;
+  const s = server({ops: {submit: async event => {submitted = event; return {ok: true, row: event};}}});
+  const list = await s.handle({jsonrpc: '2.0', id: 1, method: 'tools/list'});
+  const schema = list.result.tools.find(tool => tool.name === 'task_submit').inputSchema.properties.inPlace;
+  assert.deepEqual(schema.properties, {authorizedBy: {type: 'number'}});
+  assert.equal(schema.required, undefined, 'omitting authorizedBy cites the latest user message');
+  await call(s, 'task_submit', {profile: 'builder', orders: 'commit it', requires: ['read', 'exec', 'write'], inPlace: {authorizedBy: 42}});
+  assert.deepEqual(submitted.inPlace, {authorizedBy: 42});
 });

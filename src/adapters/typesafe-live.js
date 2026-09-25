@@ -8,7 +8,7 @@
 // Hard rules kept here: the request (headers/body) is never yielded as a `raw` event (raw
 // rows are journaled verbatim); the key is read inside the client at call time and lives on
 // the request header alone; every failure (no key, HTTP error, timeout, 4xx/5xx after one
-// retry on 429/529) yields a `jev.skipped` row and today's verdict — accept.
+// retry on 429/529) yields a `jev.skipped` row and an unavailable verdict.
 import {execFile} from 'node:child_process';
 import {createJevClient, decideVerdict, readJevSettings, verdictQuestions} from '../jev.js';
 
@@ -67,18 +67,41 @@ export function testOutputLines(report) {
 // The state Jev judges: the orders, the worker's final report, the diff of the working tree
 // against the task's start ref (falling back to HEAD outside a recorded start), untracked
 // files, and the test result lines found in the report — nothing from the journal beyond that.
-export async function buildReviewState({review, cwd, git = defaultGit, signal} = {}) {
+export async function buildReviewState({review, reviewState = null, cwd, git = defaultGit, signal} = {}) {
+  if (reviewState && typeof reviewState === 'object') {
+    const report = reviewState.report ?? review?.report ?? {};
+    const files = Array.isArray(reviewState.files) ? reviewState.files.map(String).slice(0, 200) : [];
+    return {
+      review_kind: reviewState.kind ?? 'diff',
+      orders: truncate(reviewState.orders ?? review?.orders, ORDERS_CHARS, 'orders'),
+      report: {
+        summary: truncate(report.summary ?? review?.summary ?? '', SUMMARY_CHARS, 'summary'),
+        text: truncate(report.text ?? '', REPORT_CHARS, 'report'),
+        evidence: Array.isArray(report.evidence) ? report.evidence.slice(0, 32).map(item => truncate(String(item), 16000, 'evidence')) : [],
+        next: truncate(report.next ?? '', 16000, 'next'),
+        outcome: report.outcome ?? null,
+        remaining: typeof report.remaining === 'string' ? report.remaining.slice(0, 2000) : '',
+      },
+      diff: truncate(reviewState.diff ?? '', DIFF_CHARS, 'diff'),
+      diff_base: reviewState.baseHead ?? null,
+      untracked_files: files,
+      test_output: testOutputLines(report),
+    };
+  }
   const report = review?.report ?? {};
   const base = typeof review?.head === 'string' && review.head ? review.head : 'HEAD';
   let diff = await git(['diff', base, '--'], cwd, signal);
   if (!diff && base !== 'HEAD') diff = await git(['diff', 'HEAD', '--'], cwd, signal);
   const untracked = (await git(['ls-files', '--others', '--exclude-standard'], cwd, signal)).split('\n').map(line => line.trim()).filter(Boolean).slice(0, 200);
   return {
+    review_kind: 'diff',
     orders: truncate(review?.orders, ORDERS_CHARS, 'orders'),
     report: {
       summary: truncate(report.summary ?? review?.summary ?? '', SUMMARY_CHARS, 'summary'),
       text: truncate(report.text ?? '', REPORT_CHARS, 'report'),
-      evidence: Array.isArray(report.evidence) ? report.evidence.slice(0, 32).map(item => String(item).slice(0, 400)) : [],
+      evidence: Array.isArray(report.evidence) ? report.evidence.slice(0, 32).map(item => truncate(String(item), 16000, 'evidence')) : [],
+      next: truncate(report.next ?? '', 16000, 'next'),
+      outcome: report.outcome ?? null,
       remaining: typeof report.remaining === 'string' ? report.remaining.slice(0, 2000) : '',
     },
     diff: truncate(diff, DIFF_CHARS, 'diff'),
@@ -88,20 +111,49 @@ export async function buildReviewState({review, cwd, git = defaultGit, signal} =
   };
 }
 
+async function askVerdict({stream, client, state, profile, settings, controller}) {
+  stream.push({kind: 'activity', text: `Jev verdict · asking ${profile?.model || settings.model}`});
+  let result;
+  try {
+    result = await client.ask({state, questions: verdictQuestions(state), model: profile?.model || settings.model, signal: controller.signal});
+  } catch (error) {
+    const reason = error?.code ?? 'error';
+    stream.push({kind: 'jev', name: 'skipped', data: {reason}, text: `Jev verdict unavailable · ${error?.message ?? String(error)}`});
+    stream.push({kind: 'result', status: 'completed', text: JSON.stringify({verdict: 'unavailable', jev: 'skipped', reason})});
+    return;
+  }
+  const decision = decideVerdict(result.answers, {confidence: settings.confidence, state});
+  const fired = decision.fired.length ? ` · fired: ${decision.fired.join(', ')}` : '';
+  stream.push({kind: 'model', model: result.model});
+  if (result.usage && Number.isFinite(result.usage.input_tokens)) stream.push({kind: 'usage', usage: {input: result.usage.input_tokens, output: result.usage.output_tokens ?? 0}});
+  stream.push({kind: 'jev', name: 'verdict', data: {verdict: decision.verdict, choice: decision.choice, confidence: decision.confidence, threshold: decision.threshold, probabilities: decision.probabilities, checks: decision.checks, fired: decision.fired, model: result.model, latencyMs: result.latencyMs, diffBase: state.diff_base},
+    text: `Jev verdict · ${decision.verdict}${decision.choice && decision.choice !== decision.verdict ? ` (chose ${decision.choice} below threshold)` : ''} · confidence ${decision.confidence.toFixed(2)} of ${decision.threshold}${fired} · ${result.latencyMs} ms`});
+  stream.push({kind: 'result', status: 'completed', text: JSON.stringify({verdict: decision.verdict, findings: decision.findings, confidence: decision.confidence,
+    threshold: decision.threshold, choice: decision.choice, probabilities: decision.probabilities, fired: decision.fired, leanFindings: decision.leanFindings, source: 'jev'})});
+}
+
 export function createTypesafeLive({fetchImpl, readKey, readSettings = () => readJevSettings(), git = defaultGit, clock = Date.now, timeoutMs} = {}) {
   const client = createJevClient({...(fetchImpl ? {fetchImpl} : {}), ...(readKey ? {readKey} : {}), ...(timeoutMs ? {timeoutMs} : {}), clock});
 
   const skipped = (stream, reason, text) => {
-    stream.push({kind: 'jev', name: 'skipped', data: {reason}, text: `Jev verdict skipped · ${text ?? reason} · accepting as today`});
-    stream.push({kind: 'result', status: 'completed', text: JSON.stringify({verdict: 'accept', jev: 'skipped', reason})});
+    stream.push({kind: 'jev', name: 'skipped', data: {reason}, text: `Jev verdict unavailable · ${text ?? reason}`});
+    stream.push({kind: 'result', status: 'completed', text: JSON.stringify({verdict: 'unavailable', jev: 'skipped', reason})});
   };
 
-  async function run(handle, {profile, cwd, review}) {
+  async function run(handle, {profile, cwd, review, reviewState}) {
     const {stream, controller} = handle;
     const settings = readSettings();
     if (review.stage !== 'completion') return skipped(stream, 'stage', `${review.stage} review is not a Jev decision`);
     if (!settings.enabled) return skipped(stream, 'disabled', 'Jev is disabled (/jev on)');
     if (!settings.review) return skipped(stream, 'review_off', 'Jev completion review is off (/jev review on)');
+    // A launch context carries the scheduler's per-attempt snapshot, including an unborn repository.
+    // The legacy fallback below remains for callers that have not adopted that context yet.
+    if (reviewState && typeof reviewState === 'object') {
+      stream.push({kind: 'activity', text: 'Jev verdict · collecting the report and attempt diff'});
+      const state = await buildReviewState({review, reviewState, cwd, git, signal: controller.signal});
+      if (controller.signal.aborted) return skipped(stream, 'aborted', 'cancelled');
+      return askVerdict({stream, client, state, profile, settings, controller});
+    }
     // Every verdict question is about the diff. Outside a repository there is none: an empty diff
     // reads as "nothing was done" and sends correct work back for rework round after round (observed
     // live), so Jev is not asked at all.
@@ -113,20 +165,7 @@ export function createTypesafeLive({fetchImpl, readKey, readSettings = () => rea
     stream.push({kind: 'activity', text: 'Jev verdict · collecting the report and diff'});
     const state = await buildReviewState({review, cwd, git, signal: controller.signal});
     if (controller.signal.aborted) return skipped(stream, 'aborted', 'cancelled');
-    stream.push({kind: 'activity', text: `Jev verdict · asking ${profile?.model || settings.model}`});
-    let result;
-    try {
-      result = await client.ask({state, questions: verdictQuestions(), model: profile?.model || settings.model, signal: controller.signal});
-    } catch (error) {
-      return skipped(stream, error?.code ?? 'error', error?.message ?? String(error));
-    }
-    const decision = decideVerdict(result.answers, {confidence: settings.confidence, state});
-    const fired = decision.fired.length ? ` · fired: ${decision.fired.join(', ')}` : '';
-    stream.push({kind: 'model', model: result.model});
-    if (result.usage && Number.isFinite(result.usage.input_tokens)) stream.push({kind: 'usage', usage: {input: result.usage.input_tokens, output: result.usage.output_tokens ?? 0}});
-    stream.push({kind: 'jev', name: 'verdict', data: {verdict: decision.verdict, choice: decision.choice, confidence: decision.confidence, threshold: decision.threshold, probabilities: decision.probabilities, checks: decision.checks, fired: decision.fired, model: result.model, latencyMs: result.latencyMs, diffBase: state.diff_base},
-      text: `Jev verdict · ${decision.verdict}${decision.choice && decision.choice !== decision.verdict ? ` (chose ${decision.choice} below threshold)` : ''} · confidence ${decision.confidence.toFixed(2)} of ${decision.threshold}${fired} · ${result.latencyMs} ms`});
-    stream.push({kind: 'result', status: 'completed', text: JSON.stringify({verdict: decision.verdict, findings: decision.findings, confidence: decision.confidence, source: 'jev'})});
+    return askVerdict({stream, client, state, profile, settings, controller});
   }
 
   return {

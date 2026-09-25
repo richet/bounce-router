@@ -20,9 +20,8 @@ export function parseVmStat(text) {
   const pageSize = Number(/page size of (\d+) bytes/.exec(text)?.[1]) || 16384;
   const pages = name => Number(new RegExp(`${name}:\\s+(\\d+)`).exec(text)?.[1] ?? NaN);
   const free = pages('Pages free'), inactive = pages('Pages inactive'), purgeable = pages('Pages purgeable'), wired = pages('Pages wired down');
-  const swapouts = Number(/Swapouts:\s+(\d+)/.exec(text)?.[1] ?? NaN);
   if ([free, inactive, purgeable, wired].some(Number.isNaN)) return null;
-  return {pageSize, available: (free + inactive + purgeable) * pageSize, wired: wired * pageSize, swapouts: Number.isNaN(swapouts) ? null : swapouts};
+  return {pageSize, available: (free + inactive + purgeable) * pageSize, wired: wired * pageSize};
 }
 
 export const parseSwapUsage = text => {
@@ -41,14 +40,19 @@ export function readMachine({run = sh} = {}) {
     const swap = parseSwapUsage(run('sysctl', ['-n', 'vm.swapusage'])) ?? {used: null};
     let wiredLimit = null;
     try { const raw = Number(run('sysctl', ['-n', 'iogpu.wired_limit_mb']).trim()); if (Number.isFinite(raw) && raw > 0) wiredLimit = raw * 1024 ** 2; } catch {}
-    return {known: true, ramTotal, available: vm.available, wired: vm.wired, swapUsed: swap.used, swapouts: vm.swapouts, wiredLimit: wiredLimit ?? ramTotal, at: Date.now()};
+    let pressure = null;
+    try { const level = Number(run('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level']).trim()); if (PRESSURE[level]) pressure = level; } catch {}
+    return {known: true, ramTotal, available: vm.available, wired: vm.wired, swapUsed: swap.used, pressure, wiredLimit: wiredLimit ?? ramTotal, at: Date.now()};
   } catch (error) { return {known: false, reason: error?.message ?? 'unreadable'}; }
 }
 
-// Swapping is a state, not a level: this machine sits at 8.5 GB of swap with no pressure at all. Only a
-// RISING swapout counter between two reads means the machine is paging right now.
-export const swapping = (before, after) => Boolean(before?.known && after?.known
-  && Number.isFinite(before.swapouts) && Number.isFinite(after.swapouts) && after.swapouts > before.swapouts);
+// macOS's own memory-pressure verdict (kern.memorystatus_vm_pressure_level). Swap in use is not pressure
+// (this machine sits at gigabytes of it with nothing wrong), and neither is a rising swapout counter:
+// macOS swaps a few pages out in the background at normal pressure, and comparing two reads minutes
+// apart called a 128 GB machine with 85% free "swapping" (observed 2026-09-25). Unreadable: no opinion.
+const PRESSURE = {1: 'normal', 2: 'warning', 4: 'critical'};
+export const pressureName = machine => PRESSURE[machine?.pressure] ?? 'unknown';
+export const underPressure = machine => Boolean(machine?.known && machine.pressure >= 2);
 
 // What LM Studio holds right now, from the catalogs src/local-models.js already fetches.
 // `busy` names the models with a running turn (the scheduler knows); the rest are idle and reclaimable.
@@ -90,11 +94,11 @@ export function fitLocal({sizeBytes = 0, loaded = false, machine, resident = [],
 }
 
 // `bounce resources`: the numbers the gate uses, in one screen.
-export function resourceReport({machine, fleet = [], busy = [], swapping = false, reserve = DEFAULT_RESERVE_BYTES} = {}) {
+export function resourceReport({machine, fleet = [], busy = [], reserve = DEFAULT_RESERVE_BYTES} = {}) {
   if (!machine?.known) return `Machine: unknown (${machine?.reason ?? 'unreadable'}) · bounce will not hold a local task back`;
   const resident = residentModels(fleet, busy);
   const minutes = ttl => ttl == null ? null : `${Math.round(ttl / 60)} min left`;
-  const lines = [`Machine: ${gb(machine.ramTotal)} total · ${gb(machine.available)} free · ${gb(machine.swapUsed ?? 0)} swapped (${swapping ? 'SWAPPING: local work goes to the cloud' : 'not swapping'}) · GPU wiring cap ${gb(machine.wiredLimit)}`];
+  const lines = [`Machine: ${gb(machine.ramTotal)} total · ${gb(machine.available)} free · ${gb(machine.swapUsed ?? 0)} swapped · memory pressure ${pressureName(machine)}${underPressure(machine) ? ' (local work goes to the cloud)' : ''} · GPU wiring cap ${gb(machine.wiredLimit)}`];
   lines.push(resident.length
     ? `Resident: ${resident.map(row => `${row.name} ${gb(row.sizeBytes)} (${row.idle ? 'idle' : 'busy'}${minutes(row.ttl) ? `, ${minutes(row.ttl)}` : ''})`).join(' · ')}`
     : 'Resident: nothing loaded');
@@ -109,16 +113,15 @@ export function resourceReport({machine, fleet = [], busy = [], swapping = false
 }
 
 export function createResources({run = sh, ttlMs = 3000, clock = () => Date.now()} = {}) {
-  let last = null, before = null;
+  let last = null;
   return {
     read() {
       if (last && clock() - last.at < ttlMs) return last;
-      before = last ?? before;
       last = {...readMachine({run}), at: clock()};
       return last;
     },
-    // True only when the machine paged between the last two distinct reads.
-    swapping() { return swapping(before, last); },
-    reset() { last = null; before = null; },
+    // Of the latest read: callers read() first, so it is at most ttlMs old.
+    underPressure() { return underPressure(last); },
+    reset() { last = null; },
   };
 }

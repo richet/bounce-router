@@ -1,6 +1,10 @@
 import {doingStep} from './status.js';
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'timed_out', 'rejected', 'accepted']);
 const HIDDEN_TRANSCRIPT_KINDS = new Set(['raw', 'usage', 'checkpoint', 'task.activity']);
+// `task.observed` is a throttled journal copy of the same live `task.activity` rows (src/scheduler.js
+// consumeWorkerEvents): a row seen live moments earlier lands again on restart replay. Only the
+// text is compared — a recent window, not the whole history, so a genuinely repeated line still shows.
+const OBSERVED_DEDUPE_WINDOW = 6;
 
 function taskState(kind) {
   if (kind === 'task.started') return 'running';
@@ -49,6 +53,10 @@ export function createWorkspaceProjection({activityLimit = 400, transcriptLimit 
   function addTask(event) {
     submittedRows.set(event.task, event);
     const logicalTask = event.replaces ? (lineages.get(event.replaces) ?? event.replaces) : event.task;
+    // The replacement takes over the pane of a task still on the rail (found live: a replacement for a
+    // blocked task became a second pane with the same id, and React's duplicate-key warning broke the frame).
+    const replaced = event.replaces ? tasks.get(event.replaces) : null;
+    if (replaced) removeTask(replaced);
     lineages.set(event.task, logicalTask);
     lineageOrder.push(event.task);
     if (lineageOrder.length > dedupeCap) lineages.delete(lineageOrder.shift());
@@ -61,6 +69,9 @@ export function createWorkspaceProjection({activityLimit = 400, transcriptLimit 
       state: 'queued',
       activity: [],
       ...(event.replaces ? {recovery: `replacement for ${event.replaces}`} : {}),
+      // §8: the pane names an in-place task so the user sees it is running in the real
+      // checkout, not a copy — the daemon side of "in place" the task view also carries.
+      ...(event.inPlace ? {inPlace: true} : {}),
     };
     tasks.set(event.task, task);
     renderPanes.push(task);
@@ -95,10 +106,16 @@ export function createWorkspaceProjection({activityLimit = 400, transcriptLimit 
     if (!task) return true;
     if (event.kind === 'task.activity' || event.kind === 'task.observed') {
       if (event.text) {
+        const text = String(event.text).slice(0, 16000);
         task.operation = taskText(event);
         task.activityAt = event.time ?? task.activityAt;
-        task.activity.push(String(event.text).slice(0, 16000));
-        if (task.activity.length > limit) task.activity.splice(0, task.activity.length - limit);
+        // Either copy may reach a view first (found live: the journal's before the live row), and a
+        // live row can repeat — whichever arrives second is the copy.
+        const duplicate = task.activity.slice(-OBSERVED_DEDUPE_WINDOW).some(row => row.text === text);
+        if (!duplicate) {
+          task.activity.push({text, source: event.source ?? null});
+          if (task.activity.length > limit) task.activity.splice(0, task.activity.length - limit);
+        }
         task.doing = doingStep(task.doing, event); // what the worker is doing now, from its own rows
       }
       return true;
@@ -112,6 +129,8 @@ export function createWorkspaceProjection({activityLimit = 400, transcriptLimit 
       task.model = event.requested ?? task.model;
       if (event.attempt != null) task.attempt = event.attempt;
     }
+    if (event.kind === 'task.blocked' || event.kind === 'task.input_required') task.reason = event.reason ?? null;
+    if (event.kind === 'task.started') { delete task.reason; delete task.blocked; }
     if (event.kind === 'task.milestone' || event.kind === 'task.reported' || event.kind === 'task.blocked' || event.kind === 'task.input_required') {
       task.phase = event.phase ?? task.phase;
       task.text = taskText(event) || task.text;
@@ -119,6 +138,9 @@ export function createWorkspaceProjection({activityLimit = 400, transcriptLimit 
       task.evidence = event.evidence ?? task.evidence;
       task.updatedAt = event.time ?? task.updatedAt;
     }
+    // The blocking reason is its own field, separate from `text` (which a later milestone still
+    // overwrites) — a blocked pane must keep showing why, not the next unrelated status prose.
+    if (event.kind === 'task.blocked' || event.kind === 'task.input_required') task.blocked = taskText(event) || task.blocked;
     if (event.kind === 'task.delivered') task.delivery = event.tier ?? task.delivery;
     // A completion review is a worker still working: found live (2026-09-22) a 22-minute review whose
     // pane said `completed`, so nothing in the UI showed that anyone was on it.

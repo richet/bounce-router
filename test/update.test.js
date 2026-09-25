@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {execFileSync} from 'node:child_process';
+import {fileURLToPath} from 'node:url';
 import {version, newer, checkUpdate, globalInstall, installUpdate} from '../src/update.js';
 
 // A release the registry could plausibly return: always one major above whatever package.json
@@ -15,7 +16,7 @@ function temp(t) {
   return root;
 }
 test('CLI version comes from package metadata', () => {
-  assert.equal(execFileSync(process.execPath, ['src/cli.js', '--version'], {encoding: 'utf8'}).trim(), `bounce ${version}`);
+  assert.equal(execFileSync(process.execPath, [fileURLToPath(new URL('../src/cli.js', import.meta.url)), '--version'], {encoding: 'utf8'}).trim(), `bounce ${version}`);
 });
 test('release comparison is numeric and rejects invalid or prerelease versions', () => {
   assert.equal(newer('0.1.10', '0.1.9'), true);

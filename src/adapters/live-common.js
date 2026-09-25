@@ -108,19 +108,27 @@ export function takePending(file) { const texts = readPending(file); try { fs.tr
 // vendors that mark their own stream are believed over any pattern.
 export const SPEAKER = {worker: 'worker', thinking: 'thinking', runtime: 'runtime'};
 export const RUNTIME_VOICE = {
-  opencode: [/MAXIMUM STEPS REACHED/i, /maximum number of steps allowed/i, /auto.?rejecting/i],
+  opencode: [/MAXIMUM STEPS REACHED/i, /maximum number of steps allowed/i, /Maximum steps for this agent have been reached/i, /auto.?rejecting/i],
   codex: [/^codex app-server\b/i],
   claude: [/^\[system\]/i],
   muse: [],
 };
 const THINK_BLOCK = /<think>[\s\S]*?<\/think>/g;
 const STRAY_THINK = /^\s*<\/?think>/;
+// Phrases only opencode's own step-cap notice carries: its instructions to the model.
+const RUNTIME_NOTICE = {opencode: [/Tools are disabled until next user input/i, /Respond with text only/i, /STRICT REQUIREMENTS/]};
 export function classifyText(vendor, text, {marked = null} = {}) {
   const raw = String(text ?? '');
   if (marked === SPEAKER.thinking || marked === SPEAKER.runtime) return {speaker: marked, text: raw.trim()};
   const stripped = raw.replace(THINK_BLOCK, '').replace(STRAY_THINK, '').trim();
   if (!stripped) return {speaker: raw.trim() ? SPEAKER.thinking : SPEAKER.worker, text: raw.trim()};
-  if ((RUNTIME_VOICE[vendor] ?? []).some(pattern => pattern.test(stripped))) return {speaker: SPEAKER.runtime, text: stripped};
+  if ((RUNTIME_NOTICE[vendor] ?? []).some(pattern => pattern.test(stripped))) return {speaker: SPEAKER.runtime, text: stripped};
+  // The notice asks the model to say the cap was reached and then summarize; observed live, a summary
+  // titled "Maximum Steps Reached - Final Summary" was filed as runtime noise. Only text that is
+  // nothing but runtime lines is the runtime speaking.
+  const voice = RUNTIME_VOICE[vendor] ?? [];
+  const lines = stripped.split('\n').map(line => line.replace(/^[\s#>*\-\d.]+/, '').trim()).filter(line => /[\p{L}\p{N}]/u.test(line));
+  if (lines.length && lines.every(line => voice.some(pattern => pattern.test(line)))) return {speaker: SPEAKER.runtime, text: stripped};
   return {speaker: SPEAKER.worker, text: stripped};
 }
 

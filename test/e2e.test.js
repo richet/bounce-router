@@ -1,3 +1,4 @@
+import {readJournal} from '../src/core.js';
 // End to end through `bounce` (T8): the real src/cli.js is spawned as a user would run it,
 // with BOUNCE_HOME in a tmp root and every vendor CLI replaced by a fake under test/helpers/.
 // No real vendor CLI is ever reachable: writeE2EConfig sets `executables` for all three
@@ -70,7 +71,7 @@ async function withEnv(vars, fn) {
   finally { for (const key of Object.keys(vars)) { if (previous[key] === undefined) delete process.env[key]; else process.env[key] = previous[key]; } }
 }
 
-const journalOf = dir => fs.readFileSync(path.join(dir, 'journal.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l));
+const journalOf = dir => readJournal(path.join(dir, 'journal.jsonl')).events;
 
 // Starts a real `bounce run` in orchestrator mode as its own OS process and returns once the
 // daemon has published its socket and minted the orchestrator grant. The orchestrator's CLI is
@@ -151,7 +152,8 @@ test('E2 baseline refusal: a task submitted against a checkpoint the tree no lon
       assert.equal(failed.text, 'tree differs from the task checkpoint');
       assert.equal(worker.calls.launch, 0, 'the adapter must never be launched against a drifted tree');
       const kinds = session.events.filter(e => e.task === taskId).map(e => e.kind);
-      assert.deepEqual(kinds, ['task.submitted', 'budget.reserved', 'budget.released', 'task.failed']);
+      assert.deepEqual(kinds.filter(kind => !kind.startsWith('orchestration.action.')), ['task.submitted', 'budget.reserved', 'budget.released', 'task.failed']);
+      assert.deepEqual(kinds.filter(kind => kind.startsWith('orchestration.action.')), ['orchestration.action.requested', 'orchestration.action.started', 'orchestration.action.requested', 'orchestration.action.started', 'orchestration.action.settled', 'orchestration.action.settled']);
       const released = session.events.find(e => e.kind === 'budget.released' && e.task === taskId);
       assert.deepEqual(released.amount, {starts: 1});
       assert.equal(released.text, 'baseline refusal');

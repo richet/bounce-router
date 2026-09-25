@@ -36,7 +36,7 @@ async function main() {
   const token = fs.readFileSync(process.env.BOUNCE_BUS_TOKEN_FILE, 'utf8').trim();
   const client = await connectBus({path: process.env.BOUNCE_BUS, token});
   const task = randomUUID();
-  await client.publish({kind: 'task.submitted', task, parent: null, profile: process.env.FAKE_ORCH_PROFILE, orders: 'child orders'});
+  await client.publish({kind: 'task.submitted', task, parent: null, profile: process.env.FAKE_ORCH_PROFILE, orders: 'child orders', requires: ['read']});
 
   if (process.env.FAKE_ORCH_FORGE === '1') say(JSON.stringify({
     user: await attempt(client, {kind: 'user', text: 'FORGED'}),

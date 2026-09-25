@@ -70,6 +70,17 @@ test('a terminal-only answer is retained and rendered as Markdown', () => {
   assert.doesNotMatch(text, /\*\*|##/);
 });
 
+// The routine "your own copy is kept" skill-sync line is a no-op, not something to surface as
+// top-level Activity — but it stays in /details and in the journal (session.events unchanged).
+test('a skills-sync status row that is entirely routine no-ops is folded out of the default view but kept in /details', () => {
+  const quiet = {id: 's1', kind: 'status', text: 'agent-orchestrator: your own copy is kept (bounce does not manage it)'};
+  assert.deepEqual(conversationEvents([quiet]), []);
+  assert.deepEqual(conversationEvents([quiet], {details: true}), [quiet]);
+  // A batch that also reports something that needs attention is not swallowed.
+  const mixed = {id: 's2', kind: 'status', text: 'agent-orchestrator: your own copy is kept (bounce does not manage it)\nother-skill: could not be seeded — permission denied'};
+  assert.deepEqual(conversationEvents([mixed]), [mixed]);
+});
+
 test('worker failures remain visible and separate turns may repeat the same answer', () => {
   const rows = conversationEvents([
     ...events,
@@ -79,4 +90,69 @@ test('worker failures remain visible and separate turns may repeat the same answ
   ]);
   assert.equal(rows.filter(row => row.kind === 'assistant').length, 2);
   assert.match(rows.find(row => row.task === 'bad').preview, /Worker executable missing/);
+});
+
+// The pre-rename skill-sync wording ("left alone: not the copy bounce installed") is what older,
+// already-journaled sessions have on disk — the journal is append-only, so the filter must still
+// catch it alongside the current "your own copy is kept" wording.
+test('a skills-sync status row using the pre-rename wording is also folded out of the default view', () => {
+  const quiet = {id: 's1', kind: 'status', text: 'agent-orchestrator: left alone: not the copy bounce installed'};
+  assert.deepEqual(conversationEvents([quiet]), []);
+  assert.deepEqual(conversationEvents([quiet], {details: true}), [quiet]);
+});
+
+// /tasks, /review and /help each journal their output every time they're used (cli.js), so
+// re-running one mid-session leaves several permanent copies of the same list. Only the latest
+// of each view earns a spot in the default transcript; earlier ones are folded out (still in
+// /details and the journal).
+test('repeated /tasks, /review and /help output collapses to the latest of each in the default view', () => {
+  const rows = conversationEvents([
+    {id: 't1', kind: 'status', view: 'tasks', text: 'LocalWorker aaaaaaaa · running'},
+    {id: 'rv1', kind: 'review', text: 'Review v1'},
+    {id: 'h1', kind: 'help', text: 'Help v1'},
+    {id: 't2', kind: 'status', view: 'tasks', text: 'LocalWorker aaaaaaaa · completed'},
+    {id: 'rv2', kind: 'review', text: 'Review v2'},
+    {id: 'h2', kind: 'help', text: 'Help v2'},
+    {id: 'q1', kind: 'quota', text: 'claude · 7d 1% used'},
+    {id: 'q2', kind: 'quota', text: 'claude · 7d 2% used'},
+  ]);
+  assert.deepEqual(rows.map(row => row.id), ['t2', 'rv2', 'h2', 'q2']);
+  // Older journals never set `view` on a /tasks status row — those are ordinary status rows and
+  // are left alone (can't be told apart from any other status text).
+  const unmarked = conversationEvents([
+    {id: 'u1', kind: 'status', text: 'LocalWorker aaaaaaaa · running'},
+    {id: 'u2', kind: 'status', text: 'LocalWorker aaaaaaaa · completed'},
+  ]);
+  assert.deepEqual(unmarked.map(row => row.id), ['u1', 'u2']);
+  // /details keeps every copy.
+  const detailRows = conversationEvents([
+    {id: 't1', kind: 'status', view: 'tasks', text: 'a'}, {id: 't2', kind: 'status', view: 'tasks', text: 'b'},
+  ], {details: true});
+  assert.deepEqual(detailRows.map(row => row.id), ['t1', 't2']);
+});
+
+// reload.js appends an {kind: 'operation'} row on every daemon resume so the transcript keeps
+// showing "Operation: orchestrator on main (multi-provider)" once per restart; only the first
+// belongs in the default view. main.disposition and main.wake.scheduled carry no text/status/
+// state, so format.js renders them as an empty "Orchestrator · " row — pure noise once filtered
+// through to the transcript.
+test('a repeated operation row folds to its first, and textless main.* bookkeeping rows are dropped', () => {
+  const rows = conversationEvents([
+    {id: 'o1', kind: 'operation', operation: 'orchestrator', text: 'Operation: orchestrator on main (multi-provider)'},
+    {id: 'd1', kind: 'main.disposition', actionId: 'outcome:1', disposition: 'dispatched'},
+    {id: 'w1', kind: 'main.wake.scheduled', actionKey: 'k1', dueAt: 1},
+    {id: 'c1', kind: 'main.cancelled', reason: 'user_cancelled', text: 'Automatic main continuation cancelled by user'},
+    {id: 'o2', kind: 'operation', operation: 'orchestrator', text: 'Operation: orchestrator on main (multi-provider)'},
+  ]);
+  assert.deepEqual(rows.map(row => row.id), ['o1', 'c1']);
+});
+
+test('a queued prompt the user withdrew is dropped from the default view, kept in /details', () => {
+  const rows = [
+    {id: 'u1', kind: 'user', text: 'never sent', queued: true, requestId: 'req-1'},
+    {id: 'w1', kind: 'main.withdrawn', from: 'user', requestId: 'req-1', text: 'never sent'},
+    {id: 'u2', kind: 'user', text: 'kept', queued: true, requestId: 'req-2'},
+  ];
+  assert.deepEqual(conversationEvents(rows).map(row => row.id), ['u2']);
+  assert.deepEqual(conversationEvents(rows, {details: true}).map(row => row.id), ['u1', 'w1', 'u2']);
 });

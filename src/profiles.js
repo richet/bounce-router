@@ -9,7 +9,7 @@ import {normalizeLocalSettings} from './local-models.js';
 import {PROFILE_TIERS} from './jev.js';
 
 // The code fallback for a role LABEL that no agent file declares; an agent file's own `policy` wins.
-export const READ_ONLY_ROLES = new Set(['critic', 'verifier', 'analyst']);
+export const READ_ONLY_ROLES = new Set(['critic']);
 
 // Phase 8 §3: `strategy` is a declarative Tier-1 setting — a string preset resolved to the
 // actual strategy object here, so callers (reload.js) never parse the string themselves.
@@ -139,7 +139,7 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
     let role = raw.role ?? 'builder';
     if (typeof role !== 'string' || !role) throw new Error(`profile ${name}: role must be a non-empty string`);
     if (name === orchestrator) role = 'orchestrator';
-    const policy = raw.policy ?? (raw.adapter === 'typesafe' || readOnly.has(role) ? 'read-only' : 'write');
+    const policy = raw.policy ?? (raw.adapter === 'typesafe' || readOnly.has(role) ? 'read-only' : roles?.get(role)?.policy ?? (['analyst', 'verifier'].includes(role) ? 'probe' : 'write'));
     if (!['write', 'read-only', 'probe'].includes(policy)) throw new Error(`profile ${name}: policy must be write, read-only or probe`);
     // A decision model (typesafe) has no tools: it can only ever be a read-only reviewer.
     if (raw.adapter === 'typesafe' && policy === 'write') throw new Error(`profile ${name}: typesafe must be read-only`);
@@ -186,6 +186,7 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
         // A plan session is read-only end to end: a write agent is not offered rather than refused,
         // so a fresh install (whose shipped team has write agents) still plans.
         if (settings.mode === 'plan' && (agent.policy ?? 'write') === 'write') { skipped.push({agent: agent.name, ref, reason: 'a plan session runs read-only agents only'}); return false; }
+        if (agent.policy === 'probe' && !PROBE_ADAPTERS.has(isLocal(provider) ? 'opencode' : provider)) { skipped.push({agent: agent.name, ref, reason: 'adapter cannot run isolated checks'}); return false; }
         if (isLocal(provider) && !local.enabled) { skipped.push({agent: agent.name, ref, reason: 'local models are off (/local on)'}); return false; }
         if (isLocal(provider) ? !adapterNames.includes('opencode') : !adapterNames.includes(provider)) { skipped.push({agent: agent.name, ref, reason: `no ${provider} adapter on this machine`}); return false; }
         return true;
@@ -195,9 +196,8 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
     backends.forEach(({provider, model}, index) => {
       const name = chain[index];
       const mode = settings.mode;
-      // An AI that cannot enforce `probe` plays the agent read-only: less privilege, never more, so the
-      // agent stays available (the shipped reviewer names no AI and claude plays it first by default).
-      const policy = agent.policy === 'probe' && !PROBE_ADAPTERS.has(isLocal(provider) ? 'opencode' : provider) ? 'read-only' : agent.policy ?? 'write';
+      // Unsupported probe adapters were excluded above; never silently remove command tools.
+      const policy = agent.policy ?? 'write';
       const base = {derived: true, adapter: isLocal(provider) ? 'opencode' : provider, model, mode, policy,
         fallback: chain.slice(index + 1, index + 2), role: agent.name, executables: {...(settings.executables ?? {})},
         agent: {name: agent.name, description: agent.description, policy, prompt: agent.prompt, ...(agent.maxSteps ? {maxSteps: agent.maxSteps} : {})}};

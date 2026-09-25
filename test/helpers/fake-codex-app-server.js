@@ -57,7 +57,7 @@ const handlers = {
   },
   // codex-cli 0.154's shape: the thread object, not a bare threadId.
   'thread/start': params => {
-    if (!['never', 'on-request'].includes(params?.approvalPolicy) || !['read-only', 'danger-full-access'].includes(params?.sandbox)) {
+    if (!['never', 'on-request'].includes(params?.approvalPolicy) || !['read-only', 'workspace-write', 'danger-full-access'].includes(params?.sandbox)) {
       throw Object.assign(new Error('thread/start requires App Server permission settings'), {code: -32602});
     }
     return {thread: {id: `t-${++threads}`}};

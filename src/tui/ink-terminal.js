@@ -10,7 +10,7 @@ const EMPTY_VIEW = {agentsOpen: false, selectedId: 'orchestrator', input: '', sc
 
 // CLI owns commands, drafts and focus policy. This adapter owns terminal mode, parses input once,
 // and turns the incremental event log projection into an Ink frame.
-export function createInkTerminal({stdin = process.stdin, stdout = process.stdout, onKeypress = () => {}, onPaste = () => {}, onResize = () => {}, onScroll = () => {}, onPress = () => {}, onFrame = () => {}, history, projectionOptions} = {}) {
+export function createInkTerminal({stdin = process.stdin, stdout = process.stdout, onKeypress = () => {}, onPaste = () => {}, onResize = () => {}, onScroll = () => {}, onScrollClamp = () => {}, onPress = () => {}, onFrame = () => {}, history, projectionOptions} = {}) {
   const projection = createWorkspaceProjection(projectionOptions);
   let view = {...EMPTY_VIEW};
   let app = null;
@@ -31,6 +31,8 @@ export function createInkTerminal({stdin = process.stdin, stdout = process.stdou
   const formatter = createFormatter({color: Boolean(stdout.isTTY) && !('NO_COLOR' in process.env), compact: true});
   const detailFormatter = createFormatter({color: Boolean(stdout.isTTY) && !('NO_COLOR' in process.env)});
   let prepared = null;
+  let heldTranscript = null;
+  const heldActivities = new Map();
   const transcriptRows = [];
   const formattedEvents = new Map();
   const keyboard = new PassThrough();
@@ -73,16 +75,39 @@ export function createInkTerminal({stdin = process.stdin, stdout = process.stdou
     return transcriptRows;
   }
 
-  function renderNow() {
-    if (!app || suspended || frozen || outputBlocked) return;
+  function clampScroll(id, scroll) {
+    const selected = view.agentsOpen ? view.selectedId : 'orchestrator';
+    view = {...view, paneScrolls: {...view.paneScrolls, [id]: scroll}, ...(id === selected ? {scroll} : {})};
+    onScrollClamp(id, scroll);
+  }
+
+  function frameProps() {
+    const model = projection.model();
     const contentWidth = workspaceColumns(view.columns, {sidebar: view.sidebar}).content;
     const width = view.agentsOpen && contentWidth >= 60
-      ? paneGrid(projection.model().panes.length + 1, contentWidth, 10).panes[0].width - 4
+      ? paneGrid(model.panes.length + 1, contentWidth, 10).panes[0].width - 4
       : contentWidth - 2;
-    const rowLimit = Math.max(1, (view.rows ?? 24) + Math.max(0, view.scroll ?? 0));
-    visibleTranscriptRows(view.scroll > 0 && history ? history() : projection.transcriptEvents(), width, rowLimit);
+    const transcriptScroll = view.agentsOpen ? (view.paneScrolls?.orchestrator ?? (view.selectedId === 'orchestrator' ? view.scroll : 0)) : view.scroll;
+    const rowLimit = Math.max(1, (view.rows ?? 24) + Math.max(0, transcriptScroll ?? 0));
+    if (transcriptScroll > 0) heldTranscript ??= (history ? history() : projection.transcriptEvents()).slice();
+    else heldTranscript = null;
+    const transcriptVisible = !view.agentsOpen || contentWidth >= 60 || view.selectedId === 'orchestrator';
+    if (transcriptVisible) visibleTranscriptRows(heldTranscript ?? projection.transcriptEvents(), width, rowLimit);
+    const paneIds = new Set(model.panes.map(pane => pane.id));
+    for (const id of heldActivities.keys()) if (!paneIds.has(id)) heldActivities.delete(id);
+    const panes = model.panes.map(pane => {
+      const scroll = view.paneScrolls?.[pane.id] ?? (pane.id === view.selectedId ? view.scroll : 0);
+      if (!scroll) { heldActivities.delete(pane.id); return pane; }
+      if (!heldActivities.has(pane.id)) heldActivities.set(pane.id, pane.activity.slice());
+      return {...pane, activity: heldActivities.get(pane.id)};
+    });
+    return {model: {...model, panes}, transcriptRows, view: {...view}, onScrollClamp: clampScroll};
+  }
+
+  function renderNow() {
+    if (!app || suspended || frozen || outputBlocked) return;
     renderedRevision = revision;
-    app.rerender(app.elementFactory({model: projection.model(), transcriptRows, view: {...view}}));
+    app.rerender(app.elementFactory(frameProps()));
     renderCount++;
   }
   // One bounded frame scheduler coalesces provider bursts; it never accumulates a frame queue.
@@ -116,6 +141,8 @@ export function createInkTerminal({stdin = process.stdin, stdout = process.stdou
   function reset(events = []) {
     projection.reset(events);
     prepared = null;
+    heldTranscript = null;
+    heldActivities.clear();
     formattedEvents.clear();
     transcriptRows.length = 0;
     revision++;
@@ -148,13 +175,8 @@ export function createInkTerminal({stdin = process.stdin, stdout = process.stdou
     };
     drainListener = () => { outputBlocked = false; render(); };
     stdout.on?.('drain', drainListener);
-    const contentWidth = workspaceColumns(view.columns, {sidebar: view.sidebar}).content;
-    const width = view.agentsOpen && contentWidth >= 60
-      ? paneGrid(projection.model().panes.length + 1, contentWidth, 10).panes[0].width - 4
-      : contentWidth - 2;
-    visibleTranscriptRows(projection.transcriptEvents(), width, Math.max(1, view.rows ?? 24));
     renderedRevision = revision;
-    app = inkRender(elementFactory({model: projection.model(), transcriptRows, view: {...view}}), {
+    app = inkRender(elementFactory(frameProps()), {
       stdin, stdout: output, exitOnCtrlC: false, patchConsole: false,
       onRender: ({renderTime}) => queueMicrotask(() => {
         frameCount++;

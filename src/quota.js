@@ -24,7 +24,8 @@ const codexWindows = limits => ['primary', 'secondary'].flatMap(key => {
     pick(w, 'usedPercent', 'used_percent'), pick(w, 'resetsAt', 'resets_at'), minutes)];
 });
 
-// A live stream event carrying quota, or null. Claude reports quota only this way.
+// A live stream event carrying quota, or null. During a turn this is Claude's only quota
+// source; readQuota below covers the gap between turns with a one-shot `/usage` query.
 export function quotaSnapshot(provider, raw) {
   if (!raw || typeof raw !== 'object') return null;
   if (provider === 'claude' && raw.type === 'rate_limit_event') {
@@ -47,6 +48,48 @@ export function quotaSnapshot(provider, raw) {
   return null;
 }
 
+// --- Claude's between-turn /usage query -----------------------------------
+// `claude -p "/usage" --output-format json` is a LOCAL command (zero cost/tokens) whose `result`
+// string is prose, e.g. "Current session: 8% used · resets Sep 25 at 11:49am (America/Mexico_City)".
+const USAGE_LINE = /^Current (session|week)(?: \(([^)]+)\))?: (\d+(?:\.\d+)?)% used · resets (\w+) (\d{1,2}) at (\d{1,2})(?::(\d{2}))?(am|pm) \(([^)]+)\)$/;
+const MONTHS = {Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11};
+// Given a wall-clock reading in an IANA zone, its UTC epoch — no year, so month/day/hour/minute
+// only. The double-format trick (no new deps): format a UTC guess back in the target zone, the
+// gap between the two is the zone's offset at that instant.
+function zonedEpoch(year, month, day, hour, minute, timeZone) {
+  const guess = Date.UTC(year, month, day, hour, minute);
+  const dtf = new Intl.DateTimeFormat('en-US', {timeZone, hourCycle: 'h23',
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit'});
+  const parts = dtf.formatToParts(new Date(guess)).reduce((acc, p) => {acc[p.type] = p.value; return acc;}, {});
+  const asUTC = Date.UTC(+parts.year, +parts.month - 1, +parts.day, +parts.hour, +parts.minute, +parts.second);
+  return guess - (asUTC - guess);
+}
+// No year on the line: the next occurrence at/after now, rolling into next year across December.
+function nextReset(month, day, hour, minute, timeZone, now) {
+  const year = Number(new Intl.DateTimeFormat('en-US', {timeZone, year: 'numeric'}).format(now));
+  const epoch = zonedEpoch(year, month, day, hour, minute, timeZone);
+  return epoch >= now ? epoch : zonedEpoch(year + 1, month, day, hour, minute, timeZone);
+}
+// One line -> one window, or null if the line isn't a quota line at all (skip, don't fail the read).
+function parseUsageLine(line, now) {
+  const m = USAGE_LINE.exec(line.trim());
+  if (!m) return null;
+  const [, kind, paren, percent, monStr, dayStr, hourStr, minStr, ampm, tz] = m;
+  if (!(monStr in MONTHS)) return null;
+  const hour = (Number(hourStr) % 12) + (ampm === 'pm' ? 12 : 0);
+  const resetsAt = nextReset(MONTHS[monStr], Number(dayStr), hour, minStr ? Number(minStr) : 0, tz, now);
+  // "session" is the 5-hour window rate_limit_event also reports; "week (all models)" is the
+  // 7-day window; a named model's week has no rate_limit_event counterpart, so it gets a plain
+  // `7d <Model>` label — consistent with the 7d label, distinguished by the model it names.
+  const label = kind === 'session' ? claudeLabels.five_hour
+    : !paren || paren === 'all models' ? claudeLabels.seven_day : `${claudeLabels.seven_day} ${paren}`;
+  const minutes = kind === 'session' ? claudeMinutes.five_hour : claudeMinutes.seven_day;
+  return makeWindow(label, percent, resetsAt / 1000, minutes);
+}
+export function parseUsageResult(text, now) {
+  return String(text ?? '').split('\n').map(line => parseUsageLine(line, now)).filter(Boolean);
+}
+
 // Agents that answer a quota question between turns do it over their own protocol.
 export const quotaQueries = {
   codex: {
@@ -65,46 +108,82 @@ export const quotaQueries = {
       return true;
     },
   },
+  claude: {
+    // --no-session-persistence: a print-mode /usage call would otherwise show up in the user's
+    // own `claude --resume` history for no reason — this is bounce polling, not a conversation.
+    args: ['-p', '/usage', '--output-format', 'json', '--no-session-persistence'],
+    requests: [],
+    throttleMs: 60000, // at most one /usage spawn per process per minute
+    read(raw, out, now) {
+      if (raw?.local_command !== 'usage') return false;
+      if (raw.is_error) { out.error = typeof raw.result === 'string' && raw.result ? raw.result : 'claude usage query failed'; return true; }
+      const windows = parseUsageResult(raw.result, now);
+      if (!windows.length) { out.error = 'claude reported no quota'; return true; }
+      out.windows = windows;
+      out.plan = null;
+      return true;
+    },
+  },
 };
-// Where a reading can come from: Codex answers between turns, Claude reports its
-// windows only while a turn runs, and Muse's protocol carries no quota at all.
-const streamsQuota = new Set(['claude', 'codex']);
 export const quotaUnavailable = provider => quotaQueries[provider] ? `${provider} reported no quota`
-  : streamsQuota.has(provider) ? `${provider} reports quota only while a turn runs; none seen yet`
   : `${provider} does not report quota`;
-export async function readQuota(provider, executable = provider, {spawn, timeout = 15000, cwd} = {}) {
+// One /usage spawn per provider per throttle window; readings a fraction of a second apart
+// (a redraw storm) reuse the last result. `cache` defaults to module-level so real callers share it; tests override it.
+const throttled = new Map();
+export async function readQuota(provider, executable = provider, {spawn, timeout = 15000, cwd, now = Date.now(), cache = throttled} = {}) {
   const query = quotaQueries[provider];
-  const time = new Date().toISOString();
+  const time = new Date(now).toISOString();
   if (!query) return {provider, windows: [], plan: null, time, error: quotaUnavailable(provider)};
-  const {out, error} = await queryLines({executable, args: query.args, requests: query.requests, read: query.read,
+  if (query.throttleMs) {
+    const cached = cache.get(provider);
+    if (cached && now - cached.at < query.throttleMs) return cached.result;
+  }
+  const {out, error} = await queryLines({executable, args: query.args, requests: query.requests, read: (raw, o) => query.read(raw, o, now),
     spawn, timeout, cwd, messages: {missing: `${provider} CLI not installed`, timeout: `${provider} did not answer in time`,
       closed: `${provider} exited before reporting quota`}});
-  return {provider, windows: out.windows ?? [], plan: out.plan ?? null, time,
+  const result = {provider, windows: out.windows ?? [], plan: out.plan ?? null, time,
     error: out.windows?.length ? null : out.error || error || `${provider} reported no quota`};
+  if (query.throttleMs) cache.set(provider, {at: now, result});
+  return result;
 }
 
 export const quotaFile = root => path.join(root, 'quota.json');
 export function loadQuota(root) {
   try { return JSON.parse(fs.readFileSync(quotaFile(root), 'utf8')); } catch { return {}; }
 }
-// Percentages repeat many times per turn. The store always holds the latest reading;
-// only a changed reading is written to disk, and only a change asks for a redraw.
+// A reading unchanged for this long still gets its `time` bumped to now, so the sidebar's age
+// marker (compactAge, STALE_READING_MS) never falls more than this far behind the true age of
+// the last real read.
+const TIME_REFRESH_MS = 60000;
+// Only a changed (or gone-stale) reading is written to disk, and a write merges with disk first
+// so another process's fresher reading for a different provider is never overwritten.
 export function recordQuota(store, root, snapshot) {
   if (!snapshot?.provider) return false;
   const previous = store[snapshot.provider];
   const time = snapshot.time ?? new Date().toISOString();
   const value = snapshot.windows?.length ? {...snapshot, time, error: snapshot.error ?? null}
     : previous ? {...previous, error: snapshot.error ?? null} : {...snapshot, windows: [], time};
-  store[snapshot.provider] = value;
   const same = previous && JSON.stringify({...previous, time: 0}) === JSON.stringify({...value, time: 0});
-  if (same) return false;
-  if (root) saveJSON(quotaFile(root), store);
+  // The in-memory store always carries the newest time this process has seen, whether or not it
+  // gets written — that already kept this process's own view fresh. What "went stale" per the
+  // complaint was the DISK copy: staleness below is judged against it, not the in-memory value,
+  // or a process polling on a steady cadence would never see its own previous write as stale.
+  store[snapshot.provider] = {...value, time};
+  if (!root) return !same;
+  const disk = loadQuota(root);
+  const staleOnDisk = !disk[snapshot.provider]?.time || Date.parse(time) - Date.parse(disk[snapshot.provider].time) >= TIME_REFRESH_MS;
+  if (same && !staleOnDisk) return false;
+  for (const [provider, entry] of Object.entries(disk)) {
+    if (provider === snapshot.provider) continue; // this call's own provider is always the freshest
+    if (!store[provider] || Date.parse(entry.time ?? 0) > Date.parse(store[provider].time ?? 0)) store[provider] = entry;
+  }
+  saveJSON(quotaFile(root), store);
   return true;
 }
 // Which vendors the usage panel shows: the fallback order, plus — in orchestrator mode — every
 // adapter a profile runs on (the workers' vendors are where the quota actually goes), in that
 // order, deduped, only vendors that report quota. Pure.
-export function usageOrder(order = [], profiles = {}, known = [...new Set([...streamsQuota, ...Object.keys(quotaQueries)])]) {
+export function usageOrder(order = [], profiles = {}, known = Object.keys(quotaQueries)) {
   const adapters = Object.values(profiles ?? {}).map(p => p?.adapter).filter(Boolean);
   return [...new Set([...order, ...adapters])].filter(p => known.includes(p));
 }
@@ -128,6 +207,19 @@ const since = (time, now) => {
 };
 // A window that has since reset makes its percentage obsolete: say so, never show it.
 const expired = (w, now) => w.resetsAt !== null && w.resetsAt <= now;
+// A reading older than this is worth flagging beside its percentage — /quota already says
+// "reported 1h 35m ago"; the sidebar row showed the same stale number with no hint of its age.
+const STALE_READING_MS = 30 * 60000;
+// Single-unit form ("1h ago", not "1h 35m ago"): the sidebar row has no room for the long form.
+const compactAge = (time, now) => {
+  const age = now - Date.parse(time);
+  if (!Number.isFinite(age)) return null;
+  if (age < STALE_READING_MS) return null;
+  const minutes = Math.round(age / 60000);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  return hours < 24 ? `${hours}h ago` : `${Math.floor(hours / 24)}d ago`;
+};
 // Header form: short enough to sit beside the fallback order.
 export const quotaShort = (entry, now = Date.now()) => (entry?.windows ?? [])
   .map(w => expired(w, now) ? `${w.label} reset` : `${w.label} ${w.percent}%`).join(' · ');
@@ -198,9 +290,11 @@ export function quotaPanel(store, order, {width = 30, now = Date.now(), rows = I
     return p.title([provider.toUpperCase(), entry?.plan ? planTitle(entry.plan) : null].filter(Boolean).join(' · '))
       + (cooldowns[provider] > now ? p.muted(' · cooldown') : '');
   };
-  const line = (w, detail) => {
+  const line = (w, detail, readingTime) => {
     if (expired(w, now)) return [panelRow(windowTitle(w.label), [], 'reset', width, p)];
-    const head = panelRow(windowTitle(w.label), resetForms(w, now), `${w.percent}%`, width, p);
+    const age = readingTime != null ? compactAge(readingTime, now) : null;
+    const right = age ? `${w.percent}% · ${age}` : `${w.percent}%`;
+    const head = panelRow(windowTitle(w.label), resetForms(w, now), right, width, p);
     return detail === 'bars' ? [head, quotaBar(w, width, now, p)] : [head];
   };
   const build = detail => order.flatMap((provider, index) => {
@@ -210,7 +304,7 @@ export function quotaPanel(store, order, {width = 30, now = Date.now(), rows = I
     const gap = index && detail !== 'compact' ? [''] : [];
     if (!windows.length) return [...gap, head(provider), p.muted(entry?.error ?? quotaUnavailable(provider))];
     if (detail === 'compact') return [head(provider), p.muted(quotaShort(entry, now))];
-    return [...gap, head(provider), ...windows.flatMap(w => line(w, detail))];
+    return [...gap, head(provider), ...windows.flatMap(w => line(w, detail, entry.time))];
   });
   let built = [];
   for (const detail of ['bars', 'lines', 'compact']) {

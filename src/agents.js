@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {createHash} from 'node:crypto';
+import {createHash, randomUUID} from 'node:crypto';
 import {validateOrchestration, LOCAL_ADAPTERS} from './profiles.js';
 import {normalizeLocalSettings} from './local-models.js';
 
@@ -11,7 +11,7 @@ import {normalizeLocalSettings} from './local-models.js';
 // different policy or scope. Kept in one place the way skills are, in override order:
 //   shipped with the orchestration skill  →  the adopted/edited skill in the data root
 //   →  <root>/agents/  →  <workspace>/.bounce/agents/
-// The orchestration skill ships the defaults (builder, integrator, reviewer, analyst), so a fresh
+// The orchestration skill ships the defaults (analyst, builder, debugger, reviewer), so a fresh
 // install has a working team with no file on disk; nothing but `orchestrator` is built in.
 //
 // `policy` is an attribute the file opts into, not what an agent is. `maxSteps` reaches runtimes
@@ -20,8 +20,6 @@ export const SKILL = 'agent-orchestrator';
 export const agentStore = root => path.join(root, 'agents');
 export const projectAgentStore = cwd => path.join(cwd, '.bounce', 'agents');
 export const installedSkillAgents = root => path.join(root, 'skills', SKILL, 'team');
-// `team/`, not `agents/`: the skill's `agents/` directory holds the vendor subagent role files
-// (orch-*.md for Claude Code, orch-*.toml for Codex), which are a different thing.
 const SHIPPED = fileURLToPath(new URL(`../skills/${SKILL}/team/`, import.meta.url));
 const LISTS = ['models', 'readPaths', 'writePaths', 'commands'];
 export const AUTO_MODEL = 'auto';
@@ -76,6 +74,19 @@ export function serializeAgent(agent) {
   return lines.join('\n');
 }
 
+// Readers run in other processes (the TUI host and daemon). Publish a complete file with one
+// same-directory rename so they can observe either the old definition or the new one, never the
+// create/truncate window of writeFileSync on the final pathname.
+function writeComplete(file, text) {
+  const temporary = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${randomUUID()}.tmp`);
+  try {
+    fs.writeFileSync(temporary, text, {mode: 0o600});
+    fs.renameSync(temporary, file);
+  } finally {
+    try { fs.rmSync(temporary, {force: true}); } catch {}
+  }
+}
+
 // Writes an agent file where asked, after re-parsing what will be written so an invalid definition
 // never lands. Files bounce authored are recorded by content hash so a later write never clobbers a
 // user's edit: an authored file may be rewritten only while it still matches what bounce wrote.
@@ -91,8 +102,8 @@ export function writeAgent(dir, agent, {authored = false, force = false} = {}) {
     const current = fs.readFileSync(file, 'utf8');
     if (!force && record[meta.name] !== hash(current)) throw Object.assign(new Error(`${meta.name} was edited by hand; it will not be overwritten`), {code: 'AGENT_EDITED'});
   }
-  fs.writeFileSync(file, text, {mode: 0o600});
-  if (authored) { record[meta.name] = hash(text); fs.writeFileSync(ledger, JSON.stringify(record, null, 2) + '\n', {mode: 0o600}); }
+  writeComplete(file, text);
+  if (authored) { record[meta.name] = hash(text); writeComplete(ledger, JSON.stringify(record, null, 2) + '\n'); }
   return {file, agent: meta};
 }
 const hash = value => createHash('sha256').update(value).digest('hex');

@@ -18,6 +18,7 @@ import {validateOrchestration, playedBy} from '../src/profiles.js';
 import {agentMetadata} from '../src/agents.js';
 import {undescribedModels} from '../src/roster-notes.js';
 import {fakeAdapter} from './helpers/fake-adapter.js';
+import {hostless} from './helpers/local-fakes.js';
 
 const model = (id, extra = {}) => ({id, ref: `lmstudio/${id}`, type: 'llm', tools: true, ready: true, instances: [{id: `${id}@live`, context: 65536}], context: 65536, ...extra});
 const catalogs = models => [{provider: 'local', backend: 'lmstudio', endpoint: 'lmstudio', models}];
@@ -90,7 +91,7 @@ test('scheduler: Jev\'s local pick runs the job through opencode on that model, 
   const jev = createJevDecisions({readSettings: () => ({enabled: true, routing: true}), order: () => ['claude'], locals: async () => locals,
     adapter: {ask: async () => ({answers: tier('strongest', 0.9), model: 'jev-1.13.0', latencyMs: 4})}});
   const localResolver = {resolve: async ({profile}) => ({...profile, providerID: 'lmstudio', opencodeConfig: {}}), configure() {}};
-  const scheduler = createScheduler({session, profiles: table(), jev, localResolver, gitHead: () => null, adapters: {
+  const scheduler = createScheduler({...hostless, session, profiles: table(), jev, localResolver, gitHead: () => null, adapters: {
     opencode: worker('opencode', () => [{kind: 'result', status: 'failed', recoverable: true, text: 'endpoint down'}]),
     claude: worker('claude', () => [{kind: 'result', status: 'completed', text: 'done'}])}});
   t.after(() => scheduler.close());

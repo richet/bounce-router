@@ -10,6 +10,7 @@ import path from 'node:path';
 import {Session} from '../src/core.js';
 import {createScheduler} from '../src/scheduler.js';
 import {fakeAdapter} from './helpers/fake-adapter.js';
+import {hostless} from './helpers/local-fakes.js';
 
 const waitFor = async fn => { const start = Date.now(); for (;;) { const value = fn(); if (value) return value; if (Date.now() - start > 8000) throw new Error('timed out'); await new Promise(r => setTimeout(r, 10)); } };
 const local = name => ({adapter: 'opencode', backend: 'lmstudio', endpoint: 'lmstudio', model: 'm', mode: 'yolo', policy: 'write', fallback: [], role: name, agent: {name, description: 'x', policy: 'write', prompt: 'x'}, derived: true, localOptions: {}});
@@ -21,10 +22,13 @@ test('no more local workers run at once than the endpoint allows; the rest wait 
   const gates = new Map(); let launched = [];
   const first = orders => orders.split('\n')[0]; // a local worker's orders carry a report line after them
   const opencode = fakeAdapter(({orders}) => { const gate = Promise.withResolvers(); gates.set(first(orders), gate); launched.push(first(orders)); return gate.promise; });
-  const claude = fakeAdapter(({orders}) => { launched.push(orders); return [{kind: 'result', status: 'completed', text: 'cloud done'}]; });
+  // The cloud profile is write-policy too, so it now also runs in a fenced attempt workspace and its
+  // orders carry the appended working-copy paragraph (src/scheduler.js inWorkingCopy) — take the first
+  // line, same as the opencode adapter above, rather than the raw multi-line text.
+  const claude = fakeAdapter(({orders}) => { launched.push(first(orders)); return [{kind: 'result', status: 'completed', text: 'cloud done'}]; });
   const localResolver = {resolve: async ({profile}) => ({...profile, providerID: 'lmstudio', opencodeConfig: {}}), configure() {}};
   const profiles = {a: local('a'), b: local('b'), c: local('c'), cloud: {adapter: 'claude', model: 's', mode: 'yolo', policy: 'write', fallback: [], role: 'builder'}};
-  const scheduler = createScheduler({session, adapters: {opencode, claude}, profiles, localResolver, gitHead: () => null,
+  const scheduler = createScheduler({...hostless, session, adapters: {opencode, claude}, profiles, localResolver, gitHead: () => null,
     localSettings: {endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234', maxConcurrent: 2}}}});
   t.after(() => scheduler.close());
   const one = scheduler.submit({parent: null, profile: 'a', orders: 'one', deadline: null});
@@ -61,7 +65,7 @@ test('slots are per model: a worker on an idle model starts while another model 
   const localResolver = {resolve: async ({profile}) => ({...profile, providerID: 'lmstudio', opencodeConfig: {}}), configure() {}};
   const on = (name, model) => ({adapter: 'opencode', backend: 'lmstudio', endpoint: 'lmstudio', model, mode: 'yolo', policy: 'write', fallback: [], role: name, agent: {name, description: 'x', policy: 'write', prompt: 'x'}, derived: true, localOptions: {}});
   const profiles = {b1: on('b1', 'big'), b2: on('b2', 'big'), b3: on('b3', 'big'), r1: on('r1', 'reviewer-model'), r2: on('r2', 'reviewer-model'), r3: on('r3', 'reviewer-model')};
-  const scheduler = createScheduler({session, adapters: {opencode}, profiles, localResolver, gitHead: () => null,
+  const scheduler = createScheduler({...hostless, session, adapters: {opencode}, profiles, localResolver, gitHead: () => null,
     localSettings: {endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234', maxConcurrent: 4, slotsPerModel: 2}}}});
   t.after(() => scheduler.close());
   const wait = async fn => { const start = Date.now(); for (;;) { const v = fn(); if (v) return v; if (Date.now() - start > 8000) throw new Error('timed out'); await new Promise(r => setTimeout(r, 10)); } };

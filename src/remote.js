@@ -27,7 +27,7 @@ export function hostSession({session, child, main = null}) {
       session.active = msg.provider;
     } else if (msg.type?.startsWith('main.')) {
       const method = msg.type.slice('main.'.length);
-      const fn = ['run', 'deliver', 'cancel'].includes(method) ? main?.[method] : null;
+      const fn = ['run', 'deliver', 'cancel', 'withdraw'].includes(method) ? main?.[method] : null;
       if (typeof fn !== 'function') {
         child.send({type: 'main.error', seq: msg.seq, message: 'main provider is unavailable'});
         return;
@@ -47,7 +47,8 @@ export function hostSession({session, child, main = null}) {
   return {detach() { unsubscribe(); unsubscribeMain(); child.off('message', onMessage); }};
 }
 
-// Child side: a synchronous proxy with the same public shape as Session. append/publish
+// Child side: a synchronous append/publish proxy. Durable multi-event commits remain
+// daemon-owned; this proxy intentionally does not expose Session.commit. append/publish
 // build a provisional row immediately (no seq), then the parent's reply (or its broadcast
 // of the same row, whichever arrives first) replaces it in place.
 export function createRemoteSession(channel) {
@@ -97,6 +98,7 @@ export function createRemoteSession(channel) {
       runMain: params => callMain('run', params),
       deliverMain: params => callMain('deliver', params),
       cancelMain: params => callMain('cancel', params),
+      withdrawMain: params => callMain('withdraw', params),
       main: {state: 'unknown', currentTurnId: null},
       flush,
       lock() {}, unlock() {},

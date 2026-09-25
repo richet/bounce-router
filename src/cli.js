@@ -14,6 +14,7 @@ import {modelCatalog, modelEntries, catalogNotes} from './models.js';
 import {discoverLocalModels, switchLocal} from './local-models.js';
 import {readMachine, resourceReport, createResources} from './resources.js';
 import {taskView, taskList} from './task-view.js';
+import {campaigns} from './orchestration.js';
 import {formatTaskView, formatTaskList} from './task-report.js';
 import {runLocalSetup} from './local-wizard.js';
 import {createLocalSetupView} from './local-setup-view.js';
@@ -39,6 +40,7 @@ import * as reducers from './reducers.js';
 import {providers, runProcess} from './providers.js';
 import {projectRoot, fingerprint, validate, supervise, pidAlive} from './reload.js';
 import {listSessions, resolveSessionRef, sessionsTable, sessionAge} from './sessions.js';
+import {titleSession, createAsk} from './session-title.js';
 import {createRemoteSession} from './remote.js';
 import {version, checkUpdate, globalInstall, installUpdate} from './update.js';
 import {helpText, helpRows} from './help.js';
@@ -171,7 +173,7 @@ async function main() {
     const machine = readMachine();
     const fleet = await discoverLocalModels(settings.local, {maxAge: 0}).catch(() => []);
     if (values.json) return console.log(JSON.stringify({machine, fleet}, null, 2));
-    return console.log(resourceReport({machine, fleet, busy: [], swapping: false}));
+    return console.log(resourceReport({machine, fleet, busy: []}));
   }
   if (positionals[0] === 'quota') {
     const store = await refreshQuota(settings, {root, cwd});
@@ -226,26 +228,32 @@ async function main() {
   // The agent-facing interface over MCP (docs/plans/bridge-interface.md): the same verbs and views the
   // bridge and these commands use, as typed tools, so an orchestrator stops shelling and parsing.
   if (positionals[0] === 'mcp-serve') {
-    const {createOps, liveSessionCredentials} = await import('./bridge-ops.js');
+    const {createOps, sessionBinding} = await import('./bridge-ops.js');
     const {createMcpServer, serveStdio} = await import('./mcp.js');
-    // Which session: the bus socket lives in its directory; failing that, the live one.
-    const busDir = process.env.BOUNCE_BUS && process.env.BOUNCE_BUS.endsWith('bus.sock') ? path.dirname(process.env.BOUNCE_BUS) : null;
-    const id = busDir && path.basename(path.dirname(busDir)) === 'sessions' ? path.basename(busDir)
-      : (listSessions(root).find(row => row.live)?.id ?? listSessions(root)[0]?.id ?? null);
-    const journal = id ? path.join(root, 'sessions', id, 'journal.jsonl') : null;
-    const events = () => id ? new Session(process.cwd(), {root, id}).events : [];
+    // Resolve once. Both the MCP views and mutations refresh this exact session after a
+    // daemon restart; neither is allowed to pick a newer session behind the other's back.
+    const binding = sessionBinding(root, {env: process.env});
+    const events = () => {
+      const found = binding.read();
+      if (!found.ok) return [];
+      return new Session(process.cwd(), {root, id: found.session}).events;
+    };
+    const journal = () => {
+      const found = binding.read();
+      return found.ok ? found.journal : null;
+    };
     const server = createMcpServer({
       // Codex launches this server from its own config, so the per-session grant never reaches its env:
       // without one, it finds the live session itself and refuses when that answer is not unique.
-      ops: createOps({env: process.env, discover: () => liveSessionCredentials(root)}),
-      views: {taskView: task => taskView(events(), task, {journal}), taskList: options => taskList(events(), options)},
+      ops: createOps({env: process.env, binding}),
+      views: {binding: () => binding.read(), taskView: (task, options) => taskView(events(), task, {journal: journal(), ...options}), taskList: options => taskList(events(), options), campaign: id => campaigns(events())[id] ?? null},
       version,
     });
     serveStdio(server);
     return new Promise(() => {}); // stdio server: it ends when its client closes the pipe
   }
   // The reads the orchestrator used to fake with `tail | jq` — the same view its tools return.
-  if (positionals[0] === 'task' && positionals[1] !== 'compare') {
+  if ((positionals[0] === 'task' || positionals[0] === 'tasks') && positionals[1] !== 'compare') {
     const ref = values.session || listSessions(root).find(row => row.live)?.id || listSessions(root)[0]?.id;
     if (!ref) throw new Error('No session to read · start one with `bounce`');
     const id = resolveSessionRef(root, ref);
@@ -339,7 +347,9 @@ async function main() {
   // Agent and the AGENTS pane stayed empty). Claude Code exposes --disallowedTools for exactly
   // this; other vendors' subagent features have no such switch here yet, so ORDERS.md forbids them.
   const noOwnSubagents = provider => provider === 'claude' ? ['--disallowedTools', 'Agent,Task'] : [];
-  const routerOptions = orchestrating ? {runner: options => runProcess({...options, keepBus: true}), extraArgs: noOwnSubagents} : {};
+  // Fire-and-forget: a new session's first prompt gets a model-given title once (src/session-title.js).
+  const onFirstUserPrompt = (s, cfg) => { titleSession({session: s, settings: cfg, ask: createAsk({executables: cfg.executables})}).catch(() => {}); };
+  const routerOptions = {onFirstUserPrompt, ...(orchestrating ? {runner: options => runProcess({...options, keepBus: true}), extraArgs: noOwnSubagents} : {})};
   const remoteMain = orchestrating && positionals[0] !== 'run' && typeof session.runMain === 'function';
   if (remoteMain && session.main?.provider) {
     settings.models[session.main.provider] = session.main.model ?? '';
@@ -379,6 +389,11 @@ async function main() {
     process.exit(process.exitCode ?? 0);
   }
   let attachedTurn = remoteMain && ['running', 'starting', 'blocked'].includes(session.main?.state);
+  // True from the moment Enter sends a prompt while an attached (daemon-started) turn is current
+  // until that keyboard turn settles: main-service.js queues the prompt server-side, so it has
+  // no requestId of its own yet here, but scheduleRender still must not treat the attached turn
+  // ending as this view going idle while its own reply is still waiting to start.
+  let waitingOnQueuedTurn = false;
   let input = '', inputCursor = 0, verticalColumn = null, busy = attachedTurn, suspended = false, scroll = 0, historyIndex = -1;
   let suggestion = null; // the main worker's proposed next step, offered in the prompt; never sent on its own
   const pendingTurns = [];
@@ -697,8 +712,9 @@ async function main() {
       menu: menu.map(([text, paint]) => paint(clean(text))),
       metadata: {
         ...headerProvider({settings, orchestration, active: session.active}), mode: settings.mode,
-        cwd: session.cwd, sessionId: session.id, operation: sessionOperation, pendingOperation: pendingOperation(), jev: jevSidebarLabel(settings.jev),
+        cwd: session.cwd, sessionId: session.id, name: reducers.sessionName(session.events), operation: sessionOperation, pendingOperation: pendingOperation(), jev: jevSidebarLabel(settings.jev),
         orchestrator: orchestration.orchestrator ?? 'main', pendingTurns: pendingTurns.length,
+        ownQueued: remoteMain ? reducers.queuedPrompts(session.events).length : 0,
         // The sidebar spends 11 rows on the header block, the AGENTS list and the two gaps, plus
         // one per worker; whatever is left (sidebarRows) is split between MODELS and quota, with
         // MODELS capped at 40% (and its own blank separator row when non-empty) so quota never
@@ -731,10 +747,17 @@ async function main() {
     }
     if (attachedTurn && ['main.terminal', 'main.blocked'].includes(event?.kind)) {
       attachedTurn = false;
-      busy = false;
-      notice = event.text || `Turn ${event.status ?? 'blocked'}.`;
-      // The answer is the turn's last assistant row, never this row's text (that is a failure reason).
-      suggestion = event.kind === 'main.terminal' && event.status === 'completed' && !input ? suggestionFrom(lastAnswer(session.events)) : null;
+      if (waitingOnQueuedTurn) {
+        // Our own reply is already sent (through the normal keyboard path — see the Enter
+        // handler) and main-service.js has it queued: this event only ends the FOREIGN turn we
+        // were attached to, not ours. Stay busy; the keyboard turn's own resolution reports it.
+        notice = 'Queued · runs when the current turn ends';
+      } else {
+        notice = event.text || `Turn ${event.status ?? 'blocked'}.`;
+        // The answer is the turn's last assistant row, never this row's text (that is a failure reason).
+        suggestion = event.kind === 'main.terminal' && event.status === 'completed' && !input ? suggestionFrom(lastAnswer(session.events)) : null;
+        busy = false;
+      }
     }
     if (event?.kind === 'progress') progress = clean(event.text);
     terminal?.ingest(event);
@@ -989,7 +1012,8 @@ async function main() {
           return;
         } else if (command === 'tasks') {
           const rows = Object.values(reducers.tasks(session.events));
-          session.append({kind: 'status', text: rows.length ? rows.map(task => `${task.profile} ${task.id.slice(0, 8)} · ${task.state}${task.blocker || task.error || task.summary ? ` · ${task.blocker || task.error || task.summary}` : ''}`).join('\n') : 'No tasks in this session'});
+          // `view: 'tasks'` lets the transcript fold repeated /tasks output to its latest copy.
+          session.append({kind: 'status', view: 'tasks', text: rows.length ? rows.map(task => `${task.profile} ${task.id.slice(0, 8)} · ${task.state}${task.blocker || task.error || task.summary ? ` · ${task.blocker || task.error || task.summary}` : ''}`).join('\n') : 'No tasks in this session'});
           notice = 'Task states saved in transcript · PgUp/PgDn scroll';
         } else if (command === 'rename') {
           const name = arg.trim();
@@ -1003,7 +1027,7 @@ async function main() {
           if (arg.trim()) { await switchSession(resolveSessionRef(root, arg.trim())); return; }
           const rows = listSessions(root).filter(r => r.cwd === session.cwd && r.id !== session.id).slice(0, 30);
           if (!rows.length) throw new Error('No other sessions in this workspace');
-          picker = {kind: 'session', index: 0, notes: [], entries: rows.map(r => ({id: r.id, label: `${r.name ?? r.id.slice(0, 8)} · ${sessionAge(r.updated)} ago · ${r.operation}${r.live ? ' · live' : ''} · ${r.id.slice(0, 8)}`}))};
+          picker = {kind: 'session', index: 0, notes: [], entries: rows.map(r => ({id: r.id, label: `${r.name ?? r.derivedName} · ${sessionAge(r.updated)} ago · ${r.operation}${r.live ? ' · live' : ''} · ${r.id.slice(0, 8)}`}))};
           notice = 'Pick a session to resume. Esc cancels.';
           return;
         } else if (command === 'btw') {
@@ -1061,13 +1085,19 @@ async function main() {
         history.push(text); historyIndex = -1; scroll = 0;
         const expanded = text.startsWith('/') ? expandVendorCommand(text, vendorOptions()) : null;
         notice = expanded ? `Running /${expanded.name} (${expanded.origin}) · Esc or Ctrl+C cancels the agent process group` : 'Running · Esc or Ctrl+C cancels the agent process group';
-        render(); const result = await router.run((remoteMain ? '' : orchestratorBrief) + withAsides(expanded?.prompt ?? text, asides.splice(0)), [], expanded ? {typed: text} : {}); notice = `Turn ${result}. Session saved.`;
+        render(); const result = await router.run((remoteMain ? '' : orchestratorBrief) + withAsides(expanded?.prompt ?? text, asides.splice(0)), [], expanded ? {typed: text} : {});
+        // A queued send the user pulled back (Up) settles as 'withdrawn': the withdraw's own notice stands.
+        if (result !== 'withdrawn') notice = `Turn ${result}. Session saved.`;
         suggestion = result === 'completed' && !input ? suggestionFrom(lastAnswer(session.events)) : null;
         void refreshQuota(settings, {root, store: quotas, cwd: session.cwd}).then(render, () => {});
         if (dev && result === 'completed' && fingerprint() !== loadedFingerprint) await restart();
       }
-    } catch (e) {notice = e.message; if (!input) { input = text; inputCursor = input.length; }}
+    } catch (e) {
+      notice = e.message;
+      if (!input) { input = text; inputCursor = input.length; }
+    }
     finally {
+      waitingOnQueuedTurn = false;
       if (!ownsTurn) { render(); return; }
       clearInterval(activityTimer); activityTimer = null; progress = '';
       const next = pendingTurns.shift();
@@ -1175,13 +1205,24 @@ async function main() {
           notice = `/${decision.command} cannot change the session while a turn is active · cancel it first`;
         } else if (decision.action === 'run-command') {
           void submit(text, {parsedCommand: decision, ownsTurn: false});
-        } else if (decision.action === 'queue-turn') {
-          if (attachedTurn) { notice = 'Existing turn is active · use /btw to steer it, or wait before starting a new prompt'; render(); return; }
+        } else if (decision.action === 'queue-turn' && (!attachedTurn || waitingOnQueuedTurn)) {
+          // Either this view already owns the turn that is running, or it already sent its own
+          // reply behind the attached turn (waitingOnQueuedTurn) and a further prompt must wait
+          // its turn too — the daemon client can only track one request in flight at a time.
+          // Queued locally, drained once the in-flight turn ends (the keyboard turn's own finally
+          // below).
           pendingTurns.push(text); historyIndex = -1;
           notice = `Queued · ${pendingTurns.length} turn${pendingTurns.length === 1 ? '' : 's'} waiting`;
         } else {
+          // A fresh turn, or the FIRST prompt typed while an attached (daemon-started) turn is
+          // current and this view has not sent its own reply yet: send it through the normal
+          // keyboard turn path right now (U5a: the only place a main turn starts). main-service.js
+          // queues a USER prompt server-side when it lands while a run is current, so this is
+          // never lost and never races the foreign turn for the daemon's slot.
+          if (attachedTurn) waitingOnQueuedTurn = true;
           busy = true;
           void submit(text, {parsedCommand: decision.kind === 'turn' ? decision : null});
+          if (attachedTurn) notice = 'Queued · runs when the current turn ends';
         }
       }
     }
@@ -1193,7 +1234,22 @@ async function main() {
     else if (key.name === 'delete') ({input, cursor: inputCursor} = (key.ctrl || key.meta) ? deleteWordForward(input, inputCursor) : deleteForward(input, inputCursor));
     else if (key.ctrl && key.name === 'u') { input = ''; inputCursor = 0; }
     else if (key.name === 'tab') {const i = settings.order.indexOf(selected()); router.select(settings.order[(i + 1) % settings.order.length]);}
-    else if (key.name === 'up' && !input.includes('\n')) {if (!localSetup) {historyIndex = Math.min(history.length - 1, historyIndex + 1); input = history[history.length - 1 - historyIndex] || ''; inputCursor = input.length;}}
+    else if (key.name === 'up' && !input.includes('\n')) {
+      const ownQueued = remoteMain && !input ? reducers.queuedPrompts(session.events) : [];
+      if (ownQueued.length) {
+        // Like Claude Code: Up on an empty input pulls the most recent still-queued prompt back
+        // for editing instead of recalling history. This only withdraws a queued prompt; it never
+        // starts a turn, so it needs no new submission call site (CONTRACT U5a).
+        const latest = ownQueued.at(-1);
+        void Promise.resolve(router.withdraw(latest.requestId)).then(result => {
+          if (result.withdrawn) { input = result.text; inputCursor = input.length; notice = 'Pulled back for editing · Enter resends, clear to cancel'; }
+          else notice = 'already started — cannot withdraw';
+          render();
+        }).catch(error => { notice = error.message; render(); });
+      } else if (!localSetup) {
+        historyIndex = Math.min(history.length - 1, historyIndex + 1); input = history[history.length - 1 - historyIndex] || ''; inputCursor = input.length;
+      }
+    }
     else if (key.name === 'down' && !input.includes('\n')) {if (!localSetup) {historyIndex = Math.max(-1, historyIndex - 1); input = historyIndex < 0 ? '' : history[history.length - 1 - historyIndex]; inputCursor = input.length;}}
     else if (str && !key.ctrl && !key.meta && !['left','right','home','end','delete','escape'].includes(key.name)) ({input, cursor: inputCursor} = insertText(input, inputCursor, clean(str).replace(/\n/g, ' ')));
     if (input !== beforeInput) {completionIndex = 0; menuDismissed = false;}
@@ -1205,6 +1261,11 @@ async function main() {
     onPaste: text => {
       if (suspended || copyPaused || picker) return;
       ({input, cursor: inputCursor} = insertText(input, inputCursor, clean(text))); completionIndex = 0; menuDismissed = false; render();
+    },
+    onScrollClamp: (id, value) => {
+      if (id === (agentsOpen ? selectedAgentPane : 'orchestrator')) scroll = value;
+      const saved = paneInputs.get(id);
+      if (saved) paneInputs.set(id, {...saved, scroll: value});
     },
     onScroll: amount => { if (!copyPaused) { scroll = Math.max(0, scroll + amount); render(); } },
     onPress: () => { if (suspended || copyPaused || !mouseScroll || notice === selectionHint) return; notice = selectionHint; render(); },
@@ -1223,9 +1284,17 @@ async function main() {
     t.unref?.();
   }
   void refreshQuota(settings, {root, store: quotas, cwd: session.cwd}).then(render, () => {});
+  // Nothing else refreshes the sidebar while the TUI sits idle between turns: without this, a
+  // reading shown on open just grows stale until the next turn or /quota. Checked once a minute,
+  // unref'd so it never keeps the process alive.
+  const quotaAgeTimer = setInterval(() => {
+    const oldest = Math.min(...quotaOrder().map(p => Date.parse(quotas[p]?.time ?? 0) || 0));
+    if (Date.now() - oldest > 10 * 60000) void refreshQuota(settings, {root, store: quotas, cwd: session.cwd}).then(render, () => {});
+  }, 60000);
+  quotaAgeTimer.unref?.();
 
   process.on('SIGTERM', () => { if (busy) {router.cancel(); const timer = setInterval(() => {if (!busy) {clearInterval(timer); quit();}}, 100);} else quit(); });
-  process.on('exit', () => { terminal?.unmount(); });
+  process.on('exit', () => { clearInterval(quotaAgeTimer); terminal?.unmount(); });
   enter();
   if (!dev && process.env.BOUNCE_NO_UPDATE_CHECK !== '1') {
     void globalInstall().then(() => checkUpdate({root})).then(release => {
@@ -1249,6 +1318,6 @@ const [bridgeCmd] = process.argv.slice(2);
 // the grant it holds. The supervisor strips the bus grant from every plain child it spawns, so
 // this must run in-process, like publish/wait/report — it reads config but never a session.
 (['publish', 'wait', 'report'].includes(bridgeCmd) ? runBridge()
-  : bridgeCmd === 'agents' ? main()
+  : ['agents', 'mcp-serve'].includes(bridgeCmd) ? main()
   : process.env.BOUNCE_SUPERVISED === '1' && typeof process.send === 'function' ? main() : supervise()
 ).catch(error => {console.error(`bounce: ${error.message}`); process.exitCode = 1;});

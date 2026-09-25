@@ -10,6 +10,7 @@ import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {createCodexLive} from '../../src/adapters/codex-live.js';
 import {version} from '../../src/update.js';
+import {REPORT_SCHEMA} from '../../src/reporting.js';
 
 // The fake stands in for `codex` itself: the adapter spawns it as the executable and talks the
 // app-server protocol to it. No test ever spawns a real vendor CLI.
@@ -220,6 +221,18 @@ test('X2c a probe worker gets the read-only sandbox: it runs commands, the OS re
   assert.equal(h.adapter.capabilities().executionPolicies.includes('probe'), true);
 });
 
+test('X2d a probe workspace uses workspace-write only for the isolated cwd', async t => {
+  const h = harness(t);
+  const source = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-probe-source-'));
+  t.after(() => fs.rmSync(source, {recursive: true, force: true}));
+  const handle = await h.launch({orders: 'probe it', profile: {mode: 'yolo', policy: 'probe', probeSource: source}});
+  await take(h.adapter.events(handle), 1);
+  assert.deepEqual(h.methods('thread/start')[0].params, {approvalPolicy: 'never', sandbox: 'workspace-write'});
+  assert.deepEqual(h.methods('turn/start')[0].params.sandboxPolicy, {type: 'workspaceWrite', writableRoots: [fs.realpathSync(h.root)], excludeSlashTmp: true, excludeTmpdirEnvVar: true});
+  assert.equal(h.methods('turn/start')[0].params.approvalPolicy, 'never');
+  await assert.rejects(() => h.launch({orders: 'bad probe', profile: {policy: 'probe', probeSource: h.root}}), /separate from cwd/);
+});
+
 test('X3 a mid-turn deliver waits: the second turn/start follows the first turn/completed', async t => {
   const h = harness(t, {delay: 120});
   const handle = await h.launch({orders: 'first'});
@@ -375,12 +388,7 @@ test('a scoped report grant is a parent-side experimental dynamic tool, never ch
   assert.equal(server.spawned[0][2].env.BOUNCE_REPORT_TOKEN_FILE, undefined);
   assert.deepEqual(server.lines().find(line => line.method === 'thread/start').params.dynamicTools, [{
     type: 'function', name: 'bounce_report', description: 'Publish a progress or final report for this assigned worker attempt.',
-    inputSchema: {type: 'object', properties: {
-      op: {enum: ['milestone', 'blocked', 'input_required', 'final']},
-      outcome: {enum: ['completed', 'failed', 'blocked', 'input_required']},
-      phase: {type: 'string'}, text: {type: 'string'}, next: {type: 'string'}, summary: {type: 'string'},
-      evidence: {type: 'array', items: {type: 'string'}}, remaining: {type: 'string'},
-    }, required: ['op', 'phase', 'text', 'next']},
+    inputSchema: REPORT_SCHEMA,
   }]);
 
   server.send({id: 40, method: 'item/tool/call', params: {

@@ -162,6 +162,16 @@ test('work recap includes only completed turns, uses final response and survives
   assert.deepEqual(recap([]), []);
 });
 
+test('work recap keeps intraword underscores in paths and identifiers while still stripping real emphasis/code markers', async () => {
+  const {createWorkSummary} = await import('../src/format.js');
+  const events = [
+    {kind: 'assistant', text: 'Fixed `tests/workspace_host_test.ts` and **MAX_STDERR_LENGTH**, see _really_ done'},
+    {kind: 'turn', text: 'completed'},
+  ];
+  const recap = createWorkSummary()(events);
+  assert.deepEqual(recap, ['Fixed tests/workspace_host_test.ts and MAX_STDERR_LENGTH, see really done']);
+});
+
 test('work recap discards failed provider output on fallback', async () => {
   const {createWorkSummary} = await import('../src/format.js');
   assert.deepEqual(createWorkSummary()([
