@@ -606,6 +606,54 @@ export async function judgeLease({settings, ask, signal, ...request} = {}) {
   } catch (error) { return none(error?.code ?? error?.message ?? 'error'); }
 }
 
+// ---- the in-place risk check: does the user's own word cover what an in-place task will do? -------
+
+// A Choice, not a Noul: the three outcomes are mutually exclusive readings of the same cited
+// message, and Jev's calibration for a three-way choice (like the plan/lease checks) is what
+// the confidence bar was set against — a Noul per outcome would let two disagree.
+export const INPLACE_CRITERIA = {
+  authorized: 'The cited user message asks for exactly what these orders will do in the real checkout (commit, push, open a PR, or another real-folder step it names).',
+  exceeds: 'The cited user message asks for a narrower step than these orders carry out (for example it asked to commit, but the orders also push or open a PR).',
+  unrelated: 'The cited user message is not about this real-folder step at all.',
+};
+
+export function inPlaceQuestions({citedText = '', messages = [], orders = ''} = {}) {
+  return {
+    state: {cited_message: String(citedText ?? '').slice(0, 4000),
+      other_messages: (Array.isArray(messages) ? messages : []).map(text => String(text ?? '').slice(0, 2000)).slice(0, 50),
+      orders: String(orders ?? '').slice(0, 6000)},
+    questions: {risk: {type: 'choice',
+      instructions: {question: 'Given the cited user message (and the other user messages since the last in-place task, for context), does it authorize an in-place task whose orders are as given?',
+        guidance: 'The cited message is state.cited_message; weigh it first. Pick exceeds only when the orders clearly do more than the cited message asked; pick unrelated only when the cited message is not about this step at all.'},
+      criteria: INPLACE_CRITERIA}},
+  };
+}
+
+// Pure: a verdict only when the choice is one of the criteria at or above the threshold;
+// otherwise 'unresolved' — the caller's structural check decides and journals why (jev.skipped).
+export function decideInPlace(answers, {confidence = 0.8} = {}) {
+  const risk = isObject(answers?.risk) ? answers.risk : {};
+  const conf = Number.isFinite(Number(risk.confidence)) ? Number(risk.confidence) : 0;
+  const choice = typeof risk.choice === 'string' && Object.hasOwn(INPLACE_CRITERIA, risk.choice) ? risk.choice : null;
+  const resolved = choice !== null && conf >= confidence;
+  return {verdict: resolved ? choice : 'unresolved', choice, confidence: conf, threshold: confidence,
+    probabilities: isObject(risk.probabilities) ? risk.probabilities : {}};
+}
+
+// Never throws: off, without a client, or failing, the verdict is 'unresolved' with the reason —
+// the same fallback shape judgeLease/judgePlan use, so the caller's structural check always decides.
+export async function judgeInPlace({citedText, messages, orders, settings, ask, signal} = {}) {
+  const s = normalizeJevSettings(settings);
+  const none = reason => ({verdict: 'unresolved', choice: null, confidence: 0, probabilities: {}, reason, model: null});
+  if (!s.enabled) return none('jev disabled');
+  if (typeof ask !== 'function') return none('jev unavailable');
+  const {state, questions} = inPlaceQuestions({citedText, messages, orders});
+  try {
+    const result = await ask({state, questions, model: s.model, signal});
+    return {...decideInPlace(result.answers, {confidence: s.confidence}), reason: null, model: result.model ?? s.model};
+  } catch (error) { return none(error?.code ?? error?.message ?? 'error'); }
+}
+
 // The read-only critic profile the daemon registers so a root task's `review.completion`
 // can name it. `model: ''` leaves the model to the settings read at verdict time.
 export function jevReviewerProfile(settings = {}) {
@@ -624,6 +672,7 @@ export function createJevDecisions({root = dataRoot(), adapter, readSettings = (
     lease: request => judgeLease({...request, settings: readSettings(), ask: adapter?.ask}),
     routeAI: ({orders, profiles, head, signal}) => routeAgentAI({orders, profiles, head, order: order(), ...(locals ? {locals} : {}), settings: readSettings(), ask: adapter?.ask, ...(notes ? {notes} : {}), signal}),
     route: ({orders, profiles, signal}) => routeTask({orders, profiles, order: order(), ...(locals ? {locals} : {}), settings: readSettings(), ask: adapter?.ask, ...(notes ? {notes} : {}), signal}),
+    inPlace: ({citedText, messages, orders, signal}) => judgeInPlace({citedText, messages, orders, settings: readSettings(), ask: adapter?.ask, signal}),
   };
 }
 

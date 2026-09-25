@@ -126,6 +126,27 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   function campaignActive(task, id = submittedRow(task)?.campaignId) {
     return !id || campaigns(session.events)[id]?.state === 'active';
   }
+  // The one in-place task presently `running`, if any (§6, §5): held while true, its lock.
+  // The one in-place task presently holding the lock, if any: `running` in the ordinary case, or
+  // (restart replay, §5 "restart during an in-place task keeps the lock semantics") blocked
+  // `orphaned` — its worker's termination is unverified, so the lock stays held until a human
+  // resolves it, exactly like the ordinary "queued integrations still wait" case.
+  const inPlaceRunning = () => Object.values(reducers.tasks(session.events)).find(t => submittedRow(t.id)?.inPlace
+    && (t.state === 'running' || (t.state === 'blocked' && session.events.findLast(e => e.task === t.id && e.kind === 'task.blocked')?.reason === 'orphaned'))) ?? null;
+  const integrationInFlight = () => [...actionState(session.events).values()].some(a => a.type === 'integrate' && a.status === 'started');
+  const inPlaceBusy = () => Boolean(inPlaceRunning()) || integrationInFlight();
+  const inPlaceHolder = () => inPlaceRunning()?.id ?? null;
+  // What Jev sees for the risk check (§2): the cited message first, then every OTHER user
+  // message since the last in-place task (exclusive) — never before it, so an already-spent
+  // authorization from an earlier in-place task cannot be re-read as covering this one.
+  function inPlaceRiskInputs(row) {
+    const cited = session.events.find(e => e.kind === 'user' && e.seq === row.inPlace.authorizedBy);
+    const priorInPlace = session.events.filter(e => e.kind === 'task.submitted' && e.inPlace && e.task !== row.task && (e.seq ?? 0) < (row.seq ?? Infinity))
+      .sort((a, b) => (b.seq ?? 0) - (a.seq ?? 0))[0];
+    const since = priorInPlace ? priorInPlace.inPlace.authorizedBy : 0;
+    const others = session.events.filter(e => e.kind === 'user' && (e.seq ?? 0) > since && e.seq !== cited?.seq).map(e => e.text);
+    return {citedText: cited?.text ?? '', messages: [cited?.text ?? '', ...others], orders: row.orders};
+  }
   function waitForCampaign(task, campaignId = submittedRow(task)?.campaignId) {
     if (closed) return Promise.resolve(false);
     append({kind: task ? 'task.campaign.waiting' : 'campaign.waiting', task, campaignId,
@@ -145,6 +166,13 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // look stalled, and each running model turn holds memory — observed live as a machine under memory pressure).
   // A task past the limit stays queued, says so once, and dispatches when a local turn ends.
   const slotWaiters = new Set();
+  // In-place tasks (docs/plans/in-place-tasks.md): at most one running, and never alongside a
+  // mid-flight integration of any task's — `inPlaceWaiters` holds tasks parked on that lock,
+  // exactly like `slotWaiters` parks tasks on a full local endpoint.
+  const inPlaceWaiters = new Set();
+  // Integrate actions currently gated by an in-place task's lock, so the "waiting for … (in
+  // place)" milestone journals once per gated action rather than on every reconcile() poll.
+  const integrationWaiting = new Set();
   const localEndpoint = endpoint => { try { return normalizeLocalSettings(localSettings).endpoints[endpoint] ?? {}; } catch { return {}; } };
   const localSlots = endpoint => localEndpoint(endpoint).maxConcurrent ?? 1;
   // Per model: the endpoint's slotsPerModel, else the endpoint ceiling (one model, same number).
@@ -432,6 +460,16 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       if (previous.length && !spec.replaces && !spec.retryOf) return 'job already exists; use retryOf';
     }
     if (spec.profile === AUTO_PROFILE ? !routingFallback(profiles) : !profiles[spec.profile]) return 'profile';
+    if (spec.inPlace !== undefined) {
+      // Structural check (docs/plans/in-place-tasks.md §1, always): the cited row must exist and
+      // be a `user` row — only the keyboard path writes those, and bus.js already refuses `user`
+      // from a peer, so a row that IS one was typed by the person, not asserted by any AI.
+      if (!spec.inPlace || typeof spec.inPlace !== 'object' || typeof spec.inPlace.authorizedBy !== 'number'
+        || !session.events.some(e => e.kind === 'user' && e.seq === spec.inPlace.authorizedBy)) return 'in_place_unauthorized';
+      if (!Array.isArray(spec.requires) || !spec.requires.includes('write') || !spec.requires.includes('exec')) return 'in_place_requires';
+      const profile = profiles[spec.profile];
+      if (profile && effectivePolicy(profile) !== 'yolo') return 'in_place_ineligible_profile';
+    }
     if (requireFinalReport && spec.from === 'orchestrator' && spec.requires === undefined) return 'requires: declare read, exec and/or write capabilities for this assignment';
     const requirementProblem = validateRequirements(spec.requires);
     if (requirementProblem) return requirementProblem;
@@ -527,6 +565,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       review: spec.review ?? null,
       steps: spec.steps ?? null,
       ...(spec.owns ? {owns: spec.owns} : {}),
+      ...(spec.inPlace ? {inPlace: spec.inPlace} : {}),
       jobId: spec.jobId, retryOf: spec.retryOf, campaignId: spec.campaignId, gate: spec.gate, planId: spec.planId, chunkId: spec.chunkId,
     };
     requestAction(session, {actionId: `dispatch:${task}:0`, type: 'dispatch', task}, [{...row, time: stamp()}]);
@@ -988,7 +1027,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       let workerOrders = canReport ? `${roleLead}${row.orders}\n\n${reportContract(profile)}`
         : LOCAL_ADAPTERS.has(profile.adapter) ? `${roleLead}${row.orders}\n\n${LOCAL_REPORT_LINE}` : `${roleLead}${row.orders}`;
       if (!campaignActive(task) && !await waitForCampaign(task)) { abandonLaunch(task, context); return; }
-      owned = workspaceFor(task, profile, attempt);
+      // An in-place task's worker runs directly in session.cwd: no attempt workspace, no
+      // writeFence (docs/plans/in-place-tasks.md §3) — `owned` stays null, so the ordinary
+      // cwd/orders fallbacks below already do the right thing with no further branching.
+      owned = row.inPlace ? null : workspaceFor(task, profile, attempt);
       if (owned?.disposable) profile = {...profile, probeSource: fs.realpathSync(session.cwd)};
       else if (owned) profile = {...profile, writeFence: fs.realpathSync(session.cwd)};
       append({kind: 'task.launch.requested', task, attempt, executionKey: `${task}:${attempt}`, context});
@@ -1069,7 +1111,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         ({profile, adapter} = admission);
       }
       if (!campaignActive(task) && !await waitForCampaign(task)) { abandonLaunch(task, context); return; }
-      owned = workspaceFor(task, profile, attempt);
+      // An in-place task's worker runs directly in session.cwd: no attempt workspace, no
+      // writeFence (docs/plans/in-place-tasks.md §3) — `owned` stays null, so the ordinary
+      // cwd/orders fallbacks below already do the right thing with no further branching.
+      owned = row.inPlace ? null : workspaceFor(task, profile, attempt);
       if (owned?.disposable) profile = {...profile, probeSource: fs.realpathSync(session.cwd)};
       else if (owned) profile = {...profile, writeFence: fs.realpathSync(session.cwd)};
       append({kind: 'task.launch.requested', task, attempt, executionKey: `${task}:${attempt}`, resumed: true, context});
@@ -1676,6 +1721,37 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       }
       slotWaiters.delete(task);
     }
+    if (row.inPlace) {
+      // §6: one in-place task at a time, and never while an integration (any task's) is
+      // mid-flight — it waits for that one integration, never for a copy worker.
+      if (inPlaceBusy()) {
+        if (!inPlaceWaiters.has(task)) append({kind: 'task.milestone', task, phase: 'queued', reason: 'in_place_busy',
+          text: `Waiting for ${inPlaceHolder() ?? 'an integration in progress'} (in place)`, next: 'dispatch when it clears', context});
+        inPlaceWaiters.add(task);
+        return;
+      }
+      inPlaceWaiters.delete(task);
+      // §2: Jev's risk check, when enabled — the structural (cited-row) check already
+      // admitted this task at submit time; this is the model's read of what the user's own
+      // words actually cover. Off, unconfident or unavailable: the structural check alone
+      // decided, and jev.skipped says why — the same fallback pattern every other Jev
+      // decision uses (judgeLease/judgePlan).
+      const judged = jev ? await jev.inPlace(inPlaceRiskInputs(row)) : {verdict: 'unresolved', reason: 'jev unavailable', confidence: 0, probabilities: {}, model: null};
+      if (judged.verdict === 'exceeds' || judged.verdict === 'unrelated') {
+        append({kind: 'task.failed', task, reason: judged.verdict === 'exceeds' ? 'in_place_exceeds_request' : 'in_place_unrelated',
+          text: `Jev leaned ${judged.verdict} (confidence ${Number(judged.confidence ?? 0).toFixed(2)}) on the message that authorized this in-place task; narrow the orders to what it asked, or ask the user.`,
+          confidence: judged.confidence ?? 0, probabilities: judged.probabilities ?? {}, context});
+        return;
+      }
+      if (judged.verdict === 'authorized') {
+        append({kind: 'jev.decided', task, decision: 'in_place', verdict: judged.verdict, confidence: judged.confidence ?? 0,
+          probabilities: judged.probabilities ?? {}, model: judged.model ?? null,
+          text: `Jev: in-place task authorized (confidence ${Number(judged.confidence ?? 0).toFixed(2)})`, context});
+      } else {
+        append({kind: 'jev.skipped', task, reason: judged.reason ?? 'unconfident',
+          text: `Jev in-place risk check unavailable (${judged.reason ?? 'unconfident'}); the structural check alone authorized this task`, context});
+      }
+    }
     // STRATEGY (CONTRACT.md §0/§1): the depends_on hold/fail decision and the prelaunch-review
     // decision both come from onSubmitted now — the CORE only executes the returned intent, it
     // never re-derives the decision itself. `defaultStrategy.onSubmitted` reproduces exactly
@@ -2111,7 +2187,33 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (action.type === 'completion' && !session.events.some(e => e.task === action.task && e.kind === 'review.started' && e.seq > (action.cause ?? action.seq))) return 'retry';
     const launched = session.events.some(e => e.task === action.task && ['task.launch.requested', 'task.started', 'review.started'].includes(e.kind));
     return state === 'queued' && !launched ? 'retry' : 'blocked';
+  }, gate: action => {
+    // §5: an integrate action never runs while an in-place task holds the lock. It stays
+    // 'requested' (never 'started', so `reconcile`'s retry-count cap above never sees it) until
+    // wakeInPlace() calls effects.reconcile() again once the lock clears — in its original
+    // order, since a synchronous reconcile() loop runs each action's synchronous handler body
+    // to completion before the next iteration even starts.
+    if (action.type !== 'integrate' || !inPlaceRunning()) return true;
+    if (!integrationWaiting.has(action.actionId)) {
+      integrationWaiting.add(action.actionId);
+      append({kind: 'task.milestone', task: action.task, phase: 'queued', reason: 'in_place_busy',
+        text: `Waiting for ${inPlaceHolder() ?? 'an in-place task'} (in place)`, next: 'integrate when it clears', context: submittedRow(action.task)?.context});
+    }
+    return false;
   }});
+  // Wakes both halves of the lock (§5, §6) once it can plausibly have cleared: released
+  // integrate actions in their original order, then any in-place task waiting its turn.
+  function wakeInPlace(cause) {
+    if (inPlaceRunning()) return; // still held: nothing to wake yet
+    integrationWaiting.clear();
+    effects.reconcile();
+    if (integrationInFlight() || !inPlaceWaiters.size) return;
+    for (const task of [...inPlaceWaiters]) {
+      if (reducers.tasks(session.events)[task]?.state !== 'queued') { inPlaceWaiters.delete(task); continue; }
+      const row = submittedRow(task);
+      if (row) requestDispatch(row, cause);
+    }
+  }
   const unsubscribe = session.subscribe(row => {
     if (row.kind === 'campaign.resumed' || row.kind === 'task.cancelled') for (const wake of [...campaignWaiters]) wake();
     if (row.kind === 'campaign.resumed') {
@@ -2123,6 +2225,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (row.task && TERMINAL_ROW_KINDS.has(row.kind) && reducers.TERMINAL.has(reducers.tasks(session.events)[row.task]?.state)) {
       activity.delete(row.task); toolCalls.delete(row.task);
     }
+    // §5/§6: any task-scoped row is a candidate to have moved an in-place task off `running`,
+    // or an integrate action to have settled — wakeInPlace() itself checks whether the lock
+    // has actually cleared before doing anything, so this is cheap to call liberally.
+    if (row.task && (inPlaceWaiters.size || integrationWaiting.size)) queueMicrotask(() => wakeInPlace(row.seq));
     if (row.kind === 'plan.submitted') requestAction(session, {actionId: `plan:${row.plan}`, type: 'plan', payload: {plan: row.plan}, cause: row.seq});
     if (row.kind === 'task.submitted') {
       // Any throw here (including one from before the first `await`, which an async

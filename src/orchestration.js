@@ -27,7 +27,12 @@ export function requestAction(session, {actionId, type, task, payload = {}, caus
 
 // Exactly one in-process owner per action. An interrupted external effect requires a
 // reconciliation decision; replay never assumes that a missing handle means no process ran.
-export function createActionRunner({session, handlers, reconcile = () => 'blocked'}) {
+// `gate`: an action stuck at 'requested' whose gate refuses stays there — never started, never
+// counted against `reconcile`'s retry budget — until a later call to the runner's own
+// `reconcile()` finds the gate open. This is a caller-level hold (an in-place task's
+// integration lock), distinct from `reconcile`, which is crash recovery for an action already
+// 'started' or 'blocked'.
+export function createActionRunner({session, handlers, reconcile = () => 'blocked', gate = () => true}) {
   let closed = false;
   const running = new Map();
   function settle(action, status, fields = {}) {
@@ -36,6 +41,7 @@ export function createActionRunner({session, handlers, reconcile = () => 'blocke
   }
   function execute(action) {
     if (closed || running.has(action.actionId) || !handlers[action.type]) return;
+    if (action.status === 'requested' && !gate(action)) return;
     if (action.status === 'started' || action.status === 'blocked') {
       const decision = reconcile(action);
       if (decision === 'settled') return settle(action, 'settled', {recovered: true});
