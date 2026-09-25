@@ -21,19 +21,7 @@ You never edit the repository, so the first bullet applies only to your own read
 
 ## Pick the worker
 
-The top model does not spawn copies of itself for work a cheaper worker can do reliably. Pick the least expensive worker that can make the judgment the task requires, and promote when it can't:
-
-| Work | Tier | Why it is safe there |
-|---|---|---|
-| Locate files, symbols, call sites; extract structured facts | Cheapest | Output is paths and facts the next reader opens — a wrong one fails loudly |
-| Research, routine implementation, test triage | Mid | Judgment is bounded by a spec and a test suite |
-| Independent review, ambiguous or cross-cutting debugging, security-sensitive calls | Strongest | Failure here is quiet: a wrong verdict looks exactly like a right one |
-
-Tiers are dials, the per-role contract is not. The moment a cheap role must judge unstructured material, promote it.
-
-Submit by job — `analyst` to locate, read and research, `builder` to implement (including landing shared changes behind the full gate — say so in its orders), `reviewer` to grade, `debugger` once a failure resisted a first attempt — and let bounce pick the AI for the tier. A read-only or probing agent is never escalated to get a task done: work that needs writes goes to a writing agent or is refused.
-
-When a real choice exists between providers for a substantial workstream, run one small read-only trial against the same acceptance criteria and route the rest by the result, not by brand. Don't invent a comparison you haven't run.
+Submit by job — `analyst` to locate, read and research, `builder` to implement (including landing shared changes behind the full gate — say so in its orders), `reviewer` to grade, `debugger` once a failure resisted a first attempt — and let bounce pick the AI; your orders say not to pick a tier or a model yourself. A read-only or probing agent is never escalated to get a task done: work that needs writes goes to a writing agent or is refused.
 
 ## Write the brief
 
@@ -48,7 +36,7 @@ Every brief states:
 
 Close with: *if you cannot finish within scope, stop and report why instead of expanding it.*
 
-Put a one-shot brief in the task's `orders` field. For multi-round work, write it to `ORDERS.md` in a task folder: the builder reads it and never edits it, because the reviewer grades against it.
+Put a one-shot brief in the task's `orders` field; multi-round work resubmits through bounce's own rework cycle (task.rework), not a hand-maintained file.
 
 ## Patterns
 
@@ -56,26 +44,15 @@ Put a one-shot brief in the task's `orders` field. For multi-round work, write i
 
 **Build.** One builder owns the change and runs the checks. Batch related fixes into one brief so the same large files aren't reread by several workers.
 
-**Independent review.** A fresh reviewer sees three things: the orders, the actual diff, and test output it produced itself. Never the builder's summary or transcript — a summary rounds in the builder's favour, a transcript carries every doubt the builder talked itself out of. It returns `ACCEPT` or `REWORK` with must-fixes and does not fix them. Most of what an isolated reviewer catches is sloppy scope; a `REWORK` is as often a reason to fix the orders as the diff.
+**Independent review.** A fresh reviewer sees three things: the orders, the actual diff, and test output it produced itself. Never the builder's summary or transcript — a summary rounds in the builder's favour, a transcript carries every doubt the builder talked itself out of. It returns `PASS` or `FAIL` with must-fixes and does not fix them. Most of what an isolated reviewer catches is sloppy scope; a `FAIL` is as often a reason to fix the orders as the diff.
 
 **Debugging.** Give a strong worker the failure, the reproduction, and the evidence; it returns cause plus proof, not a patch. Use it once a straightforward attempt has failed.
-
-**Ticket loop** (multi-file or multi-round): use a task folder with `ORDERS.md`, a `CHANGES.md` log, and each round's verdict; ticket goes `OPEN → DONE → ACCEPTED`, back to `OPEN` on rework. The orders must say whether worktrees, commits, or a PR are authorized.
-
-1. Each builder attempt runs in its own isolated workspace; bounce integrates it into the checkout.
-2. Build, run the suite in that tree, leave the change in the state the orders require (working tree, commit, or PR), and log to `CHANGES.md`. Deviations flagged, not buried.
-3. Review with a **new** reviewer every round; retire it after its verdict.
-4. Rework goes back to the **same** builder, context intact.
-5. Integrate and run the full suite behind the merge; a red suite reverts rather than being patched forward. Where direct commits to the main branch are forbidden, integrating means opening the PR.
-6. Clean up the worktree and branch.
-
-Reviewers are always cold and new, or they grade their own expectations. Builders persist, or you pay for the same context twice.
 
 ## Integrate
 
 A report is evidence, not proof, and so is a terminal row: `task.completed` says a worker believed it was done. Check that it answered the brief, open the actual diff or artifact, and rerun high-risk verification yourself — "tests passed" in a report is a claim.
 
-- **The diff must be the whole change.** Review the specified revision *and* its staged and unstaged working-tree changes. A clean tree is required only when the orders require a commit; otherwise unexpected files or changes are a `REWORK`.
+- **The diff must be the whole change.** Review the specified revision *and* its staged and unstaged working-tree changes. A clean tree is required only when the orders require a commit; otherwise unexpected files or changes are a `FAIL`.
 - **A rate limit mid-wave is a wave failure.** Siblings can report "complete" with nothing in them. Check each produced real output before using any of it.
 - Resolve conflicting reports from primary evidence, not by majority.
 
