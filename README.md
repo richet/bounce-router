@@ -152,7 +152,8 @@ Headless usage: `bounce run "Explain this screenshot" --image "/path/Screen shot
 - `/quota` refreshes and prints the usage each agent reports. On terminals at least 100 columns wide, a right sidebar topped by the BOUNCE wordmark shows the provider, mode, model, operation mode and state, queued prompts, workspace, session id, each agent's short quota reading, and an AGENTS list of the main agent and every worker with its state. It is on by default; `/sidebar` toggles it (`/sidebar on|off` sets it) and the choice is saved in `config.json` as `sidebar`. Narrower terminals keep the header. Use `/review` to print the full text of every completed turn's result in chronological order.
 - `/local` shows local models, the OpenCode bridge and the agents a local model may play; `/local verify` runs one real turn; `/local setup [loaded]` picks which model plays each agent and applies it to this session; `/local activate [AGENT]` re-reads agent files into the running session.
 - `/skills` lists bounce's skills and where each agent has them; `/skills sync`, `/skills new NAME`, `/skills add PATH`, `/skills remove NAME`, `/skills import [provider]`, `/skills clear`, `/skills reset` and `/skills seed --force` manage them. See [Skills](#skills).
-- `/btw TEXT` steers the focused agent while it works — the message is delivered into the running turn (or to the selected worker when the AGENTS pane is open). The agent reads it when its current tool call returns, so if the orchestrator is inside a `bounce wait`, bounce ends that wait at once with a `wait.interrupted` row telling it to read the message first; the notice says exactly that. When nothing is running it is saved as an aside for the next turn.
+- `/steer TEXT` steers the focused agent while it works — the message is delivered into the running turn (or to the selected worker when the AGENTS pane is open). The agent reads it when its current tool call returns, so if the orchestrator is inside a `bounce wait`, bounce ends that wait at once with a `wait.interrupted` row telling it to read the message first; the notice says exactly that. When nothing is running it is saved as an aside for the next turn.
+- `/btw QUESTION` asks a quick side question about this session — a one-shot, read-only call to the same model the session runs on, answered from the recent conversation (and, in orchestrator mode, the orchestrator's state note and task list). It never joins, delays or steers the running turn, works busy or idle, and its answer never feeds back into the orchestrator's own context.
 - `/sessions`, `/rename NAME`, `/resume [SESSION]` and `/detach` manage sessions; see [Sessions](#sessions). `/agents`, `/tasks`, `/stop` and `/msg` are orchestrator commands; see [Orchestrator mode](#orchestrator-mode).
 - `/login [provider]`, `/new`, `/note TEXT`, `/retry`, `/help`, `/quit`.
 - Any other `/NAME` is looked up among the commands your agents keep — a repository's `.claude/commands/NAME.md`, Codex prompts, skills — and sent as the turn. See [Your agents' commands](#your-agents-commands).
@@ -170,7 +171,7 @@ Sessions run in a daemon that outlives the view:
 
 - `bounce run "prompt" --detach` starts the session in the background and prints its id; without `--detach`, `run` streams events and exits when the turn ends (`--json` for machine-readable rows).
 - `/detach` closes the interactive view while the orchestrator and its workers keep running.
-- `bounce attach SESSION` reopens the view on a live session from any terminal; `--json` streams its journal instead. While an attached turn is still active, new prompts are held — use `/btw` to steer it.
+- `bounce attach SESSION` reopens the view on a live session from any terminal; `--json` streams its journal instead. While an attached turn is still active, new prompts are held — use `/steer` to steer it.
 - `bounce stop SESSION` cancels the running task tree and ends the daemon; `/quit` does the same from inside.
 
 A session's `daemon.json` records the live daemon and is removed on a clean exit; `bounce sessions` checks that its PID is still alive before marking a session ●. The daemon escalates from SIGTERM to SIGKILL on teardown, so a vendor CLI that ignores SIGTERM cannot keep a stopped session alive.
@@ -227,7 +228,7 @@ The orchestrator does not have to poll, and its orders tell it not to wait eithe
 
 In the TUI:
 
-- `/agents [TASK]` opens split panes for the orchestrator and every worker; Tab and Shift+Tab cycle the focused pane, or name a task to focus it. With a worker focused, Enter and `/btw` deliver to that worker. `/agents` again, or Esc on an empty prompt, returns to the transcript. `/zoom` and `/attach` are aliases.
+- `/agents [TASK]` opens split panes for the orchestrator and every worker; Tab and Shift+Tab cycle the focused pane, or name a task to focus it. With a worker focused, Enter and `/steer` deliver to that worker. `/agents` again, or Esc on an empty prompt, returns to the transcript. `/zoom` and `/attach` are aliases.
 - `/tasks` prints every task's state and retained outcome.
 - `/stop [TASK]` cancels one task, or every running task with no argument. Cancellation is verified: a worker that ignores SIGTERM is killed.
 - `/msg TASK TEXT` sends a message to a running worker.

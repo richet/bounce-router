@@ -133,6 +133,11 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
   function event(e, width) {
     // `model` carries no text: it is what the header's model label reads, not a transcript row.
     if (['raw', 'usage', 'model', 'peer.native', 'peer.joined', 'task.attempt.ended', 'task.report.staged', 'checkpoint', 'wait.served'].includes(e.kind) || e.kind.startsWith('budget.')) return [];
+    // /btw: a side exchange, dimmed so it reads apart from the main conversation it never joins
+    // (src/btw.js never feeds these rows back into the orchestrator's own context).
+    if (e.kind === 'btw.asked') return [clip(style.muted(`btw · ${clean(e.text)}`), width), ''];
+    if (e.kind === 'btw.answered') return [...markdown(e.text, width - 2).map(line => style.muted(line)), ...(e.model ? [style.muted(`  (${clean(e.model)})`)] : []), ''];
+    if (e.kind === 'btw.failed') return [style.muted(`btw · no answer (${clean(e.reason ?? 'failed')})`), ''];
     if (e.kind === 'attempt' && e.status === 'started') return event({...e, kind: 'status', text: 'Starting provider…'}, width);
     if (e.kind.startsWith('main.')) {
       const label = {'main.starting': 'Starting', 'main.started': 'Running', 'main.terminal': 'Finished', 'main.blocked': 'Blocked', 'main.delivery': 'Message'}[e.kind] ?? 'Orchestrator';

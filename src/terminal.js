@@ -4,7 +4,7 @@ import wrapAnsi from 'wrap-ansi';
 export const commands = [
   ['provider', 'Select default agent'], ['model', 'Select model'], ['local', 'Set up local workers · /local setup [loaded]'], ['order', 'Set fallback order'],
   ['mode', 'Set yolo or plan mode'], ['login', 'Sign in to an agent'], ['new', 'Start new session'],
-  ['note', 'Save handoff note'], ['btw', 'Aside for the next turn'], ['rename', 'Name this session'], ['resume', 'Resume a session'], ['sessions', 'List sessions here'], ['skills', 'Manage and install skills'],
+  ['note', 'Save handoff note'], ['btw', 'Ask a side question about this session'], ['steer', 'Steer live, or aside for the next turn'], ['rename', 'Name this session'], ['resume', 'Resume a session'], ['sessions', 'List sessions here'], ['skills', 'Manage and install skills'],
   ['review', 'Show full session work items'], ['quota', 'Show reported quota'], ['retry', 'Clear quota cooldowns'],
   ['update', 'Install latest npm release'],
   ['details', 'Expand or fold transcript details'], ['sidebar', 'Show or hide the status sidebar'],

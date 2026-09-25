@@ -33,6 +33,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {spawn, spawnSync} from 'node:child_process';
+import {randomUUID} from 'node:crypto';
 
 import {parseArgs} from 'node:util';
 import {Session, Router, config, saveJSON, dataRoot} from './core.js';
@@ -41,6 +42,7 @@ import {providers, runProcess} from './providers.js';
 import {projectRoot, fingerprint, validate, supervise, pidAlive} from './reload.js';
 import {listSessions, resolveSessionRef, sessionsTable, sessionAge} from './sessions.js';
 import {titleSession, createAsk} from './session-title.js';
+import {askBtw, createBtwAsk} from './btw.js';
 import {createRemoteSession} from './remote.js';
 import {version, checkUpdate, globalInstall, installUpdate} from './update.js';
 import {helpText, helpRows} from './help.js';
@@ -398,8 +400,8 @@ async function main() {
   let suggestion = null; // the main worker's proposed next step, offered in the prompt; never sent on its own
   const pendingTurns = [];
   const asides = [];
-  async function noteAside(text) {
-    if (!text) throw new Error('Use /btw <text>');
+  async function steerAside(text) {
+    if (!text) throw new Error('Use /steer <text>');
     const task = agentsOpen ? selectedWorker() : null;
     if (task) {
       if (reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) throw new Error('This worker has finished');
@@ -740,10 +742,10 @@ async function main() {
     }
     // A turn this view did not start — the daemon waking the orchestrator on worker outcomes
     // (main-service.js) — is held exactly like a turn found running at attach: new prompts are
-    // refused with a notice, /btw steers it, Esc cancels it, its terminal row releases the input.
+    // refused with a notice, /steer steers it, Esc cancels it, its terminal row releases the input.
     if (remoteMain && !busy && event?.kind === 'main.starting') {
       attachedTurn = true; busy = true;
-      notice = event.handoff ? 'Orchestrator woke on worker outcomes · /btw steers it, Esc cancels' : 'Existing turn is active · use /btw to steer it';
+      notice = event.handoff ? 'Orchestrator woke on worker outcomes · /steer steers it, Esc cancels' : 'Existing turn is active · /steer steers it · /btw asks aside';
     }
     if (attachedTurn && ['main.terminal', 'main.blocked'].includes(event?.kind)) {
       attachedTurn = false;
@@ -1030,8 +1032,18 @@ async function main() {
           picker = {kind: 'session', index: 0, notes: [], entries: rows.map(r => ({id: r.id, label: `${r.name ?? r.derivedName} · ${sessionAge(r.updated)} ago · ${r.operation}${r.live ? ' · live' : ''} · ${r.id.slice(0, 8)}`}))};
           notice = 'Pick a session to resume. Esc cancels.';
           return;
+        } else if (command === 'steer') {
+          await steerAside(arg.trim());
+          return;
         } else if (command === 'btw') {
-          await noteAside(arg.trim());
+          // A side question, never a turn: it neither reads busy nor touches router/session.active,
+          // and it journals its own question/answer rows rather than delivering into anything.
+          const question = arg.trim();
+          if (!question) throw new Error('Use /btw <question>');
+          const id = randomUUID().slice(0, 8);
+          notice = 'btw · answering…';
+          render();
+          askBtw({session, settings, orchestration, ask: createBtwAsk({executables: settings.executables}), id, question}).catch(() => {});
           return;
         } else if (command === 'agents' || command === 'zoom' || command === 'attach') {
           if (orchestration.operation !== 'orchestrator') throw new Error('/agents is only available in orchestrator mode');

@@ -1,7 +1,7 @@
 // The input lane is deliberately independent from terminal completion and command execution:
 // callers classify before considering whether a main model turn is already busy.
 export const commandCatalog = {
-  immediate: ['provider', 'model', 'local', 'order', 'mode', 'note', 'btw', 'rename', 'sessions', 'skills', 'review', 'quota', 'retry', 'operation', 'stop', 'msg', 'agents', 'tasks', 'help', 'detach', 'details', 'sidebar', 'jev'],
+  immediate: ['provider', 'model', 'local', 'order', 'mode', 'note', 'btw', 'steer', 'rename', 'sessions', 'skills', 'review', 'quota', 'retry', 'operation', 'stop', 'msg', 'agents', 'tasks', 'help', 'detach', 'details', 'sidebar', 'jev'],
   turn: ['continue'],
   lifecycle: ['login', 'new', 'resume', 'update', 'restart', 'quit'],
 };
