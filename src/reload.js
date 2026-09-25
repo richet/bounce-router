@@ -314,6 +314,9 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     'Capacity waits, progress and failures are journaled. Do not infer a worker crash from silence alone; inspect its latest task state.',
     'A local worker (… via opencode) uses the workspace and tools allowed by its policy: read-only agents read and search but cannot run commands; probe agents can run sandboxed verification commands; write agents edit files and run commands in their assigned workspace. Its answer is its report. Never ask a read-only analyst to claim it ran tests; delegate execution to a command-capable worker and cite its results.',
     'Require observed tests from local builders, and review their diff as you would any worker\'s.',
+    // The view prefills the input from this line (src/tui/suggestion.js): Tab accepts it, Enter sends it.
+    // Found live (session 159f4746): it sent a user-requested commit to workers seven times; none had git.
+    'Workers run in copies of the repository without .git, so a worker cannot commit, push or open a PR yet. When the user asks for one, say so once and propose the split (paths and one-line messages) instead of dispatching git work that cannot succeed.',
     'When one prompt from the user would move the work forward (an approval, a decision, a follow-up request), end the answer with one line `Next: <the prompt, as the user would type it>` — the view offers it prefilled in the input. One concrete prompt, not a question or a list; omit the line when nothing is needed from the user.',
     ...(jev?.enabled && jev?.review ? ['Jev completion verdicts are on: a root task you submit without review.completion gets a fast Jev accept/rework check against its orders, report and diff before it is accepted; a confident rework sends the same worker one rework round. Name a review.completion profile yourself to replace it.'] : []),
     '',

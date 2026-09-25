@@ -657,6 +657,9 @@ test('O2 orchestrator single-provider: the orchestrator submits over the bridge,
   assert.equal(orders.includes('initial inspection, every phase change, and before completion'), true, 'checkpoint cadence is explicit');
   // The input prefill (Tab, Enter) needs the answer to state its next prompt; nothing else asked for it.
   assert.equal(orders.includes('end the answer with one line `Next: <the prompt, as the user would type it>`'), true, 'the orchestrator is asked for the prefill line');
+  // Found live (session 159f4746): the orchestrator offered to commit, then sent the commit to workers seven
+  // times — each found a copy with no .git. Until workers get git, the orders have to say so.
+  assert.equal(orders.includes('Workers run in copies of the repository without .git, so a worker cannot commit, push or open a PR yet. When the user asks for one, say so once and propose the split (paths and one-line messages) instead of dispatching git work that cannot succeed.'), true, 'the orchestrator knows a worker cannot do git work yet');
   // No `jev` block in config.json: the brief is exactly today's — no auto roster line, no Jev
   // sentence, and the synthetic reviewer is neither a submit target nor the example's profile.
   assert.equal(orders.includes('auto →'), false);
