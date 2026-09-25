@@ -180,7 +180,7 @@ const SEED_DETAIL = {
   updated: 'updated to the bundled version',
   current: 'already current',
   modified: 'left alone: edited since bounce installed it',
-  unmanaged: 'left alone: not the copy bounce installed',
+  unmanaged: 'your own copy is kept (bounce does not manage it)',
   withdrawn: 'not reinstalled: removed after bounce seeded it — "skills seed --force" brings it back',
   failed: 'could not be seeded',
 };

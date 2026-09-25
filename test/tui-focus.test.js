@@ -82,15 +82,15 @@ test('a finished turn ends on what to do next: the answer\'s TLDR, who is still 
     ev(6, 'task.input_required', {task: T, text: 'Which exclude?'}),
     ev(7, 'assistant', {provider: 'claude', text: answer}), ev(8, 'main.terminal', {status: 'completed', text: answer, provider: 'claude'})];
   const lines = render(events);
-  const tail = lines.slice(lines.findIndex(line => line.startsWith('▸ Next · ')));
-  assert.equal(tail.slice(0, -2).map(line => line.trim()).join(' '), '▸ Next · Round 4 is running with two builders; nothing is fixed yet. No decision is needed from you.');
+  const tail = lines.slice(lines.findIndex(line => line.startsWith('▸ TLDR · ')));
+  assert.equal(tail.slice(0, -2).map(line => line.trim()).join(' '), '▸ TLDR · Round 4 is running with two builders; nothing is fixed yet. No decision is needed from you.');
   assert.deepEqual(tail.slice(-2), ['  1 worker running · 1 waiting on you: build_claude (/agents 02a9a23d)', '']);
   assert.equal(tail.every(line => line.length <= 80), true);
   assert.equal(lines.some(line => line.includes('Finished · completed')), false);
   // a long answer with no TLDR: its first sentence. A short answer is still on screen right above, so
   // it is not repeated; with no workers either, the turn just ends. A failed turn keeps saying so.
   const wordy = render([ev(1, 'user', {text: 'hi'}), ev(2, 'assistant', {provider: 'claude', text: `The gate passes. Details follow.\n\n${'More detail. '.repeat(60)}`}), ev(3, 'main.terminal', {status: 'completed', provider: 'claude'})]);
-  assert.deepEqual(wordy.slice(-2), ['▸ Next · The gate passes.', '']);
+  assert.deepEqual(wordy.slice(-2), ['▸ TLDR · The gate passes.', '']);
   const short = render([ev(1, 'user', {text: 'hi'}), ev(2, 'assistant', {provider: 'claude', text: 'The gate passes.'}), ev(3, 'main.terminal', {status: 'completed', provider: 'claude'})]);
   assert.equal(short.some(line => line.includes('Next')), false);
   assert.equal(short.filter(line => line.includes('The gate passes.')).length, 1);

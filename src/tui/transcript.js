@@ -11,13 +11,25 @@ const WORKER_STATES = {
   'task.rejected': 'rejected',
 };
 const WORKER_PROGRESS = new Set(['task.milestone', 'task.reported']);
-const HIDDEN = new Set(['turn', 'attempt', 'main.starting', 'main.started', 'main.delivery']);
+// main.disposition and main.wake.scheduled are orchestrator bookkeeping with no text/status/state
+// of their own — format.js's main.* fallback renders them as an empty "Orchestrator · " row.
+const HIDDEN = new Set(['turn', 'attempt', 'main.starting', 'main.started', 'main.delivery', 'main.disposition', 'main.wake.scheduled']);
 // What the folded view leaves out. All of it stays in details mode and in the journal.
 // Vendor plumbing that a CLI reports as status, and bounce rows that are machinery, not conversation:
 // the hand-off prompt is written FOR the orchestrator, a review's start and raw verdict JSON are
 // covered by the verdict line and the worker's block, control rows are the user's own commands, and
 // a stall ping is what the rail's red row already says.
 const PLUMBING = /^(hook_started|hook_response|background_tasks_changed|task_updated|Task (started|stopped|completed|updated) ·)/;
+// A skill-sync summary (src/skills.js seedSummary) is one line per skill; "your own copy is kept"
+// is the routine no-op (the user's own edit is left alone, nothing bounce did). A batch where
+// every line is that no-op is quiet plumbing; one line worth acting on keeps the whole row visible.
+// The journal is append-only, so sessions from before this line's wording was renamed still carry
+// the old "left alone: not the copy bounce installed" text — match both.
+const SKILL_SYNC_QUIET_LINE = /^[^\n:]+: (your own copy is kept \(bounce does not manage it\)|left alone: not the copy bounce installed)$/;
+const isQuietSkillSync = text => {
+  const lines = String(text ?? '').split('\n').filter(Boolean);
+  return lines.length > 0 && lines.every(line => SKILL_SYNC_QUIET_LINE.test(line));
+};
 const MACHINERY = new Set(['handoff', 'review.started', 'review.finished', 'policy.escalated', 'policy.corrected']);
 const TOOL_CALL = /^[A-Za-z_][\w.-]*: \{/;
 // What a finished turn leaves you with: the answer's TLDR (else its first sentence), without markdown.
@@ -38,8 +50,11 @@ const progressLabel = event => String(event.text ?? '').split(' · ')[0];
 export function conversationEvents(events, {details = false} = {}) {
   const rows = [];
   const workers = new Map();
+  const viewSlots = new Map();
+  const queuedUserSlots = new Map(); // requestId -> its `user` row's index, until withdrawn removes it
   let lastAnswer = null;
   let lastProvider;
+  let sawOperation = false;
 
   for (const event of events) {
     // A reported model is header metadata with no text; it would only split a progress run.
@@ -95,8 +110,43 @@ export function conversationEvents(events, {details = false} = {}) {
       rows.push(event);
       continue;
     }
+    // A queued prompt the user pulled back (main.withdrawn, cli.js's Up-arrow handling) was never
+    // actually sent: drop its `user` row from the default view too, as if it never happened. Both
+    // rows stay in /details and in the journal.
+    if (event.kind === 'main.withdrawn' && event.requestId) {
+      const slot = queuedUserSlots.get(event.requestId);
+      if (slot !== undefined) rows[slot] = null;
+      continue;
+    }
+    if (event.kind === 'user' && event.queued && event.requestId) {
+      queuedUserSlots.set(event.requestId, rows.length);
+      rows.push(event);
+      continue;
+    }
     if (HIDDEN.has(event.kind) || MACHINERY.has(event.kind) || event.kind?.startsWith('control.')) continue;
-    if (event.kind === 'status' && PLUMBING.test(String(event.text ?? ''))) continue;
+    if (event.kind === 'status' && (PLUMBING.test(String(event.text ?? '')) || isQuietSkillSync(event.text))) continue;
+    // reload.js appends a fresh `operation` row on every daemon resume; only the first belongs
+    // in the default view (later ones just repeat "Operation: orchestrator on main …").
+    if (event.kind === 'operation') {
+      if (sawOperation) continue;
+      sawOperation = true;
+      rows.push(event);
+      continue;
+    }
+    // /tasks, /review, /help and /quota journal their output on every use (cli.js) so re-running one
+    // mid-session leaves several permanent copies of the same list. Keep only the latest of each
+    // in the default view; earlier ones stay in the journal and in /details. Older journals never
+    // marked a /tasks status row with `view`, so an unmarked one can't be told apart from an
+    // ordinary status row — leave those alone.
+    const view = ['review', 'help', 'quota'].includes(event.kind) ? event.kind : event.kind === 'status' && event.view === 'tasks' ? 'tasks' : null;
+    if (view) {
+      const previous = viewSlots.get(view);
+      if (previous) rows[previous.index] = null;
+      const row = {...event, index: rows.length};
+      viewSlots.set(view, row);
+      rows.push(row);
+      continue;
+    }
     // A run of tool rows — calls and their pasted output — is one line: how many calls, and the last.
     if (event.kind === 'tool') {
       const isCall = TOOL_CALL.test(String(event.text ?? '').trim());

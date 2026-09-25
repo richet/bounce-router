@@ -19,7 +19,8 @@ test('workspace projection replays once, applies events once, and keeps activity
   const visible = snapshot.panes.map(({id, kind, task, profile, state, model, phase, text, next, activity}) => ({id, kind, task, profile, state, model, phase, text, next, activity}));
   assert.deepEqual(visible, [{
     id: 'worker:build', kind: 'worker', task: 'build', profile: 'worker', state: 'running',
-    model: 'gpt', phase: 'test', text: 'tests', next: 'review', activity: ['two', 'three'],
+    model: 'gpt', phase: 'test', text: 'tests', next: 'review',
+    activity: [{text: 'two', source: null}, {text: 'three', source: null}],
   }]);
   assert.equal(snapshot.transcript.length, 3);
 });
@@ -77,7 +78,7 @@ test('worker panes retain progress evidence, current operation, delivery, and me
     role: 'worker',
     profile: 'worker',
     state: 'running',
-    activity: ['node --test'],
+    activity: [{text: 'node --test', source: null}],
     model: 'gpt',
     phase: 'verify',
     text: 'tests running',
@@ -92,6 +93,26 @@ test('worker panes retain progress evidence, current operation, delivery, and me
       activityAt: '2026-09-14T00:00:01.000Z',
     },
   });
+});
+
+// Observed live (2026-09-25): a worker's final checkpoint milestone landed after task.blocked
+// (same tick), and task.text — shared between milestone prose and the blocker — clobbered the
+// blocker reason with the milestone's unrelated success text. The pane then showed `blocked` with
+// no visible reason. The blocker must survive a later milestone and clear only on a new attempt.
+test('a blocker survives a later milestone and clears only when the task starts again', () => {
+  const projection = createWorkspaceProjection();
+  projection.replay([
+    {kind: 'task.submitted', id: '1', seq: 1, task: 'build', profile: 'worker'},
+    {kind: 'task.blocked', id: '2', seq: 2, task: 'build', reason: 'conflict', text: 'Artifact integration conflict: src/core/operation.ts; isolated work preserved'},
+    {kind: 'task.milestone', id: '3', seq: 3, task: 'build', phase: 'done', text: 'All four ordered steps completed successfully'},
+  ]);
+  let pane = projection.snapshot().panes.find(p => p.task === 'build');
+  assert.equal(pane.state, 'blocked');
+  assert.equal(pane.text, 'All four ordered steps completed successfully');
+  assert.equal(pane.blocked, 'Artifact integration conflict: src/core/operation.ts; isolated work preserved');
+  projection.ingest({kind: 'task.started', id: '4', seq: 4, task: 'build', attempt: 2});
+  pane = projection.snapshot().panes.find(p => p.task === 'build');
+  assert.equal(pane.blocked, undefined);
 });
 
 test('verified replacement keeps the logical pane identity and exposes recovery state', () => {
@@ -172,9 +193,46 @@ test('a task under completion review reads as reviewing, with the reviewer named
   const pane = projection.snapshot().panes.find(p => p.task === 'land');
   assert.equal(pane.state, 'reviewing');
   assert.equal(pane.reviewer, 'reviewer');
-  assert.equal(pane.activity.at(-1), 'reading the diff');
+  assert.equal(pane.activity.at(-1).text, 'reading the diff');
   // the verdict ends it: accepted is terminal again, and the pane leaves
   projection.ingest({kind: 'review.finished', id: '6', seq: 6, task: 'land', stage: 'completion', verdict: 'accept'});
   projection.ingest({kind: 'task.accepted', id: '7', seq: 7, task: 'land', stage: 'completion'});
   assert.deepEqual(projection.paneIds(), ['orchestrator']);
+});
+
+// `task.observed` (src/scheduler.js consumeWorkerEvents) is a throttled journal copy of the same
+// live `task.activity` rows — a worker pane must not show the same prose twice.
+test('a task.observed row copying an already-shown task.activity row is not stored again', () => {
+  const projection = createWorkspaceProjection();
+  projection.replay([{kind: 'task.submitted', id: '1', seq: 1, task: 'build', profile: 'worker'}]);
+  projection.ingest({kind: 'task.activity', id: '2', seq: 2, task: 'build', text: 'reading file.js', source: 'assistant'});
+  projection.ingest({kind: 'task.observed', id: '3', seq: 3, task: 'build', text: 'reading file.js', source: 'assistant'});
+  assert.deepEqual(projection.snapshot().panes[0].activity, [{text: 'reading file.js', source: 'assistant'}]);
+  // a genuinely different observed row still lands
+  projection.ingest({kind: 'task.observed', id: '4', seq: 4, task: 'build', text: 'now writing file.js', source: 'assistant'});
+  assert.deepEqual(projection.snapshot().panes[0].activity.map(row => row.text), ['reading file.js', 'now writing file.js']);
+});
+
+// Found live (2026-09-25, session 159f4746): "Lint passes (exit code 0…)" showed twice in a worker pane
+// while the journal held it once — the journal copy can reach a view before the live row does, and
+// a live row can repeat. Whichever arrives second is the copy.
+test('the live row arriving after its journal copy, or a live row repeated, is not stored again', () => {
+  const projection = createWorkspaceProjection();
+  projection.replay([{kind: 'task.submitted', id: '1', seq: 1, task: 'build', profile: 'worker'}]);
+  projection.ingest({kind: 'task.observed', id: '2', seq: 2, task: 'build', text: 'Lint passes (exit code 0, no errors).', source: 'assistant'});
+  projection.ingest({kind: 'task.activity', id: '3', seq: 3, task: 'build', text: 'Lint passes (exit code 0, no errors).', source: 'assistant'});
+  projection.ingest({kind: 'task.activity', id: '4', seq: 4, task: 'build', text: 'All 155 tests passed.', source: 'assistant'});
+  projection.ingest({kind: 'task.activity', id: '5', seq: 5, task: 'build', text: 'All 155 tests passed.', source: 'assistant'});
+  assert.deepEqual(projection.snapshot().panes[0].activity.map(row => row.text), ['Lint passes (exit code 0, no errors).', 'All 155 tests passed.']);
+});
+
+// After a daemon restart, replayed history holds only the journaled `task.observed` copies — older
+// rows never carried a `source` field. They must still be stored (and later render as prose).
+test('a task.observed row replayed with no source field is still stored', () => {
+  const projection = createWorkspaceProjection();
+  projection.replay([
+    {kind: 'task.submitted', id: '1', seq: 1, task: 'build', profile: 'worker'},
+    {kind: 'task.observed', id: '2', seq: 2, task: 'build', text: 'restarted mid-run, still reading file.js'},
+  ]);
+  assert.deepEqual(projection.snapshot().panes[0].activity, [{text: 'restarted mid-run, still reading file.js', source: null}]);
 });

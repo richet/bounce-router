@@ -176,9 +176,10 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
       if (m) { try { const o = JSON.parse(m[2]); const what = String(o.description || o.path || o.file_path || (typeof o.command === 'string' ? o.command.split('\n')[0] : '') || o.pattern || o.query || ''); last = ` · last: ${m[1]}${what ? `(${what})` : ''}`; } catch { last = ` · last: ${m[1]}`; } }
       return [oneLine(`  ⚙ ${e.calls} tool call${e.calls === 1 ? '' : 's'}${last}`, width, style.muted)];
     }
-    // How a finished turn ends: what it came to, and who is still working or waiting on you.
+    // How a finished turn ends: what it came to, and who is still working or waiting on you. Labelled
+    // TLDR, not Next: found live, "Next · <the answer's own question>" read as a proposed prompt.
     if (compact && e.kind === 'next') {
-      const said = e.tldr ? wrap(`▸ Next · ${clean(e.tldr)}`, width - 2).slice(0, 4).map((row, index) => index ? `  ${row.trimStart()}` : style.title(row)) : [];
+      const said = e.tldr ? wrap(`▸ TLDR · ${clean(e.tldr)}`, width - 2).slice(0, 4).map((row, index) => index ? `  ${row.trimStart()}` : style.title(row)) : [];
       const workers = [e.running ? `${e.running} worker${e.running === 1 ? '' : 's'} running` : '',
         e.waiting?.length ? `${e.waiting.length} waiting on you: ${e.waiting.map(w => `${clean(w.profile)} (/agents ${w.task.slice(0, 8)})`).join(', ')}` : ''].filter(Boolean).join(' · ');
       return [...said, ...(workers ? [clip(`  ${e.waiting?.length ? style.status(workers) : style.muted(workers)}`, width)] : []), ''];
@@ -300,9 +301,16 @@ export function createWorkSummary() {
       if (event.kind === 'result' && event.success && event.text && event.text !== 'Turn completed') response = event.text;
       if (event.kind !== 'turn') continue;
       if (event.text === 'completed') {
+        // Strip real emphasis/code markers only — a blanket [*`_] strip used to eat intraword
+        // underscores in paths and identifiers too (tests/workspace_host_test.ts, MAX_STDERR_LENGTH).
         const lines = clean(response).split('\n').map(line => line
           .replace(/^\s*(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+)/, '')
-          .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1').replace(/[*`_]/g, '').trim());
+          .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+          .replace(/`([^`]*)`/g, '$1')
+          .replace(/\*\*([^*]+)\*\*/g, '$1')
+          .replace(/(?<![\w*])\*([^\s*][^*]*?)\*(?!\w)/g, '$1')
+          .replace(/(?<![\w_])_([^\s_][^_]*?)_(?!\w)/g, '$1')
+          .trim());
         const summary = lines.find(line => line && !/^(?:summary|changes|done|completed|tests|implementation)[:.!]?$/i.test(line));
         items.push(summary || 'Completed turn');
       }

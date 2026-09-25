@@ -996,7 +996,8 @@ async function main() {
           return;
         } else if (command === 'tasks') {
           const rows = Object.values(reducers.tasks(session.events));
-          session.append({kind: 'status', text: rows.length ? rows.map(task => `${task.profile} ${task.id.slice(0, 8)} · ${task.state}${task.blocker || task.error || task.summary ? ` · ${task.blocker || task.error || task.summary}` : ''}`).join('\n') : 'No tasks in this session'});
+          // `view: 'tasks'` lets the transcript fold repeated /tasks output to its latest copy.
+          session.append({kind: 'status', view: 'tasks', text: rows.length ? rows.map(task => `${task.profile} ${task.id.slice(0, 8)} · ${task.state}${task.blocker || task.error || task.summary ? ` · ${task.blocker || task.error || task.summary}` : ''}`).join('\n') : 'No tasks in this session'});
           notice = 'Task states saved in transcript · PgUp/PgDn scroll';
         } else if (command === 'rename') {
           const name = arg.trim();
