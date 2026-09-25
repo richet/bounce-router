@@ -15,6 +15,7 @@ import {installUpdate} from './update.js';
 import {spawn} from 'node:child_process';
 import {parseArgs} from 'node:util';
 import {Session, config, dataRoot, pidAlive} from './core.js';
+import {loadQuota, recordQuota, quotaSnapshot} from './quota.js';
 import {seedSkills, seedSummary} from './skills.js';
 const SEED_NOTABLE = ['invalid', 'unmanaged', 'modified', 'withdrawn', 'failed'];
 import {resolveSessionRef} from './sessions.js';
@@ -537,6 +538,14 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // widened in place as it opens tasks, so it can report on its work and on nothing else. The
   // scheduler stays unaware of the bus; token paths are daemon-side state, never journaled.
   const workerTokens = new Map(); // peer -> token file, for the life of that worker's grant
+  // The TUI records quota from the raw rows it renders (src/cli.js); a headless daemon never
+  // opened one, so a worker's or the orchestrator's own turns went unrecorded until the next
+  // `bounce quota` happened to query it. Raw rows only exist in orchestrator mode (main-service's
+  // main turn, scheduler's worker turns) — same rows the TUI reads, recordQuota is idempotent.
+  const quotas = orchestrating ? loadQuota(root) : null;
+  const quotaUnsubscribe = orchestrating ? session.subscribe(row => {
+    if (row.kind === 'raw') recordQuota(quotas, root, quotaSnapshot(row.provider, row.raw));
+  }) : () => {};
   const grantsUnsubscribe = !orchestrating ? () => {} : session.subscribe(row => {
     if (row.kind === 'task.submitted' && orchestratorOwns(session.events, row.task)) bus.extendGrant('orchestrator', [row.task]);
     else if (row.kind === 'task.started') {
@@ -591,6 +600,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
       process.exitCode = code;
       stopUnsubscribe();
       grantsUnsubscribe();
+      quotaUnsubscribe();
       closeLocalActivation();
       closeJevActivation();
       closeCampaignContinuation();

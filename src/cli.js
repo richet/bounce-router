@@ -1282,9 +1282,17 @@ async function main() {
     t.unref?.();
   }
   void refreshQuota(settings, {root, store: quotas, cwd: session.cwd}).then(render, () => {});
+  // Nothing else refreshes the sidebar while the TUI sits idle between turns: without this, a
+  // reading shown on open just grows stale until the next turn or /quota. Checked once a minute,
+  // unref'd so it never keeps the process alive.
+  const quotaAgeTimer = setInterval(() => {
+    const oldest = Math.min(...quotaOrder().map(p => Date.parse(quotas[p]?.time ?? 0) || 0));
+    if (Date.now() - oldest > 10 * 60000) void refreshQuota(settings, {root, store: quotas, cwd: session.cwd}).then(render, () => {});
+  }, 60000);
+  quotaAgeTimer.unref?.();
 
   process.on('SIGTERM', () => { if (busy) {router.cancel(); const timer = setInterval(() => {if (!busy) {clearInterval(timer); quit();}}, 100);} else quit(); });
-  process.on('exit', () => { terminal?.unmount(); });
+  process.on('exit', () => { clearInterval(quotaAgeTimer); terminal?.unmount(); });
   enter();
   if (!dev && process.env.BOUNCE_NO_UPDATE_CHECK !== '1') {
     void globalInstall().then(() => checkUpdate({root})).then(release => {
