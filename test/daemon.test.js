@@ -646,6 +646,19 @@ test('O2 orchestrator single-provider: the orchestrator submits over the bridge,
   const skillLine = orders.split('\n').find(line => line.startsWith('Skill: '));
   assert.equal(fs.existsSync(skillLine.slice('Skill: '.length)), true);
   assert.equal(orders.includes('BOUNCE_BUS_TOKEN_FILE='), true);
+  // The orders govern over the user's own global CLAUDE.md/WORKFLOW.md (item 2): first lines say so.
+  assert.match(orders, /^These orders govern this session\. Where the user's CLAUDE\.md or WORKFLOW\.md conflict with them/m);
+  assert.equal(orders.includes('Never push, and never add'), true);
+  assert.equal(orders.includes('AI attribution to commits or PRs.'), true);
+  // Small work stays with the orchestrator (item 1): it may do it itself, not dispatch everything.
+  assert.equal(orders.includes('Do small things yourself: answer questions, read files, run read-only checks, and run a short real-folder'), true);
+  assert.equal(orders.includes('Dispatch a worker for anything that edits source or will take more than about five'), true);
+  assert.equal(orders.includes('Delegate every implementation task to a worker profile below'), false);
+  assert.equal(orders.includes('Do not edit the repository yourself and do not read bounce\'s own source'), false);
+  // A retry may name its own next profile (item 3).
+  assert.equal(orders.includes('After a failed attempt, you may name the next profile for the retry yourself and say why'), true);
+  // No jev block: the Jev advice line is absent too, same as every other Jev-conditional line.
+  assert.equal(orders.includes('A task.accepted row may carry advice from an unsure Jev review'), false);
   // Found live: a reviewer's 12 KB FAIL verdict reached the orchestrator cut at
   // 1,200 characters. It tried task_get, four shapes of `bounce wait` and two --help pages, concluded the
   // bridge had no full-report option, and began re-reading the source itself. The option now exists; the
@@ -656,8 +669,12 @@ test('O2 orchestrator single-provider: the orchestrator submits over the bridge,
   assert.equal(orders.includes('You may publish only: task.submitted, task.accepted, task.rework, task.milestone, task.blocked, task.input_required, task.usage, task.activity, message.'), true);
   // steps is refused-without when the completion reviewer is a verifier, so the brief has to name it.
   assert.equal(orders.includes('steps (the verification steps, as text) — required when the completion reviewer is a verifier profile'), true);
-  assert.equal(orders.includes('phase, text, next, and evidence'), true, 'workers receive the durable progress checkpoint contract');
-  assert.equal(orders.includes('initial inspection, every phase change, and before completion'), true, 'checkpoint cadence is explicit');
+  // Milestone/report contract is a worker instruction, not an orchestrator order (item 7): the
+  // orchestrator only reads outcomes and does not publish milestones on a worker's behalf.
+  assert.equal(orders.includes('Workers report their own progress and final result through `bounce report`/their report tool'), true);
+  assert.equal(orders.includes('you do not publish milestones for them'), true);
+  assert.equal(orders.includes('Publish task.milestone with task, phase, text, next, and evidence'), false);
+  assert.equal(orders.includes('A Codex worker calls its scoped `bounce_report` tool'), false);
   // The input prefill (Tab, Enter) needs the answer to state its next prompt; nothing else asked for it.
   assert.equal(orders.includes('end the answer with one line `Next: <the prompt, as the user would type it>`'), true, 'the orchestrator is asked for the prefill line');
   // Found live (session 159f4746): the orchestrator offered to commit, then sent the commit to workers seven
@@ -851,7 +868,8 @@ test('O-jev orchestrator with Jev review on: the root task is Jev-reviewed befor
   assert.equal(journal.includes('daemon-test-key-4242'), false);
   assert.equal(fs.readFileSync(path.join(root, 'config.json'), 'utf8').includes('daemon-test-key-4242'), false);
   const orders = fs.readFileSync(path.join(session.dir, 'orchestrator', 'ORDERS.md'), 'utf8');
-  assert.match(orders, /build → codex \(builder\) \[tier mid\] — Steady on routine implementation\./, 'the profile\'s own tier, the note\'s sentence');
+  // The roster prose (tier/capabilities per profile) is gone (item 6): just the one-line roster.
+  assert.match(orders, /^Worker profiles \(one AI each\): [\w, ]*\bbuild\b[\w, ]* — name one only when the user asks for that AI, or for a retry \(see above\)\.$/m);
   assert.equal(session.events.some(e => e.kind === 'jev.roster' || (e.kind === 'jev.skipped' && e.reason === 'roster')), false);
   assert.equal(orders.includes('jev →'), false, 'the synthetic reviewer is not a roster entry');
   assert.match(orders, /auto → Jev routing is off \(\/jev routing on\): resolves to build/);

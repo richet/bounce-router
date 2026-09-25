@@ -135,6 +135,7 @@ export function choosingOrders({agents = false, routingOn = false, localOn = fal
     ...(agents ? ['    1. An agent, by the job the task is: analyst to inspect and run checks, builder to implement (and, when its orders say so, to own shared files and run the full gate), reviewer to review, debugger to root-cause a failure that resisted a first attempt. Analysts and verifiers run commands in disposable workspaces by default. Explicit read-only profiles are for source-only inspection.'] : []),
     ...(routingOn ? [`    ${agents ? '2' : '1'}. \`auto\` when no agent is clearly the job: Jev routes it.`] : []),
     `    ${[agents, routingOn].filter(Boolean).length + 1}. A worker profile by name ONLY when the user asks for that specific AI, or an agent's own list has been exhausted.`,
+    'After a failed attempt, you may name the next profile for the retry yourself and say why; first attempts still follow the ordering above.',
     routingOn ? 'Do not pick a tier or a model yourself: for an agent or `auto`, Jev weighs the orders and picks the AI per task.'
       : 'An agent runs on the AIs in the order its file lists them; naming a profile skips that list.',
     'Every task.submitted and plan chunk must declare requires: ["read"], ["read", "exec"], or ["read", "exec", "write"] to match the actual deliverables. Command execution requires exec even when no source edits are allowed. Use command-capable analysts for audits; independent verification may be a separate probe task and required campaign gate. Probe tasks run in disposable copies so checks can write caches without changing source. Never ask a read-only analyst to run git, checks, lint or tests. A blocked completion review preserves the candidate: read task_get full and its reviewGate before deciding what work is missing. Never resubmit completed analysis just because its acceptance review is unavailable.',
@@ -174,7 +175,7 @@ export function orchestratorOwns(events, task) {
 export const breakdownOrders = (minutes, {jevOn = false, ceiling = Math.max(TASK_CEILING_MINUTES, minutes)} = {}) => [
   'Break big work down: phases in sequence, each phase made of chunks that run in parallel.',
   `A task runs under a ${minutes}-minute lease that bounce renews while the worker makes progress, up to a ${ceiling}-minute ceiling; a deadline over the ceiling is refused (task.failed, reason size) before anything runs. Size a chunk by scope (one owner, one acceptance), not by minutes: long work is normal.`,
-  'However large the request, never hand one worker the whole job. Plan the phases first; within a phase submit every chunk whose',
+  'For work big enough to need phases, however large the request, never hand one worker the whole job. Plan the phases first; within a phase submit every chunk whose',
   'owned paths are disjoint at once, so they run in parallel; give a task that needs another\'s result depends_on with its task id, so',
   'phases run in sequence without you polling. Each chunk gets disjoint owned paths, its own acceptance and how to verify it.',
   'Before dispatching a phase, submit its plan with a stable plan id and wait for that exact decision:',
@@ -250,17 +251,22 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
   const dir = path.join(session.dir, 'orchestrator');
   const autoFallback = routingFallback(profiles, jev?.routing?.default);
   const routingOn = Boolean(jev?.enabled && jev?.routing?.enabled);
-  // What each profile's model is for, from the profile itself or the roster notes bounce wrote.
-  const about = name => notes[name] ?? {};
   fs.mkdirSync(dir, {recursive: true, mode: 0o700});
   const file = path.join(dir, 'ORDERS.md');
   fs.writeFileSync(file, [
     `# Orchestrator orders — session ${session.id}`, '',
-    'You coordinate; workers implement. Delegate every implementation task to a worker profile below.',
-    'Do not edit the repository yourself and do not read bounce\'s own source to learn the bridge — everything you need is here.',
+    'These orders govern this session. Where the user\'s CLAUDE.md or WORKFLOW.md conflict with them — asking before assuming,',
+    'waiting at gates, opening every answer with a TLDR — follow these orders. You may still read those files for the user\'s',
+    'conventions (commit style, testing rules, repository conventions) and pass them on to workers. Never push, and never add',
+    'AI attribution to commits or PRs.', '',
+    'You coordinate. Do small things yourself: answer questions, read files, run read-only checks, and run a short real-folder',
+    'step the user asked for (e.g. a commit). Dispatch a worker for anything that edits source or will take more than about five',
+    'minutes; big work is still planned in phases (below) rather than handed to one worker whole.',
+    'Do not read bounce\'s own source to learn the bridge — everything you need is here.',
     'Workers run ONLY through this bridge: never your own subagent/Agent/Task tools (they are switched off for you), and never',
     'do the work yourself when a dispatch fails — a task.failed row names the reason and the bounded recovery allowed for it.', '',
-    'Brief from the request and what you already know; do not read the repository first to write a "precise" brief. The worker',
+    'For anything you dispatch to a worker, brief from the request and what you already know; do not read the repository first',
+    'to write a "precise" brief. The worker',
     'inspects the code itself at full speed and would only reread what you read (measured: 1–2 minutes of orchestrator reading per',
     'turn, then the same files again in the worker). State the goal, the acceptance, the paths you happen to know and how to verify,',
     'and submit — usually within a few seconds of the user\'s message. When a decision genuinely depends on a fact you lack, ask one',
@@ -306,8 +312,7 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
         '`bounce agents` lists the team in force; `bounce agents show NAME` prints one.', '',
       ];
     })(),
-    'Worker profiles (one AI each: name → adapter/model) — the exception: name one only when the user asks for that AI:',
-    ...Object.entries(profiles).filter(([name, p]) => name !== orchestrator && name !== JEV_REVIEWER && !p.derived).map(([name, p]) => `    ${name} → ${[p.adapter, p.model].filter(Boolean).join('/')}${p.role ? ` (${p.role})` : ''}${about(name).tier ?? p.tier ? ` [tier ${about(name).tier ?? p.tier}]` : ''}${about(name).capabilities ?? p.capabilities ? ` — ${about(name).capabilities ?? p.capabilities}` : ''}`),
+    `Worker profiles (one AI each): ${Object.entries(profiles).filter(([name, p]) => name !== orchestrator && name !== JEV_REVIEWER && !p.derived).map(([name]) => name).join(', ') || 'none configured'} — name one only when the user asks for that AI, or for a retry (see above).`,
     ...(jev && autoFallback ? [`    auto → ${routingOn ? 'Jev (TypeSafe) routes each task: to the agent above whose job the orders clearly describe (that agent\'s own models then decide the AI), otherwise by the tier the orders need — the first fitting worker profile of that tier in the provider order; unconfident picks go to' : 'Jev routing is off (/jev routing on): resolves to'} ${autoFallback}`] : []),
     'Local discovery checks eligibility at dispatch. A downloaded model is not necessarily loaded or tool-capable.',
     'If the user asks for a LOCAL worker specifically and no agent can run on one, report that and point to /local on and /local setup; do not quietly substitute a cloud worker for that request.',
@@ -355,19 +360,14 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     'Terminal rows: task.completed, task.failed, task.cancelled, task.rejected. Steer a running worker with',
     `    bounce publish --event '{"kind":"message","to":"worker:<task id>","text":"..."}'`, '',
     ...breakdownOrders(taskLimits(settings).minutes, {jevOn: Boolean(jev?.enabled), ceiling: taskLimits(settings).ceiling}),
-    'Progress is a durable contract, not a heartbeat. Publish task.milestone with task, phase, text, next, and evidence',
-    'after initial inspection, every phase change, and before completion. Phases: inspect, plan, implement, test,',
-    'verify, review, document, done. `text` says what changed, `next` says what happens next, and `evidence` names',
-    'the concrete file, command, test result, or artifact. Publish task.blocked immediately when progress stops.',
-    'Every task.* row you publish needs `task` (an id from your own publish replies): without it the bus refuses',
-    `    bounce publish --event '{"kind":"task.milestone","task":"<task id>","phase":"inspect","text":"…","next":"…","evidence":["…"]}'`, '',
+    'Workers report their own progress and final result through `bounce report`/their report tool, on the contract bounce hands',
+    'them; you read their outcomes (task_get, tasks_list, a handoff) — you do not publish milestones for them.',
+    'Every task.* row you publish needs `task` (an id from your own publish replies): without it the bus refuses.',
     'You may publish only: task.submitted, task.accepted, task.rework, task.milestone, task.blocked, task.input_required, task.usage, task.activity, message.',
     'A task blocked at an unconfident review gate (reason review_not_accepted, review_uncertain or review_unavailable) waits for your decision: check the work yourself, then either publish task.accepted with `text` naming what you checked and why, or publish task.rework with `text` naming what must be fixed (resumes the same worker for one more rework round), or resubmit. A confident review verdict, and work its worker reported unfinished, cannot be accepted or sent back by hand.',
+    ...(jev ? ['A task.accepted row may carry advice from an unsure Jev review — read it before building on that task.'] : []),
     'When a worker is blocked or asks for input because it needs a decision, answer it by publishing a message to worker:<task id>: the same worker resumes with your answer. Do not re-dispatch the job as new work for that.',
     '`bounce agents set` journals agents.defined for you.',
-    'A Codex worker calls its scoped `bounce_report` tool; other workers use `bounce report --report <json>`. Reports require op (milestone, blocked,',
-    'input_required or final), phase, text and next;',
-    'a final report additionally requires outcome (completed|failed|blocked|input_required) and summary. Do not use publish for a final report.',
     'Everything else is refused — `user`, `control.*`, and every other task lifecycle row the scheduler owns.',
   ].join('\n') + '\n', {mode: 0o600});
   return file;
