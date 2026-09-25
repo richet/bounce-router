@@ -26,10 +26,76 @@ export function liveSessionCredentials(root, {list = null, readdir = fs.readdirS
   if (!live.length) return {ok: false, reason: 'no live bounce session on this machine: start one with `bounce`, or set BOUNCE_BUS and BOUNCE_BUS_TOKEN_FILE'};
   if (live.length > 1) return {ok: false, reason: `${live.length} live bounce sessions (${live.map(row => row.id.slice(0, 8)).join(', ')}): set BOUNCE_BUS and BOUNCE_BUS_TOKEN_FILE to name the one you mean`};
   const home = nodePath.join(root, 'sessions', live[0].id);
+  // `createBus` may need a short fallback outside the session directory. daemon.json
+  // is the daemon's published endpoint; deriving bus.sock here silently binds reads
+  // and writes to different places on long BOUNCE_HOME paths.
+  let daemon = null;
+  try { daemon = JSON.parse(fs.readFileSync(nodePath.join(home, 'daemon.json'), 'utf8')); } catch {}
   let token = null;
   try { token = readdir(nodePath.join(home, 'tokens')).find(name => name.startsWith('orchestrator-')) ?? null; } catch {}
   if (!token) return {ok: false, reason: `session ${live[0].id.slice(0, 8)} has no orchestrator grant yet: it is not running in orchestrator mode, or has not started its first turn`};
-  return {ok: true, path: nodePath.join(home, 'bus.sock'), tokenFile: nodePath.join(home, 'tokens', token), session: live[0].id};
+  return {ok: true, path: daemon?.bus || nodePath.join(home, 'bus.sock'), tokenFile: nodePath.join(home, 'tokens', token), session: live[0].id,
+    incarnation: daemon?.started ?? null};
+}
+
+// A binding is selected exactly once, then refreshed only for that same session. This
+// is what prevents an MCP server from reading session A after session B has appeared.
+export function sessionBinding(root, {env = process.env, discover = liveSessionCredentials} = {}) {
+  const explicit = env.BOUNCE_SESSION;
+  const envBus = env.BOUNCE_BUS;
+  let selected = null;
+  const choose = () => {
+    if (selected) return {ok: true, session: selected};
+    if (explicit) {
+      const rows = listSessions(root);
+      const matches = rows.filter(row => row.id === explicit || row.id.startsWith(explicit));
+      if (matches.length !== 1) return {ok: false, code: 'session_not_found', reason: `session ${explicit} is not an unambiguous session`, repair: 'set BOUNCE_SESSION to one full session id'};
+      selected = matches[0].id;
+      return {ok: true, session: selected};
+    }
+    // A server launched inside a session keeps its own grant. Match that endpoint to
+    // the session record so its reads share the binding without replacing a worker or
+    // user capability with the orchestrator token.
+    if (envBus) {
+      const matches = listSessions(root).filter(row => row.live && (() => {
+        try { return JSON.parse(fs.readFileSync(nodePath.join(root, 'sessions', row.id, 'daemon.json'), 'utf8')).bus === envBus; }
+        catch { return false; }
+      })());
+      if (matches.length !== 1) return {ok: false, code: 'session_binding_unresolved', reason: 'the supplied BOUNCE_BUS does not identify one live session', repair: 'set BOUNCE_SESSION to the intended session id'};
+      selected = matches[0].id;
+      return {ok: true, session: selected};
+    }
+    const found = discover(root);
+    if (!found.ok) return found;
+    selected = found.session;
+    return {ok: true, session: selected};
+  };
+  const read = () => {
+    const chosen = choose();
+    if (!chosen.ok) return chosen;
+    const home = nodePath.join(root, 'sessions', chosen.session);
+    let daemon = null;
+    try { daemon = JSON.parse(fs.readFileSync(nodePath.join(home, 'daemon.json'), 'utf8')); } catch {}
+    const conventional = nodePath.join(home, 'bus.sock');
+    if (envBus && envBus !== daemon?.bus && envBus !== conventional) return {ok: false, code: 'session_bus_mismatch', reason: `BOUNCE_BUS does not belong to session ${chosen.session.slice(0, 8)}`, repair: 'set BOUNCE_SESSION to the session that owns BOUNCE_BUS, or unset one of them'};
+    return {ok: true, session: chosen.session, path: envBus || daemon?.bus || conventional, journal: nodePath.join(home, 'journal.jsonl'), incarnation: daemon?.started ?? null};
+  };
+  const refresh = () => {
+    const bound = read();
+    if (!bound.ok) return bound;
+    const home = nodePath.join(root, 'sessions', bound.session);
+    // Discovery never lends a stale token to a dead session. Explicit offline sessions
+    // remain readable through read(), but cannot mutate until their daemon is live.
+    if (!envBus && !listSessions(root).some(row => row.id === bound.session && row.live)) return {ok: false, code: 'session_not_live', reason: `session ${bound.session.slice(0, 8)} is not live`, repair: 'resume that session before submitting or waiting'};
+    const tokenFile = envBus ? env.BOUNCE_BUS_TOKEN_FILE : (() => {
+      try { const token = fs.readdirSync(nodePath.join(home, 'tokens')).find(name => name.startsWith('orchestrator-')) ?? null; return token && nodePath.join(home, 'tokens', token); } catch { return null; }
+    })();
+    if (!tokenFile) return {ok: false, code: 'missing_grant', reason: `session ${bound.session.slice(0, 8)} has no usable bridge grant`, repair: 'start or resume that session with its bridge grant'};
+    let token;
+    try { token = fs.readFileSync(tokenFile, 'utf8').trim(); } catch (error) { return {ok: false, code: 'missing_grant', reason: `cannot read token file: ${error.message}`, repair: 'refresh the session bridge grant'}; }
+    return {...bound, tokenFile, token};
+  };
+  return {read, refresh, session: () => selected};
 }
 
 // A server the vendor client launches — `bounce mcp-serve` from codex's own config — never receives the
@@ -56,10 +122,10 @@ export function credentials(env = process.env, {reporting = false, discover = nu
 
 // Every verb resolves to {ok: true, row|rows|view} or {ok: false, reason, code}: a transport decides how to
 // say it, never what it says. Nothing here throws for an expected failure.
-export function createOps({env = process.env, connect = connectBus, clock = () => Date.now(), waitChunkMs = WAIT_CHUNK_MS, discover = null} = {}) {
+export function createOps({env = process.env, connect = connectBus, clock = () => Date.now(), waitChunkMs = WAIT_CHUNK_MS, discover = null, binding = null} = {}) {
   async function withClient(reporting, use) {
-    const credential = credentials(env, {reporting, discover});
-    if (!credential.ok) return {ok: false, reason: credential.reason, code: 'no_credential'};
+    const credential = reporting ? credentials(env, {reporting, discover}) : (binding ? binding.refresh() : credentials(env, {reporting, discover}));
+    if (!credential.ok) return {ok: false, reason: credential.reason, code: credential.code ?? 'no_credential', repair: credential.repair};
     let client;
     try { client = await connect({path: credential.path, token: credential.token}); }
     catch (error) { return {ok: false, reason: error.message, code: error.code ?? -32001}; }

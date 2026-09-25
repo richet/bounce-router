@@ -14,6 +14,7 @@ import {modelCatalog, modelEntries, catalogNotes} from './models.js';
 import {discoverLocalModels, switchLocal} from './local-models.js';
 import {readMachine, resourceReport, createResources} from './resources.js';
 import {taskView, taskList} from './task-view.js';
+import {campaigns} from './orchestration.js';
 import {formatTaskView, formatTaskList} from './task-report.js';
 import {runLocalSetup} from './local-wizard.js';
 import {createLocalSetupView} from './local-setup-view.js';
@@ -226,26 +227,32 @@ async function main() {
   // The agent-facing interface over MCP (docs/plans/bridge-interface.md): the same verbs and views the
   // bridge and these commands use, as typed tools, so an orchestrator stops shelling and parsing.
   if (positionals[0] === 'mcp-serve') {
-    const {createOps, liveSessionCredentials} = await import('./bridge-ops.js');
+    const {createOps, sessionBinding} = await import('./bridge-ops.js');
     const {createMcpServer, serveStdio} = await import('./mcp.js');
-    // Which session: the bus socket lives in its directory; failing that, the live one.
-    const busDir = process.env.BOUNCE_BUS && process.env.BOUNCE_BUS.endsWith('bus.sock') ? path.dirname(process.env.BOUNCE_BUS) : null;
-    const id = busDir && path.basename(path.dirname(busDir)) === 'sessions' ? path.basename(busDir)
-      : (listSessions(root).find(row => row.live)?.id ?? listSessions(root)[0]?.id ?? null);
-    const journal = id ? path.join(root, 'sessions', id, 'journal.jsonl') : null;
-    const events = () => id ? new Session(process.cwd(), {root, id}).events : [];
+    // Resolve once. Both the MCP views and mutations refresh this exact session after a
+    // daemon restart; neither is allowed to pick a newer session behind the other's back.
+    const binding = sessionBinding(root, {env: process.env});
+    const events = () => {
+      const found = binding.read();
+      if (!found.ok) return [];
+      return new Session(process.cwd(), {root, id: found.session}).events;
+    };
+    const journal = () => {
+      const found = binding.read();
+      return found.ok ? found.journal : null;
+    };
     const server = createMcpServer({
       // Codex launches this server from its own config, so the per-session grant never reaches its env:
       // without one, it finds the live session itself and refuses when that answer is not unique.
-      ops: createOps({env: process.env, discover: () => liveSessionCredentials(root)}),
-      views: {taskView: task => taskView(events(), task, {journal}), taskList: options => taskList(events(), options)},
+      ops: createOps({env: process.env, binding}),
+      views: {binding: () => binding.read(), taskView: (task, options) => taskView(events(), task, {journal: journal(), ...options}), taskList: options => taskList(events(), options), campaign: id => campaigns(events())[id] ?? null},
       version,
     });
     serveStdio(server);
     return new Promise(() => {}); // stdio server: it ends when its client closes the pipe
   }
   // The reads the orchestrator used to fake with `tail | jq` — the same view its tools return.
-  if (positionals[0] === 'task' && positionals[1] !== 'compare') {
+  if ((positionals[0] === 'task' || positionals[0] === 'tasks') && positionals[1] !== 'compare') {
     const ref = values.session || listSessions(root).find(row => row.live)?.id || listSessions(root)[0]?.id;
     if (!ref) throw new Error('No session to read · start one with `bounce`');
     const id = resolveSessionRef(root, ref);
@@ -1249,6 +1256,6 @@ const [bridgeCmd] = process.argv.slice(2);
 // the grant it holds. The supervisor strips the bus grant from every plain child it spawns, so
 // this must run in-process, like publish/wait/report — it reads config but never a session.
 (['publish', 'wait', 'report'].includes(bridgeCmd) ? runBridge()
-  : bridgeCmd === 'agents' ? main()
+  : ['agents', 'mcp-serve'].includes(bridgeCmd) ? main()
   : process.env.BOUNCE_SUPERVISED === '1' && typeof process.send === 'function' ? main() : supervise()
 ).catch(error => {console.error(`bounce: ${error.message}`); process.exitCode = 1;});

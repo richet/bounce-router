@@ -163,13 +163,13 @@ test('missing final report gets one real report-only resume and accepts its scop
       assert.match(message, /call the bounce_report tool/);
       assert.doesNotMatch(message, /bounce report --report/);
       assert.throws(() => scheduler.report({...grant, attempt: 1, report: {op: 'milestone', phase: 'old', text: 'late', next: 'none'}}), /stale report/);
-      scheduler.report({...grant, report: {op: 'final', outcome: 'completed', phase: 'done', text: 'Verified', next: 'none', summary: 'Actual result', evidence: ['test/log'], remaining: 'none'}});
+      scheduler.report({...grant, report: {op: 'final', outcome: 'completed', phase: 'done', text: 'Verified', next: 'none', summary: 'Actual result', evidence: ['test/log'], remaining: ''}});
       return {attempt: 2};
     },
     async *events() { yield {kind: 'native', provider: 'A', sessionId: 'thread'}; yield {kind: 'result', status: 'completed', text: 'preamble'}; },
     cancel: async () => ({verified: true}),
   };
-  scheduler = createScheduler({session, adapters: {codex: adapter}, profiles: {A: {adapter: 'codex', mode: 'plan'}}, requireFinalReport: true, reportGrant: identity => { grant = identity; return {}; }, watchdog: {interval: null}});
+  scheduler = createScheduler({session, adapters: {codex: adapter}, profiles: {A: {adapter: 'codex', mode: 'plan'}}, requireFinalReport: true, reportGrant: identity => { grant = identity; return {}; }, limits: {attempts: 1}, watchdog: {interval: null}});
   t.after(() => { scheduler.close(); fs.rmSync(root, {recursive: true, force: true}); });
   const submitted = scheduler.submit({profile: 'A', orders: 'work', budget: {starts: 2}});
   await rowAfter(session, row => ['task.failed', 'task.completed'].includes(row.kind) && row.task === submitted.task);
@@ -195,4 +195,17 @@ test('watchdog does not kill a worker producing observed work solely for missing
     await scheduler.tick();
   }
   assert.equal(scheduler.tasks()[submitted.task].state, 'running');
+});
+
+test('restart after verified worker exit without an outcome exposes a concrete recovery blocker', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-ended-gap-'));
+  const session = new Session(root, {root});
+  session.append({kind: 'task.submitted', task: 'ended', profile: 'A', orders: 'work'});
+  session.append({kind: 'task.started', task: 'ended', attempt: 1});
+  session.append({kind: 'task.attempt.ended', task: 'ended', attempt: 1, verifiedTermination: true});
+  const scheduler = createScheduler({session, adapters: {A: heldAdapter()}, profiles: {A: {adapter: 'A'}}, watchdog: {interval: null}});
+  t.after(() => { scheduler.close(); fs.rmSync(root, {recursive: true, force: true}); });
+  await scheduler.reconcile();
+  assert.equal(scheduler.tasks().ended.state, 'blocked');
+  assert.equal(session.events.findLast(e => e.kind === 'task.blocked')?.reason, 'outcome_recovery_required');
 });

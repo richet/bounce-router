@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {spawnLive, vendorEnv, appendPending, readPending, takePending, promptSafe, verifiedCancel, PENDING_MAX, TEXT_MAX} from '../../src/adapters/live-common.js';
+import {spawnLive, vendorEnv, appendPending, readPending, takePending, promptSafe, verifiedCancel, classifyText, SPEAKER, PENDING_MAX, TEXT_MAX} from '../../src/adapters/live-common.js';
 const tmp = t => { const d = fs.mkdtempSync(path.join(os.tmpdir(), 'live-common-')); t.after(() => fs.rmSync(d, {recursive: true, force: true})); return d; };
 const collect = async events => { const out = []; for await (const e of events) out.push(e); return out; };
 
@@ -45,6 +45,11 @@ test('promptSafe flattens newlines and cuts to 1000 characters; non-strings are 
   assert.equal(promptSafe('a\nb\r\nc'), 'a b c');
   assert.equal(promptSafe('x'.repeat(1500)).length, 1000);
   assert.equal(promptSafe(null), 'null');
+});
+test('the ACE maximum-steps notice is runtime text, never a worker answer', () => {
+  assert.deepEqual(classifyText('opencode', 'Maximum steps for this agent have been reached'), {
+    speaker: SPEAKER.runtime, text: 'Maximum steps for this agent have been reached',
+  });
 });
 test('verifiedCancel: SIGTERM suffices for a cooperative child; a SIGTERM-trapping child needs SIGKILL; both verified within bounds', async () => {
   const kills = [];

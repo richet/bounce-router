@@ -59,3 +59,11 @@ export function revertOutside(cwd, before, owns = []) {
   }
   return reverted.sort();
 }
+
+// Inspection never rewrites a shared workspace: another worker or the user may own the bytes.
+export function outsideChanges(cwd, before, owns = []) {
+  if (!owns.length) return [];
+  const after = treeSnapshot(cwd);
+  return [...new Set([...Object.keys(before), ...Object.keys(after)])].filter(file =>
+    !ownedBy(file, owns) && !(before[file] && after[file] && same(before[file], after[file]))).sort();
+}

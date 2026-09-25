@@ -53,11 +53,11 @@ test('decidePlan: a confident finding rejects the plan naming the chunk and the 
   assert.equal(PLAN_CHECKS.phase_sized.instructions('c'), 'Chunk "c" describes a whole phase or several independent pieces of work, not one bounded piece with a single owner and a single acceptance.');
 });
 
-test('judgePlan never throws: Jev off or failing accepts the plan with the reason on record, so an orchestrator that plans is never blocked by the gate itself', async () => {
+test('judgePlan keeps Jev-off structural acceptance, but records an enabled reviewer failure as unavailable', async () => {
   const off = await judgePlan({plan, settings: {enabled: false}, ask: async () => { throw new Error('no'); }});
   assert.deepEqual([off.verdict, off.reason], ['accept', 'jev disabled']);
   const broken = await judgePlan({plan, settings: {enabled: true}, ask: async () => { throw Object.assign(new Error('boom'), {code: 'timeout'}); }});
-  assert.deepEqual([broken.verdict, broken.reason], ['accept', 'timeout']);
+  assert.deepEqual([broken.verdict, broken.reason], ['unavailable', 'timeout']);
   const asked = [];
   const judged = await judgePlan({plan, settings: {enabled: true}, ask: async request => { asked.push(request); return {answers: {...answerFor('gate', {}), ...answerFor('fix', {phase_sized: 0.9})}, model: 'jev-1.13.0', latencyMs: 12}; }});
   assert.deepEqual([judged.verdict, judged.findings[0].chunk, judged.model], ['reject', 'fix', 'jev-1.13.0']);
@@ -75,11 +75,11 @@ test('scheduler: a plan.submitted row is judged and answered with plan.accepted 
   verdict = {...answerFor('gate', {}), ...answerFor('fix', {})};
   session.append({kind: 'plan.submitted', plan: 'p1', from: 'orchestrator', ...plan});
   const accepted = await waitFor(() => session.events.find(e => e.kind === 'plan.accepted' && e.plan === 'p1'));
-  assert.equal(accepted.text, 'Plan P2 gate accepted: 2 chunks (Jev, model jev-1.13.0)');
+  assert.equal(accepted.text, 'P2 gate: plan.accepted');
   verdict = {...answerFor('gate', {phase_sized: 0.93}), ...answerFor('fix', {})};
   session.append({kind: 'plan.submitted', plan: 'p2', from: 'orchestrator', ...plan});
   const rejected = await waitFor(() => session.events.find(e => e.kind === 'plan.rejected' && e.plan === 'p2'));
   assert.equal(rejected.findings.length, 1);
-  assert.equal(rejected.text, `Plan P2 gate needs work: chunk "gate" — ${PLAN_CHECKS.phase_sized.fix} (0.93)`);
+  assert.equal(rejected.text, 'P2 gate: plan.rejected');
 });
 const waitFor = async fn => { const start = Date.now(); for (;;) { const v = fn(); if (v) return v; if (Date.now() - start > 8000) throw new Error('timed out'); await new Promise(r => setTimeout(r, 10)); } };

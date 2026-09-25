@@ -214,8 +214,8 @@ export function verdictQuestions() {
   };
 }
 
-// Pure: `rework` only when the Choice says so with confidence at or above the threshold;
-// anything else (accept, low confidence, an unexpected answer shape) is today's accept.
+// A decision that cannot meet the configured confidence bar is unresolved. It must never be
+// converted into acceptance merely because transport succeeded.
 export function decideVerdict(answers, {confidence = 0.8, state = null} = {}) {
   const decision = isObject(answers?.decision) ? answers.decision : {};
   const choice = typeof decision.choice === 'string' ? decision.choice : null;
@@ -228,9 +228,11 @@ export function decideVerdict(answers, {confidence = 0.8, state = null} = {}) {
   // times on checks it could not satisfy.)
   const dropped = state && typeof state.diff === 'string' && state.diff.trim() ? firedRaw.filter(name => name === 'empty_diff') : [];
   const fired = firedRaw.filter(name => !dropped.includes(name));
-  const rework = choice === 'rework' && conf >= confidence && !(dropped.length && !fired.length);
+  const resolved = (choice === 'accept' || choice === 'rework') && conf >= confidence;
+  const rework = resolved && choice === 'rework' && !(dropped.length && !fired.length);
+  const verdict = !resolved ? 'unavailable' : rework ? 'rework' : 'accept';
   const findings = rework ? (fired.length ? fired.map(name => VERDICT_CHECKS[name].fix) : ['Jev judged the work not ready against the orders; re-read the orders and the report against the diff before resubmitting.']) : [];
-  return {verdict: rework ? 'rework' : 'accept', choice, confidence: conf, threshold: confidence, probabilities: isObject(decision.probabilities) ? decision.probabilities : {}, checks, fired, ...(dropped.length ? {dropped} : {}), findings};
+  return {verdict, choice, confidence: conf, threshold: confidence, probabilities: isObject(decision.probabilities) ? decision.probabilities : {}, checks, fired, ...(dropped.length ? {dropped} : {}), findings};
 }
 
 // ---- model routing: a Choice over the roster plus Nouls for the access the orders need ----
@@ -515,20 +517,22 @@ export function decidePlan(answers, {plan, confidence = 0.8, ceilingMinutes = nu
   return {verdict: findings.length ? 'reject' : 'accept', findings, noted};
 }
 
-// Never throws: with Jev off or failing the plan is accepted with the reason on record, so the gate
-// itself never blocks an orchestrator that plans. Structural findings are still made without Jev.
+// Disabled model review uses explicit structural validation. An enabled but unavailable
+// reviewer cannot manufacture acceptance; preserve structural rejection when already known.
 export async function judgePlan({plan, settings, ask, ceilingMinutes = null, signal} = {}) {
   const s = normalizeJevSettings(settings);
   const structural = decidePlan({}, {plan, confidence: s.confidence, ceilingMinutes});
   const off = reason => ({...structural, reason, model: null});
+  const unavailable = reason => ({...structural, verdict: structural.verdict === 'reject' ? 'reject' : 'unavailable', reason, model: null});
   if (!s.enabled) return off('jev disabled');
-  if (typeof ask !== 'function') return off('routing unavailable');
+  if (typeof ask !== 'function') return unavailable('plan reviewer unavailable');
   const {state, questions} = planQuestions(plan);
   if (!Object.keys(questions).length) return off('no chunks');
   try {
     const result = await ask({state, questions, model: s.model, signal});
+    if (Object.keys(questions).some(name => !Number.isFinite(result.answers?.[name]?.noul))) return unavailable('incomplete plan review');
     return {...decidePlan(result.answers, {plan, confidence: s.confidence, ceilingMinutes}), reason: null, model: result.model, latencyMs: result.latencyMs};
-  } catch (error) { return off(error?.code ?? error?.message ?? 'error'); }
+  } catch (error) { return unavailable(error?.code ?? error?.message ?? 'error'); }
 }
 
 // ---- the lease judge: is a running task still getting somewhere, at the end of its lease? --------

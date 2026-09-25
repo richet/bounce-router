@@ -47,7 +47,8 @@ export function hostSession({session, child, main = null}) {
   return {detach() { unsubscribe(); unsubscribeMain(); child.off('message', onMessage); }};
 }
 
-// Child side: a synchronous proxy with the same public shape as Session. append/publish
+// Child side: a synchronous append/publish proxy. Durable multi-event commits remain
+// daemon-owned; this proxy intentionally does not expose Session.commit. append/publish
 // build a provisional row immediately (no seq), then the parent's reply (or its broadcast
 // of the same row, whichever arrives first) replaces it in place.
 export function createRemoteSession(channel) {

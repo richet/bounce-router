@@ -6,6 +6,7 @@ import net from 'node:net';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import {actionState, campaignCommand, requestAction} from './orchestration.js';
 
 // Peers publish from a positive allowlist: everything a session, the scheduler or the daemon writes is refused regardless of `from`,
 // because handoff() folds user/note rows into every later prompt and Router reads cooldown rows.
@@ -97,7 +98,7 @@ export async function reapStaleSockets({platform = process.platform, uid = proce
 
 // Resolves once actually listening; rejects (never throws async/uncaught) on any
 // bind/chmod failure — a stale non-socket file at the chosen path, EADDRINUSE, etc.
-export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = AUTH_TIMEOUT, validate = () => null, prepare = null, report: receiveReport = null}) {
+export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = AUTH_TIMEOUT, validate = () => null, prepare = null, report: receiveReport = null, commandCampaign = campaignCommand}) {
   const grants = new Map(); // peer -> {peer, tasks, canSubmit, context, token, file, sockets}
   const tokenToPeer = new Map();
   const tokensDir = path.join(dir, 'tokens');
@@ -180,6 +181,12 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
       if (e.from === undefined) e.from = peer;
       else if (e.from !== peer) return refuse(id, -32001, 'unauthorized');
       if (typeof e.kind !== 'string') return refuse(id, -32602, 'invalid event');
+      if (e.kind.startsWith('campaign.')) {
+        if (!authenticated.canSubmit || !['user', 'orchestrator'].includes(peer)) return refuse(id, -32001, 'unauthorized');
+        if (!['campaign.start', 'campaign.extend', 'campaign.complete', 'campaign.block', 'campaign.pause', 'campaign.resume', 'campaign.scope'].includes(e.kind)) return refuse(id, -32602, 'invalid campaign command');
+        try { return send({jsonrpc: '2.0', id, result: commandCampaign(session, e)}); }
+        catch (error) { return refuse(id, -32602, error.message); }
+      }
       if (e.kind.startsWith(USER_ONLY_PREFIX) ? peer !== 'user' : !PEER_KINDS.has(e.kind)) return refuse(id, -32001, 'unauthorized');
       if (e.kind === 'task.submitted') {
         // A canSubmit grant may open a root (parent explicitly null); anything with a parent needs that parent in its own tasks.
@@ -196,9 +203,13 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         // The scheduler may decorate a valid submission before it is journaled (a Jev completion
         // reviewer for a root task that names none); the decorated row is what everyone reads.
         if (typeof prepare === 'function') e = prepare(e);
+        const preparedProblem = validate(e);
+        if (preparedProblem) return refuse(id, -32602, `invalid prepared event: ${preparedProblem}`);
+        if (e.retryOf !== undefined && (!authenticated.tasks.includes(e.retryOf) || typeof e.retryOf !== 'string')) return refuse(id, -32001, 'unauthorized retry');
       } else if (e.kind === 'plan.submitted') {
         // A phase's breakdown, judged by Jev before any of its chunks run (scheduler: plan.accepted/plan.rejected).
         if (!Array.isArray(e.chunks) || !e.chunks.length || e.chunks.some(c => !c || typeof c !== 'object' || typeof c.id !== 'string' || !c.id || typeof c.orders !== 'string' || !c.orders)) return refuse(id, -32602, 'invalid event: plan.submitted needs chunks, each with an id and orders');
+        if (!authenticated.canSubmit || !['user', 'orchestrator'].includes(peer)) return refuse(id, -32001, 'unauthorized');
         if (typeof e.plan !== 'string' || !e.plan) e.plan = crypto.randomUUID();
       } else if (e.kind.startsWith('task.')) {
         // A task.* row without its task is a malformed event, not an authority failure: say so
@@ -217,9 +228,16 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         if (typeof e.to !== 'string' || !e.to) return refuse(id, -32602, 'invalid event');
         // A worker is addressable only by a grant that owns its task (the scheduler turns the text into
         // adapter input): the same boundary as reporting on it. The user peer addresses anyone.
-        if (e.to.startsWith('worker:') && peer !== 'user' && !authenticated.tasks.includes(e.to.slice('worker:'.length))) return refuse(id, -32001, 'unauthorized');
+        if (/^(worker|review):/.test(e.to) && peer !== 'user' && !authenticated.tasks.includes(e.to.slice(e.to.indexOf(':') + 1))) return refuse(id, -32001, 'unauthorized');
+        if (e.to.startsWith('review:') && !['user', 'orchestrator'].includes(peer)) return refuse(id, -32001, 'unauthorized');
       }
-      const row = session.publish(e);
+      let row;
+      if (e.kind === 'task.submitted' || e.kind === 'plan.submitted') {
+        requestAction(session, e.kind === 'task.submitted'
+          ? {actionId: `dispatch:${e.task}:0`, type: 'dispatch', task: e.task}
+          : {actionId: `plan:${e.plan}`, type: 'plan', payload: {plan: e.plan}}, [e]);
+        row = session.events.findLast(event => event.kind === e.kind && (e.task ? event.task === e.task : event.plan === e.plan));
+      } else row = session.publish(e);
       send({jsonrpc: '2.0', id, result: row});
     }
 
@@ -240,6 +258,8 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
     function handleWait(id, {match = {}, timeout, afterSeq = 0}) {
       if (!Number.isInteger(timeout) || timeout > 600000) return refuse(id, -32602, 'invalid params: timeout must be an integer number of ms, at most 600000 (10 minutes); wait again to keep waiting');
       const outcomeWait = typeof match.task === 'string' && TASK_TERMINAL.has(match.kind);
+      const planWait = match.planDecision === true && typeof match.plan === 'string';
+      const PLAN_DECISIONS = new Set(['plan.accepted', 'plan.rejected', 'plan.unavailable']);
       const latestReplacement = task => {
         let current = task;
         const visited = new Set();
@@ -251,8 +271,11 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         }
         return current;
       };
-      const matches = row => (outcomeWait
+      const matches = row => (planWait
+        ? row.plan === match.plan && PLAN_DECISIONS.has(row.kind)
+        : outcomeWait
         ? row.task === latestReplacement(match.task) && TASK_TERMINAL.has(row.kind)
+          && ![...actionState(session.events).values()].some(action => action.task === row.task && action.type === 'terminal' && ['requested', 'started'].includes(action.status))
           && !(row.kind === 'task.completed' && session.events.find(event => event.kind === 'task.submitted' && event.task === row.task)?.review?.completion)
           && Object.entries(match).every(([key, value]) => key === 'kind' || key === 'task' || row[key] === value)
         : Object.entries(match).every(([key, value]) => row[key] === value))
@@ -276,7 +299,11 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
       const interruption = row => authenticated.peer === 'orchestrator' && row.kind === 'main.delivery' && row.state === 'acknowledged'
         && {kind: 'wait.interrupted', from: 'bounce', reason: 'message', messageId: row.messageId,
           text: 'A message from the user was delivered to your turn: read it and act on it before waiting again'};
-      const unsubscribe = session.subscribe(row => { if (matches(row)) finish(row); else { const cut = interruption(row); if (cut) finish(cut); } });
+      const unsubscribe = session.subscribe(row => {
+        const outcome = outcomeWait ? session.events.findLast(matches) : matches(row) ? row : null;
+        if (outcome) finish(outcome);
+        else { const cut = interruption(row); if (cut) finish(cut); }
+      });
       const timer = setTimeout(() => finish(null), timeout);
       timer.unref?.();
       pendingWaits.add(cleanup);

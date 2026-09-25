@@ -1,19 +1,25 @@
 import {randomUUID} from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
+import {createAttemptWorkspace, captureArtifact, integrateArtifact} from './workspace-artifacts.js';
 import * as reducers from './reducers.js';
 import {takeCheckpoint, sameTree} from './checkpoint.js';
 import {POLICY_RANK, effectivePolicy, LOCAL_ADAPTERS, playedBy, READ_ONLY_ROLES as READONLY_ROLES} from './profiles.js';
 import {defaultStrategy} from './strategy.js';
 import {reportEvent, validateReport} from './reporting.js';
+import {parseFinalReport, FINAL_REPORT_INSTRUCTION} from './final-report.js';
+import {actionState, campaigns, createActionRunner, requestAction} from './orchestration.js';
 import {normalizeLocalSettings} from './local-models.js';
 import {createLocalResolver} from './local-resolve.js';
 import {createResources, residentModels, sizeOf, fitLocal, gb, DEFAULT_RESERVE_BYTES} from './resources.js';
 import {concludeAsk} from './adapters/live-common.js';
 import {failedAttempts, repeatRefusal, REPEAT_LIMIT} from './loop-guard.js';
 import {discoverLocalModels} from './local-models.js';
-import {routingFallback} from './jev.js';
-import {validOwns, treeSnapshot, revertOutside} from './owned-paths.js';
+import {planTaskAdmission} from './plan-admission.js';
+import {supervisePlan} from './plan-supervision.js';
+import {judgePlan, routingFallback} from './jev.js';
+import {validOwns} from './owned-paths.js';
 import {execFileSync} from 'node:child_process';
 
 const FALLBACK_REASONS = new Set(['limited', 'missing', 'backend_unavailable', 'watchdog', 'local_unavailable', 'worker_runtime', 'incomplete_report']);
@@ -26,7 +32,7 @@ const SIZE_FIELDS = ['lines', 'probes', 'minutes'];
 // step of the local 27B at 77k tokens of context took up to three minutes of prefill (live).
 // concludeCap: the most a conclusion that keeps showing activity is waited for. Found live: a 27B was
 // still generating its answer 284 s into a fixed 300 s grace, and a whole 60 min review was lost.
-export const WATCHDOG_DEFAULTS = {interval: 5000, silence: 300_000, stall: 600_000, grace: 120_000, concludeGrace: 300_000, concludeCap: 900_000};
+export const WATCHDOG_DEFAULTS = {interval: 5000, startupMs: 120_000, silence: 300_000, stall: 600_000, grace: 120_000, concludeGrace: 300_000, concludeCap: 900_000};
 const DEFAULT_DEADLINE_MINUTES = 60; // a worker with no declared deadline; the watchdog ladder still catches silence
 const DEFAULT_CEILING_MINUTES = 60; // no lease is renewed past this, measured from the lineage's first start
 const CALL_MEMORY = 200; // tool calls remembered per running task, to tell new work from repeated work
@@ -51,7 +57,7 @@ const isPositiveInt = n => Number.isInteger(n) && n > 0;
 const REPORT_ONLY_WINDOW_MS = 120000;
 // `opencode` workers report by answering (or `bounce report` when they can run commands); it must be
 // told to CALL it, not to run `bounce report`, because the opencode tier has no shell (Q3).
-const LOCAL_REPORT_LINE = 'Your final answer is your report: when you are done, state the outcome, what you changed, how you verified it (paste the test output line), and what remains. There is no report tool or endpoint to reach.';
+const LOCAL_REPORT_LINE = FINAL_REPORT_INSTRUCTION;
 const reportInstruction = profile => profile?.adapter === 'codex'
   ? 'call the bounce_report tool with the report object'
   : 'use bounce report --report <json>';
@@ -101,15 +107,36 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // task's declared size is otherwise informational. The old built-in 150/6/15 defaults refused
   // real orchestrations (a 400-line brief) with no way to see why — a shallow rule, removed.
   const limits = {rounds: 2, ...suppliedLimits};
-  if (!isPositiveInt(limits.rounds) || SIZE_FIELDS.some(field => limits[field] !== undefined && !isPositiveInt(limits[field])) || (limits.ceiling !== undefined && !isPositiveInt(limits.ceiling))) throw new Error('malformed: limits');
+  if (!isPositiveInt(limits.rounds) || (limits.attempts !== undefined && !isPositiveInt(limits.attempts)) || SIZE_FIELDS.some(field => limits[field] !== undefined && !isPositiveInt(limits[field])) || (limits.ceiling !== undefined && !isPositiveInt(limits.ceiling))) throw new Error('malformed: limits');
   // The deadline is a lease renewed while the worker makes progress; the ceiling is the hard stop.
   const ceilingMs = (limits.ceiling ?? Math.max(DEFAULT_CEILING_MINUTES, limits.minutes ?? DEFAULT_DEADLINE_MINUTES)) * 60000;
   const watchdogConfig = {...WATCHDOG_DEFAULTS, ...suppliedWatchdog};
   const intervalOk = watchdogConfig.interval === null || isPositiveInt(watchdogConfig.interval);
-  if (!intervalOk || !isPositiveInt(watchdogConfig.silence) || !isPositiveInt(watchdogConfig.stall) || !isPositiveInt(watchdogConfig.grace) || !isPositiveInt(watchdogConfig.concludeGrace) || !isPositiveInt(watchdogConfig.concludeCap)) throw new Error('malformed: watchdog');
+  if (!intervalOk || !isPositiveInt(watchdogConfig.startupMs) || !isPositiveInt(watchdogConfig.silence) || !isPositiveInt(watchdogConfig.stall) || !isPositiveInt(watchdogConfig.grace) || !isPositiveInt(watchdogConfig.concludeGrace) || !isPositiveInt(watchdogConfig.concludeCap)) throw new Error('malformed: watchdog');
   const handles = new Map(); // task -> {adapter, handle}
+  let closed = false;
+  const planController = new AbortController();
+  const cancellationRequests = new Set();
   const reviews = new Map(); // task -> {adapter, handle}, one review in flight per task (A3)
   const heldTasks = new Set(); // tasks queued behind an unaccepted depends_on, re-evaluated on terminal rows
+  const campaignWaiters = new Set();
+  function campaignActive(task, id = submittedRow(task)?.campaignId) {
+    return !id || campaigns(session.events)[id]?.state === 'active';
+  }
+  function waitForCampaign(task, campaignId = submittedRow(task)?.campaignId) {
+    if (closed) return Promise.resolve(false);
+    append({kind: task ? 'task.campaign.waiting' : 'campaign.waiting', task, campaignId,
+      text: 'Campaign is paused or needs input; new execution waits for explicit resume'});
+    return new Promise(resolve => {
+      const wake = () => {
+        if (closed || reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) {
+          campaignWaiters.delete(wake); resolve(false);
+        } else if (campaignActive(task, campaignId)) { campaignWaiters.delete(wake); resolve(true); }
+      };
+      campaignWaiters.add(wake);
+      wake();
+    });
+  }
   // Local workers waiting for a slot: `local.endpoints.<name>.maxConcurrent` is how many the endpoint
   // runs at once (LM Studio is loaded with that many parallel slots; more would queue inside it and
   // look stalled, and each running model turn holds memory — observed live as a swapping machine).
@@ -169,8 +196,23 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // instant the journal would have picked anyway, so the real-clock path is byte-for-byte
   // unchanged; only the fake-clock path (tests) actually diverges from `new Date().toISOString()`.
   const stamp = () => new Date(clock()).toISOString();
-  const append = event => session.append({...event, time: stamp()});
-  const publish = event => session.publish({...event, time: stamp()});
+  const append = event => {
+    if (closed) return null;
+    const submitted = event.task ? session.events.find(e => e.kind === 'task.submitted' && e.task === event.task) : null;
+    const row = {...submitted && {jobId: submitted.jobId, campaignId: submitted.campaignId}, ...event, time: stamp()};
+    if (row.kind === 'task.completed') {
+      if (!submitted?.review?.completion && !publishArtifact(row.task, row)) return null;
+      const actionId = `completion:${row.task}:${reducers.tasks(session.events)[row.task]?.attempt ?? 0}`;
+      requestAction(session, {actionId, type: 'completion', task: row.task}, [row]);
+      return session.events.findLast(e => e.kind === row.kind && e.task === row.task);
+    }
+    if (['task.failed', 'task.cancelled', 'task.deadline', 'task.accepted', 'task.rejected'].includes(row.kind)) {
+      requestTerminal(row, [row]);
+      return session.events.findLast(e => e.kind === row.kind && e.task === row.task);
+    }
+    return session.append(row);
+  };
+  const publish = event => closed ? null : session.publish({...event, time: stamp()});
   const localActivity = (task, attempt, context) => event => {
     if (reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state) || launchingAttempts.get(task)?.cancelReason) return;
     append({kind: 'task.milestone', task, attempt, phase: event.phase, text: String(event.text).slice(0, 2000), next: 'continue local worker', context});
@@ -193,6 +235,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       await admitMemory({profile: resolved, task, attempt, context, signal: controller.signal});
       controller.signal.throwIfAborted();
       launching.phase = 'launch';
+      launching.requestedAt = clock();
       // Nothing ran before a launch fails, so the failure is always a verified non-start.
       return {profile: resolved, adapter: adapters[profile.adapter], signal: controller.signal, failed: () => true};
     } finally { clearTimeout(timer); }
@@ -264,6 +307,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   function finalizeReport({task, attempt, from, context}) {
     const final = session.events.findLast(e => e.kind === 'task.reported' && e.task === task && e.attempt === attempt);
     if (!final) return false;
+    if (final.outcome === 'completed' && final.remaining?.trim()) { append({kind: 'task.failed', task, reason: 'incomplete_report', text: final.remaining, from, context}); return true; }
     if (final.outcome === 'completed') append({kind: 'task.completed', task, summary: final.summary, artifacts: final.evidence, from, context});
     else if (final.outcome === 'failed') append({kind: 'task.failed', task, reason: 'reported_failure', text: final.summary, from, context});
     else if (final.outcome === 'blocked') append({kind: 'task.blocked', task, text: final.summary, from, context});
@@ -294,6 +338,20 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   }
 
   const validate = (spec, view) => {
+    if ((spec.planId !== undefined || spec.chunkId !== undefined) && spec.jobId) {
+      const admission = planTaskAdmission(session.events, spec);
+      if (!admission.ok) return admission.reason;
+    }
+    if (spec.retryOf !== undefined && !view[spec.retryOf]) return 'retryOf';
+    if (spec.campaignId) {
+      const campaign = campaigns(session.events)[spec.campaignId];
+      if (!campaign || campaign.state !== 'active') return 'campaign is not active';
+      if (!spec.gate || !campaign.required.includes(spec.gate)) return 'campaign gate';
+    }
+    if (spec.jobId) {
+      const previous = session.events.filter(e => e.kind === 'task.submitted' && e.jobId === spec.jobId);
+      if (previous.length && !spec.replaces && !spec.retryOf) return 'job already exists; use retryOf';
+    }
     if (spec.profile === AUTO_PROFILE ? !routingFallback(profiles) : !profiles[spec.profile]) return 'profile';
     if (typeof spec.orders !== 'string' || !spec.orders) return 'orders';
     if (spec.deadline !== null && spec.deadline !== undefined && !Number.isFinite(spec.deadline)) return 'deadline';
@@ -340,9 +398,19 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // strategy all see an ordinary completion review. An explicit review.completion always wins;
   // with Jev disabled or off for review, the row is untouched and behaviour is exactly today's.
   function prepare(spec) {
+    const predecessor = spec.retryOf ?? spec.replaces;
+    const original = predecessor ? rawSubmittedRow(predecessor) : null;
+    const activeCampaign = Object.values(campaigns(session.events)).filter(c => c.state === 'active');
+    const campaignId = spec.campaignId ?? original?.campaignId ?? (activeCampaign.length === 1 ? activeCampaign[0].id : undefined);
+    const task = spec.task ?? randomUUID();
+    const jobId = original?.jobId ?? spec.jobId ?? (spec.planId && spec.chunkId ? `plan:${spec.planId}:${spec.chunkId}` : `job:${task}`);
+    spec = {...spec, task, jobId, ...(campaignId ? {campaignId} : {}),
+      ...(original ? {replaces: predecessor, retryOf: predecessor, parent: original.parent ?? null,
+        deadline: original.deadline, budget: undefined, owns: original.owns, review: original.review ?? undefined,
+        gate: original.gate, planId: original.planId, chunkId: original.chunkId, depends_on: original.depends_on ?? []} : {})};
     const reviewer = jev && profiles[jev.reviewer];
     if (!reviewer || reviewer.adapter !== 'typesafe' || !READONLY_ROLES.has(reviewer.role) || strategy !== defaultStrategy) return spec;
-    if (spec.parent != null || spec.review?.completion) return spec;
+    if (spec.review?.completion) return spec;
     let settings;
     try { settings = jev.settings(); } catch { return spec; }
     if (!settings?.enabled || !settings.review) return spec;
@@ -350,12 +418,13 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   }
 
   function submit(rawSpec) {
+    if (rawSpec.ref) { const existing = session.events.find(e => e.kind === 'task.submitted' && e.ref === rawSpec.ref); if (existing) return existing; }
     const spec = prepare(rawSpec);
     const view = reducers.tasks(session.events);
     const problem = validate(spec, view);
     if (problem) throw new Error(`malformed: ${problem}`);
     const task = spec.task ?? randomUUID();
-    return append({
+    const row = {
       kind: 'task.submitted', task,
       parent: spec.parent ?? null,
       from: spec.from,
@@ -373,7 +442,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       review: spec.review ?? null,
       steps: spec.steps ?? null,
       ...(spec.owns ? {owns: spec.owns} : {}),
-    });
+      jobId: spec.jobId, retryOf: spec.retryOf, campaignId: spec.campaignId, gate: spec.gate, planId: spec.planId, chunkId: spec.chunkId,
+    };
+    requestAction(session, {actionId: `dispatch:${task}:0`, type: 'dispatch', task}, [{...row, time: stamp()}]);
+    return rawSubmittedRow(task);
   }
 
   // The task's own root for BUDGET purposes: follows a replacement to the task it replaced
@@ -414,15 +486,44 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     : error.code === 'limited' ? {reason: 'limited', text: error.message}
     : {reason: 'error', text: error.message};
 
-  // A write worker under a task that declares `owns` gets the tree snapshotted before its turn, so
-  // what it changed outside those paths can be put back afterwards (src/owned-paths.js).
-  function ownedSnapshot(task, profile) {
-    const owns = submittedRow(task)?.owns;
-    if (!Array.isArray(owns) || !owns.length || effectivePolicy(profile) === 'read-only' || !session.cwd) return null;
-    try { return {owns, before: treeSnapshot(session.cwd)}; } catch { return null; }
+  const workspaces = new Map();
+  function workspaceFor(task, profile, attempt) {
+    if (POLICY_RANK[effectivePolicy(profile)] < POLICY_RANK.write) return null;
+    const prior = workspaces.get(task) ?? workspaces.get(submittedRow(task)?.replaces);
+    if (prior) { workspaces.set(task, prior); return {...prior, attemptId: `${task}-${attempt}`}; }
+    const previous = session.events.findLast(e => e.kind === 'task.workspace' && (e.task === task || e.task === submittedRow(task)?.replaces));
+    if (previous) {
+      const workspace = JSON.parse(fs.readFileSync(previous.metadata, 'utf8'));
+      workspace.cwd = previous.cwd;
+      workspaces.set(task, workspace);
+      return {...workspace, attemptId: `${task}-${attempt}`};
+    }
+    const relative = path.relative(fs.realpathSync(session.cwd), fs.realpathSync(session.dir));
+    const nested = relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+    const dir = nested ? path.join(os.tmpdir(), 'bounce-workspaces', session.id, task) : path.join(session.dir, 'tasks', task);
+    fs.mkdirSync(dir, {recursive: true, mode: 0o700});
+    const workspace = createAttemptWorkspace({cwd: session.cwd, dir, owns: submittedRow(task)?.owns?.length ? submittedRow(task).owns : ['**'], attemptId: `${task}-${attempt}`});
+    workspaces.set(task, workspace);
+    append({kind: 'task.workspace', task, attempt, cwd: workspace.cwd, metadata: path.join(workspace.cwd, '.attempt-workspace.json'), baselineHash: workspace.baselineHash});
+    return workspace;
+  }
+  function artifactFor(task) {
+    const row = session.events.findLast(e => e.kind === 'task.artifact' && e.task === task);
+    return row ? {row, artifact: JSON.parse(fs.readFileSync(row.file, 'utf8'))} : null;
+  }
+  function publishArtifact(task, continuation) {
+    const found = artifactFor(task);
+    if (!found) return true;
+    const {row, artifact} = found;
+    if (session.events.some(e => e.kind === 'task.integrated' && e.task === task && e.artifactId === artifact.id)) return true;
+    requestAction(session, {actionId: `integrate:${task}:${artifact.id}`, type: 'integrate', task,
+      payload: {artifactId: artifact.id, file: row.file, dir: row.dir, continuation}},
+    [{kind: 'task.integration.requested', task, artifactId: artifact.id, digest: artifact.digest, time: stamp()}]);
+    return false;
   }
 
   function maybeFallback(row) {
+    if (session.events.some(e => e.kind === 'task.submitted' && e.replaces === row.task && e.task !== row.task)) return;
     if (!FALLBACK_REASONS.has(row.reason)) return;
     const view = reducers.tasks(session.events);
     const t = view[row.task];
@@ -434,8 +535,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (!profile) return; // the profile this task ran under no longer exists: nothing to fall back from
     // Terminal notifications can be duplicated by a provider. One immutable attempt gets at
     // most one successor, even before its first replacement has had time to launch.
-    if (session.events.some(e => e.kind === 'task.submitted' && e.replaces === row.task && e.task !== row.task)
-      || session.events.some(e => e.kind === 'policy.fallback' && e.task === row.task)) return;
+    if (session.events.some(e => e.kind === 'task.submitted' && e.replaces === row.task && e.task !== row.task)) return;
     const lineageRoot = lineageRootOf(row.task, view);
     const tried = new Set(lineageProfiles(lineageRoot, view));
     const deadline = deadlineAtFor(row.task);
@@ -453,16 +553,18 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       append({kind: 'policy.fallback.skipped', task: row.task, reason, text: reason === 'no_profile_configured' ? 'No fallback profile configured' : 'No untried fallback profile satisfies the task policy', context: submittedRow(row.task)?.context});
       return;
     }
-    append({kind: 'policy.fallback', task: row.task, from_profile: t.profile, to_profile: next, reason: row.reason});
+    append({kind: 'policy.fallback', task: row.task, from_profile: t.profile, to_profile: next, reason: row.reason, ref: `fallback:${row.task}:${next}`});
     const original = submittedRow(row.task);
     const originalRef = submittedRow(lineageRoot)?.ref;
     submit({
+      jobId: original.jobId, campaignId: original.campaignId, gate: original.gate, planId: original.planId, chunkId: original.chunkId,
       parent: original.parent, context: original.context, profile: next,
       orders: `${original.orders}\n\nRecovery from ${row.task}: ${row.reason}. ${row.text ?? ''}\nInspect existing work before continuing; do not repeat side effects blindly.\nLast progress: ${JSON.stringify(t.lastMilestone ?? null)}\nPartial report: ${JSON.stringify(session.events.findLast(event => event.kind === 'task.reported' && event.task === row.task) ?? null)}`,
       deadline: original.deadline,
       ...(original.depends_on?.length ? {depends_on: original.depends_on} : {}),
       ...(original.review ? {review: original.review} : {}), ...(original.steps ? {steps: original.steps} : {}),
       ...(original.checkpoint ? {checkpoint: original.checkpoint} : {}), ...(original.risk ? {risk: original.risk} : {}),
+      ...(original.owns ? {owns: original.owns} : {}),
       ...(original.size ? {size: original.size} : {}), replaces: row.task, ref: `${originalRef ?? row.task}:fallback:${next}`,
     });
   }
@@ -470,7 +572,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // A held task (queued behind an unaccepted depends_on) has no budget.reserved yet, so
   // re-running dispatch() on it is always safe: sizing/depth/profile/mode were already
   // satisfied the first time and cannot change, only the dependency's state can.
-  // After a daemon restart (`--resume`): the constructor already failed every mid-flight task
+  // After a daemon restart (`--resume`): the constructor blocks unverified mid-flight tasks
   // as orphaned; what is left is dispatching the tasks that were queued but never launched
   // (dispatch only ever fires from a live task.submitted subscription, not from history).
   let recoveryPromise;
@@ -478,21 +580,29 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return recoveryPromise ??= reconcileState();
   }
   async function reconcileState() {
-    // A local worker orphaned by a daemon restart has nothing to reconcile: there are no containers,
-    // and publication is atomic, so an interrupted worker published nothing — its task-local copy is
-    // simply abandoned. Termination of the previous process is still unverified, so such a task stays
+    effects.reconcile();
+    // Older journals and a crash between an external peer row and its subscriber may
+    // lack an intent. Reconstruct the obligation from the committed transition.
+    for (const row of [...session.events]) {
+      if (['task.failed', 'task.cancelled', 'task.deadline', 'task.accepted', 'task.rejected'].includes(row.kind)) requestTerminal(row);
+      else if (row.kind === 'task.completed') requestAction(session, {actionId: `completion:${row.task}:${row.attempt ?? reducers.tasks(session.events)[row.task]?.attempt ?? 0}`, type: 'completion', task: row.task});
+      else if (row.kind === 'plan.submitted') requestAction(session, {actionId: `plan:${row.plan}`, type: 'plan', payload: {plan: row.plan}, cause: row.seq});
+    }
+    // An isolated worker's unpublished files stay in its attempt workspace. An interrupted
+    // integration resumes through its durable action and manifest. For a lost worker handle,
+    // termination of the previous process is still unverified, so the task stays
     // blocked for inspection rather than being auto-recovered on a guarantee this design cannot make.
     for (const [task, t] of Object.entries(reducers.tasks(session.events))) {
       if (t.state !== 'queued' || handles.has(task) || heldTasks.has(task) || routing.has(task)) continue;
       const row = submittedRow(task);
-      if (row) dispatch(row).catch(error => append({kind: 'task.failed', task, reason: 'error', text: error.message, context: row.context}));
+      if (row) requestDispatch(row, session.events.findLast(e => TERMINAL_ROW_KINDS.has(e.kind))?.seq ?? 0);
     }
   }
   function wakeSlotWaiters() {
     for (const task of [...slotWaiters]) {
       if (!reducers.tasks(session.events)[task] || reducers.tasks(session.events)[task].state !== 'queued') { slotWaiters.delete(task); continue; }
       const row = submittedRow(task);
-      if (row) dispatch(row).catch(error => append({kind: 'task.failed', task, reason: 'error', text: error.message, context: row.context}));
+      if (row) requestDispatch(row, session.events.findLast(e => TERMINAL_ROW_KINDS.has(e.kind))?.seq ?? 0);
     }
   }
   function reevaluateHeld() {
@@ -500,7 +610,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       heldTasks.delete(task);
       const row = submittedRow(task);
       if (!row) continue;
-      dispatch(row).catch(error => append({kind: 'task.failed', task, reason: 'error', text: error.message, context: row.context}));
+      requestDispatch(row, session.events.findLast(e => TERMINAL_ROW_KINDS.has(e.kind))?.seq ?? 0);
     }
   }
 
@@ -529,7 +639,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // this task.accepted first, by subscriber order, and resolves with it: the bus's
       // `wait.served` names this row's seq, and main-service's pendingHandoffs() has nothing
       // later to announce.
-      append({kind: 'task.accepted', task, stage: 'completion', by: 'strategy', context});
+      const accepted = {kind: 'task.accepted', task, stage: 'completion', by: 'strategy', context};
+      if (publishArtifact(task, accepted)) append(accepted);
       return;
     }
     if (intent && typeof intent === 'object' && intent.action === 'review') {
@@ -549,9 +660,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const hook = invokeHook(() => strategy.onTerminal(row.task, view, api), row.task, row.context);
     if (!hook.ok) return;
     if (!hook.intent || typeof hook.intent !== 'object' || !Array.isArray(hook.intent.submit)) return;
-    for (const spec of hook.intent.submit) {
-      try { submit(spec); }
-      catch { /* a malformed fan-out spec is dropped: a strategy can never crash the daemon */ }
+    for (const [index, spec] of hook.intent.submit.entries()) {
+      try { submit({...spec, ref: spec.ref ?? `successor:${row.task}:${row.kind}:${row.seq}:${index}`}); }
+      catch (error) { append({kind: 'policy.escalated', task: row.task, reason: 'invalid_successor', text: error.message, context: row.context}); }
     }
   }
 
@@ -565,6 +676,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     let observedAt = -Infinity;
     try {
       for await (const event of adapter.events(handle)) {
+        if (closed) return;
         if (requireFinalReport && ['tool', 'assistant', 'progress'].includes(event.kind) && clock() - observedAt >= 5000) {
           observedAt = clock();
           append({kind: 'task.observed', task, text: String(event.text ?? '').slice(0, 16000), from, context});
@@ -588,19 +700,25 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
             // has exited before publishing a lifecycle event that can release dependents or
             // create a fallback. An unverifiable process stays visibly blocked.
             const stopped = await adapter.cancel(handle);
+            if (closed) return;
+            if (cancellationRequests.has(task)) return;
             if (stopped?.verified !== true) {
               append({kind: 'task.blocked', task, text: 'termination unverified', from, context});
               return;
             }
             if (handles.get(task)?.handle !== handle || reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) return;
-            // The task's owned paths are a contract, not a request: every change the turn made outside
-            // them is put back now, before any completion is journaled, so a review sees the tree the
-            // task was allowed to produce. Found live: a worker edited a forbidden file and said done.
+            append({kind: 'task.attempt.ended', task, attempt: reducers.tasks(session.events)[task]?.attempt, verifiedTermination: true, from, context});
             if (owned) {
-              const reverted = revertOutside(session.cwd, owned.before, owned.owns);
-              if (reverted.length) append({kind: 'task.reverted', task, files: reverted, text: `Reverted ${reverted.length} change${reverted.length === 1 ? '' : 's'} outside the owned paths: ${reverted.join(', ')}`, from, context});
+              const artifact = captureArtifact(owned);
+              append({kind: 'task.artifact', task, attempt: reducers.tasks(session.events)[task]?.attempt,
+                artifactId: artifact.id, digest: artifact.digest, resultHash: artifact.resultHash,
+                file: path.join(owned.dir, 'artifacts', `${artifact.id}.json`), dir: owned.dir, cwd: owned.cwd, from, context});
+              if (artifact.violations.length || artifact.unsupported.length) {
+                append({kind: 'task.blocked', task, reason: artifact.violations.length ? 'ownership_violation' : 'artifact_unsupported',
+                  text: `Isolated artifact cannot be integrated: ${JSON.stringify(artifact.violations.length ? artifact.violations : artifact.unsupported)}`, from, context});
+                return;
+              }
             }
-            if (requireFinalReport) append({kind: 'task.attempt.ended', task, attempt: reducers.tasks(session.events)[task]?.attempt, from, context});
             if (event.status === 'completed' && requireFinalReport) {
               const state = reducers.tasks(session.events)[task]?.state;
               const attempt = state ? reducers.tasks(session.events)[task]?.attempt : null;
@@ -608,8 +726,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
                 // A local worker's answer IS its report: asking a small model to also drive a report
                 // protocol is the step it fails most, and the continuation that chased it never once
                 // succeeded. Only `completed` is inferred, and the row says it was.
-                if (LOCAL_ADAPTERS.has(profile.adapter) && typeof event.text === 'string' && event.text.trim()) {
-                  append({kind: 'task.completed', task, summary: event.text, synthesized: true, from, context});
+                const envelope = parseFinalReport(event.text);
+                if (envelope) {
+                  append(reportEvent({task, attempt, report: envelope, from, context}));
+                  finalizeReport({task, attempt, from, context});
                 } else await requestFinalReport({task, attempt, context, adapter});
               }
             } else if (event.status === 'completed') append({kind: 'task.completed', task, summary: event.text, from, context});
@@ -657,6 +777,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // already checked by the caller.
   async function launchWorker(row, {reserve = true} = {}) {
     const {task, context} = row;
+    if (!campaignActive(task) && !await waitForCampaign(task)) return;
+    if (!admitAttempt(task, context)) return;
     const root = budgetRootOf(task, reducers.tasks(session.events));
     // `reserve: false` means the caller (dispatch) already made this reservation, synchronously,
     // before its own first await (§4) — never reserve twice for the same start.
@@ -666,7 +788,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     fs.mkdirSync(dir, {recursive: true, mode: 0o700});
     const baseProfile = profiles[row.profile];
     const attempt = session.events.filter(e => e.kind === 'task.started' && e.task === task).length + 1;
-    launchingAttempts.set(task, {attempt, reports: []});
+    launchingAttempts.set(task, {attempt, reports: [], requestedAt: clock()});
     // This is the sole capability injected into a worker environment. It is minted before
     // launch, bound to one immutable attempt, and is not the ambient orchestration grant.
     const reportEnv = reportGrant?.({task, attempt, context});
@@ -691,11 +813,14 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       const canReport = reportEnv && !LOCAL_ADAPTERS.has(profile.adapter);
       let workerOrders = canReport ? `${roleLead}${row.orders}\n\nTo report progress, ${reportInstruction(profile)} using your scoped report endpoint. Final reports require op:\"final\", outcome, summary, phase, text and next; do not publish task completion directly.`
         : LOCAL_ADAPTERS.has(profile.adapter) ? `${roleLead}${row.orders}\n\n${LOCAL_REPORT_LINE}` : `${roleLead}${row.orders}`;
-      owned = ownedSnapshot(task, profile);
-      handle = await adapter.launch({peer: workerFrom(task), profile, orders: workerOrders, cwd: session.cwd, dir,
+      if (!campaignActive(task) && !await waitForCampaign(task)) return;
+      owned = workspaceFor(task, profile, attempt);
+      append({kind: 'task.launch.requested', task, attempt, executionKey: `${task}:${attempt}`, context});
+      handle = await adapter.launch({peer: workerFrom(task), profile, orders: workerOrders, cwd: owned?.cwd ?? session.cwd, dir,
         task, attempt, context, signal: admission?.signal,
         onActivity: LOCAL_ADAPTERS.has(profile.adapter) ? localActivity(task, attempt, context) : undefined,
         report: requireFinalReport ? ({report: payload}) => report({task, attempt, context, report: payload}) : undefined});
+      if (closed) { await adapter.cancel(handle); return; }
     } catch (error) {
       const verified = admission ? admission.failed(error) : true;
       // The reservation this launch was going to consume never ran a process: release it (§4).
@@ -741,9 +866,14 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   }
 
   async function resumeWorker({task, row, round, findings, context, reportOnly = false}) {
+    if (!campaignActive(task) && !await waitForCampaign(task)) return;
+    if (!admitAttempt(task, context)) {
+      append({kind: 'budget.released', task, root: budgetRootOf(task, reducers.tasks(session.events)), amount: reportOnly ? {starts: 1} : {rounds: 1}, text: 'attempt admission refused', context});
+      return;
+    }
     const baseProfile = resolvedLocalProfiles.get(task) ?? profiles[row.profile];
     const attempt = session.events.filter(e => e.kind === 'task.started' && e.task === task).length + 1;
-    launchingAttempts.set(task, {attempt, reports: []});
+    launchingAttempts.set(task, {attempt, reports: [], requestedAt: clock()});
     const reportEnv = reportGrant?.({task, attempt, context});
     let profile = reportEnv ? {...baseProfile, report: reportEnv} : baseProfile;
     const dir = path.join(session.dir, 'tasks', task);
@@ -761,11 +891,14 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         admission = await admitLocal(profile, task, attempt, context);
         ({profile, adapter} = admission);
       }
-      owned = ownedSnapshot(task, profile);
-      handle = await adapter.resume({peer: workerFrom(task), profile, native, message: reportEnv && !LOCAL_ADAPTERS.has(profile.adapter) ? `${message}\n\nTo report, ${reportInstruction(profile)}; finals require outcome, summary, phase, text and next.` : LOCAL_ADAPTERS.has(profile.adapter) ? `${message}\n\n${LOCAL_REPORT_LINE}` : message, cwd: session.cwd, dir, checkpoint: row.checkpoint,
+      if (!campaignActive(task) && !await waitForCampaign(task)) return;
+      owned = workspaceFor(task, profile, attempt);
+      append({kind: 'task.launch.requested', task, attempt, executionKey: `${task}:${attempt}`, resumed: true, context});
+      handle = await adapter.resume({peer: workerFrom(task), profile, native, message: reportEnv && !LOCAL_ADAPTERS.has(profile.adapter) ? `${message}\n\nTo report, ${reportInstruction(profile)}; finals require outcome, summary, phase, text and next.` : LOCAL_ADAPTERS.has(profile.adapter) ? `${message}\n\n${LOCAL_REPORT_LINE}` : message, cwd: owned?.cwd ?? session.cwd, dir, checkpoint: row.checkpoint,
         task, attempt, context, signal: admission?.signal,
         onActivity: LOCAL_ADAPTERS.has(profile.adapter) ? localActivity(task, attempt, context) : undefined,
         report: requireFinalReport ? ({report: payload}) => report({task, attempt, context, report: payload}) : undefined});
+      if (closed) { await adapter.cancel(handle); return; }
     } catch (error) {
       const verified = admission ? admission.failed(error) : true;
       // The rework round's own reservation (`{rounds: 1}`, made by the caller before this
@@ -820,10 +953,12 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // launch and the stream ending, so cancel()/stop() can reach it; a throwing stream (A4) ends
   // the same way a broken worker stream does — unreadable, handle cancelled, never left open.
   async function runReview({task, stage, round, profileName, profile, orders, dir, context, peer = reviewFrom(task), review = {stage, round, orders}}) {
+    if (!campaignActive(task) && !await waitForCampaign(task)) return {verdict: 'unreadable', cancelled: true};
     append({kind: 'review.started', task, stage, round, profile: profileName, from: peer, context});
     let adapter = adapters[profile.adapter];
     let admission;
-    const launchState = {task, pending: true};
+    const launchState = {task, pending: true, requestedAt: clock()};
+    reviews.set(peer, launchState);
     let handle, owned = null;
     try {
       if (LOCAL_ADAPTERS.has(profile.adapter) && profile.backend === 'lmstudio') {
@@ -831,7 +966,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         admission = await admitLocal(profile, task, round, context, launchState);
         ({profile, adapter} = admission);
       }
-      handle = await adapter.launch({peer, profile, orders, cwd: session.cwd, dir, task, attempt: round, context, signal: admission?.signal, review});
+      if (!campaignActive(task) && !await waitForCampaign(task)) return {verdict: 'unreadable', cancelled: true};
+      const captured = artifactFor(task);
+      const reviewState = captured ? {orders: review.orders, report: review.report, diff: captured.artifact.diff, files: captured.artifact.files, baseHead: captured.artifact.baselineHash} : null;
+      handle = await adapter.launch({peer, profile, orders, cwd: captured?.row.cwd ?? session.cwd, dir, task, attempt: round, context, signal: admission?.signal, review, reviewState});
+      if (closed) { await adapter.cancel(handle); return {verdict: 'unreadable', cancelled: true}; }
       if (launchState.cancelReason) {
         const stopped = await adapter.cancel(handle);
         if (stopped?.verified === true) reviews.delete(peer);
@@ -854,10 +993,12 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // Keyed by peer (not task): the CORE runs multi-reviewer rounds one reviewer at a time
     // (CONTRACT §5), so at most one entry per task ever exists at once — for the single-
     // reviewer default this key IS `review:${task}`, byte-identical to before Phase 8.
-    reviews.set(peer, {adapter, handle, task});
-    let resultStatus = null, resultText = null;
+    const reviewEntry = {adapter, handle, task};
+    reviews.set(peer, reviewEntry);
+    let resultStatus = null, resultText = null, streamError = null;
     try {
       for await (const event of adapter.events(handle)) {
+        if (closed) return {verdict: 'unreadable', cancelled: true};
         switch (event.kind) {
           case 'milestone': append({kind: 'task.milestone', task, text: event.text, evidence: event.evidence, from: peer, context}); break;
           case 'usage': append({kind: 'task.usage', task, usage: event.usage, from: peer, context}); break;
@@ -872,15 +1013,20 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
           case 'delta': break;
           case 'result': resultStatus = event.status; resultText = event.text; break;
         }
+        if (event.kind === 'result') break;
       }
     } catch (error) {
-      append({kind: 'review.finished', task, stage, round, verdict: 'unreadable', text: error.message, from: peer, context});
-      await adapter.cancel(handle).catch(() => {});
-      return {verdict: 'unreadable'};
-    } finally {
-      reviews.delete(peer);
+      streamError = error;
     }
-    const verdict = parseVerdict(resultStatus, resultText);
+    const stopped = await stopReview(reviewEntry);
+    if (closed) return {verdict: 'unreadable', cancelled: true};
+    if (stopped?.verified !== true) {
+      append({kind: 'task.blocked', task, reason: 'termination_unverified', text: 'termination unverified', from: peer, context});
+      return {verdict: 'unreadable', cancelled: true};
+    }
+    reviews.delete(peer);
+    const verdict = streamError ? {verdict: 'unreadable'} : parseVerdict(resultStatus, resultText);
+    if (streamError) resultText = streamError.message;
     append({kind: 'review.finished', task, stage, round, verdict: verdict.verdict, text: resultText ?? null, from: peer, context});
     return verdict;
   }
@@ -1070,6 +1216,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       return;
     }
     // accept
+    if (stage === 'completion' && !publishArtifact(task, {kind: 'task.accepted', task, stage, by: reviewFrom(task), context})) return;
     append({kind: 'task.accepted', task, stage, by: reviewFrom(task), context});
     if (stage === 'prelaunch') {
       if (availableStarts(root) < 1) return escalateBudget(task, context);
@@ -1109,7 +1256,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   }
 
   async function dispatch(row) {
+    if (closed) return;
+    if (row.campaignId && campaigns(session.events)[row.campaignId]?.state !== 'active') { heldTasks.add(row.task); return; }
     const {task, parent, context} = row;
+    if (handles.has(task) || launchingAttempts.has(task) || [...reviews.values()].some(review => review.task === task)) return;
     row = submittedRow(task) ?? row; // a re-dispatch (held task, restart) sees an already-routed profile
     // Sizing refusal, first of all: a task over the skill's sizing rule never launches,
     // checked in a fixed field order so the reported field is deterministic.
@@ -1129,6 +1279,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     }
     // The same job, failed the same way this many times, is a loop: bounce stops rather than running it
     // again, and says what to change. Found live: ten identical reviewer tasks, each killed at the ceiling.
+    const jobStarts = session.events.filter(e => e.kind === 'task.started' && e.jobId === row.jobId);
+    if (row.jobId && jobStarts.length >= (suppliedLimits.attempts ?? 3)) {
+      append({kind: 'task.failed', task, reason: 'attempts_exhausted', text: 'Logical job attempt allowance exhausted', context}); return;
+    }
     const attempts = failedAttempts(session.events.filter(e => e.task !== task), row);
     if (attempts.length >= REPEAT_LIMIT) {
       append({kind: 'task.failed', task, reason: 'repeat', attempts: attempts.map(a => a.task), context,
@@ -1144,7 +1298,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       return view[id]?.parent ? 1 + depthOf(view[id].parent, seen) : 0;
     };
     if (parent != null && 1 + depthOf(parent) > depthCap) {
-      append({kind: 'task.failed', task, reason: 'depth', text: `depth exceeds cap ${depthCap}`, context});
+      // Say what happened, not just which rule fired: this row is all the rail shows, and a task that was
+      // refused in the same second it was submitted otherwise reads as one queued forever.
+      append({kind: 'task.failed', task, reason: 'depth', context,
+        text: `delegation under ${String(parent).slice(0, 8)} exceeds depth cap ${depthCap}; use retryOf for a continuation of existing work`});
       return;
     }
     // `profile: "auto"`: route before anything reads the profile. Jev picks (when enabled for
@@ -1310,7 +1467,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // reads pending work from the log rather than from memory here. `worker:` is the only
   // deliverable prefix: a `review:` address (read-only, no bus grant) is never matched below.
   async function deliverTo(task, row, target) {
-    const entry = handles.get(task);
+    const entry = target.review ? [...reviews.values()].find(item => item.task === task && item.handle) : handles.get(task);
     const delivered = (tier, text = null) => append({kind: 'task.delivered', task, tier, message: row.id, text, from: 'bounce', context: row.context});
     if (target.entry && (entry !== target.entry || entry?.handle.turnId !== target.turnId)) return delivered('failed', 'turn changed before delivery');
     if (!entry || reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) return delivered('queued', 'no live worker');
@@ -1328,8 +1485,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // overlaps two deliveries to the same worker.
   const deliveryTails = new Map(); // task -> promise for the last delivery still in flight
   function enqueueDelivery(task, row) {
-    const entry = handles.get(task);
-    const target = {entry, turnId: entry?.handle.turnId};
+    const review = row.to?.startsWith('review:');
+    const entry = review ? [...reviews.values()].find(item => item.task === task && item.handle) : handles.get(task);
+    const target = {entry, turnId: entry?.handle.turnId, review};
     const tail = (deliveryTails.get(task) ?? Promise.resolve())
       .then(() => deliverTo(task, row, target))
       .catch(error => {
@@ -1349,14 +1507,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // With leases: the end of the current lease — one lease per `task.lease.renewed` in the lineage,
   // plus the first — never past the ceiling. The same arithmetic as reducers.watchdog.
   function deadlineAtFor(task) {
-    const view = reducers.tasks(session.events);
-    const root = lineageRootOf(task, view);
-    const startedRows = session.events.filter(e => e.kind === 'task.started' && e.task === root);
-    if (!startedRows.length) return null;
-    const startedAt = Date.parse(startedRows[0].time);
-    const leaseMs = taskDeadlineMs(submittedRow(root));
-    const renewals = session.events.filter(e => e.kind === 'task.lease.renewed' && view[e.task] && lineageRootOf(e.task, view) === root).length;
-    return Math.min(startedAt + leaseMs * (renewals + 1), startedAt + Math.max(ceilingMs, leaseMs));
+    return reducers.attemptLease(session.events, task, {defaultDeadlineMs: taskDeadlineMs(submittedRow(task)), ceilingMs})?.deadlineAt ?? null;
   }
 
   // §3: a signature (task, 'silent'|'stalled') resets the moment a NEW progress row lands —
@@ -1554,6 +1705,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // the same log/activity/now is idempotent beyond the dedupe rules §3 already specifies.
   async function tick() {
     const now = clock();
+    for (const [task, pending] of [...launchingAttempts, ...[...reviews.values()].filter(entry => entry.pending).map(entry => [entry.task, entry])]) {
+      if (pending.cancelReason || pending.phase === 'admission' || now - pending.requestedAt < watchdogConfig.startupMs) continue;
+      append({kind: 'policy.escalated', task, reason: 'startup_timeout', text: 'Provider startup exceeded its allowance; verifying termination before recovery'});
+      await cancelOne(task, reducers.tasks(session.events), 'watchdog');
+    }
     const rows = reducers.watchdog(session.events, now, {activity, watchdog: {...watchdogConfig, defaultDeadlineMs: (limits.minutes ?? DEFAULT_DEADLINE_MINUTES) * 60000, ceilingMs}});
     for (const r of rows) {
       // A parked task that outlived its lease with nobody answering ends here. The escalation still
@@ -1567,7 +1723,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   }
   let watchdogInterval = null;
   if (typeof watchdogConfig.interval === 'number' && watchdogConfig.interval > 0) {
-    watchdogInterval = setInterval(() => { tick().catch(() => {}); }, watchdogConfig.interval);
+    watchdogInterval = setInterval(() => { tick().catch(error => append({kind: 'policy.escalated', reason: 'watchdog_error', text: error.message})); }, watchdogConfig.interval);
     watchdogInterval.unref?.();
   }
 
@@ -1576,46 +1732,104 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // lands it in a terminal state (a task.completed into 'reviewing' does not prune; the later
   // task.accepted/rejected/rework path does its own transition and gets checked in turn).
   const TERMINAL_ROW_KINDS = new Set(['task.completed', 'task.failed', 'task.cancelled', 'task.deadline', 'task.rejected', 'task.accepted']);
+  function requestDispatch(row, cause = 0) {
+    requestAction(session, {actionId: `dispatch:${row.task}:${cause}`, type: 'dispatch', task: row.task, cause});
+  }
+  function requestTerminal(row, events = []) {
+    const attempt = row.attempt ?? reducers.tasks(session.events)[row.task]?.attempt ?? 0;
+    requestAction(session, {actionId: `terminal:${row.task}:${row.kind}:${attempt}`, type: 'terminal', task: row.task, payload: {kind: row.kind}}, events);
+  }
+  const effects = createActionRunner({session, handlers: {
+    integrate: action => {
+      try {
+        const {artifactId, file, dir, continuation} = action.payload;
+        const artifact = JSON.parse(fs.readFileSync(file, 'utf8'));
+        if (artifact.id !== artifactId) throw new Error('artifact identity mismatch');
+        const result = integrateArtifact({cwd: session.cwd, artifact, dir});
+        if (result.status !== 'integrated') {
+          append({kind: 'task.blocked', task: action.task, reason: `integration_${result.status}`, text: `Artifact integration ${result.status}${result.path ? `: ${result.path}` : ''}; isolated work preserved`, artifactId});
+          return;
+        }
+        if (!session.events.some(e => e.kind === 'task.integrated' && e.task === action.task && e.artifactId === artifactId)) append({kind: 'task.integrated', task: action.task, artifactId, resultHash: artifact.resultHash});
+        append(continuation);
+      } catch (error) {
+        append({kind: 'task.blocked', task: action.task, reason: 'integration_interrupted', text: `Artifact integration interrupted: ${error.message}; durable manifest retained for restart recovery`});
+        throw error;
+      }
+    },
+    terminal: action => {
+      const row = session.events.findLast(e => e.task === action.task && e.kind === action.payload.kind);
+      if (!row) return;
+      if (row.kind === 'task.failed' || (row.kind === 'task.cancelled' && row.reason === 'watchdog')) maybeFallback(row);
+      else if (row.kind === 'task.cancelled' && row.reason !== 'deadline') append({kind: 'policy.fallback.skipped', task: row.task, reason: 'explicit_cancellation', text: 'user cancellation never recovers', context: row.context, ref: `cancel-skip:${row.task}`});
+      else if (row.kind === 'task.deadline') append({kind: 'policy.fallback.skipped', task: row.task, reason: 'deadline_exhausted', text: 'logical deadline exhausted', context: row.context, ref: `deadline-skip:${row.task}`});
+      handleTerminal(row);
+    },
+    plan: async action => {
+      const row = session.events.find(e => e.kind === 'plan.submitted' && e.plan === action.payload.plan);
+      if (!row || session.events.some(e => ['plan.accepted', 'plan.rejected', 'plan.unavailable'].includes(e.kind) && e.plan === row.plan)) return;
+      if (!campaignActive(null, row.campaignId) && !await waitForCampaign(null, row.campaignId)) return;
+      const result = await supervisePlan({events: session.events, plan: row.plan, now: clock,
+        startupMs: watchdogConfig.startupMs, signal: planController.signal,
+        append: event => append({...event, planId: row.plan, phase: row.phase, campaignId: row.campaignId, context: row.context}),
+        run: ({signal}) => jev?.plan ? jev.plan({plan: row, ceilingMinutes: ceilingMs / 60000, signal})
+          : judgePlan({plan: row, settings: {enabled: false}, ceilingMinutes: ceilingMs / 60000, signal})});
+      if (result.status !== 'decision' || closed) return;
+      const decision = result.decision ?? {verdict: 'unavailable', reason: 'empty_decision'};
+      const kind = decision.verdict === 'accept' ? 'plan.accepted' : decision.verdict === 'rework' || decision.verdict === 'reject' ? 'plan.rejected' : 'plan.unavailable';
+      append({kind, plan: row.plan, planId: row.plan, phase: row.phase, campaignId: row.campaignId, chunks: row.chunks?.length ?? 0,
+        findings: decision.findings ?? [], noted: decision.noted ?? [], model: decision.model ?? null,
+        reason: decision.reason ?? null, context: row.context, text: `${row.phase ?? 'Plan'}: ${kind}${decision.reason ? ` (${decision.reason})` : ''}`});
+    },
+    completion: async action => {
+      try { await handleCompleted(action.task); }
+      catch (error) { append({kind: 'task.failed', task: action.task, reason: 'error', text: error.message}); }
+    },
+    dispatch: async action => {
+      const row = submittedRow(action.task);
+      const current = reducers.tasks(session.events)[action.task];
+      if (!row || !current || !['queued', 'waiting'].includes(current.state) || handles.has(action.task)) return;
+      try { await dispatch(row); }
+      catch (error) { append({kind: 'task.failed', task: row.task, reason: 'error', text: error.message, context: row.context}); }
+    },
+  }, reconcile: action => {
+    if (action.type === 'integrate') return session.events.filter(e => e.kind === 'orchestration.action.started' && e.actionId === action.actionId).length < 3 ? 'retry' : 'blocked';
+    if (action.type === 'terminal') return 'retry';
+    if (action.type === 'plan') return session.events.some(e => ['plan.accepted', 'plan.rejected', 'plan.unavailable'].includes(e.kind) && e.plan === action.payload.plan) ? 'settled' : 'retry';
+    const state = reducers.tasks(session.events)[action.task]?.state;
+    if (reducers.TERMINAL.has(state)) return 'settled';
+    if (action.type === 'completion' && !session.events.some(e => e.task === action.task && e.kind === 'review.started' && e.seq > (action.cause ?? action.seq))) return 'retry';
+    const launched = session.events.some(e => e.task === action.task && ['task.launch.requested', 'task.started', 'review.started'].includes(e.kind));
+    return state === 'queued' && !launched ? 'retry' : 'blocked';
+  }});
   const unsubscribe = session.subscribe(row => {
-    if (row.task && TERMINAL_ROW_KINDS.has(row.kind) && reducers.TERMINAL.has(reducers.tasks(session.events)[row.task]?.state)) { activity.delete(row.task); toolCalls.delete(row.task); }
-    if (row.kind === 'plan.submitted' && jev?.plan) {
-      // The plan gate: judged off the row, answered with plan.accepted or plan.rejected. Warns, never
-      // refuses the chunks that follow — the gate is new, and a wrong "phase-sized" would block a
-      // planning orchestrator; that switch flips once it has been seen right on real phases.
-      jev.plan({plan: row, ceilingMinutes: limits.minutes !== undefined || limits.ceiling !== undefined ? ceilingMs / 60000 : null}).then(decision => {
-        const name = row.phase ? `Plan ${row.phase}` : 'Plan';
-        if (decision.verdict === 'accept') append({kind: 'plan.accepted', plan: row.plan, chunks: (row.chunks ?? []).length, noted: decision.noted ?? [], reason: decision.reason ?? null, model: decision.model ?? null, context: row.context,
-          text: `${name} accepted: ${(row.chunks ?? []).length} chunk${(row.chunks ?? []).length === 1 ? '' : 's'}${decision.reason ? ` (${decision.reason})` : ` (Jev, model ${decision.model})`}`});
-        else append({kind: 'plan.rejected', plan: row.plan, findings: decision.findings, noted: decision.noted ?? [], model: decision.model ?? null, context: row.context,
-          text: `${name} needs work: ${decision.findings.map(f => `chunk "${f.chunk}" — ${f.fix} (${f.confidence.toFixed(2)})`).join('; ')}`});
-      }).catch(error => append({kind: 'plan.accepted', plan: row.plan, reason: error.message, context: row.context, text: `Plan gate failed (${error.message}); the plan stands`}));
+    if (row.kind === 'campaign.resumed' || row.kind === 'task.cancelled') for (const wake of [...campaignWaiters]) wake();
+    if (row.kind === 'campaign.resumed') {
+      for (const task of Object.values(reducers.tasks(session.events))) if (task.campaignId === row.campaignId && ['queued', 'waiting'].includes(task.state) && !handles.has(task.id)) {
+        const submitted = submittedRow(task.id);
+        if (submitted) requestDispatch(submitted, row.seq);
+      }
     }
+    if (row.task && TERMINAL_ROW_KINDS.has(row.kind) && reducers.TERMINAL.has(reducers.tasks(session.events)[row.task]?.state)) {
+      activity.delete(row.task); toolCalls.delete(row.task);
+    }
+    if (row.kind === 'plan.submitted') requestAction(session, {actionId: `plan:${row.plan}`, type: 'plan', payload: {plan: row.plan}, cause: row.seq});
     if (row.kind === 'task.submitted') {
       // Any throw here (including one from before the first `await`, which an async
       // function turns into a rejection rather than a synchronous throw) must land on the
       // task as its own failure — never disappear, leaving the task queued forever.
-      dispatch(row).catch(error => append({kind: 'task.failed', task: row.task, reason: 'error', text: error.message, context: row.context}));
+      requestDispatch(row);
     }
     if (row.kind === 'task.completed') {
       // STRATEGY (CONTRACT.md §2 onCompleted): a second (and later) task.completed on the same
       // task re-enters review exactly the same way — the hook and runCompletionReview both
       // read state fresh off the log every time.
-      handleCompleted(row.task).catch(error => append({kind: 'task.failed', task: row.task, reason: 'error', text: error.message, context: row.context}));
+      requestAction(session, {actionId: `completion:${row.task}:${reducers.tasks(session.events)[row.task]?.attempt ?? 0}`, type: 'completion', task: row.task});
     }
-    else if (row.kind === 'task.failed') { maybeFallback(row); handleTerminal(row); }
-    else if (row.kind === 'task.cancelled') {
-      if (row.reason === 'watchdog') maybeFallback(row);
-      else if (row.reason !== 'deadline') append({kind: 'policy.fallback.skipped', task: row.task, reason: 'explicit_cancellation', text: 'user cancellation never recovers', context: row.context});
-      handleTerminal(row);
-    }
-    else if (row.kind === 'task.deadline') {
-      append({kind: 'policy.fallback.skipped', task: row.task, reason: 'deadline_exhausted', text: 'logical deadline exhausted', context: row.context});
-      handleTerminal(row);
-    }
-    else if (row.kind === 'task.accepted' || row.kind === 'task.rejected') handleTerminal(row);
+    else if (['task.failed', 'task.cancelled', 'task.deadline', 'task.accepted', 'task.rejected'].includes(row.kind)) requestTerminal(row);
     // Messages to `user`/`orchestrator`/anyone else — and a malformed empty worker
     // address — are not this subscriber's business.
-    else if (row.kind === 'message' && typeof row.to === 'string' && row.to.startsWith('worker:') && row.to.length > 'worker:'.length) enqueueDelivery(row.to.slice('worker:'.length), row);
+    else if (row.kind === 'message' && typeof row.to === 'string' && /^(worker|review):.+/.test(row.to)) enqueueDelivery(row.to.slice(row.to.indexOf(':') + 1), row);
     // task.activity is a LIVE_KIND (never journaled): the only way the watchdog ever learns
     // about it is right here, off the same subscriber every other peer-published row reaches.
     // An integer `expect` declares a bounded slow step; §2 caps it at the task's own deadline
@@ -1647,7 +1861,24 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // `attempt` is set by task.started: a parent is 'waiting' the moment a child is submitted even
   // if it never launched, and a dispatch refusal leaves a never-started task 'blocked' — neither
   // had a worker to lose, so neither is orphaned.
-  for (const t of Object.values(initialView)) if ((MID_FLIGHT.has(t.state) || t.state === 'queued') && (t.attempt != null || session.events.some(row => row.task === t.id && row.kind === 'task.local_selected')) && !handles.has(t.id))
+  const executionEnded = task => {
+    const started = session.events.findLast(e => e.task === task && ['task.launch.requested', 'task.started', 'review.started'].includes(e.kind));
+    const ended = session.events.findLast(e => e.task === task && (e.kind === 'task.attempt.ended' && e.verifiedTermination || e.kind === 'review.finished'));
+    return ended && ended.seq > (started?.seq ?? Infinity);
+  };
+  // A verified exit can precede persistence of its result. Keep this crash window
+  // visible; an exited process cannot supply the missing answer on replay.
+  const pendingRecovery = [...actionState(session.events).values()];
+  for (const t of Object.values(initialView)) {
+    if (!executionEnded(t.id) || !['running', 'reviewing', 'waiting'].includes(t.state)) continue;
+    const recoverable = pendingRecovery.some(action => action.task === t.id &&
+      ['integrate', 'completion'].includes(action.type) && !['settled', 'cancelled'].includes(action.status));
+    const completed = session.events.some(e => e.task === t.id && e.kind === 'task.completed');
+    if (!recoverable && !completed) append({kind: 'task.blocked', task: t.id,
+      reason: 'outcome_recovery_required', context: t.context,
+      text: 'Worker exit was verified, but no durable outcome was recorded; inspect preserved work and submit an explicit retry'});
+  }
+  for (const t of Object.values(initialView)) if (!executionEnded(t.id) && (MID_FLIGHT.has(t.state) || t.state === 'queued') && (t.attempt != null || session.events.some(row => row.task === t.id && ['task.local_selected', 'task.launch.requested', 'review.started'].includes(row.kind))) && !handles.has(t.id))
     if (session.events.findLast(e => e.task === t.id && e.kind === 'task.blocked')?.reason !== 'orphaned') append({kind: 'task.blocked', task: t.id, reason: 'orphaned', text: 'termination unverified after daemon restart; inspect the previous worker process before resubmitting', context: t.context});
 
   // Cycle-guarded for the same reason as the root-walkers above.
@@ -1659,6 +1890,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
 
   async function cancelOne(id, view, reason = 'user') {
     if (session.events.findLast(e => e.task === id && e.kind === 'task.blocked')?.reason === 'orphaned') return false;
+    if (!cancellationRequests.has(id)) {
+      cancellationRequests.add(id);
+      append({kind: 'task.cancel.requested', task: id, attempt: view[id]?.attempt ?? null, reason, context: view[id]?.context});
+    }
     const launching = launchingAttempts.get(id);
     if (launching) {
       launching.cancelReason = reason;
@@ -1684,7 +1919,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         append({kind: 'task.blocked', task: id, text: 'termination pending: review launch has not resolved', context: view[id].context});
         return false;
       }
-      const reviewResult = await reviewEntry.adapter.cancel(reviewEntry.handle);
+      const reviewResult = await stopReview(reviewEntry);
       if (reviewResult?.verified !== true) {
         append({kind: 'task.blocked', task: id, text: 'termination unverified', from: peer, context: view[id].context});
         return false;
@@ -1697,6 +1932,25 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       return false;
     }
     append({kind: 'task.cancelled', task: id, reason, from: workerFrom(id), context: view[id].context});
+    return true;
+  }
+
+  function stopReview(entry) {
+    return entry.stopping ??= Promise.resolve().then(() => entry.adapter.cancel(entry.handle)).catch(() => ({verified: false}));
+  }
+
+  function admitAttempt(task, context) {
+    const submitted = submittedRow(task);
+    const jobId = submitted?.jobId;
+    const starts = session.events.filter(e => e.kind === 'task.started' && (jobId ? submittedRow(e.task)?.jobId === jobId : e.task === task));
+    if (starts.length >= (limits.attempts ?? 3)) {
+      append({kind: 'task.failed', task, reason: 'attempts_exhausted', text: 'Logical job attempt allowance exhausted; retain progress and request a scope decision', context});
+      return false;
+    }
+    if (starts.length && clock() >= Date.parse(starts[0].time) + ceilingMs) {
+      append({kind: 'task.failed', task, reason: 'deadline', text: 'Logical job ceiling exhausted', context});
+      return false;
+    }
     return true;
   }
 
@@ -1755,6 +2009,6 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     spend: () => reducers.spend(session.events),
     // Test-only observable for the live activity map's size (F2/A5) — never used by production code.
     _activitySize: () => activity.size,
-    close: () => { unsubscribe(); if (watchdogInterval) clearInterval(watchdogInterval); },
+    close: () => { closed = true; planController.abort(); for (const wake of [...campaignWaiters]) wake(); effects.close(); unsubscribe(); if (watchdogInterval) clearInterval(watchdogInterval); },
   };
 }

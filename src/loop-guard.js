@@ -9,7 +9,14 @@ export const REPEAT_LIMIT = 2;
 const DEAD_ENDS = new Set(['ceiling', 'no_progress', 'stuck', 'deadline', 'watchdog']);
 const normalize = orders => String(orders ?? '').replace(/\s+/g, ' ').trim();
 
-export const sameJob = (a, b) => a.profile === b.profile && normalize(a.orders) === normalize(b.orders);
+export const sameJob = (a, b) => {
+  if (a.jobId && b.jobId && a.jobId === b.jobId) return true;
+  // Explicit campaign/plan identity distinguishes repeated briefs in different scopes.
+  // Ad hoc roots must still retain the old identical-brief loop guard; auto-generated
+  // per-submission IDs are not permission to reset it.
+  if ((a.campaignId || a.planId || b.campaignId || b.planId) && a.jobId && b.jobId) return false;
+  return a.profile === b.profile && normalize(a.orders) === normalize(b.orders);
+};
 
 // Every earlier attempt at this job that died a dead end, oldest first, with how it died.
 export function failedAttempts(events, job) {

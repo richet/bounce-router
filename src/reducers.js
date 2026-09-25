@@ -22,6 +22,7 @@ const emptyTask = id => ({id, parent: null, replaces: null, lastMilestone: null,
 export function tasks(events) {
   const result = {};
   const priorState = {};
+  const integrationBlocked = new Set();
   const ensure = id => result[id] ??= emptyTask(id);
   const settleParent = parentId => {
     const parent = result[parentId];
@@ -41,6 +42,7 @@ export function tasks(events) {
     if (e.kind === 'task.submitted') {
       const t = ensure(e.task);
       if (TERMINAL.has(t.state)) continue;
+      t.jobId = e.jobId ?? e.task; t.campaignId = e.campaignId ?? null; t.gate = e.gate ?? null; t.planId = e.planId ?? null; t.chunkId = e.chunkId ?? null;
       t.context = e.context; t.profile = e.profile; t.deadline = e.deadline; t.budget = e.budget && {...e.budget}; t.replaces = e.replaces ?? null;
       t.review = e.review ?? null; t.depends_on = e.depends_on ? [...e.depends_on] : []; t.steps = e.steps ?? null;
       if (t.state === 'waiting') priorState[e.task] = 'queued'; else t.state = 'queued';
@@ -61,7 +63,18 @@ export function tasks(events) {
         if (t.state === 'waiting') priorState[e.task] = 'running'; else t.state = 'running';
         t.attempt = e.attempt;
         break;
-      case 'task.blocked': t.state = 'blocked'; t.blocker = e.text; break;
+      case 'task.blocked':
+        t.state = 'blocked'; t.blocker = e.text;
+        if (e.reason === 'integration_interrupted') integrationBlocked.add(e.task);
+        else integrationBlocked.delete(e.task);
+        break;
+      case 'task.integrated':
+        // Only a completed durable publication can resolve this infrastructure blocker.
+        // Worker-authored blockers still require their own explicit recovery.
+        if (t.state === 'blocked' && integrationBlocked.delete(e.task)) {
+          t.state = t.review?.completion ? 'reviewing' : 'running'; t.blocker = null;
+        }
+        break;
       case 'task.input_required': t.state = 'input_required'; break;
       case 'task.milestone':
         if (t.state === 'waiting') priorState[e.task] = 'running';
@@ -217,34 +230,17 @@ export function watchdog(events, now, {activity = new Map(), watchdog: cfg} = {}
     }
     // A completion review is a worker turn too, with its own lease from `review.started` — the worker's
     // own elapsed time is not the reviewer's budget. Found live: a 24-minute review nothing was watching.
-    const reviewing = t.state === 'reviewing';
+    const activeReview = events.findLast(e => e.task === t.id && ['review.started', 'review.finished'].includes(e.kind));
+    const reviewing = t.state === 'reviewing' || activeReview?.kind === 'review.started';
     if (t.state !== 'running' && !reviewing) continue;
-    const root = lineageRoot(t.id);
-    const startedRows = reviewing
-      ? events.filter(e => e.kind === 'review.started' && e.task === t.id)
-      : events.filter(e => e.kind === 'task.started' && e.task === root);
-    if (!startedRows.length) continue;
-    const startedAt = Date.parse(reviewing ? startedRows.at(-1).time : startedRows[0].time);
-    const ownStart = events.filter(e => e.kind === 'task.started' && e.task === t.id).at(-1);
-    const submitted = events.find(e => e.kind === 'task.submitted' && e.task === root);
-    // The deadline is a lease (docs/plans/task-leases.md): each `task.lease.renewed` adds one more, and
-    // none reaches past the ceiling. Two different clocks, deliberately: the CEILING is the lineage's
-    // wall-clock bound, measured from its first start; the LEASE belongs to the attempt running now and
-    // is measured from its own start. Found live: a fallback launched with 58 s of the lease
-    // left because its predecessor had burned 14 of the 15 minutes, so it could only fail. A fresh
-    // attempt is owed a full lease; the ceiling and the loop guard are what stop a job buying time by
-    // failing over and over (Daniel, 2026-09-22).
-    const leaseMs = submitted?.deadline ?? cfg.defaultDeadlineMs;
-    const leaseFrom = reviewing ? startedAt : Date.parse((ownStart ?? startedRows[0]).time);
-    const renewals = events.filter(e => e.kind === 'task.lease.renewed' && e.task === t.id && (reviewing ? e.stage === 'review' : !e.stage)).length;
-    const ceilingAt = startedAt + Math.max(cfg.ceilingMs ?? leaseMs, leaseMs);
-    const leaseStartAt = Math.min(leaseFrom + leaseMs * renewals, ceilingAt);
-    const deadlineAt = Math.min(leaseFrom + leaseMs * (renewals + 1), ceilingAt);
+    const lease = attemptLease(events, t.id, {...cfg, stage: reviewing ? 'review' : 'turn'});
+    if (!lease) continue;
+    const {startedAt, leaseMs, leaseStartAt, deadlineAt, renewals, ceilingAt, leaseFrom} = lease;
     // Liveness is about THIS worker, so it is measured from this attempt's own start — never the
     // lineage's. Found live: a fallback launched the second its predecessor died was escalated
     // as "stalled for 843 s" one second later, because the root's start seeded its progress clock. Only
     // the ceiling above spans the lineage; this and the lease both belong to the attempt.
-    let progressAt = Date.parse((reviewing ? startedRows.at(-1) : ownStart ?? startedRows.at(-1)).time);
+    let progressAt = leaseFrom;
     for (const e of events) {
       if (e.task !== t.id) continue;
       if (e.kind === 'task.milestone' || e.kind === 'task.usage' || e.kind === 'task.blocked') progressAt = Math.max(progressAt, Date.parse(e.time));
@@ -273,6 +269,31 @@ export function watchdog(events, now, {activity = new Map(), watchdog: cfg} = {}
     if (verdicts.length) result.push({task: t.id, stage: reviewing ? 'review' : 'turn', startedAt, deadlineAt, leaseMs, leaseStartAt, renewals, ceilingAt, elapsed, lastActivityAt: activityAt, lastProgressAt: progressAt, expectUntil, verdicts});
   }
   return result;
+}
+
+export function attemptLease(events, task, {defaultDeadlineMs = 3600000, ceilingMs = 3600000, stage} = {}) {
+  const view = tasks(events);
+  let root = task;
+  const seen = new Set();
+  while (view[root]?.replaces && view[view[root].replaces] && !seen.has(root)) {
+    seen.add(root); root = view[root].replaces;
+  }
+  const review = events.findLast(e => e.kind === 'review.started' && e.task === task);
+  const reviewEnd = events.findLast(e => e.kind === 'review.finished' && e.task === task);
+  const reviewing = stage === 'review' || (stage === undefined && review && (!reviewEnd || review.seq > reviewEnd.seq));
+  const rootStart = events.find(e => e.kind === 'task.started' && e.task === root);
+  const ownStart = events.findLast(e => e.kind === 'task.started' && e.task === task);
+  const start = reviewing ? review : ownStart ?? rootStart;
+  if (!start) return null;
+  const startedAt = Date.parse((rootStart ?? start).time);
+  const leaseFrom = Date.parse(start.time);
+  const submitted = events.find(e => e.kind === 'task.submitted' && e.task === root);
+  const leaseMs = submitted?.deadline ?? defaultDeadlineMs;
+  const renewals = events.filter(e => e.kind === 'task.lease.renewed' && e.task === task && e.seq > start.seq && (reviewing ? e.stage === 'review' : !e.stage)).length;
+  const ceilingAt = startedAt + Math.max(ceilingMs, leaseMs);
+  return {stage: reviewing ? 'review' : 'turn', startedAt, leaseFrom, leaseMs, renewals, ceilingAt,
+    leaseStartAt: Math.min(leaseFrom + leaseMs * renewals, ceilingAt),
+    deadlineAt: Math.min(leaseFrom + leaseMs * (renewals + 1), ceilingAt)};
 }
 
 export function cooldowns(events, now) {

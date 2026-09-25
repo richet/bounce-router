@@ -43,7 +43,7 @@ test('a snapshot of the tree, and the revert of every change outside the owned p
   fs.rmSync(cwd, {recursive: true, force: true});
 });
 
-test('scheduler: a write worker that changes a file outside its owned paths has that change reverted and journaled; the task still completes and the review sees the reverted tree', async t => {
+test('scheduler: an isolated worker ownership violation preserves the source and blocks with its artifact', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'owned-sched-')));
   const cwd = path.join(root, 'ws'); fs.mkdirSync(path.join(cwd, 'src'), {recursive: true});
   fs.writeFileSync(path.join(cwd, 'src/cart.js'), 'export const x = 1;\n'); fs.writeFileSync(path.join(cwd, 'src/setup.ts'), 'original\n');
@@ -55,14 +55,12 @@ test('scheduler: a write worker that changes a file outside its owned paths has 
   t.after(() => scheduler.close());
   const row = scheduler.submit({parent: null, profile: 'builder', orders: 'change src/cart.js only', owns: ['src/cart.js']});
   assert.deepEqual(row.owns, ['src/cart.js']);
-  await waitFor(() => ['completed', 'accepted'].includes(scheduler.tasks()[row.task]?.state));
-  assert.equal(fs.readFileSync(path.join(cwd, 'src/cart.js'), 'utf8'), 'export const x = 2;', 'the owned change stays');
-  assert.equal(fs.readFileSync(path.join(cwd, 'src/setup.ts'), 'utf8'), 'original\n', 'the forbidden change is gone');
-  const reverted = session.events.find(e => e.kind === 'task.reverted' && e.task === row.task);
-  assert.deepEqual(reverted.files, ['src/setup.ts']);
-  assert.equal(reverted.text, 'Reverted 1 change outside the owned paths: src/setup.ts');
-  const kinds = session.events.filter(e => e.task === row.task).map(e => e.kind);
-  assert.equal(kinds.indexOf('task.reverted') < kinds.indexOf('task.completed'), true, 'reverted before the completion is journaled, so a review sees the reverted tree');
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'blocked');
+  assert.equal(fs.readFileSync(path.join(cwd, 'src/cart.js'), 'utf8'), 'export const x = 1;\n', 'the source workspace is unchanged');
+  assert.equal(fs.readFileSync(path.join(cwd, 'src/setup.ts'), 'utf8'), 'original\n', 'the forbidden source edit is absent');
+  const blocked = session.events.find(e => e.kind === 'task.blocked' && e.task === row.task);
+  assert.equal(blocked.reason, 'ownership_violation');
+  assert.ok(session.events.some(e => e.kind === 'task.artifact' && e.task === row.task), 'the isolated artifact is retained for inspection');
   // a task without owns is untouched, and a read-only worker never snapshots
   assert.throws(() => scheduler.submit({parent: null, profile: 'builder', orders: 'x', owns: ['/abs']}), /owns/);
   assert.throws(() => scheduler.submit({parent: null, profile: 'builder', orders: 'x', owns: 'src'}), /owns/);

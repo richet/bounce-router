@@ -3,7 +3,7 @@
 // 143 KB of raw JSON went into the chat, the journal and its own next context packet. These views are the
 // answer to that question, bounded by construction: capped lists with a count of the rest, cut text, and a
 // POINTER to the journal rather than its contents. Pure — the same fold src/reducers.js gives the TUI.
-import {tasks as taskStates} from './reducers.js';
+import {tasks as taskStates, attemptLease} from './reducers.js';
 
 export const FINDINGS_SHOWN = 10;
 export const MILESTONES_SHOWN = 3;
@@ -31,16 +31,18 @@ export function taskView(events, task, {now = Date.now(), journal = null, report
   const findings = rowsOf(events, task, 'task.finding');
   const milestones = rowsOf(events, task, 'task.milestone').slice(-MILESTONES_SHOWN)
     .map(row => ({phase: cut(row.phase, 80), text: cut(row.text, TEXT_MAX), next: cut(row.next, 120)}));
-  const terminal = [...mine].reverse().find(e => ['task.completed', 'task.failed', 'task.cancelled', 'task.deadline'].includes(e.kind));
+  const terminal = [...mine].reverse().find(e => ['task.accepted', 'task.rejected', 'task.completed', 'task.failed', 'task.cancelled', 'task.deadline', 'task.blocked'].includes(e.kind));
   const verdict = lastOf(events, task, 'review.finished');
   const blocked = state.state === 'blocked' ? lastOf(events, task, 'task.blocked') : null;
-  const leaseMs = submitted?.deadline ?? null;
+  const leaseRow = attemptLease(events, task, {defaultDeadlineMs: submitted?.deadline ?? 3600000, ceilingMs: submitted?.deadline ?? 3600000, stage: 'turn'});
+  const artifact = lastOf(events, task, 'task.artifact');
+  const integrated = lastOf(events, task, 'task.integrated');
   const seqs = mine.map(e => e.seq).filter(Number.isFinite);
   return {
     task, state: state.state, profile: state.profile ?? null, ai: started?.requested ?? null,
     orders: cut(submitted?.orders, TEXT_MAX),
     elapsed: started ? minutes(now - Date.parse(started.time)) : null,
-    lease: leaseMs ? {renewals: rowsOf(events, task, 'task.lease.renewed').length, minutes: Math.round(leaseMs / 60000)} : null,
+    lease: leaseRow ? {renewals: leaseRow.renewals, minutes: Math.round(leaseRow.leaseMs / 60000)} : null,
     rounds: state.rounds ?? 0,
     reviewer: lastOf(events, task, 'review.started')?.profile ?? null,
     verdict: verdict ? {verdict: verdict.verdict, stage: verdict.stage ?? null} : null,
@@ -51,6 +53,8 @@ export function taskView(events, task, {now = Date.now(), journal = null, report
     ...(report ? {report: (terminal?.summary ?? terminal?.text ?? state.summary ?? null)} : {}),
     reason: terminal?.reason ?? null,
     blocker: blocked ? cut(blocked.text, TEXT_MAX) : null,
+    artifact: lastOf(events, task, 'artifact.captured')?.artifact ?? (artifact ? {id: artifact.artifactId, digest: artifact.digest, resultHash: artifact.resultHash} : null),
+    integration: lastOf(events, task, 'artifact.integrated')?.status ?? (integrated ? 'integrated' : null),
     // The raw material, named — never carried. Whoever wants it reads it themselves.
     journal: journal ? {path: journal, task, fromSeq: seqs.length ? Math.min(...seqs) : null, toSeq: seqs.length ? Math.max(...seqs) : null} : null,
   };

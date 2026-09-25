@@ -53,18 +53,18 @@ test('`bounce local on|off` saves the switch and answers like `bounce jev on|off
 test('Jev\'s status names the team: the jobs it can route to, who hands it the AI, and where local models stand', async t => {
   const root = tmp(t);
   fs.mkdirSync(path.join(root, 'agents'));
-  for (const name of ['builder', 'integrator', 'reviewer']) fs.writeFileSync(path.join(root, 'agents', `${name}.md`), agentFile(name, name === 'reviewer' ? 'read-only' : 'write', 'claude/sonnet'));
+  for (const name of ['builder', 'debugger', 'reviewer']) fs.writeFileSync(path.join(root, 'agents', `${name}.md`), agentFile(name, name === 'reviewer' ? 'read-only' : 'write', 'claude/sonnet'));
   fs.writeFileSync(path.join(root, 'agents', 'analyst.md'), agentFile('analyst', 'read-only', 'lmstudio/coder-30b, claude/default'));
   const settings = {operation: 'orchestrator', order: ['claude'], mode: 'yolo', models: {}, profiles: {main: {adapter: 'claude'}}, jev: {enabled: true}};
   const run = (line, cwd = root) => jevCommand(line.split(/\s+/).filter(Boolean), {root, cwd, settings, save: () => {}, env: {}, discover: async () => []});
   const pinned = (await run('')).text.split('\n');
   assert.equal(pinned.length, 3);
-  assert.equal(pinned[1], '  jobs auto can route to: analyst → lmstudio/coder-30b (via opencode) · builder → claude/sonnet · integrator → claude/sonnet · reviewer → claude/sonnet');
+  assert.equal(pinned[1], '  jobs auto can route to: analyst → lmstudio/coder-30b (via opencode) · builder → claude/sonnet · debugger → claude/sonnet · reviewer → claude/sonnet');
   assert.equal(pinned[2], '  AI picked by Jev: none — every agent names its own AIs, so Jev never picks one, local or cloud. `models: [auto, …]` hands it the choice (/local on does that for every agent).');
 
   fs.writeFileSync(path.join(root, 'agents', 'analyst.md'), agentFile('analyst', 'read-only', 'auto, claude/default'));
   const handed = (await run('')).text.split('\n');
-  assert.equal(handed[1], '  jobs auto can route to: analyst → auto (Jev) · builder → claude/sonnet · integrator → claude/sonnet · reviewer → claude/sonnet');
+  assert.equal(handed[1], '  jobs auto can route to: analyst → auto (Jev) · builder → claude/sonnet · debugger → claude/sonnet · reviewer → claude/sonnet');
   assert.equal(handed[2], '  AI picked by Jev: analyst · by the tier the orders need: a local model of that tier first, else a cloud AI (/local off for cloud only)');
   settings.local = {enabled: false};
   assert.equal((await run('')).text.split('\n')[2], '  AI picked by Jev: analyst · cloud AIs only: local models are off (/local on)');

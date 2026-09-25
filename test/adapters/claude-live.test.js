@@ -70,11 +70,12 @@ test('L1b hook literal: a task directory with a space or a quote still gets mess
 
 test('L2 deliver live: the message and its auth line reach the running turn over the socket', async t => {
   const dir = tmp(t), sock = path.join(dir, 's'), received = path.join(dir, 'received.log');
-  withEnv(t, {FAKE_SOCKET: sock, FAKE_TOKEN: 'tok-l2', FAKE_SESSION: 'sess-l2', FAKE_RECEIVED: received, FAKE_HOLD: '1', FAKE_READY: '', FAKE_STDERR_LINES: ''});
+  const ready = path.join(dir, 'ready');
+  withEnv(t, {FAKE_SOCKET: sock, FAKE_TOKEN: 'tok-l2', FAKE_SESSION: 'sess-l2', FAKE_RECEIVED: received, FAKE_HOLD: '1', FAKE_READY: ready, FAKE_STDERR_LINES: ''});
   const adapter = createClaudeLive({});
   const handle = await adapter.launch({peer: {}, profile: {mode: 'yolo', ...launcher}, orders: 'hold', cwd: dir, dir});
   t.after(() => adapter.cancel(handle));
-  assert.equal(await waitFor(() => fs.existsSync(path.join(dir, 'messaging.json'))), true);
+  assert.equal(await waitFor(() => fs.existsSync(ready)), true);
   assert.equal(await adapter.deliver(handle, {text: 'ping'}), 'live');
   assert.equal(await waitFor(() => fs.existsSync(received) && lines(received).length === 2), true);
   assert.deepEqual(lines(received), ['{"type":"auth","token":"tok-l2"}', '{"type":"user","message":{"role":"user","content":"ping"}}']);
@@ -113,11 +114,12 @@ test('L3 deliver next-turn: with no socket the message queues for --resume, one 
   withEnv(t, {FAKE_SOCKET: '', FAKE_SESSION: 'sess-l3', FAKE_HOLD: '1', FAKE_READY: '', FAKE_STDERR_LINES: ''});
   const adapter = createClaudeLive({});
   const handle = await adapter.launch({peer: {}, profile: {mode: 'yolo', ...launcher}, orders: 'hold', cwd: dir, dir});
-  t.after(() => adapter.cancel(handle));
-  assert.equal(await adapter.deliver(handle, {text: 'a'}), 'next-turn');
-  assert.equal(await adapter.deliver(handle, {text: 'b'}), 'next-turn');
-  assert.deepEqual(lines(path.join(dir, 'pending.jsonl')), ['{"text":"a"}', '{"text":"b"}']);
-  assert.deepEqual(adapter.pending(dir), ['a', 'b']);
+  try {
+    assert.equal(await adapter.deliver(handle, {text: 'a'}), 'next-turn');
+    assert.equal(await adapter.deliver(handle, {text: 'b'}), 'next-turn');
+    assert.deepEqual(lines(path.join(dir, 'pending.jsonl')), ['{"text":"a"}', '{"text":"b"}']);
+    assert.deepEqual(adapter.pending(dir), ['a', 'b']);
+  } finally { await adapter.cancel(handle); }
 });
 
 test('L3b deliver: a forged non-string socket is refused without a connect attempt', async t => {

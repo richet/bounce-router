@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {fork} from 'node:child_process';
+import {fork, spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {fakeOpencodeBin} from './helpers/fake-opencode-bin.js';
 import http from 'node:http';
@@ -13,7 +13,29 @@ import {hostSession} from '../src/remote.js';
 import {createLocalActivation} from '../src/local-activation.js';
 import {createScheduler} from '../src/scheduler.js';
 import {starterProfiles, validateOrchestration} from '../src/profiles.js';
-import {rolesFor, agentMetadata} from '../src/agents.js';
+import {rolesFor, agentMetadata, serializeAgent} from '../src/agents.js';
+
+test('agent writes never expose a partial final file to another process', {timeout:10000}, async t => {
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'bounce-agent-atomic-'));
+  t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  const agent={name:'analyst',description:'atomic visibility probe',policy:'read-only',models:['codex/default'],prompt:'x'.repeat(32*1024*1024)};
+  const expected=Buffer.byteLength(serializeAgent(agent));
+  const moduleUrl=new URL('../src/agents.js',import.meta.url).href;
+  const source=`import {writeAgent} from ${JSON.stringify(moduleUrl)};\nconst agent={name:'analyst',description:'atomic visibility probe',policy:'read-only',models:['codex/default'],prompt:'x'.repeat(32*1024*1024)};\nconsole.log('READY');\nsetTimeout(()=>{writeAgent(process.env.BOUNCE_TEST_DIR,agent,{force:true});console.log('DONE');},25);`;
+  const child=spawn(process.execPath,['--input-type=module','-e',source],{env:{...process.env,BOUNCE_TEST_DIR:root},stdio:['ignore','pipe','pipe']});
+  let output=''; child.stdout.on('data',chunk=>output+=chunk); child.stderr.on('data',chunk=>output+=chunk);
+  await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(new Error(output)),2000);child.stdout.on('data',()=>{if(output.includes('READY')){clearTimeout(timer);resolve();}});});
+  const file=path.join(root,'analyst.md');
+  let partial=null;
+  while(child.exitCode===null){
+    if(fs.existsSync(file)){const size=fs.statSync(file).size;if(size!==expected){partial=size;break;}}
+    await new Promise(resolve=>setImmediate(resolve));
+  }
+  if(partial!==null) child.kill('SIGKILL');
+  await new Promise(resolve=>child.exitCode===null?child.once('close',resolve):resolve());
+  assert.equal(partial,null,`the final pathname exposed ${partial} of ${expected} bytes`);
+  assert.equal(fs.statSync(file).size,expected,output);
+});
 
 test('TUI setup loaded stays interactive during a held main turn, saves on consent, and Esc cancels only setup', {timeout:20000}, async t => {
   const bin=fakeOpencodeBin(t,{model:'loaded'});
@@ -52,13 +74,12 @@ test('TUI setup loaded stays interactive during a held main turn, saves on conse
   slow=false;response.setHeader('content-type','application/json');response.end(payload);
   // Setup opens on the shipped agents, one numbered pick each: analyst takes the loaded model, the rest are skipped.
   await wait(()=>output.includes('analyst ('));await answer('1','builder (');
-  await answer('skip','integrator (');await answer('skip','reviewer (');await answer('skip','Save this configuration?');
+  await answer('skip','debugger (');await answer('skip','reviewer (');await answer('skip','Save this configuration?');
   assert.equal(output.includes('unloaded-choice'),false,'`loaded` never offers a model that would have to be loaded');
-  child.stdin.write('y\r');await wait(()=>fs.existsSync(path.join(root,'agents','analyst.md')));
+  child.stdin.write('y\r');await wait(()=>output.includes('agents analyst active in this session'));
   assert.deepEqual(agentMetadata(fs.readFileSync(path.join(root,'agents','analyst.md'),'utf8')).models,['lmstudio/loaded','codex/default']);
   assert.deepEqual(JSON.parse(fs.readFileSync(file)).profiles,{main:{adapter:'codex'}},'no profile is created');
   assert.equal(posts,0);assert.equal(runs,1);assert.equal(cancels,0);
-  await wait(()=>output.includes('agents analyst active in this session'));
   assert.deepEqual([profiles.analyst.adapter, profiles.analyst.model, profiles.analyst.fallback], ['opencode', 'loaded', ['analyst~2']]);
   assert.equal(profiles['analyst~2'].adapter, 'codex');
   assert.equal(session.events.filter(row => row.kind === 'local.profiles.activated').length, 1);
@@ -71,7 +92,7 @@ test('TUI setup loaded stays interactive during a held main turn, saves on conse
   const localStatus=session.events.findLast(e=>e.kind==='status'&&e.text?.includes('OpenCode:'));
   assert.doesNotMatch(localStatus.text,/NOT READY/);
   assert.match(localStatus.text,/run \/local verify to prove the bridge/);
-  assert.match(localStatus.text,/Agents a local model may play: analyst \(lmstudio\/loaded, read-only\)/);
+  assert.match(localStatus.text,/Agents a local model may play: analyst \(lmstudio\/loaded, probe\)/);
   await answer('/local setup loaded','analyst (');
   child.stdin.write('\u001b');await wait(()=>output.includes('Local setup cancelled'));
   assert.equal(cancels,0);assert.equal(runs,1);
@@ -115,7 +136,7 @@ test('TUI setup on a config with no profiles block writes an agent file and neve
   const answer=async(text,next)=>{const offset=output.length;child.stdin.write(text+'\r');await wait(()=>output.slice(offset).includes(next));};
   await wait(()=>output.includes('Ready.'));
   await answer('/local setup loaded','analyst (');
-  await answer('1','builder (');await answer('skip','integrator (');await answer('skip','reviewer (');await answer('skip','Save this configuration?');
+  await answer('1','builder (');await answer('skip','debugger (');await answer('skip','reviewer (');await answer('skip','Save this configuration?');
   child.stdin.write('y\r');await wait(()=>output.includes('agents analyst active in this session'));
   const saved=JSON.parse(fs.readFileSync(file));
   assert.equal(saved.orchestrator,'main');

@@ -108,7 +108,7 @@ export function takePending(file) { const texts = readPending(file); try { fs.tr
 // vendors that mark their own stream are believed over any pattern.
 export const SPEAKER = {worker: 'worker', thinking: 'thinking', runtime: 'runtime'};
 export const RUNTIME_VOICE = {
-  opencode: [/MAXIMUM STEPS REACHED/i, /maximum number of steps allowed/i, /auto.?rejecting/i],
+  opencode: [/MAXIMUM STEPS REACHED/i, /maximum number of steps allowed/i, /Maximum steps for this agent have been reached/i, /auto.?rejecting/i],
   codex: [/^codex app-server\b/i],
   claude: [/^\[system\]/i],
   muse: [],

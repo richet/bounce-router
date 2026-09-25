@@ -47,6 +47,7 @@ export const defaultStrategy = {
   },
   onReviewVerdict(task, verdicts, view, api) {
     const v = verdicts[0];
+    if (v.verdict === 'unavailable') return {action: 'escalate', reason: 'review_unavailable', text: `Required review unavailable: ${v.reason ?? 'no confident verdict'}`};
     if (v.verdict === 'accept') return {action: 'accept'};
     // An unreadable verdict from a reviewer that RAN used to block the task, which needs a human. Found
     // live: the reviewer hit its step cap, its notice failed to parse, and the task sat

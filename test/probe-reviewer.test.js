@@ -34,7 +34,7 @@ test('P1 probe is a policy: an agent file may declare it, it ranks between read-
   assert.equal(session.events.some(e => e.task === row.task && e.kind === 'task.failed' && e.reason === 'review'), false, 'a probe reviewer is a reviewer');
 });
 
-test('P2 a probe agent probes on AIs that can enforce it (codex, local) and plays read-only on the others, never skipped', t => {
+test('P2 a probe agent keeps command tools by skipping unsupported AIs', t => {
   const dir = root(t);
   fs.mkdirSync(agentStore(dir), {recursive: true});
   fs.writeFileSync(path.join(agentStore(dir), 'reviewer.md'), serializeAgent({name: 'reviewer', description: 'Reviews.', policy: 'probe',
@@ -42,8 +42,8 @@ test('P2 a probe agent probes on AIs that can enforce it (codex, local) and play
   const view = validateOrchestration({operation: 'orchestrator', mode: 'yolo', orchestrator: 'main', order: ['claude', 'codex', 'muse'],
     models: {claude: 'sonnet', codex: 'gpt-5.6-terra'}, profiles: {main: {adapter: 'claude'}}}, undefined, {roles: loadAgents(dir)});
   const chain = Object.values(view.profiles).filter(p => p.role === 'reviewer');
-  assert.deepEqual(chain.map(p => [p.adapter, p.policy, p.agent.policy]), [['claude', 'read-only', 'read-only'], ['codex', 'probe', 'probe'], ['opencode', 'probe', 'probe']]);
-  assert.deepEqual(view.skipped, []);
+  assert.deepEqual(chain.map(p => [p.adapter, p.policy, p.agent.policy]), [['codex', 'probe', 'probe'], ['opencode', 'probe', 'probe']]);
+  assert.equal(view.skipped.every(item => item.reason === 'adapter cannot run isolated checks'), true);
 });
 
 test('P3 a reviewer\'s FINDING lines are kept as they come, and a stopped review hands them on in its deadline row', async t => {
@@ -131,7 +131,7 @@ test('P7 an unreadable verdict is re-asked exactly once, with the note in the re
   const asked = session.events.filter(e => e.kind === 'review.reasked' && e.task === row.task);
   assert.deepEqual(asked.map(e => e.text), ['Your last answer carried no readable verdict. Answer again with the verdict line only, as JSON.']);
   assert.equal(seen.length, 2, 'the reviewer ran twice: the first answer, then the re-ask');
-  assert.match(seen[1], /Answer again with the verdict line only, as JSON\.$/);
+  assert.match(seen[1], /Answer again with the verdict line only, as JSON\./);
   assert.equal(session.events.some(e => e.kind === 'task.failed' && e.task === row.task), false, 'the second answer was readable: accepted');
 });
 

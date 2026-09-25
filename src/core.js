@@ -32,6 +32,64 @@ export function saveJSON(file, value) {
   fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + '\n', {mode: 0o600});
   fs.renameSync(tmp, file);
 }
+
+const JOURNAL_COMMIT = 'journal.commit';
+
+function journalError(message) { return new Error(`Invalid journal commit: ${message}`); }
+function validCommitEvent(event) {
+  if (typeof event.kind !== 'string' || !event.kind || event.kind === JOURNAL_COMMIT || LIVE_KINDS.has(event.kind)) return false;
+  if (event.id !== undefined && (typeof event.id !== 'string' || !event.id)) return false;
+  return event.time === undefined || (typeof event.time === 'string' && !!event.time);
+}
+
+// The journal deliberately keeps its old one-row-per-line format readable. New multi-row state
+// transitions use one JSONL envelope, which is either wholly present or a torn final tail. The
+// returned `events` are always logical rows; callers never need to know how they were stored.
+export function readJournal(file) {
+  if (!fs.existsSync(file)) return {events: [], nextSeq: 1, commitRefs: new Map(), repair: null};
+  const source = fs.readFileSync(file, 'utf8');
+  const lines = source.split('\n');
+  const events = [], commitRefs = new Map();
+  let nextSeq = 1, offset = 0, repair = null;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const final = i === lines.length - 1;
+    const ended = !final || source.endsWith('\n');
+    const bytes = Buffer.byteLength(line) + (ended ? 1 : 0);
+    if (!line) { offset += bytes; continue; }
+    let record;
+    try { record = JSON.parse(line); }
+    catch (error) {
+      if (!final) throw error;
+      repair = {offset, newline: false};
+      break;
+    }
+    if (record?.kind === JOURNAL_COMMIT) {
+      if (record.version !== 2) throw new Error(`Unsupported journal commit version: ${record.version}`);
+      if (typeof record.id !== 'string' || !record.id || typeof record.time !== 'string' || !record.time) throw journalError('id and time are required');
+      if (!Array.isArray(record.events) || !record.events.length) throw journalError('events must be a nonempty array');
+      if (record.ref !== undefined && (typeof record.ref !== 'string' || !record.ref)) throw journalError('ref must be a nonempty string');
+      if (record.ref && commitRefs.has(record.ref)) throw journalError(`duplicate ref ${record.ref}`);
+      const rows = record.events;
+      for (const row of rows) {
+        if (!row || typeof row !== 'object' || Array.isArray(row) || typeof row.id !== 'string' || !row.id
+          || typeof row.time !== 'string' || typeof row.kind !== 'string' || !row.kind || row.seq !== nextSeq) {
+          throw journalError('events must be complete logical rows with consecutive seq values');
+        }
+        events.push(row);
+        nextSeq++;
+      }
+      if (record.ref) commitRefs.set(record.ref, rows);
+    } else {
+      events.push(record);
+      // v1 may have no seq at all. Preserve its historical next-seq behavior exactly.
+      nextSeq = (record?.seq ?? events.length) + 1;
+    }
+    offset += bytes;
+    if (final && !ended) repair = {offset: Buffer.byteLength(source), newline: true};
+  }
+  return {events, nextSeq, commitRefs, repair};
+}
 // Configs written for the in-house `local` adapter are brought forward in place, so a machine that
 // worked before keeps working without the user editing JSON (docs/plans/opencode-adapter.md).
 // Saved configs move forward on load, once, "as if it had never been otherwise":
@@ -114,45 +172,113 @@ export class Session {
     this.file = path.join(this.dir, 'journal.jsonl');
     if (id && !fs.existsSync(this.file)) throw new Error(`Session not found: ${id}`);
     fs.mkdirSync(this.dir, {recursive: true, mode: 0o700});
-    // Ignore only a torn final write. Corruption in a completed record is an error.
-    if (fs.existsSync(this.file)) {
-      const source = fs.readFileSync(this.file, 'utf8');
-      const lines = source.split('\n');
-      for (let i = 0; i < lines.length; i++) {
-        if (!lines[i]) continue;
-        try { this.events.push(JSON.parse(lines[i])); }
-        catch (error) { if (i !== lines.length - 1) throw error; }
-      }
-      if (!source.endsWith('\n')) this.needsRepair = true;
-    }
+    const journal = readJournal(this.file);
+    this.events = journal.events;
+    this.repair = journal.repair;
     // ref index for O(1) dedupe; seq continues from the last row (legacy rows count as their own 1-based index).
     this.refIndex = new Map();
     for (const e of this.events) if (typeof e.ref === 'string' && !this.refIndex.has(e.ref)) this.refIndex.set(e.ref, e);
-    const last = this.events.at(-1);
-    this.nextSeq = (last ? last.seq ?? this.events.length : 0) + 1;
-    this.listeners = new Set(); this.subscriberErrors = [];
+    this.commitRefIndex = journal.commitRefs;
+    this.nextSeq = journal.nextSeq;
+    this.listeners = new Set(); this.subscriberErrors = []; this.emitQueue = []; this.emitting = false; this.writerUsable = true;
     this.cwd = this.events.find(e => e.kind === 'session')?.cwd ?? fs.realpathSync(cwd);
-    if (!this.events.length) this.append({kind: 'session', cwd: this.cwd, text: this.cwd});
+    if (!this.events.length) this.append({kind: 'session', cwd: this.cwd, text: this.cwd, schemaVersion: 2, policyVersion: 2, runtime: process.version});
     this.active = this.events.findLast(e => e.kind === 'route')?.provider;
   }
   append(event) {
-    if (this.needsRepair) {
-      fs.writeFileSync(this.file, this.events.map(e => JSON.stringify(e)).join('\n') + '\n', {mode: 0o600});
-      this.needsRepair = false;
-    }
+    this.#repairJournal();
     if (typeof event.ref === 'string' && this.refIndex.has(event.ref)) return this.refIndex.get(event.ref);
-    const row = {id: randomUUID(), time: new Date().toISOString(), ...event, from: defaultFrom(event), context: event.context ?? this.context, seq: this.nextSeq++};
-    fs.appendFileSync(this.file, JSON.stringify(row) + '\n', {mode: 0o600});
+    const row = {id: randomUUID(), time: new Date().toISOString(), ...event, from: defaultFrom(event), context: event.context ?? this.context, seq: this.nextSeq};
+    this.#writeDurably(JSON.stringify(row) + '\n');
+    this.nextSeq++;
     this.events.push(row);
     if (typeof row.ref === 'string') this.refIndex.set(row.ref, row);
     this.emit(row);
     return row;
   }
+  // One persisted envelope is the commit boundary for a state transition and every action it
+  // requires. A ref identifies the whole transition: retrying it returns every original row.
+  commit(events, {ref, version = 2} = {}) {
+    if (version !== 2) throw new Error(`Unsupported journal commit version: ${version}`);
+    if (!Array.isArray(events) || !events.length || events.some(event => !event || typeof event !== 'object' || Array.isArray(event) || !validCommitEvent(event))) {
+      throw journalError('events must be nonempty complete non-live logical rows');
+    }
+    if (ref !== undefined && (typeof ref !== 'string' || !ref)) throw journalError('ref must be a nonempty string');
+    if (ref && this.commitRefIndex.has(ref)) return this.commitRefIndex.get(ref);
+    this.#repairJournal();
+    const rows = events.map((event, index) => ({...event, id: event.id ?? randomUUID(), time: event.time ?? new Date().toISOString(),
+      from: defaultFrom(event), context: event.context ?? this.context, seq: this.nextSeq + index}));
+    const envelope = {kind: JOURNAL_COMMIT, version, id: randomUUID(), time: new Date().toISOString(), ...(ref ? {ref} : {}), events: rows};
+    this.#writeDurably(JSON.stringify(envelope) + '\n');
+    this.nextSeq += rows.length;
+    this.events.push(...rows);
+    for (const row of rows) if (typeof row.ref === 'string' && !this.refIndex.has(row.ref)) this.refIndex.set(row.ref, row);
+    if (ref) this.commitRefIndex.set(ref, rows);
+    this.#emitMany(rows);
+    return rows;
+  }
+  #repairJournal() {
+    if (!this.repair) return;
+    if (this.repair.newline) this.#writeDurably('\n');
+    else fs.truncateSync(this.file, this.repair.offset);
+    this.repair = null;
+  }
+  #writeDurably(text) {
+    if (!this.writerUsable) throw new Error('Journal writer is unusable; reconstruct it from disk before appending');
+    let fd;
+    let initialSize;
+    let wroteBytes = false;
+    let grew = false;
+    let failure;
+    try {
+      fd = fs.openSync(this.file, 'a', 0o600);
+      initialSize = fs.fstatSync(fd).size;
+      const bytes = Buffer.from(text);
+      let offset = 0;
+      while (offset < bytes.length) {
+        const written = fs.writeSync(fd, bytes, offset, bytes.length - offset);
+        if (!Number.isInteger(written) || written <= 0) throw new Error('Journal write failed');
+        wroteBytes = true;
+        offset += written;
+      }
+      fs.fsyncSync(fd);
+    } catch (error) {
+      failure = error;
+      if (fd !== undefined && initialSize !== undefined) {
+        try { grew = fs.fstatSync(fd).size > initialSize; }
+        catch { grew = true; }
+      }
+    }
+    try { if (fd !== undefined) fs.closeSync(fd); }
+    catch (error) { failure ??= error; }
+    if (failure) {
+      if (wroteBytes || grew) this.writerUsable = false;
+      throw failure;
+    }
+  }
   // onEvent stays the display's hook; subscribers (bus, scheduler) fan out beside it.
   emit(row) {
-    this.onEvent?.(row);
-    // One broken subscriber (a policy, the bus) must not turn a journal write into a caller-visible crash.
-    for (const fn of this.listeners) { try { fn(row); } catch (error) { if (this.subscriberErrors.push({error, row}) > 100) this.subscriberErrors.shift(); } }
+    this.emitQueue.push(row);
+    this.#drainEmits();
+  }
+  #emitMany(rows) {
+    this.emitQueue.push(...rows);
+    this.#drainEmits();
+  }
+  #drainEmits() {
+    if (this.emitting) return;
+    this.emitting = true;
+    try {
+      while (this.emitQueue.length) {
+        const next = this.emitQueue.shift();
+        try { this.onEvent?.(next); } catch (error) { this.#recordSubscriberError(error, next); }
+        // One broken subscriber (a policy, the bus) must not turn a journal write into a caller-visible crash.
+        for (const fn of this.listeners) { try { fn(next); } catch (error) { this.#recordSubscriberError(error, next); } }
+      }
+    } finally { this.emitting = false; }
+  }
+  #recordSubscriberError(error, row) {
+    if (this.subscriberErrors.push({error, row}) > 100) this.subscriberErrors.shift();
   }
   subscribe(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn); }
   // Live kinds are folded in memory only: delivered straight to onEvent, never journaled, no seq assigned.

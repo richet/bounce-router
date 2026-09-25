@@ -6,19 +6,26 @@ import {handoff} from './core.js';
 import {failedAttempts} from './loop-guard.js';
 import {imagePaths, saveImages, providerInput} from './images.js';
 import {cooldowns, tasks, TERMINAL} from './reducers.js';
+import {
+  OUTCOME_KINDS,
+  PLAN_DECISIONS,
+  acceptedPlanSatisfied,
+  actionSetKey,
+  blockedActionSet,
+  pendingMainActions,
+  taskDispositionEvidence,
+  wakeAttempts,
+} from './continuations.js';
 
 // The rows that end a task for the orchestrator's purposes (mirrors bus.js's TASK_TERMINAL).
 // `blocked` and `input_required` are here because a parked task is news, not a resting state: its worker
 // has exited, so no later row will change it, no watchdog covers it (reducers.js skips both) and no parent
 // settles on it. Found live in three sessions — 40 minutes, 89 minutes, and one that simply ran out of
 // journal — each ended only by the user cancelling. The row itself carries the question that was waiting.
-const HANDOFF_KINDS = new Set(['task.completed', 'task.accepted', 'task.failed', 'task.cancelled', 'task.deadline', 'task.rejected',
-  'task.blocked', 'task.input_required']);
-const PARKED = new Set(['blocked', 'input_required']);
+const HANDOFF_KINDS = OUTCOME_KINDS;
 const HANDOFF_TEXT_MAX = 2000; // per task: a final report summary or failure text, never a transcript
 const HANDOFF_DELAY_MS = 1000; // several tasks ending together become one wake-up turn
-const DEAD_END_PROMPT = 'Your last turn dispatched nothing and nothing of yours is running, so no outcome can arrive and bounce cannot wake you again. Check whether a submission of yours was refused (the refusal says why), then either dispatch the work or tell the user plainly what is blocking it and what you need. Do not end this turn expecting an outcome that nothing will produce.';
-const WAKE_PROMPT = 'Continue your orders. The worker outcomes above were not returned by any wait of yours and have not been reported to the user: synthesize them now (what each task produced, what failed and why, what remains). If a task you still need is listed as running, wait on it with `bounce wait` before reporting. Do not re-run finished work.';
+const WAKE_PROMPT = 'Continue your orders. Resolve the pending outcomes and decisions above: schedule the successor, name the event being awaited, finish the authorized scope, or report a concrete blocker. If a task you still need is listed as running, wait on it with `bounce wait` before reporting. Do not re-run finished work.';
 
 // A task is the orchestrator's when the root of its `replaces` lineage was submitted by the
 // orchestrator peer: a fallback replacement is journaled by the scheduler (`from: bounce`), yet
@@ -28,22 +35,6 @@ function orchestratorsTask(session, view, id) {
   while (view[id]?.replaces && view[view[id].replaces] && !seen.has(id)) { seen.add(id); id = view[id].replaces; }
   return session.events.find(e => e.kind === 'task.submitted' && e.task === id)?.from === 'orchestrator';
 }
-const replaced = (session, id) => session.events.some(e => e.kind === 'task.submitted' && e.replaces === id && e.task !== id);
-
-// A child's outcome travels up only while an ancestor is still alive to carry it. Found live: the
-// orchestrator named an already-accepted task as the parent, so the chain was terminal on arrival and two
-// finished tasks woke nobody. Cycle-guarded, like the replaces walk above it.
-function carriedByAncestor(view, id) {
-  const seen = new Set();
-  let parent = view[id]?.parent;
-  while (parent && view[parent] && !seen.has(parent)) {
-    if (!TERMINAL.has(view[parent].state)) return true;
-    seen.add(parent);
-    parent = view[parent].parent;
-  }
-  return false;
-}
-
 // The wake-up block: one entry per task whose end the orchestrator has not been handed, with
 // the terminal row's outcome — the final report summary (task.reported, folded by the scheduler
 // into task.completed's `summary`) or the failure text — and the roots still running.
@@ -66,7 +57,16 @@ export function handoffBlock(session, ended) {
   return lines.join('\n');
 }
 
-export function createMainService({session, adapters, profile, settings, profiles = {}, readRouting = () => settings, orchestratorEnv = {}, brief = '', handoffDelayMs = HANDOFF_DELAY_MS}) {
+export function createMainService({session, adapters, profile, settings, profiles = {}, readRouting = () => settings,
+  orchestratorEnv = {}, brief = '', handoffDelayMs = HANDOFF_DELAY_MS, continuationState,
+  clock = {}, watchdog = {}}) {
+  const now = clock.now ?? Date.now;
+  const setTimer = clock.setTimeout ?? setTimeout;
+  const clearTimer = clock.clearTimeout ?? clearTimeout;
+  const startupMs = watchdog.startupMs ?? 30000;
+  const runningMs = watchdog.runningMs ?? 30 * 60000;
+  const retryDelayMs = watchdog.retryDelayMs ?? handoffDelayMs;
+  const maxWakeAttempts = watchdog.maxWakeAttempts ?? 2;
   const listeners = new Set(), native = new Map();
   for (const event of session.events) {
     if (event.kind === 'peer.native' && event.from === 'main') native.set(event.provider, {provider: event.provider, sessionId: event.sessionId});
@@ -92,45 +92,135 @@ export function createMainService({session, adapters, profile, settings, profile
   let selection = session.events.findLast(e => e.kind === 'route' && e.from === 'main') ??
     {provider: profile.adapter, model: profile.model || settings.models?.[profile.adapter] || '', mode: profile.mode, policy: profile.policy};
   session.active = selection.provider;
-  let current = null, closed = false;
-  const previousState = session.events.findLast(event => ['main.starting', 'main.started', 'main.terminal', 'main.blocked'].includes(event.kind));
-  if (previousState && previousState.kind !== 'main.terminal') {
-    current = {id: previousState.requestId, turnId: previousState.turnId, unverified: true, orphaned: true};
+  const lastCancellation = session.events.findLast(event => event.kind === 'main.cancelled');
+  const lastManualRequest = session.events.findLast(event => event.kind === 'main.requested' && !event.wake);
+  let current = null, closed = false, blockedState = null;
+  let autoWakeSuppressed = Boolean(lastCancellation && (!lastManualRequest || lastCancellation.seq > lastManualRequest.seq));
+  const unfinishedExecution = session.events.findLast(event => {
+    if (!['main.starting', 'main.started'].includes(event.kind)) return false;
+    return !session.events.some(later => later.seq > event.seq && later.requestId === event.requestId
+      && ['main.terminal', 'main.blocked'].includes(later.kind));
+  });
+  const replayRequest = session.events.findLast(event => event.kind === 'main.requested'
+    && !session.events.some(later => later.seq > event.seq && later.requestId === event.requestId
+      && ['main.starting', 'main.started', 'main.terminal', 'main.blocked'].includes(later.kind)));
+  if (unfinishedExecution) {
+    current = {id: unfinishedExecution.requestId, turnId: unfinishedExecution.turnId, unverified: true, orphaned: true};
+    blockedState = {reason: 'orphaned', requestId: current.id};
     session.append({kind: 'main.blocked', from: 'main', requestId: current.id, turnId: current.turnId, state: 'blocked', reason: 'orphaned', text: 'Termination unverified after daemon restart; inspect the previous orchestrator process before continuing'});
   }
-  const state = () => ({state: current?.unverified ? 'blocked' : current ? current.handle ? 'running' : 'starting' : 'idle',
+  const previousSafetyBlock = session.events.findLast(event => event.kind === 'main.blocked'
+    && ['orphaned', 'termination_uncertain'].includes(event.reason));
+  if (!current && previousSafetyBlock
+    && !session.events.some(event => event.seq > previousSafetyBlock.seq && event.kind === 'main.requested')) {
+    current = {id: previousSafetyBlock.requestId, turnId: previousSafetyBlock.turnId, unverified: true, orphaned: true, finished: true};
+    blockedState = {reason: previousSafetyBlock.reason, requestId: previousSafetyBlock.requestId};
+  }
+  const state = () => ({state: current?.unverified || blockedState ? 'blocked' : current ? current.handle ? 'running' : 'starting' : 'idle',
     provider: selection.provider, model: selection.model, mode: selection.mode, policy: selection.policy, currentTurnId: current?.turnId ?? null, requestId: current?.id ?? null});
   function emit(event) {
     const row = session.append({...event, from: 'main', context: session.id});
     for (const listener of listeners) listener(row);
+    return row;
   }
-  function finish(run, status, reason) {
+  function notify(rows) {
+    for (const row of rows) for (const listener of listeners) listener(row);
+  }
+  function stopWatchdog(run) {
+    if (run.watchdogTimer) clearTimer(run.watchdogTimer);
+    run.watchdogTimer = null;
+  }
+  function dispositionRows(run, status) {
+    if (status !== 'completed') return [];
+    const pending = pendingMainActions(session.events, {continuationState});
+    const pendingIds = new Set(pending.map(action => action.actionId));
+    const byOutcome = new Map(pending.filter(action => action.outcomeSeq !== null).map(action => [action.outcomeSeq, action]));
+    const ids = new Set(run.actionIds ?? []);
+    for (const served of session.events) {
+      if (served.kind !== 'wait.served' || served.seq <= run.requestedSeq) continue;
+      const servedRow = session.events.find(row => row.seq === served.served);
+      const action = byOutcome.get(served.served) ?? pending.find(candidate => candidate.task && candidate.task === servedRow?.task);
+      if (action) ids.add(action.actionId);
+    }
+    const rows = [];
+    for (const actionId of ids) {
+      const delivered = run.actions?.find(candidate => candidate.actionId === actionId);
+      const action = pending.find(candidate => candidate.actionId === actionId)
+        ?? (delivered?.task ? pending.find(candidate => candidate.task === delivered.task) : null)
+        ?? (delivered?.planId ? pending.find(candidate => candidate.planId === delivered.planId) : null)
+        ?? delivered;
+      if (!action) continue;
+      if (action.kind === 'plan.accepted' && !acceptedPlanSatisfied(session.events, action)) continue;
+      if (action.kind === 'campaign.pending' && pendingIds.has(actionId)) continue;
+      const evidence = action.task ? taskDispositionEvidence(session.events, action, {afterSeq: run.requestedSeq}) : null;
+      if (action.task && !evidence) continue;
+      rows.push({kind: 'main.disposition', actionId: action.actionId, outcomeSeq: action.outcomeSeq, requestId: run.id,
+        ...(action.task ? {task: action.task} : {}), ...(action.planId ? {planId: action.planId} : {}),
+        ...(evidence?.successor ? {successor: evidence.successor} : {}),
+        disposition: action.kind === 'plan.accepted' ? 'dispatched' : evidence?.disposition ?? 'reported', from: 'main', context: session.id});
+    }
+    return rows;
+  }
+  function finish(run, status, reason, {suppressReconcile = false, extraRows = []} = {}) {
     if (run.finished) return;
     run.finished = true;
+    stopWatchdog(run);
     if (current === run) current = null;
-    session.append({kind: 'turn', provider: run.provider, text: status === 'interrupted' ? 'cancelled' : status, status: status === 'interrupted' ? 'cancelled' : status});
-    emit({kind: 'main.terminal', requestId: run.id, turnId: run.turnId, state: 'idle', status, ...(reason ? {reason, text: reason} : {})});
-    // A turn that never launched (the orchestrator's own vendor limited or missing) told the
-    // orchestrator nothing: its outcomes are still pending. A wake-up gets one more attempt
-    // after the usual delay, then they ride on the next prompt rather than a retry loop.
-    if (!run.started) {
-      if (!run.wake) return;
-      if (status === 'failed' && !wakeRetried) { wakeRetried = true; arm(); return; }
-      session.append({kind: 'status', text: `Worker outcomes not handed to the orchestrator: ${reason ?? status}; they ride on the next prompt`});
+    const rows = [
+      {kind: 'turn', provider: run.provider, text: status === 'interrupted' ? 'cancelled' : status,
+        status: status === 'interrupted' ? 'cancelled' : status},
+      {kind: 'main.terminal', from: 'main', context: session.id, requestId: run.id, turnId: run.turnId,
+        state: 'idle', status, ...(reason ? {reason, text: reason} : {})},
+      ...dispositionRows(run, status),
+      ...extraRows,
+    ];
+    const committed = session.commit(rows, {ref: `main-terminal:${run.id}`, version: 2});
+    notify(committed.filter(row => row.kind.startsWith('main.')));
+    if (!suppressReconcile && status !== 'interrupted' && !run.userCancelled) reconcile();
+  }
+  function block(run, reason, text, extra = {}) {
+    if (run.finished) return;
+    stopWatchdog(run);
+    run.unverified = reason === 'termination_uncertain' || reason === 'orphaned';
+    run.finished = true;
+    if (current === run && !run.unverified) current = null;
+    blockedState = {reason, requestId: run.id, ...extra};
+    emit({kind: 'main.blocked', requestId: run.id, turnId: run.turnId, state: 'blocked', reason, text, ...extra});
+  }
+  function armWatchdog(run, stage) {
+    stopWatchdog(run);
+    const duration = stage === 'startup' ? startupMs : runningMs;
+    if (!Number.isFinite(duration) || duration <= 0) return;
+    run.watchdogTimer = setTimer(() => { void watchdogExpired(run, stage); }, duration);
+  }
+  async function watchdogExpired(run, stage) {
+    if (closed || current !== run || run.finished || run.userCancelled) return;
+    run.timedOut = true;
+    if (!run.handle) {
+      block(run, 'termination_uncertain', `Main ${stage} timed out before bounce obtained process identity; inspect the provider process before retrying`,
+        {failure: {code: 'main_timeout', stage}});
       return;
     }
-    // Whatever ended during the turn without being returned by one of its waits wakes it now.
-    if (pendingHandoffs().length) { arm(); return; }
-    // A turn that ends with nothing running and no outcome owed is a dead end: no row will ever arrive,
-    // so no wake can ever fire. Found live: a turn ended saying bounce would "resume the campaign with the
-    // verdict" after its only submit had been refused. The user is told in their own transcript, and the
-    // orchestrator is woken once to see it — once, never a loop: a wake that itself dispatches nothing
-    // ends here quietly, because by then the orchestrator has been told and it is the user's move.
-    if (!run.wake && !anythingRunning() && planAwaitingDispatch()) {
-      session.append({kind: 'status', text: 'That turn dispatched nothing and nothing is running, so no outcome can arrive. Waking the orchestrator once to look; after that it is your move.'});
-      deadEndNudge = true;
-      arm();
+    const stopped = await adapters[run.provider].cancel(run.handle).catch(error => ({verified: false, error: error.message}));
+    if (!stopped?.verified) {
+      block(run, 'termination_uncertain', `Main ${stage} timed out and provider termination could not be verified`,
+        {failure: {code: 'main_timeout', stage}});
+      return;
     }
+    run.handle = null;
+    const rootRequestId = run.rootRequestId ?? run.id;
+    const recoveries = session.events.filter(row => row.kind === 'main.recovery' && row.rootRequestId === rootRequestId).length;
+    if (!run.resumed || recoveries >= 1) {
+      block(run, 'main_timeout_exhausted', `Main ${stage} timed out after verified termination; automatic recovery is exhausted`,
+        {failure: {code: 'main_timeout', stage, verifiedTermination: true}});
+      return;
+    }
+    native.delete(run.provider);
+    const nextRequestId = randomUUID();
+    finish(run, 'failed', `Main ${stage} timed out; provider termination verified`, {suppressReconcile: true,
+      extraRows: [{kind: 'main.recovery', from: 'main', context: session.id, requestId: run.id, nextRequestId,
+        rootRequestId, reason: 'main_timeout', stage, verifiedTermination: true}]});
+    start({...run.params, id: nextRequestId, recoveryOf: run.id, rootRequestId, provider: run.provider}, {wake: run.wake, forceFresh: true});
   }
   async function execute(run, params) {
     const tried = new Set();
@@ -140,7 +230,7 @@ export function createMainService({session, adapters, profile, settings, profile
       const provider = candidate.adapter;
       if (tried.has(provider) || !adapters[provider]) continue;
       tried.add(provider);
-      if (cooldowns(session.events, Date.now())[provider] > Date.now()) continue;
+      if (cooldowns(session.events, now())[provider] > now()) continue;
       run.provider = provider;
       run.selected = {...profile, ...candidate, role: 'orchestrator',
         policy: run.selected.policy === 'read-only' || profile.policy === 'read-only' ? 'read-only' : candidate.policy,
@@ -151,13 +241,14 @@ export function createMainService({session, adapters, profile, settings, profile
       session.active = provider;
       session.append({kind: 'route', from: 'main', ...selection, text: `Orchestrator selected ${provider}`});
       emit({kind: 'main.starting', ...selection, requestId: run.id, turnId: null, state: 'starting', ...(run.wake ? {handoff: true} : {})});
+      armWatchdog(run, 'startup');
       const result = await attempt(run, params);
       if (run.unverified || run.finished) return;
       if (run.cancelled || closed) { finish(run, 'interrupted'); return; }
       if (!['limited', 'missing'].includes(result)) return;
       run.previousProvider = provider;
       if (result === 'limited') session.append({kind: 'cooldown', provider,
-        until: Date.now() + (settings.cooldownMinutes ?? 30) * 60000,
+        until: now() + (settings.cooldownMinutes ?? 30) * 60000,
         text: 'Main provider quota exhausted; trying the next eligible provider.'});
     }
     finish(run, run.cancelled || closed ? 'interrupted' : 'unavailable', 'No main provider available. Check fallback configuration or clear local cooldowns with /retry.');
@@ -175,9 +266,14 @@ export function createMainService({session, adapters, profile, settings, profile
       const text0 = run.outcomes ? `${run.outcomes}\n\n${params.text}` : params.text;
       const prompt = [brief, roster, previous && run.previousProvider === run.provider ? text0 : handoff(session, text0, settings.contextChars)].filter(Boolean).join('\n');
       const text = providerInput(run.provider, prompt, run.images);
-      run.handle = previous && adapter.resume
+      run.resumed = Boolean(previous && adapter.resume && !run.forceFresh);
+      run.handle = run.resumed
         ? await adapter.resume({...options, native: previous, message: text})
         : await adapter.launch({...options, orders: text});
+      if (run.finished) {
+        if (run.handle) await adapter.cancel(run.handle).catch(() => ({verified: false}));
+        return;
+      }
       if (run.cancelled || closed) {
         const stopped = await adapter.cancel(run.handle);
         if (!stopped?.verified) throw new Error('Main provider termination unverified');
@@ -185,7 +281,7 @@ export function createMainService({session, adapters, profile, settings, profile
       }
       run.turnId = run.handle.turnId ?? run.id;
       run.started = true;
-      wakeRetried = false;
+      armWatchdog(run, 'running');
       emit({kind: 'main.started', requestId: run.id, turnId: run.turnId, state: 'running'});
       for await (const event of adapter.events(run.handle)) {
         if (event.kind === 'native') {
@@ -204,23 +300,25 @@ export function createMainService({session, adapters, profile, settings, profile
       const stopped = await adapter.cancel(run.handle);
       if (!stopped?.verified) throw new Error('Main provider termination unverified');
       run.handle = null;
+      stopWatchdog(run);
       if (run.finished) return;
       const status = run.cancelled || closed ? 'interrupted' : result?.status;
       if (['limited', 'missing'].includes(status)) return status;
       finish(run, ['completed', 'failed', 'limited', 'interrupted'].includes(status) ? status : 'failed',
         result ? result.text : 'Provider exited without a terminal result');
     } catch (error) {
+      stopWatchdog(run);
       run.handle ??= error.handle;
-      if (error.code === 'limited' && !run.handle) {
-        run.unverified = true;
-        emit({kind: 'main.blocked', requestId: run.id, turnId: run.turnId, state: 'blocked', text: 'Main launch termination unverified: no process handle returned'});
+      if (!run.handle && error.code !== 'missing' && error.spawned !== false) {
+        block(run, 'termination_uncertain', `Main launch failed without process identity: ${error.message}`,
+          {failure: {code: error.code ?? 'launch_failed', stage: 'startup'}});
         return;
       }
       if (run.handle) {
         const stopped = await adapter.cancel(run.handle).catch(() => ({verified: false}));
         if (!stopped?.verified) {
-          run.unverified = true;
-          emit({kind: 'main.blocked', requestId: run.id, turnId: run.turnId, state: 'blocked', text: 'Main provider termination unverified'});
+          block(run, 'termination_uncertain', 'Main provider termination unverified',
+            {failure: {code: error.code ?? 'provider_failed', stage: run.started ? 'running' : 'startup'}});
           return;
         }
       }
@@ -240,42 +338,31 @@ export function createMainService({session, adapters, profile, settings, profile
   // still wakes. Log-derived, so a daemon restart changes nothing; one entry per task, its
   // last terminal row. A failure the scheduler has already replaced (policy.fallback) is not
   // an outcome yet: its replacement's end is.
-  function pendingHandoffs() {
-    const view = tasks(session.events);
-    // Delivered means the wake turn REPORTED, not that it started: a wake that was interrupted, or that
-    // returned nothing, told the orchestrator nothing and its outcomes are still owed.
-    const finished = new Set(session.events.filter(event => event.kind === 'main.terminal' && event.status === 'completed').map(event => event.requestId));
-    const started = new Set(session.events.filter(event => event.kind === 'main.started' && finished.has(event.requestId)).map(event => event.requestId));
-    const byHand = row => row.from === 'orchestrator' || row.from === 'user';
-    const seen = row => session.events.some(e => (e.kind === 'wait.served' && e.task === row.task && (!(e.served < row.seq) || byHand(row)))
-      || (e.kind === 'handoff' && started.has(e.requestId) && e.seq > row.seq && e.tasks?.includes(row.task)));
-    const byTask = new Map();
-    for (const row of session.events) {
-      if (!HANDOFF_KINDS.has(row.kind)) continue;
-      const t = view[row.task];
-      if (!t || carriedByAncestor(view, row.task) || !(TERMINAL.has(t.state) || PARKED.has(t.state)) || replaced(session, row.task) || !orchestratorsTask(session, view, row.task)) continue;
-      byTask.set(row.task, row);
+  function pendingActions() {
+    return pendingMainActions(session.events, {continuationState});
+  }
+  function actionBlock(actions) {
+    const taskRows = actions.filter(action => action.task).map(action => action.row);
+    const blocks = taskRows.length ? [handoffBlock(session, taskRows)]
+      : ['Pending orchestration decisions delivered by bounce, not typed by the user:'];
+    for (const action of actions) {
+      if (action.task) continue;
+      if (action.kind === 'plan.accepted') {
+        blocks.push(`- plan ${action.planId ?? '?'}${action.phase ? ` · phase ${action.phase}` : ''} · accepted · dispatch ${action.expectedChunks ?? 'its'} approved chunk(s), name the event being awaited, or record a concrete blocker.`);
+      } else if (action.kind === 'plan.rejected') {
+        blocks.push(`- plan ${action.planId ?? '?'}${action.phase ? ` · phase ${action.phase}` : ''} · rejected · submit a corrected plan or record the specific blocker.`);
+      } else if (action.kind === 'plan.unavailable') {
+        blocks.push(`- plan ${action.planId ?? '?'}${action.phase ? ` · phase ${action.phase}` : ''} · review unavailable · repair the gate, name the wait, or record the specific blocker.`);
+      } else {
+        blocks.push(`- campaign ${action.campaignId ?? '?'} · ${action.row.text ?? 'authorized obligations remain'} · schedule the successor, name the wait, or record the specific blocker.`);
+      }
     }
-    return [...byTask.values()].filter(row => !seen(row));
+    return blocks.join('\n');
   }
-  // A plan bounce accepted, with nothing dispatched since. That is the shape of the dead end worth
-  // acting on: the orchestrator got its go-ahead and then ended the turn without submitting a chunk —
-  // usually because a submit was refused. An ordinary turn that dispatches nothing (a question answered,
-  // a campaign finished) is not this, and must not be nudged.
-  function planAwaitingDispatch() {
-    const accepted = session.events.findLast(row => row.kind === 'plan.accepted');
-    if (!accepted) return false;
-    const dispatched = session.events.findLast(row => row.kind === 'task.submitted');
-    return !dispatched || dispatched.seq < accepted.seq;
-  }
-  // Any task of the orchestrator's that could still produce an outcome.
-  function anythingRunning() {
-    const view = tasks(session.events);
-    return Object.values(view).some(t => !TERMINAL.has(t.state) && orchestratorsTask(session, view, t.id));
-  }
-  function start(params, {wake}) {
+  function start(params, {wake, forceFresh = false} = {}) {
     if (closed) return {accepted: false, reason: 'daemon_closed'};
     if (current) return {accepted: false, reason: current.unverified ? 'termination_unverified' : 'busy'};
+    if (blockedState && ['termination_uncertain', 'orphaned'].includes(blockedState.reason)) return {accepted: false, reason: 'termination_unverified'};
     if (Object.values(tasks(session.events)).some(t => t.state === 'blocked' && session.events.findLast(e => e.task === t.id && e.kind === 'task.blocked')?.reason === 'orphaned')) return {accepted: false, reason: 'termination_unverified'};
     if (typeof params?.text !== 'string' || !params.text.trim()) return {accepted: false, reason: 'empty_prompt'};
     if (params.files !== undefined && (!Array.isArray(params.files) || params.files.some(file => typeof file !== 'string'))) return {accepted: false, reason: 'invalid_attachments'};
@@ -288,14 +375,19 @@ export function createMainService({session, adapters, profile, settings, profile
     const provider = params.provider ?? selection.provider;
     if (LOCAL_ADAPTERS.has(provider) || !adapters[provider]) return {accepted: false, reason: 'unknown_provider'};
     let images;
-    try { images = saveImages([...new Set([...(params.files ?? []), ...imagePaths(params.text, session.cwd)])], session); }
+    try { images = params.savedImages ?? saveImages([...new Set([...(params.files ?? []), ...imagePaths(params.text, session.cwd)])], session); }
     catch (error) { return {accepted: false, reason: error.message}; }
     let routes;
     try { routes = fallbackRoutes(params.routing ?? readRouting()); }
     catch (error) { return {accepted: false, reason: error.message}; }
     const selected = {...profile, ...(provider === selection.provider ? {mode: selection.mode ?? profile.mode, policy: selection.policy ?? profile.policy} : {}), adapter: provider, model: params.model ??
       (provider === selection.provider ? selection.model : settings.models?.[provider] ?? '')};
-    const run = {id: params.id ?? randomUUID(), provider, selected, routes, images, wake,
+    const actions = pendingActions();
+    if (wake && !actions.length) return {accepted: false, reason: 'nothing_pending'};
+    const actionKey = actions.length ? actionSetKey(actions) : null;
+    const run = {id: params.id ?? randomUUID(), provider, selected, routes, images, wake, actionKey, actions,
+      actionIds: actions.map(action => action.actionId), outcomeSeqs: actions.map(action => action.outcomeSeq).filter(Number.isInteger),
+      forceFresh, rootRequestId: params.rootRequestId ?? params.id, recoveryOf: params.recoveryOf, params: {...params, savedImages: images},
       previousProvider: session.events.findLast(event => event.kind === 'main.starting')?.provider,
       handle: null, turnId: null, cancelled: false, finished: false, started: false};
     // Outcomes are journaled here, synchronously with the prompt row, and the very same text
@@ -303,14 +395,23 @@ export function createMainService({session, adapters, profile, settings, profile
     // orchestrator was told. A typed prompt carries them too (`wake: false`): the user's own
     // turn is never raced by a synthetic one. The block counts as delivered only once this
     // requestId reaches main.started; a launch that fails leaves the outcomes pending.
-    const ended = pendingHandoffs();
-    if (ended.length) {
-      run.outcomes = handoffBlock(session, ended);
-      session.append({kind: 'handoff', wake, requestId: run.id, tasks: ended.map(row => row.task), text: wake ? `${run.outcomes}\n\n${params.text}` : run.outcomes, from: 'bounce'});
-    }
+    if (actions.length) run.outcomes = actionBlock(actions);
+    const requested = {kind: 'main.requested', from: 'main', context: session.id, requestId: run.id,
+      wake, text: params.text, provider, model: selected.model ?? '', mode: selected.mode, policy: selected.policy,
+      images, actionIds: run.actionIds, outcomeSeqs: run.outcomeSeqs, actionKey,
+      attempt: wake && actionKey ? wakeAttempts(session.events, actionKey) + 1 : 1,
+      dueAt: wake ? now() : null, ...(params.recoveryOf ? {recoveryOf: params.recoveryOf, rootRequestId: run.rootRequestId} : {})};
+    const committed = [requested];
+    if (!wake) committed.unshift({kind: 'user', text: params.text, ...(params.typed ? {typed: params.typed} : {}), ...(images.length ? {images} : {})});
+    if (actions.length) committed.push({kind: 'handoff', wake, requestId: run.id,
+      actionIds: run.actionIds, outcomeSeqs: run.outcomeSeqs, tasks: actions.filter(action => action.task).map(action => action.task),
+      text: wake ? `${run.outcomes}\n\n${params.text}` : run.outcomes, from: 'bounce'});
+    const rows = session.commit(committed, {ref: `main-request:${run.id}`, version: 2});
+    run.requestedSeq = rows.find(row => row.kind === 'main.requested').seq;
     current = run;
+    blockedState = null;
+    if (!wake) autoWakeSuppressed = false;
     session.active = provider;
-    if (!wake) session.append({kind: 'user', text: params.text, ...(params.typed ? {typed: params.typed} : {}), ...(images.length ? {images} : {})});
     run.done = Promise.resolve().then(() => execute(run, {...params}));
     return {accepted: true, requestId: run.id, state: 'started'};
   }
@@ -319,27 +420,77 @@ export function createMainService({session, adapters, profile, settings, profile
   // happened?". Coalesced over a short window; a user prompt that lands first wins (start()
   // gives it the same block) and the timer finds nothing left to do. Classic mode never
   // constructs this service (reload.js), so nothing here can fire outside orchestrator mode.
-  let wakeTimer = null, wakeRetried = false, deadEndNudge = false;
+  let wakeTimer = null, wakeTimerKey = null;
   function wake() {
     wakeTimer = null;
+    const scheduledKey = wakeTimerKey;
+    wakeTimerKey = null;
     if (closed || current) return;
-    const ended = pendingHandoffs();
-    if (!ended.length && !deadEndNudge) return;
-    const nudging = !ended.length && deadEndNudge;
-    deadEndNudge = false;
-    const result = start({text: nudging ? DEAD_END_PROMPT : WAKE_PROMPT}, {wake: true});
-    if (!result.accepted && result.reason !== 'busy') session.append({kind: 'status', text: `Worker outcomes not handed to the orchestrator: ${result.reason}; they ride on the next prompt`});
+    const actions = pendingActions();
+    if (!actions.length) return;
+    if (actionSetKey(actions) !== scheduledKey) { reconcile(); return; }
+    const result = start({text: WAKE_PROMPT}, {wake: true});
+    if (!result.accepted && result.reason !== 'busy' && result.reason !== 'nothing_pending') {
+      session.append({kind: 'status', text: `Pending orchestration actions could not be handed to the orchestrator: ${result.reason}`});
+    }
   }
   // The timer is ref'd on purpose: a pending wake-up is work the daemon owes, not something to
   // drop if the loop happens to empty (Node 22 does exactly that; an unref'd timer stranded the
   // outcomes). It cannot outlive the daemon — close() clears it before the bus goes down.
-  function arm() {
-    if (closed || current || wakeTimer) return;
-    wakeTimer = setTimeout(wake, handoffDelayMs);
+  function arm(actions, key, attempt) {
+    if (closed || current || wakeTimer || autoWakeSuppressed) return;
+    const existing = session.events.findLast(row => row.kind === 'main.wake.scheduled' && row.actionKey === key && row.attempt === attempt);
+    const dueAt = existing?.dueAt ?? now() + (attempt === 1 ? handoffDelayMs : retryDelayMs);
+    if (!existing) session.commit([{kind: 'main.wake.scheduled', from: 'main', context: session.id, actionKey: key,
+      actionIds: actions.map(action => action.actionId), outcomeSeqs: actions.map(action => action.outcomeSeq).filter(Number.isInteger),
+      attempt, dueAt}], {ref: `main-wake-scheduled:${key}:${attempt}`, version: 2});
+    wakeTimerKey = key;
+    wakeTimer = setTimer(wake, Math.max(0, dueAt - now()));
+  }
+  function settleObservedPlans(actions) {
+    const settled = actions.filter(action => action.kind === 'plan.accepted' && action.expectedChunks !== 0
+      && acceptedPlanSatisfied(session.events, action));
+    for (const action of settled) session.commit([{kind: 'main.disposition', from: 'main', context: session.id,
+      actionId: action.actionId, outcomeSeq: action.outcomeSeq, disposition: 'dispatched'}],
+    {ref: `main-plan-disposition:${action.actionId}`, version: 2});
+    return settled.length > 0;
+  }
+  function reconcile() {
+    if (closed || current || wakeTimer || autoWakeSuppressed) return;
+    let actions = pendingActions();
+    if (settleObservedPlans(actions)) actions = pendingActions();
+    if (!actions.length) return;
+    const key = actionSetKey(actions);
+    const priorBlock = session.events.findLast(row => row.kind === 'main.blocked' && row.actionKey === key);
+    if (blockedActionSet(session.events, key)) {
+      blockedState = priorBlock ? {reason: priorBlock.reason, actionKey: key} : blockedState;
+      return;
+    }
+    const attempts = wakeAttempts(session.events, key);
+    if (attempts >= maxWakeAttempts) {
+      const reason = actions.some(action => action.kind === 'plan.accepted') ? 'plan_undispatched'
+        : actions.some(action => action.kind === 'campaign.pending') ? 'campaign_blocked' : 'wake_retry_exhausted';
+      const outcomeSeqs = actions.map(action => action.outcomeSeq).filter(Number.isInteger);
+      const text = reason === 'plan_undispatched'
+        ? `Accepted plan still has undispatched chunks after ${attempts} continuation attempts; inspect plan/task admission and dispatch the missing chunks or change scope explicitly.`
+        : `Pending orchestration outcomes remain unresolved after ${attempts} continuation attempts; inspect provider health and resume explicitly.`;
+      blockedState = {reason, actionKey: key};
+      const blocker = {kind: 'main.blocked', from: 'main', context: session.id, state: 'blocked', reason, actionKey: key,
+        actionIds: actions.map(action => action.actionId), outcomeSeqs, attempts, text};
+      const dispositions = actions.filter(action => action.kind !== 'campaign.pending').map(action => ({kind: 'main.disposition',
+        from: 'main', context: session.id, actionId: action.actionId, outcomeSeq: action.outcomeSeq,
+        ...(action.task ? {task: action.task} : {}), ...(action.planId ? {planId: action.planId} : {}),
+        disposition: 'blocked', blocker: reason}));
+      const committed = session.commit([blocker, ...dispositions], {ref: `main-blocked:${key}`, version: 2});
+      notify(committed);
+      return;
+    }
+    arm(actions, key, attempts + 1);
   }
   const unsubscribeHandoff = session.subscribe(row => {
-    if (!HANDOFF_KINDS.has(row.kind) || closed || current || wakeTimer) return;
-    if (pendingHandoffs().some(ended => ended.task === row.task)) arm();
+    if (![...HANDOFF_KINDS, ...PLAN_DECISIONS, 'task.submitted', 'main.disposition'].includes(row.kind)
+      && !row.kind.startsWith('campaign.')) return;
+    reconcile();
   });
   const service = {
     state,
@@ -363,24 +514,34 @@ export function createMainService({session, adapters, profile, settings, profile
     },
     async cancel({id} = {}) {
       const run = current;
-      if (!run) return {accepted: true, verified: true};
+      if (!run) {
+        autoWakeSuppressed = true;
+        if (wakeTimer) { clearTimer(wakeTimer); wakeTimer = null; wakeTimerKey = null; }
+        session.append({kind: 'main.cancelled', from: 'user', reason: 'user_cancelled', text: 'Automatic main continuation cancelled by user'});
+        return {accepted: true, verified: true};
+      }
       if (run.orphaned) return {accepted: false, verified: false, reason: 'termination_unverified'};
       if (id && id !== run.id) return {accepted: false, reason: 'turn_changed'};
+      autoWakeSuppressed = true;
+      if (wakeTimer) { clearTimer(wakeTimer); wakeTimer = null; wakeTimerKey = null; }
       run.cancelled = true;
+      run.userCancelled = true;
+      session.append({kind: 'main.cancelled', from: 'user', requestId: run.id, reason: 'user_cancelled', text: 'Main turn cancelled by user'});
       if (!run.handle) return {accepted: true, state: 'cancelling'};
       const stopped = await adapters[run.provider].cancel(run.handle);
       if (stopped?.verified) finish(run, 'interrupted');
-      else { run.unverified = true; emit({kind: 'main.blocked', requestId: run.id, state: 'blocked', text: 'Main provider termination unverified'}); }
+      else block(run, 'termination_uncertain', 'Main provider termination unverified during cancellation',
+        {failure: {code: 'cancel_failed', stage: run.started ? 'running' : 'startup'}});
       return {accepted: true, ...stopped};
     },
     async close() {
       closed = true;
       unsubscribeRoster();
       unsubscribeHandoff();
-      if (wakeTimer) { clearTimeout(wakeTimer); wakeTimer = null; }
+      if (wakeTimer) { clearTimer(wakeTimer); wakeTimer = null; wakeTimerKey = null; }
       const run = current;
       if (!run) return {verified: true};
-      if (run.orphaned) return {verified: false};
+      if (run.orphaned || run.unverified) return {verified: false};
       run.cancelled = true;
       if (run.handle) {
         const stopped = await adapters[run.provider].cancel(run.handle).catch(() => ({verified: false}));
@@ -395,6 +556,17 @@ export function createMainService({session, adapters, profile, settings, profile
     void service.deliver({text: row.text, expectedTurnId: current.turnId}).then(result => {
       session.append({kind: 'status', text: `Worker roster notification: ${result.state}; available in the next orchestrator prompt regardless of live-delivery support`});
     });
+  });
+  queueMicrotask(() => {
+    if (closed || current) return;
+    if (replayRequest) {
+      const result = start({id: replayRequest.requestId, text: replayRequest.text, provider: replayRequest.provider,
+        model: replayRequest.model, mode: replayRequest.mode, savedImages: replayRequest.images ?? [],
+        rootRequestId: replayRequest.rootRequestId}, {wake: Boolean(replayRequest.wake)});
+      if (!result.accepted && result.reason !== 'nothing_pending') reconcile();
+      return;
+    }
+    reconcile();
   });
   return service;
 }

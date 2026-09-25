@@ -11,6 +11,12 @@ test('A1 who is speaking: the worker, its thinking, or the runtime', () => {
   // opencode's own step-cap notice (live: it became a review's verdict and blocked the task)
   const cap = '</think>\n\nCRITICAL - MAXIMUM STEPS REACHED\n\nThe maximum number of steps allowed for this task has been reached. Tools are disabled until next user input.';
   assert.equal(classifyText('opencode', cap).speaker, SPEAKER.runtime);
+  // ...but a model that titles its own summary after the notice is the worker speaking (observed live: the
+  // summary was filed as runtime noise and the reviewer failed with "no answer")
+  const summary = '\n</think>\n\n## Maximum Steps Reached - Final Summary\n\n### Work Completed\n1. Baseline: 148 passed, 1 failed.\n\n### Remaining Tasks\n1. Re-run the corrupt-tail probes.';
+  assert.equal(classifyText('opencode', summary).speaker, SPEAKER.worker);
+  assert.match(classifyText('opencode', summary).text, /^## Maximum Steps Reached - Final Summary\n\n### Work Completed/);
+  assert.equal(classifyText('opencode', 'Maximum steps for this agent have been reached').speaker, SPEAKER.runtime);
   // opencode refusing a path is the runtime too
   assert.equal(classifyText('opencode', 'auto-rejecting permission ask for /etc/hosts').speaker, SPEAKER.runtime);
   // thinking: a closed block, or a stray marker with nothing else left

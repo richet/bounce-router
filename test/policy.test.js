@@ -7,13 +7,25 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {Session} from '../src/core.js';
-import {createScheduler} from '../src/scheduler.js';
+import {createScheduler as createSchedulerImpl} from '../src/scheduler.js';
+const schedulers = new WeakMap();
+const createScheduler = options => {
+  const scheduler = createSchedulerImpl(options);
+  schedulers.get(options.session)?.add(scheduler);
+  return scheduler;
+};
 import {fakeAdapter} from './helpers/fake-adapter.js';
 
 const setup = t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-policy-'));
-  t?.after(() => fs.rmSync(root, {recursive: true, force: true}));
-  return {root, session: new Session(root, {root})};
+  const session = new Session(root, {root});
+  const owned = new Set(); schedulers.set(session, owned);
+  t?.after(async () => {
+    for (const scheduler of owned) scheduler.close();
+    await new Promise(resolve => setImmediate(resolve));
+    fs.rmSync(root, {recursive: true, force: true});
+  });
+  return {root, session};
 };
 
 const waitFor = async (fn, {timeout = 2000, interval = 5} = {}) => {
@@ -25,10 +37,15 @@ const waitFor = async (fn, {timeout = 2000, interval = 5} = {}) => {
     await new Promise(resolve => setTimeout(resolve, interval));
   }
 };
+const BOOKKEEPING = new Set(['orchestration.action.requested', 'orchestration.action.started', 'orchestration.action.settled', 'task.attempt.ended', 'task.cancel.requested', 'task.workspace', 'task.launch.requested', 'task.artifact', 'task.integration.requested', 'task.integrated']);
+const lifecycleKinds = rows => {
+  assert.ok(rows.some(e => e.kind === 'orchestration.action.requested'), 'durable action is recorded');
+  return rows.filter(e => !BOOKKEEPING.has(e.kind)).map(e => e.kind);
+};
 
 const worker = () => ({adapter: 'worker', model: 'w', mode: 'yolo', fallback: []});
 const critic = () => ({adapter: 'critic', model: 'c', mode: 'yolo', fallback: [], role: 'critic'});
-const verifier = () => ({adapter: 'verifier', model: 'v', mode: 'yolo', fallback: [], role: 'verifier'});
+const verifier = () => ({adapter: 'verifier', model: 'v', mode: 'yolo', fallback: [], role: 'verifier', policy: 'probe'});
 
 test('P1 prelaunch reject: worker never launches, task ends rejected with the questions', async t => {
   const {session} = setup(t);
@@ -39,7 +56,7 @@ test('P1 prelaunch reject: worker never launches, task ends rejected with the qu
   const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null, review: {prelaunch: 'C'}});
   await waitFor(() => scheduler.tasks()[row.task]?.state === 'rejected');
 
-  const kinds = session.events.filter(e => e.task === row.task).map(e => e.kind);
+  const kinds = lifecycleKinds(session.events.filter(e => e.task === row.task));
   assert.deepEqual(kinds, ['task.submitted', 'budget.reserved', 'review.started', 'review.finished', 'task.rejected']);
   const rejected = session.events.find(e => e.kind === 'task.rejected');
   assert.deepEqual(rejected.questions, ['probe 3 has no expected output']);
@@ -56,8 +73,8 @@ test('P2 prelaunch accept precedes task.started; a later direct completion accep
   const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null, review: {prelaunch: 'C'}});
   await waitFor(() => scheduler.tasks()[row.task]?.state === 'completed');
 
-  const kinds = session.events.filter(e => e.task === row.task || e.kind === 'peer.joined').map(e => e.kind);
-  assert.deepEqual(kinds, ['task.submitted', 'budget.reserved', 'review.started', 'review.finished', 'task.accepted', 'budget.reserved', 'peer.joined', 'task.started', 'task.completed']);
+  const kinds = lifecycleKinds(session.events.filter(e => e.task === row.task || e.kind === 'peer.joined'));
+  assert.deepEqual(kinds, ['task.submitted', 'budget.reserved', 'review.started', 'review.finished', 'task.accepted', 'budget.reserved', 'peer.joined', 'task.started', 'task.output', 'task.completed']);
   const acceptedRow = session.events.find(e => e.kind === 'task.accepted');
   assert.equal(acceptedRow.stage, 'prelaunch');
   assert.equal(acceptedRow.by, `review:${row.task}`);
@@ -184,7 +201,7 @@ test('P5d depends_on (A1): a dependent submitted after its dependency merely com
   const rowB = scheduler.submit({parent: null, profile: 'B', orders: 'b', deadline: null, depends_on: [rowA.task]});
   await new Promise(resolve => setImmediate(resolve));
   const rowsForB = session.events.slice(before).filter(e => e.task === rowB.task);
-  assert.deepEqual(rowsForB.map(e => e.kind), ['task.submitted']);
+  assert.deepEqual(lifecycleKinds(rowsForB), ['task.submitted']);
   assert.equal(adapterB.calls.launch, 0);
 
   session.append({kind: 'task.accepted', task: rowA.task, stage: 'completion', by: 'orchestrator'});
@@ -225,7 +242,8 @@ test('P6c completion verifier receives steps verbatim, dir ends review-completio
   const scheduler = createScheduler({session, adapters: {worker: workerAdapter, verifier: verifierAdapter}, profiles});
   const row = scheduler.submit({parent: null, profile: 'A', orders: 'the brief', deadline: null, review: {completion: 'V'}, steps: '1. do a\n2. do b'});
   await waitFor(() => scheduler.tasks()[row.task]?.state === 'accepted');
-  assert.equal(seenOrders, '1. do a\n2. do b');
+  assert.equal(seenOrders.split('\n\n')[0], '1. do a\n2. do b');
+  assert.match(seenOrders, /disposable workspace/);
   assert.equal(seenDir.endsWith('review-completion-1'), true);
 });
 
@@ -287,9 +305,13 @@ test('P8 pending messages fold into the resume message once (A2): round 1 only, 
   deferredCritic.resolve();
   await waitFor(() => scheduler.tasks()[row.task]?.state === 'blocked');
 
+  // `A` is a write-policy (yolo) worker in an isolated copy, so its resume message now carries the
+  // appended working-copy paragraph (src/scheduler.js inWorkingCopy) after the folded text.
   assert.equal(workerAdapter.calls.resume, 2);
-  assert.equal(workerAdapter.resumeCalls[0].message, 'Rework round 1:\n- fix x\nnote one');
-  assert.equal(workerAdapter.resumeCalls[1].message, 'Rework round 2:\n- fix y');
+  assert.equal(workerAdapter.resumeCalls[0].message.startsWith('Rework round 1:\n- fix x\nnote one'), true, workerAdapter.resumeCalls[0].message);
+  assert.match(workerAdapter.resumeCalls[0].message, /\n\nYour working copy is .+: it is a copy of the project, and only changes made there are your work\. Writes to the original checkout .+ are refused\.$/);
+  assert.equal(workerAdapter.resumeCalls[1].message.startsWith('Rework round 2:\n- fix y'), true, workerAdapter.resumeCalls[1].message);
+  assert.match(workerAdapter.resumeCalls[1].message, /\n\nYour working copy is .+: it is a copy of the project, and only changes made there are your work\. Writes to the original checkout .+ are refused\.$/);
   const deliveredForM1 = session.events.filter(e => e.kind === 'task.delivered' && e.message === m1.id).map(e => e.tier);
   assert.deepEqual(deliveredForM1, ['queued', 'next-turn']);
 });

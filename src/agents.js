@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {createHash} from 'node:crypto';
+import {createHash, randomUUID} from 'node:crypto';
 import {validateOrchestration, LOCAL_ADAPTERS} from './profiles.js';
 import {normalizeLocalSettings} from './local-models.js';
 
@@ -76,6 +76,19 @@ export function serializeAgent(agent) {
   return lines.join('\n');
 }
 
+// Readers run in other processes (the TUI host and daemon). Publish a complete file with one
+// same-directory rename so they can observe either the old definition or the new one, never the
+// create/truncate window of writeFileSync on the final pathname.
+function writeComplete(file, text) {
+  const temporary = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${randomUUID()}.tmp`);
+  try {
+    fs.writeFileSync(temporary, text, {mode: 0o600});
+    fs.renameSync(temporary, file);
+  } finally {
+    try { fs.rmSync(temporary, {force: true}); } catch {}
+  }
+}
+
 // Writes an agent file where asked, after re-parsing what will be written so an invalid definition
 // never lands. Files bounce authored are recorded by content hash so a later write never clobbers a
 // user's edit: an authored file may be rewritten only while it still matches what bounce wrote.
@@ -91,8 +104,8 @@ export function writeAgent(dir, agent, {authored = false, force = false} = {}) {
     const current = fs.readFileSync(file, 'utf8');
     if (!force && record[meta.name] !== hash(current)) throw Object.assign(new Error(`${meta.name} was edited by hand; it will not be overwritten`), {code: 'AGENT_EDITED'});
   }
-  fs.writeFileSync(file, text, {mode: 0o600});
-  if (authored) { record[meta.name] = hash(text); fs.writeFileSync(ledger, JSON.stringify(record, null, 2) + '\n', {mode: 0o600}); }
+  writeComplete(file, text);
+  if (authored) { record[meta.name] = hash(text); writeComplete(ledger, JSON.stringify(record, null, 2) + '\n'); }
   return {file, agent: meta};
 }
 const hash = value => createHash('sha256').update(value).digest('hex');

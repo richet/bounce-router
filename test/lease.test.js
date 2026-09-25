@@ -10,14 +10,27 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {Session} from '../src/core.js';
-import {createScheduler} from '../src/scheduler.js';
+import {createScheduler as createSchedulerImpl} from '../src/scheduler.js';
 import {fakeAdapter} from './helpers/fake-adapter.js';
 import {workerThread} from '../src/format.js';
+import {attemptLease} from '../src/reducers.js';
 
+const schedulers = new WeakMap();
+const createScheduler = options => {
+  const scheduler = createSchedulerImpl(options);
+  schedulers.get(options.session)?.add(scheduler);
+  return scheduler;
+};
 const setup = t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-lease-'));
-  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
-  return new Session(root, {root});
+  const session = new Session(root, {root});
+  const owned = new Set(); schedulers.set(session, owned);
+  t.after(async () => {
+    for (const scheduler of owned) scheduler.close();
+    await new Promise(resolve => setImmediate(resolve));
+    fs.rmSync(root, {recursive: true, force: true});
+  });
+  return session;
 };
 const waitFor = async (fn, {timeout = 2000} = {}) => {
   const start = Date.now();
@@ -31,6 +44,23 @@ const waitFor = async (fn, {timeout = 2000} = {}) => {
 const MIN = 60000;
 const watchdog = {interval: null, silence: 120000, stall: 600000, grace: 120000, concludeGrace: 30000};
 const profiles = {A: {adapter: 'A', model: 'w', mode: 'yolo', fallback: []}};
+
+test('a replacement review keeps its renewable lease but cannot outlive the logical job ceiling', () => {
+  const at = minutes => new Date(minutes * MIN).toISOString();
+  const events = [
+    {kind: 'task.submitted', task: 'original', jobId: 'job:1', deadline: MIN, time: at(0), seq: 1},
+    {kind: 'task.started', task: 'original', jobId: 'job:1', time: at(0), seq: 2},
+    {kind: 'task.submitted', task: 'retry', jobId: 'job:1', replaces: 'original', deadline: MIN, time: at(1), seq: 3},
+    {kind: 'task.started', task: 'retry', jobId: 'job:1', time: at(1), seq: 4},
+    {kind: 'review.started', task: 'retry', time: at(2), seq: 5},
+    {kind: 'task.lease.renewed', task: 'retry', stage: 'review', time: at(3), seq: 6},
+  ];
+  const lease = attemptLease(events, 'retry', {defaultDeadlineMs: MIN, ceilingMs: 3 * MIN, stage: 'review'});
+  assert.deepEqual(lease, {
+    stage: 'review', startedAt: 0, leaseFrom: 2 * MIN, leaseMs: MIN, renewals: 1,
+    ceilingAt: 3 * MIN, leaseStartAt: 3 * MIN, deadlineAt: 3 * MIN,
+  });
+});
 
 // A clock the test drives, a never-ending worker, and a helper that advances time while the worker
 // shows activity (optionally naming the tool call it made, as the OpenCode adapter does).

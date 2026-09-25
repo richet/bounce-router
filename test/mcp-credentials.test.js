@@ -11,7 +11,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {liveSessionCredentials, credentials} from '../src/bridge-ops.js';
+import {spawn} from 'node:child_process';
+import {fileURLToPath} from 'node:url';
+import {liveSessionCredentials, credentials, sessionBinding} from '../src/bridge-ops.js';
+import {Session} from '../src/core.js';
+import {createMcpServer} from '../src/mcp.js';
+
+const cliPath = fileURLToPath(new URL('../src/cli.js', import.meta.url));
 
 const root = t => {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-mcp-cred-')));
@@ -33,6 +39,51 @@ test('one live session: the server finds its socket and the orchestrator token',
   assert.equal(found.ok, true);
   assert.equal(found.path, path.join(home, 'bus.sock'));
   assert.equal(found.tokenFile, path.join(home, 'tokens', 'orchestrator-aaaaaaaa'));
+});
+
+// A deep BOUNCE_HOME makes createBus use its short per-user fallback socket. Discovery
+// must use the daemon's recorded endpoint, never reconstruct <session>/bus.sock.
+test('discovery preserves the daemon\'s actual fallback socket endpoint', t => {
+  const dir = root(t);
+  const home = session(dir, 'aaaaaaaa-1111');
+  fs.writeFileSync(path.join(home, 'daemon.json'), JSON.stringify({pid: process.pid, bus: '/tmp/bounce-test/fallback.sock', started: '2026-09-24T00:00:00.000Z'}));
+  const found = liveSessionCredentials(dir, {list: () => [{id: 'aaaaaaaa-1111', live: true}]});
+  assert.equal(found.ok, true);
+  assert.equal(found.path, '/tmp/bounce-test/fallback.sock');
+});
+
+test('an explicit binding refreshes a restarted same session and never retargets another live one', t => {
+  const dir = root(t);
+  const a = new Session(dir, {root: dir});
+  const b = new Session(dir, {root: dir});
+  for (const [session, bus] of [[a, '/tmp/a-first.sock'], [b, '/tmp/b.sock']]) {
+    fs.mkdirSync(path.join(session.dir, 'tokens'), {recursive: true});
+    fs.writeFileSync(path.join(session.dir, 'tokens', 'orchestrator-test'), 'token');
+    fs.writeFileSync(path.join(session.dir, 'daemon.json'), JSON.stringify({pid: process.pid, bus, started: '2026-09-24T00:00:00.000Z'}));
+  }
+  const binding = sessionBinding(dir, {env: {BOUNCE_SESSION: a.id}});
+  assert.deepEqual([binding.refresh().session, binding.refresh().path], [a.id, '/tmp/a-first.sock']);
+  fs.writeFileSync(path.join(a.dir, 'daemon.json'), JSON.stringify({pid: process.pid, bus: '/tmp/a-restarted.sock', started: '2026-09-24T01:00:00.000Z'}));
+  assert.deepEqual([binding.refresh().session, binding.refresh().path], [a.id, '/tmp/a-restarted.sock']);
+});
+
+test('an explicit session and supplied bus must name the same endpoint', t => {
+  const dir = root(t);
+  const session = new Session(dir, {root: dir});
+  fs.mkdirSync(path.join(session.dir, 'tokens'), {recursive: true});
+  fs.writeFileSync(path.join(session.dir, 'tokens', 'orchestrator-test'), 'token');
+  fs.writeFileSync(path.join(session.dir, 'daemon.json'), JSON.stringify({pid: process.pid, bus: '/tmp/a.sock'}));
+  const binding = sessionBinding(dir, {env: {BOUNCE_SESSION: session.id, BOUNCE_BUS: '/tmp/b.sock', BOUNCE_BUS_TOKEN_FILE: path.join(session.dir, 'tokens', 'orchestrator-test')}});
+  assert.equal(binding.read().code, 'session_bus_mismatch');
+  assert.equal(binding.refresh().code, 'session_bus_mismatch');
+});
+
+test('MCP read binding refusals remain structured rather than looking like empty views', async () => {
+  const refusal = {ok: false, code: 'session_bus_mismatch', reason: 'BOUNCE_BUS does not belong to session aaa', repair: 'set BOUNCE_SESSION'};
+  const server = createMcpServer({ops: {}, views: {binding: () => refusal}, version: '0'});
+  const reply = await server.handle({jsonrpc: '2.0', id: 1, method: 'tools/call', params: {name: 'tasks_list', arguments: {}}});
+  assert.equal(reply.result.isError, true);
+  assert.deepEqual(reply.result.structuredContent, {code: 'session_bus_mismatch', reason: refusal.reason, repair: refusal.repair});
 });
 
 test('no live session is a refusal, not a guess at the most recent one', t => {
@@ -95,4 +146,35 @@ test('createOps forwards discovery to every verb, and reports its refusal', asyn
   assert.match(refused.reason, /4 live bounce sessions/, 'the caller is told which session to name, not "must be set"');
   assert.equal(refused.code, 'no_credential');
   assert.equal(asked.length >= 0, true);
+});
+
+// Composition gate: the real stdio executable must forward `full` through MCP,
+// while discovery reads daemon.json's actual endpoint. No core or bus mock is used.
+test('real mcp-serve returns task_get(full) through its actual stdio CLI', async t => {
+  const dir = root(t);
+  const session = new Session(dir, {root: dir});
+  const report = `FINAL REPORT\n${'evidence '.repeat(300)}END`;
+  session.append({kind: 'task.submitted', task: 't1', parent: null, profile: 'builder', orders: 'land it'});
+  session.append({kind: 'task.started', task: 't1', attempt: 1});
+  session.append({kind: 'task.completed', task: 't1', summary: report});
+  // An offline historical journal is readable once named explicitly; it has no daemon
+  // or bridge grant, so the same binding must still refuse subsequent mutations.
+  const child = spawn(process.execPath, [cliPath, 'mcp-serve'], {env: {...process.env, BOUNCE_HOME: dir, BOUNCE_SESSION: session.id, BOUNCE_NO_UPDATE_CHECK: '1'}, stdio: ['pipe', 'pipe', 'pipe']});
+  let buffer = '', stderr = '';
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  const response = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`mcp-serve timed out: ${stderr}`)), 5000);
+    child.stdout.on('data', chunk => {
+      buffer += chunk;
+      const line = buffer.indexOf('\n');
+      if (line < 0) return;
+      clearTimeout(timer); resolve(JSON.parse(buffer.slice(0, line)));
+    });
+  });
+  t.after(() => { child.kill('SIGKILL'); });
+  child.stdin.write(JSON.stringify({jsonrpc: '2.0', id: 1, method: 'tools/call', params: {name: 'task_get', arguments: {task: 't1', full: true}}}) + '\n');
+  const reply = await response;
+  assert.equal(reply.result.isError, undefined, JSON.stringify(reply));
+  assert.equal(reply.result.structuredContent.report, report);
+  assert.match(reply.result.content[0].text, /END$/);
 });

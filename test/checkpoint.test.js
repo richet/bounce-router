@@ -4,14 +4,27 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {Session} from '../src/core.js';
-import {createScheduler} from '../src/scheduler.js';
+import {createScheduler as createSchedulerImpl} from '../src/scheduler.js';
 import {takeCheckpoint, sameTree} from '../src/checkpoint.js';
 import {fakeAdapter} from './helpers/fake-adapter.js';
 
+const schedulers = new WeakMap();
+const createScheduler = options => {
+  const scheduler = createSchedulerImpl(options);
+  schedulers.get(options.session)?.add(scheduler);
+  return scheduler;
+};
+
 const setup = t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-checkpoint-'));
-  t?.after(() => fs.rmSync(root, {recursive: true, force: true}));
-  return {root, session: new Session(root, {root})};
+  const session = new Session(root, {root});
+  const owned = new Set(); schedulers.set(session, owned);
+  t?.after(async () => {
+    for (const scheduler of owned) scheduler.close();
+    await new Promise(resolve => setImmediate(resolve));
+    fs.rmSync(root, {recursive: true, force: true});
+  });
+  return {root, session};
 };
 
 const waitFor = async (fn, {timeout = 2000, interval = 5} = {}) => {
@@ -95,7 +108,8 @@ test('C4 scheduler: dispatch refuses when the tree no longer matches the submitt
   // synchronous span, before the checkpoint's own await — so a baseline refusal reserves
   // first, then releases what it never consumed.
   const kinds = session.events.filter(e => e.task === row.task).map(e => e.kind);
-  assert.deepEqual(kinds, ['task.submitted', 'budget.reserved', 'budget.released', 'task.failed']);
+  assert.deepEqual(kinds.filter(kind => !kind.startsWith('orchestration.action.')), ['task.submitted', 'budget.reserved', 'budget.released', 'task.failed']);
+  assert.deepEqual(kinds.filter(kind => kind.startsWith('orchestration.action.')), ['orchestration.action.requested', 'orchestration.action.started', 'orchestration.action.requested', 'orchestration.action.started', 'orchestration.action.settled', 'orchestration.action.settled']);
   const released = session.events.find(e => e.kind === 'budget.released' && e.task === row.task);
   assert.deepEqual(released.amount, {starts: 1});
   assert.equal(released.text, 'baseline refusal');
