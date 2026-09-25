@@ -138,9 +138,11 @@ export function quorumStrategy(n) {
 const isJevLean = v => (v.choice === 'accept' || v.choice === 'rework') && Number.isFinite(Number(v.threshold));
 function jevAdvice(v) {
   const p = Number(v.probabilities?.[v.choice]);
+  const conf = Number(v.confidence);
+  const bar = Number.isFinite(p) && Number.isFinite(conf) ? ` (probability ${p.toFixed(2)}, confidence ${conf.toFixed(2)} below the ${v.threshold} bar)` : '';
   const fired = Array.isArray(v.fired) && v.fired.length ? `; fired: ${v.fired.join(', ')}` : '';
   const findings = Array.isArray(v.leanFindings) ? v.leanFindings.map(f => ` ${f}`).join('') : '';
-  return `Jev leaned ${v.choice}${Number.isFinite(p) ? ` (${p.toFixed(2)})` : ''} below the ${v.threshold} confidence bar${fired}.${findings}`;
+  return `Jev leaned ${v.choice}${bar}${fired}.${findings}`;
 }
 
 // A review that answered below its confidence bar still answered. Rework-leaning is a refusal to
@@ -150,7 +152,9 @@ function reviewGate(v) {
   const lean = v.choice === 'accept' || v.choice === 'rework' ? v.choice : null;
   if (!lean) return {action: 'escalate', reason: 'review_unavailable', text: `Required review unavailable: ${v.reason ?? 'no confident verdict'}`};
   const p = Number(v.probabilities?.[lean]);
-  const bar = `Jev leaned ${lean}${Number.isFinite(p) ? ` (${p.toFixed(2)})` : ''} below the ${v.threshold ?? 0.8} confidence bar on both asks`;
+  const conf = Number(v.confidence);
+  const range = Number.isFinite(p) && Number.isFinite(conf) ? ` (probability ${p.toFixed(2)}, confidence ${conf.toFixed(2)} below the ${v.threshold ?? 0.8} bar)` : '';
+  const bar = `Jev leaned ${lean}${range} on both asks`;
   if (lean === 'accept') return {action: 'escalate', reason: 'review_uncertain', text: `Review uncertain: ${bar}. Decide: accept, or send back with findings of your own.`};
   const fired = Array.isArray(v.fired) && v.fired.length ? `; fired: ${v.fired.join(', ')}` : '';
   const findings = Array.isArray(v.leanFindings) ? v.leanFindings : [];

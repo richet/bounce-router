@@ -20,3 +20,15 @@ test('review-blocked handoff carries the candidate reference and gate without ca
   assert.doesNotMatch(text, /Still running:.*audit/);
   assert.doesNotMatch(text, /Still running:.*input/);
 });
+
+test('a task.accepted handoff carries an unsure Jev\'s advice, not just the summary', () => {
+  const session = {events: [
+    {kind: 'task.submitted', seq: 1, task: 'lean', profile: 'build', orders: 'do it', from: 'orchestrator'},
+    {kind: 'task.started', seq: 2, task: 'lean', attempt: 1},
+    {kind: 'task.completed', seq: 3, task: 'lean', summary: 'done'},
+    {kind: 'task.accepted', seq: 4, task: 'lean', stage: 'completion',
+      advice: 'Jev leaned rework (probability 0.86, confidence 0.72 below the 0.8 bar).'},
+  ]};
+  const text = handoffBlock(session, [session.events[3]]);
+  assert.match(text, /Jev leaned rework \(probability 0\.86, confidence 0\.72 below the 0\.8 bar\)\./);
+});

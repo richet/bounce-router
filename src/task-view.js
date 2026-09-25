@@ -101,6 +101,7 @@ export function taskView(events, task, {now = Date.now(), journal = null, report
     rounds: state.rounds ?? 0,
     reviewer: currentReview(events, task, result, 'review.started')?.profile ?? null,
     verdict: verdict ? {verdict: verdict.verdict, stage: verdict.stage ?? null} : null,
+    advice: terminal?.kind === 'task.accepted' ? terminal.advice ?? null : null,
     candidate: result ? {seq: result.seq, attempt: result.attempt, digest: result.digest, outcome: result.outcome, summary: cut(result.summary, SUMMARY_MAX) || null} : null,
     reviewGate,
     milestones,

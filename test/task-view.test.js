@@ -84,6 +84,15 @@ test('task view uses the reducer lease and exposes accepted provenance', () => {
   assert.deepEqual(view.lease, {renewals: 1, minutes: 15});
 });
 
+test('a task.accepted with an unsure Jev\'s advice attached shows it in the view and the report text', () => {
+  const events = [...log, at(9, {kind: 'review.finished', seq: 10, task: 'land', verdict: 'unavailable'}),
+    at(10, {kind: 'task.accepted', seq: 11, task: 'land',
+      advice: 'Jev leaned rework (probability 0.86, confidence 0.72 below the 0.8 bar).'})];
+  const view = taskView(events, 'land', {now});
+  assert.equal(view.advice, 'Jev leaned rework (probability 0.86, confidence 0.72 below the 0.8 bar).');
+  assert.match(formatTaskView(view), /advice: Jev leaned rework \(probability 0\.86, confidence 0\.72 below the 0\.8 bar\)\./);
+});
+
 // Found live: a local reviewer produced a 12 KB FAIL verdict with a blocker and a
 // working repro; the orchestrator got it cut mid-word at 1,200 characters — "* **Expected**: The system should
 // detec…" — then spent six minutes trying `task_get`, four shapes of `bounce wait`, and two --help pages before

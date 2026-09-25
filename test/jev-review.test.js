@@ -120,8 +120,8 @@ test('Jev on: a root task with no completion reviewer gets the jev critic; a con
 // fired a check; blocking on it (after an identical re-ask) cost a finished task a gate and an
 // orchestrator turn. With Jev off a completed task is accepted, so a lean is accepted too, with advice.
 for (const [lean, probabilities, nouls, wording] of [
-  ['rework', {rework: 0.67, accept: 0.33}, {remaining_work: 0.7}, /^Jev leaned rework \(0\.67\) below the 0\.8 confidence bar; fired: remaining_work\./],
-  ['accept', {accept: 0.6, rework: 0.4}, {}, /^Jev leaned accept \(0\.60\) below the 0\.8 confidence bar\.$/],
+  ['rework', {rework: 0.67, accept: 0.33}, {remaining_work: 0.7}, /^Jev leaned rework \(probability 0\.67, confidence 0\.35 below the 0\.8 bar\); fired: remaining_work\./],
+  ['accept', {accept: 0.6, rework: 0.4}, {}, /^Jev leaned accept \(probability 0\.60, confidence 0\.35 below the 0\.8 bar\)\.$/],
 ]) test(`an unconfident ${lean} lean is accepted with its findings attached as advice`, async t => {
   const {session} = setup(t);
   const worker = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done'}]);
@@ -166,7 +166,7 @@ test('a low-confidence rework is accepted with Jev\'s lean as advice, not blocke
   assert.equal(session.events.some(e => e.kind === 'task.rework' || e.kind === 'task.blocked' || e.kind === 'review.reasked'), false);
   assert.equal(session.events.filter(e => e.kind === 'jev.verdict').length, 1, 'asked once');
   const accepted = session.events.findLast(e => e.kind === 'task.accepted' && e.task === row.task);
-  assert.match(accepted.advice, /^Jev leaned rework \(0\.\d+\) below the 0\.8 confidence bar/);
+  assert.match(accepted.advice, /^Jev leaned rework \(probability 0\.\d+, confidence 0\.\d+ below the 0\.8 bar\)/);
   assert.equal(worker.calls.resume, 0);
 });
 

@@ -52,6 +52,9 @@ export function handoffBlock(session, ended) {
       : row.summary ?? row.text ?? (Array.isArray(row.questions) && row.questions.length ? row.questions.join('; ') : null) ?? t.summary ?? t.error ?? '';
     lines.push(`- task ${row.task} · profile ${t.profile ?? '?'} · ${row.kind}${row.reason ? ` · reason: ${row.reason}` : ''}${t.replaces ? ` · replaces ${t.replaces}` : ''}`);
     if (outcome) lines.push(`  ${String(outcome).slice(0, HANDOFF_TEXT_MAX).replace(/\n/g, '\n  ')}`);
+    // A task.accepted row may carry advice from an unsure Jev review (src/strategy.js jevAdvice):
+    // read it before building on the accepted work, not just its summary.
+    if (row.kind === 'task.accepted' && row.advice) lines.push(`  advice: ${String(row.advice).slice(0, HANDOFF_TEXT_MAX)}`);
     const invalidReport = session.events.findLast(event => event.kind === 'task.report.invalid' && event.task === row.task);
     const output = session.events.findLast(event => event.kind === 'task.output' && event.task === row.task);
     if (invalidReport && (!candidate || invalidReport.seq > candidate.seq)) {
