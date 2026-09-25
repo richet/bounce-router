@@ -436,7 +436,7 @@ test('D4 stop cancels a hanging task, prints control.stopped, exits 0, daemon di
 test('D5 stop with unverifiable termination exits 1, lists the unverified id, keeps daemon.json', async t => {
   const root = tmpRoot('bounce-d5-');
   t.after(() => fs.rmSync(root, {recursive: true, force: true}));
-  const {id, dir, trail} = await runHarnessDaemon(root, 'stubborn');
+  const {id, dir, info: started, trail} = await runHarnessDaemon(root, 'stubborn');
   const stop = await run(['stop', id], bounceEnv(root), {timeout: 20000});
   assert.equal(stop.code, 1);
   assert.match(stop.stdout, /unverified/);
@@ -448,6 +448,9 @@ test('D5 stop with unverifiable termination exits 1, lists the unverified id, ke
     return value.unverified ? value : null;
   }).catch(error => { throw new Error(`${error.message}; daemon ended ${JSON.stringify(trail.exit)}; stop: ${stop.stdout}${stop.stderr}; daemon stderr: ${trail.stderr}`); });
   assert.equal(info.unverified.length, 1);
+  // Found in a gate (2026-09-25): the teardown's rmSync hit ENOTEMPTY while the daemon was still
+  // writing its session; wait for it to exit, as D4 and D10 do.
+  await waitFor(() => !pidAlive(started.pid));
 });
 
 // Incident (Phase 3 gate, 2026-09-12): under load the D5 daemon's main child survived the
