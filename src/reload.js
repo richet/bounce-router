@@ -175,7 +175,7 @@ export function orchestratorOwns(events, task) {
 export const breakdownOrders = (minutes, {jevOn = false, ceiling = Math.max(TASK_CEILING_MINUTES, minutes)} = {}) => [
   'Break big work down: phases in sequence, each phase made of chunks that run in parallel.',
   `A task runs under a ${minutes}-minute lease that bounce renews while the worker makes progress, up to a ${ceiling}-minute ceiling; a deadline over the ceiling is refused (task.failed, reason size) before anything runs. Size a chunk by scope (one owner, one acceptance), not by minutes: long work is normal.`,
-  'For work big enough to need phases, however large the request, never hand one worker the whole job. Plan the phases first; within a phase submit every chunk whose',
+  'For work big enough to need phases, do not hand one worker the whole job. Plan the phases first; within a phase submit every chunk whose',
   'owned paths are disjoint at once, so they run in parallel; give a task that needs another\'s result depends_on with its task id, so',
   'phases run in sequence without you polling. Each chunk gets disjoint owned paths, its own acceptance and how to verify it.',
   'Before dispatching a phase, submit its plan with a stable plan id and wait for that exact decision:',

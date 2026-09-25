@@ -48,7 +48,7 @@ test('the lease is 15 minutes and the ceiling 60 unless the config says otherwis
   assert.equal(lines[0], 'Break big work down: phases in sequence, each phase made of chunks that run in parallel.');
   assert.equal(lines[1], 'A task runs under a 15-minute lease that bounce renews while the worker makes progress, up to a 60-minute ceiling; a deadline over the ceiling is refused (task.failed, reason size) before anything runs. Size a chunk by scope (one owner, one acceptance), not by minutes: long work is normal.');
   const text = lines.join('\n');
-  for (const part of ['depends_on', 'disjoint owned paths', 'Review each phase before the next one starts', 'never hand one worker the whole job',
+  for (const part of ['depends_on', 'disjoint owned paths', 'Review each phase before the next one starts', 'For work big enough to need phases, do not hand one worker the whole job',
     'A chunk that stops making progress or reaches the ceiling is asked for its conclusion and reported as is: resubmit what is left with that progress in its orders, or record the concrete campaign blocker after bounded recovery.'])
     assert.equal(text.includes(part), true, part);
   for (const gone of ['No task may be given more than', 'split what is left', 'do not extend it', 'smaller']) assert.equal(text.includes(gone), false, gone);
