@@ -47,7 +47,12 @@ export const defaultStrategy = {
   },
   onReviewVerdict(task, verdicts, view, api) {
     const v = verdicts[0];
-    if (v.verdict === 'unavailable') return {action: 'escalate', reason: 'review_unavailable', text: `Required review unavailable: ${v.reason ?? 'no confident verdict'}`};
+    if (v.verdict === 'unavailable') {
+      if (view[task]?.state === 'reviewing' && Number.isFinite(v.confidence) && api.reAsked && !api.reAsked(task)) {
+        return {action: 'rereview', reason: reviewGate(v).reason, text: 'Review the same preserved candidate again. Keep uncertainty explicit; do not invent evidence or request a worker restart.'};
+      }
+      return reviewGate(v);
+    }
     if (v.verdict === 'accept') return {action: 'accept'};
     // An unreadable verdict from a reviewer that RAN used to block the task, which needs a human. Found
     // live: the reviewer hit its step cap, its notice failed to parse, and the task sat
@@ -126,4 +131,19 @@ export function quorumStrategy(n) {
     },
     onTerminal() { return {submit: []}; },
   };
+}
+
+// A review that answered below its confidence bar still answered. Rework-leaning is a refusal to
+// accept, accept-leaning is doubt; only a review with no choice at all is unavailable. None of them
+// accepts or sends work back on its own: the gate holds and the text says what to decide.
+function reviewGate(v) {
+  const lean = v.choice === 'accept' || v.choice === 'rework' ? v.choice : null;
+  if (!lean) return {action: 'escalate', reason: 'review_unavailable', text: `Required review unavailable: ${v.reason ?? 'no confident verdict'}`};
+  const p = Number(v.probabilities?.[lean]);
+  const bar = `Jev leaned ${lean}${Number.isFinite(p) ? ` (${p.toFixed(2)})` : ''} below the ${v.threshold ?? 0.8} confidence bar on both asks`;
+  if (lean === 'accept') return {action: 'escalate', reason: 'review_uncertain', text: `Review uncertain: ${bar}. Decide: accept, or send back with findings of your own.`};
+  const fired = Array.isArray(v.fired) && v.fired.length ? `; fired: ${v.fired.join(', ')}` : '';
+  const findings = Array.isArray(v.leanFindings) ? v.leanFindings : [];
+  return {action: 'escalate', reason: 'review_not_accepted', findings,
+    text: `Review did not accept: ${bar}${fired}.${findings.map(f => ` ${f}`).join('')} Decide: accept, send back with these findings, or resubmit.`};
 }

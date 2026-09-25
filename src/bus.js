@@ -7,6 +7,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import {actionState, campaignCommand, requestAction} from './orchestration.js';
+import {tasks} from './reducers.js';
+
+const UNCONFIDENT_GATES = new Set(['review_not_accepted', 'review_uncertain', 'review_unavailable']);
 
 // Peers publish from a positive allowlist: everything a session, the scheduler or the daemon writes is refused regardless of `from`,
 // because handoff() folds user/note rows into every later prompt and Router reads cooldown rows.
@@ -98,7 +101,7 @@ export async function reapStaleSockets({platform = process.platform, uid = proce
 
 // Resolves once actually listening; rejects (never throws async/uncaught) on any
 // bind/chmod failure — a stale non-socket file at the chosen path, EADDRINUSE, etc.
-export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = AUTH_TIMEOUT, validate = () => null, prepare = null, report: receiveReport = null, commandCampaign = campaignCommand}) {
+export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = AUTH_TIMEOUT, validate = () => null, prepare = null, report: receiveReport = null, accept: acceptOverride = null, commandCampaign = campaignCommand}) {
   const grants = new Map(); // peer -> {peer, tasks, canSubmit, context, token, file, sockets}
   const tokenToPeer = new Map();
   const tokensDir = path.join(dir, 'tokens');
@@ -220,9 +223,19 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         // A peer may close out a task that has no completion reviewer of its own; one with
         // review.completion set is only ever accepted by the review policy (task.rejected/
         // task.rework/policy.* stay unpublishable to peers, so this is the one remaining gap).
+        // The one exception (user decision 2026-09-25): a task held at an UNCONFIDENT review gate — the
+        // reviewer leaned without reaching its bar, or gave no verdict — may be accepted by its owner,
+        // with text saying what was checked. The row names the gate it overrides. A confident verdict,
+        // or work the worker itself reported unfinished, is never accepted by hand.
         if (e.kind === 'task.accepted') {
           const submitted = session.events.find(row => row.kind === 'task.submitted' && row.task === e.task);
-          if (submitted?.review?.completion) return refuse(id, -32602, 'invalid event: review');
+          if (submitted?.review?.completion) {
+            const blocked = tasks(session.events)[e.task]?.state === 'blocked'
+              ? session.events.findLast(row => row.kind === 'task.blocked' && row.task === e.task) : null;
+            if (!UNCONFIDENT_GATES.has(blocked?.reason)) return refuse(id, -32602, 'invalid event: review: only while it is blocked at an unconfident review gate (review_not_accepted, review_uncertain or review_unavailable) can a task with a completion reviewer be accepted by hand; otherwise its review decides');
+            if (typeof e.text !== 'string' || !e.text.trim()) return refuse(id, -32602, 'invalid event: review: accepting over the review gate needs text naming what you checked and why you accept it');
+            e = {...e, overrides: blocked.reason};
+          }
         }
       } else if (e.kind === 'message') {
         if (typeof e.to !== 'string' || !e.to) return refuse(id, -32602, 'invalid event');
@@ -237,7 +250,8 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
           ? {actionId: `dispatch:${e.task}:0`, type: 'dispatch', task: e.task}
           : {actionId: `plan:${e.plan}`, type: 'plan', payload: {plan: e.plan}}, [e]);
         row = session.events.findLast(event => event.kind === e.kind && (e.task ? event.task === e.task : event.plan === e.plan));
-      } else row = session.publish(e);
+      } else if (e.overrides && typeof acceptOverride === 'function') row = acceptOverride(e);
+      else row = session.publish(e);
       send({jsonrpc: '2.0', id, result: row});
     }
 

@@ -33,6 +33,39 @@ test('state: orders, the final report, the diff against the start ref, untracked
   assert.equal(big.diff_base, 'HEAD');
 });
 
+test('state uses the scheduler-provided attempt snapshot, including an unborn repository', async () => {
+  const state = await buildReviewState({review, cwd: '/repo', git: async () => { throw new Error('must not read git'); }, reviewState: {
+    orders: 'Create the first file.', report: review.report, diff: 'diff --git a/new.js b/new.js\n+hello', files: ['new.js'], baseHead: null,
+  }});
+  assert.equal(state.orders, 'Create the first file.');
+  assert.equal(state.diff_base, null);
+  assert.equal(state.diff, 'diff --git a/new.js b/new.js\n+hello');
+  assert.deepEqual(state.untracked_files, ['new.js']);
+});
+
+test('launch accepts a top-level attempt snapshot without probing git', async () => {
+  const adapter = createTypesafeLive({fetchImpl: async () => okResponse({answers: answers('accept', 0.95)}), readKey: () => ({key: 'k', source: 'env'}), readSettings: () => settings, git: async () => { throw new Error('must not read git'); }});
+  const events = await drain(adapter, await adapter.launch({profile: {}, cwd: '/repo', review, reviewState: {orders: review.orders, report: review.report, diff: 'new file', files: ['new.js'], baseHead: null}}));
+  assert.equal(lastVerdict(events).verdict, 'accept');
+});
+
+test('a report review in an unborn repository asks report questions without probing git', async () => {
+  const calls = [];
+  const adapter = createTypesafeLive({
+    fetchImpl: async (url, options) => { calls.push({url, options}); return okResponse({answers: answers('accept', 0.95)}); },
+    readKey: () => ({key: 'k', source: 'env'}), readSettings: () => settings,
+    git: async () => { throw new Error('must not read git'); },
+  });
+  const reviewState = {kind: 'report', orders: 'Audit the rollout and report evidence.', report: {
+    summary: 'Audited rollout', text: 'Checked logs. 12 passing.', evidence: ['12 passing'], remaining: '',
+  }, files: [], diff: '', baseHead: null};
+  const events = await drain(adapter, await adapter.launch({profile: {}, cwd: '/unborn', review, reviewState}));
+  const body = JSON.parse(calls[0].options.body);
+  assert.equal(body.state.review_kind, 'report');
+  assert.deepEqual(Object.keys(body.questions), ['decision', 'assignment_unmet', 'unbacked_evidence', 'remaining_work']);
+  assert.equal(lastVerdict(events).verdict, 'accept');
+});
+
 test('testOutputLines picks result-looking lines from the report text and evidence, capped', () => {
   assert.deepEqual(testOutputLines({text: 'did things\n12 passing\nrandom\nPASS src/a.test.js', evidence: ['✓ renders', 'src/x.js']}), ['12 passing', 'PASS src/a.test.js', '✓ renders']);
   assert.equal(testOutputLines({text: Array.from({length: 200}, (_, i) => `${i} passed`).join('\n')}).length, 80);
@@ -71,17 +104,17 @@ test('happy path: the request carries state and questions with the Bearer key; a
   assert.deepEqual(await adapter.cancel(handle), {verified: true});
 });
 
-test('a low-confidence rework and a plain accept both end in accept', async () => {
-  for (const [choice, confidence] of [['rework', 0.6], ['accept', 0.97]]) {
+test('a low-confidence verdict is unavailable; a confident accept remains accept', async () => {
+  for (const [choice, confidence, verdict] of [['rework', 0.6, 'unavailable'], ['accept', 0.97, 'accept']]) {
     const adapter = createTypesafeLive({fetchImpl: async () => okResponse({answers: answers(choice, confidence)}), readKey: () => ({key: 'k', source: 'env'}), readSettings: () => settings, git: gitStub()});
     const events = await drain(adapter, await adapter.launch({profile: {}, cwd: '/repo', review}));
-    assert.equal(lastVerdict(events).verdict, 'accept');
+    assert.equal(lastVerdict(events).verdict, verdict);
     assert.deepEqual(lastVerdict(events).findings, []);
     assert.equal(events.find(e => e.kind === 'jev').name, 'verdict');
   }
 });
 
-test('every failure skips with its reason and accepts as today: no key, HTTP error after the 429 retry, timeout, disabled, review off', async () => {
+test('every failure is explicitly unavailable: no key, HTTP error after the 429 retry, timeout, disabled, review off', async () => {
   const cases = [
     {name: 'missing_key', readKey: () => null, fetchImpl: async () => okResponse({answers: {}})},
     {name: 'http_500', readKey: () => ({key: 'k', source: 'file'}), fetchImpl: async () => okResponse({error: 'x'}, {status: 500})},
@@ -96,16 +129,16 @@ test('every failure skips with its reason and accepts as today: no key, HTTP err
     const skipped = events.find(e => e.kind === 'jev');
     assert.equal(skipped.name, 'skipped', c.name);
     assert.equal(skipped.data.reason, c.name);
-    assert.match(skipped.text, /accepting as today/);
-    assert.deepEqual(lastVerdict(events), {verdict: 'accept', jev: 'skipped', reason: c.name});
+    assert.match(skipped.text, /unavailable/);
+    assert.deepEqual(lastVerdict(events), {verdict: 'unavailable', jev: 'skipped', reason: c.name});
   }
 });
 
-test('a prelaunch review is not a Jev decision: skipped, accept', async () => {
+test('a prelaunch review is not a Jev decision: skipped, unavailable', async () => {
   const adapter = createTypesafeLive({fetchImpl: async () => { throw new Error('must not be called'); }, readKey: () => ({key: 'k', source: 'env'}), readSettings: () => settings, git: gitStub()});
   const events = await drain(adapter, await adapter.launch({profile: {}, cwd: '/repo', review: {stage: 'prelaunch', orders: 'x'}}));
   assert.equal(events.find(e => e.kind === 'jev').data.reason, 'stage');
-  assert.equal(lastVerdict(events).verdict, 'accept');
+  assert.equal(lastVerdict(events).verdict, 'unavailable');
 });
 
 test('a worker launch (no review) is refused: the adapter cannot carry out a task', async () => {
@@ -115,7 +148,7 @@ test('a worker launch (no review) is refused: the adapter cannot carry out a tas
   assert.equal(await adapter.deliver({}, {text: 'hi'}), 'queued');
 });
 
-test('cancel aborts an in-flight request; the stream ends with a skipped accept', async () => {
+test('cancel aborts an in-flight request; the stream ends with a skipped unavailable verdict', async () => {
   let abortSeen = false;
   const fetchImpl = (url, {signal}) => new Promise((_, reject) => signal.addEventListener('abort', () => { abortSeen = true; reject(signal.reason); }));
   const adapter = createTypesafeLive({fetchImpl, readKey: () => ({key: 'k', source: 'env'}), readSettings: () => settings, git: gitStub()});
@@ -126,5 +159,5 @@ test('cancel aborts an in-flight request; the stream ends with a skipped accept'
   const events = await drained;
   assert.equal(abortSeen, true);
   assert.equal(events.find(e => e.kind === 'jev').data.reason, 'aborted');
-  assert.equal(lastVerdict(events).verdict, 'accept');
+  assert.equal(lastVerdict(events).verdict, 'unavailable');
 });

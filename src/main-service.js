@@ -1,3 +1,4 @@
+import {candidateResult, isReviewGate} from './task-result.js';
 import {LOCAL_ADAPTERS} from './profiles.js';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -40,13 +41,26 @@ function orchestratorsTask(session, view, id) {
 // into task.completed's `summary`) or the failure text — and the roots still running.
 export function handoffBlock(session, ended) {
   const view = tasks(session.events);
-  const running = Object.values(view).filter(t => !t.parent && !TERMINAL.has(t.state) && orchestratorsTask(session, view, t.id));
+  const running = Object.values(view).filter(t => !t.parent && !TERMINAL.has(t.state) && !['blocked', 'input_required'].includes(t.state) && orchestratorsTask(session, view, t.id));
   const lines = ['Worker outcomes not yet handed to you (delivered by bounce, not typed by the user):'];
   for (const row of ended) {
     const t = view[row.task] ?? {};
-    const outcome = row.summary ?? row.text ?? (Array.isArray(row.questions) && row.questions.length ? row.questions.join('; ') : null) ?? t.summary ?? t.error ?? '';
+    const candidate = candidateResult(session.events, row.task);
+    const reviewBlocked = row.kind === 'review.blocked' || isReviewGate(row);
+    const gate = session.events.findLast(event => event.task === row.task && event.kind === 'review.blocked') ?? (reviewBlocked ? row : null);
+    const outcome = reviewBlocked && candidate ? candidate.summary
+      : row.summary ?? row.text ?? (Array.isArray(row.questions) && row.questions.length ? row.questions.join('; ') : null) ?? t.summary ?? t.error ?? '';
     lines.push(`- task ${row.task} · profile ${t.profile ?? '?'} · ${row.kind}${row.reason ? ` · reason: ${row.reason}` : ''}${t.replaces ? ` · replaces ${t.replaces}` : ''}`);
     if (outcome) lines.push(`  ${String(outcome).slice(0, HANDOFF_TEXT_MAX).replace(/\n/g, '\n  ')}`);
+    const invalidReport = session.events.findLast(event => event.kind === 'task.report.invalid' && event.task === row.task);
+    const output = session.events.findLast(event => event.kind === 'task.output' && event.task === row.task);
+    if (invalidReport && (!candidate || invalidReport.seq > candidate.seq)) {
+      lines.push(`  report validation: ${String(invalidReport.diagnostic ?? 'invalid_report').slice(0, 500)}`);
+      if (output) lines.push(`  Worker output preserved (${output.chars} characters, attempt ${output.attempt}); use task_get with full: true. This is unvalidated output, not an accepted candidate. Do not repeat the audit before reading it.`);
+    }
+    if (reviewBlocked && candidate) lines.push(`  candidate: task.reported seq ${candidate.seq ?? '?'} · sha256 ${candidate.digest.slice(0, 12)}`);
+    // The reason names the kind of gate; the text is what the reviewer actually answered and what to decide.
+    if (reviewBlocked) lines.push(`  review gate: blocked · ${String([gate?.reason ?? row.reason, gate?.text ?? row.text].filter(Boolean).join(' · ') || 'review unavailable').slice(0, HANDOFF_TEXT_MAX)}`);
     // You see one outcome at a time; bounce sees the pattern. Found live: ten identical reviewer tasks,
     // each killed at its ceiling and resubmitted, because no single handoff showed the repetition.
     const submitted = session.events.find(e => e.kind === 'task.submitted' && e.task === row.task);

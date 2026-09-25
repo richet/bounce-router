@@ -200,39 +200,70 @@ export const VERDICT_CHECKS = {
   },
 };
 
-export function verdictQuestions() {
+export const REPORT_VERDICT_CHECKS = {
+  assignment_unmet: {
+    instructions: 'The final report does not address the assignment, required deliverables, or acceptance criteria stated in the orders.',
+    fix: 'The report does not show how it addressed the assignment; complete the missing work or explain the concrete blocker.',
+  },
+  unbacked_evidence: {
+    instructions: 'The report claims a conclusion, verification, or result without report text, command output, or listed evidence backing that claim.',
+    fix: 'The report makes claims without evidence; include the command output, observation, or artifact that supports each claim.',
+  },
+  remaining_work: {
+    instructions: 'The report says the assigned analysis is done while work required to complete that analysis remains. Identifying unfinished project phases, defects, or recommended future implementation is a valid audit deliverable, not unfinished analysis.',
+    fix: 'The report says done but names remaining work; finish it or report the assignment as blocked with what is left.',
+  },
+};
+
+const checksFor = state => state?.review_kind === 'report' ? REPORT_VERDICT_CHECKS : VERDICT_CHECKS;
+
+export function verdictQuestions(state = null) {
+  const reportReview = state?.review_kind === 'report';
+  const checks = checksFor(state);
   return {
     decision: {
       type: 'choice',
-      instructions: 'Given the orders, the worker\'s final report and the diff of its changes, should this task be accepted as done or sent back to the same worker for rework?',
+      instructions: reportReview
+        ? 'Given the assignment and the analyst\'s report, should this assignment be accepted as complete or sent back for a better report or further analysis?'
+        : 'Given the orders, the worker\'s final report and the diff of its changes, should this task be accepted as done or sent back to the same worker for rework?',
       criteria: {
-        accept: 'The diff and the report satisfy the orders: scope respected, claims backed by output or files, no material work left undone.',
-        rework: 'Something material is wrong or missing: scope violated, a claim unbacked, an acceptance criterion unmet, or named work remaining.',
+        accept: reportReview
+          ? 'The report addresses the assignment, backs its claims with evidence, and completes the assigned analysis. An audit may correctly identify defects and future project work without implementing it.'
+          : 'The diff and the report satisfy the orders: scope respected, claims backed by output or files, no material work left undone.',
+        rework: reportReview
+          ? 'The report misses the assigned analysis or lacks evidence for material claims. Do not require an analyst to implement the project work identified by the audit.'
+          : 'Something material is wrong or missing: scope violated, a claim unbacked, an acceptance criterion unmet, or named work remaining.',
       },
     },
-    ...Object.fromEntries(Object.entries(VERDICT_CHECKS).map(([name, check]) => [name, {type: 'noul', instructions: check.instructions}])),
+    ...Object.fromEntries(Object.entries(checks).map(([name, check]) => [name, {type: 'noul', instructions: check.instructions}])),
   };
 }
 
 // A decision that cannot meet the configured confidence bar is unresolved. It must never be
 // converted into acceptance merely because transport succeeded.
 export function decideVerdict(answers, {confidence = 0.8, state = null} = {}) {
+  const activeChecks = checksFor(state);
   const decision = isObject(answers?.decision) ? answers.decision : {};
   const choice = typeof decision.choice === 'string' ? decision.choice : null;
   const conf = Number.isFinite(Number(decision.confidence)) ? Number(decision.confidence) : 0;
-  const checks = Object.fromEntries(Object.keys(VERDICT_CHECKS).map(name => [name, Number.isFinite(Number(answers?.[name]?.noul)) ? Number(answers[name].noul) : null]));
-  const firedRaw = Object.keys(VERDICT_CHECKS).filter(name => checks[name] !== null && checks[name] >= 0.5);
+  const checks = Object.fromEntries(Object.keys(activeChecks).map(name => [name, Number.isFinite(Number(answers?.[name]?.noul)) ? Number(answers[name].noul) : null]));
+  const firedRaw = Object.keys(activeChecks).filter(name => checks[name] !== null && checks[name] >= 0.5);
   // A check the state itself contradicts is not a finding the worker can act on: `empty_diff` says
   // the diff shows nothing, so when the diff Jev was shown is not empty the check is dropped. A rework
   // that keeps no actionable finding is an accept. (Observed live: a correct change sent back three
   // times on checks it could not satisfy.)
-  const dropped = state && typeof state.diff === 'string' && state.diff.trim() ? firedRaw.filter(name => name === 'empty_diff') : [];
+  const dropped = state?.review_kind !== 'report' && state && typeof state.diff === 'string' && state.diff.trim() ? firedRaw.filter(name => name === 'empty_diff') : [];
   const fired = firedRaw.filter(name => !dropped.includes(name));
   const resolved = (choice === 'accept' || choice === 'rework') && conf >= confidence;
   const rework = resolved && choice === 'rework' && !(dropped.length && !fired.length);
   const verdict = !resolved ? 'unavailable' : rework ? 'rework' : 'accept';
-  const findings = rework ? (fired.length ? fired.map(name => VERDICT_CHECKS[name].fix) : ['Jev judged the work not ready against the orders; re-read the orders and the report against the diff before resubmitting.']) : [];
-  return {verdict, choice, confidence: conf, threshold: confidence, probabilities: isObject(decision.probabilities) ? decision.probabilities : {}, checks, fired, ...(dropped.length ? {dropped} : {}), findings};
+  const findings = rework ? (fired.length ? fired.map(name => activeChecks[name].fix) : [state?.review_kind === 'report'
+    ? 'Jev judged the report not ready against the assignment; re-read the assignment and support the report with evidence before resubmitting.'
+    : 'Jev judged the work not ready against the orders; re-read the orders and the report against the diff before resubmitting.']) : [];
+  // An unconfident rework is not sent back, but it is still Jev's answer: its fired checks go with it
+  // so whoever decides sees what Jev objected to instead of "no verdict".
+  const leanFindings = !resolved && choice === 'rework' ? fired.map(name => activeChecks[name].fix) : [];
+  return {verdict, choice, confidence: conf, threshold: confidence, probabilities: isObject(decision.probabilities) ? decision.probabilities : {}, checks, fired, ...(dropped.length ? {dropped} : {}), findings, leanFindings};
 }
 
 // ---- model routing: a Choice over the roster plus Nouls for the access the orders need ----
@@ -491,7 +522,7 @@ const globRe = glob => new RegExp(`^${glob.split('**').map(part => part.split('*
 const pathsOverlap = (a, b) => a === b || globRe(a).test(b) || globRe(b).test(a);
 
 export function planQuestions(plan) {
-  const chunks = (plan?.chunks ?? []).map(c => ({id: c.id, profile: c.profile, orders: String(c.orders ?? '').slice(0, 6000), owns: c.owns ?? [], depends_on: c.depends_on ?? [],
+  const chunks = (plan?.chunks ?? []).map(c => ({id: c.id, profile: c.profile, ...(c.requires !== undefined ? {requires: c.requires} : {}), orders: String(c.orders ?? '').slice(0, 6000), owns: c.owns ?? [], depends_on: c.depends_on ?? [],
     ...(Number.isFinite(c.deadline) ? {deadline_minutes: Math.round(c.deadline / 60000)} : {})}));
   const questions = {};
   for (const c of chunks) for (const [name, check] of Object.entries(PLAN_CHECKS)) questions[`${c.id}.${name}`] = {type: 'noul', instructions: check.instructions(c.id)};

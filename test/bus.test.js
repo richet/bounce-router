@@ -38,6 +38,17 @@ const waitFor = async (condition, {timeout = 1000, interval = 5} = {}) => {
   }
 };
 
+test('campaign commands are admitted only for authorized principals and journal canonical lifecycle rows', async t => {
+  const {session, bus} = await setup(t);
+  const user = await connect(bus, 'user', {canSubmit: true, context: session.id});
+  const started = await user.publish({kind: 'campaign.start', campaignId: 'c1', objective: 'land reliability', required: ['bridge']});
+  assert.deepEqual([started.kind, started.campaignId, started.from], ['campaign.started', 'c1', 'user']);
+  const worker = await connect(bus, 'worker:t1', {tasks: ['t1']});
+  await assert.rejects(worker.publish({kind: 'campaign.block', campaignId: 'c1', reason: 'forged'}), error => error.code === -32001);
+  await assert.rejects(user.publish({kind: 'campaign.started', campaignId: 'c2', objective: 'forged', required: ['x']}), error => error.code === -32602);
+  await assert.rejects(worker.publish({kind: 'plan.submitted', plan: 'p1', chunks: [{id: 'x', orders: 'x'}]}), error => error.code === -32001);
+});
+
 // A raw JSON-RPC-lines client that doesn't go through connectBus's auth handshake,
 // for tests that need to see the wire directly (bad first lines, unknown methods,
 // malformed lines). Resolves deterministically on line count, never on a sleep.
@@ -77,7 +88,7 @@ const rawConnect = async (bus, t) => {
 test('legacy: importing src/bus.js does not change Session exports or defaults()', () => {
   const before = ['order', 'mode', 'models', 'cooldownMinutes', 'contextChars', 'executables', 'skills', 'sidebar'];
   assert.deepEqual(Object.keys(defaults()).sort(), before.sort());
-  assert.deepEqual(Object.keys(core).sort(), ['LIVE_KINDS', 'Router', 'Session', 'config', 'dataRoot', 'defaults', 'gitSnapshot', 'handoff', 'migrateSettings', 'pidAlive', 'saveJSON'].sort());
+  assert.deepEqual(Object.keys(core).sort(), ['LIVE_KINDS', 'Router', 'Session', 'config', 'dataRoot', 'defaults', 'gitSnapshot', 'handoff', 'migrateSettings', 'pidAlive', 'readJournal', 'saveJSON'].sort());
 });
 
 test('P1 round trip: publish as the granted peer lands in the journal', async t => {
@@ -582,8 +593,28 @@ test('task.accepted: the owning grant is refused -32602 invalid event: review wh
   t.after(() => a.close());
   await assert.rejects(
     a.publish({kind: 'task.accepted', task: 't1', stage: 'completion', by: 'orchestrator'}),
-    error => error.code === -32602 && error.message === 'invalid event: review'
+    error => error.code === -32602 && /^invalid event: review: only while it is blocked at an unconfident review gate/.test(error.message)
   );
+});
+
+// Observed live (2026-09-25): three reviewers that passed sat blocked at an unconfident review gate,
+// the block text said "Decide: accept…", and every accept was refused "invalid event: review".
+test('task.accepted: the orchestrator may accept over an unconfident review gate, with text saying why, and nothing else', async t => {
+  const {session, bus} = await setup(t);
+  for (const [task, reason] of [['gate', 'review_not_accepted'], ['unsure', 'review_uncertain'], ['nothing', 'review_unavailable'], ['unfinished', 'report_incomplete']]) {
+    session.append({kind: 'task.submitted', task, parent: null, profile: 'p', orders: 'x', review: {completion: 'jev'}});
+    session.append({kind: 'task.blocked', task, reason, text: 'held'});
+  }
+  const a = await connect(bus, 'orchestrator', {tasks: ['gate', 'unsure', 'nothing', 'unfinished']});
+  t.after(() => a.close());
+  await assert.rejects(a.publish({kind: 'task.accepted', task: 'gate', stage: 'completion', by: 'orchestrator'}),
+    error => error.code === -32602 && error.message === 'invalid event: review: accepting over the review gate needs text naming what you checked and why you accept it');
+  const row = await a.publish({kind: 'task.accepted', task: 'gate', stage: 'completion', by: 'orchestrator', text: 'Re-ran the two cited tests myself: both pass; the claims match output.ts:3-78.'});
+  assert.deepEqual([row.kind, row.by, row.overrides, row.text.slice(0, 22)], ['task.accepted', 'orchestrator', 'review_not_accepted', 'Re-ran the two cited t']);
+  assert.equal((await a.publish({kind: 'task.accepted', task: 'unsure', stage: 'completion', by: 'orchestrator', text: 'checked'})).overrides, 'review_uncertain');
+  assert.equal((await a.publish({kind: 'task.accepted', task: 'nothing', stage: 'completion', by: 'orchestrator', text: 'checked'})).overrides, 'review_unavailable');
+  await assert.rejects(a.publish({kind: 'task.accepted', task: 'unfinished', stage: 'completion', by: 'orchestrator', text: 'checked'}),
+    error => error.code === -32602 && /^invalid event: review: only while it is blocked at an unconfident review gate/.test(error.message));
 });
 
 test('task.accepted: the owning grant is journaled when the submitted row has review.prelaunch only, or no review at all', async t => {

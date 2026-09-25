@@ -107,6 +107,9 @@ export function tasks(events) {
         // first went terminal at `completed`, so settleParent does not re-fire here.
         if (t.state === 'reviewing') { t.state = 'accepted'; t.accepted = true; settleParent(t.parent); }
         else if (t.state === 'completed') { t.state = 'accepted'; t.accepted = true; }
+        // An owner's accept over an unconfident review gate (bus.js admits it only then, and marks it
+        // `overrides`) is the exit from that gate's `blocked`; a plain accept never moves a blocked task.
+        else if (t.state === 'blocked' && e.overrides) { t.state = 'accepted'; t.accepted = true; settleParent(t.parent); }
         break;
     }
   }

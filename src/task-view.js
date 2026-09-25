@@ -4,6 +4,7 @@
 // answer to that question, bounded by construction: capped lists with a count of the rest, cut text, and a
 // POINTER to the journal rather than its contents. Pure — the same fold src/reducers.js gives the TUI.
 import {tasks as taskStates, attemptLease} from './reducers.js';
+import {candidateResult, isReviewGate} from './task-result.js';
 
 export const FINDINGS_SHOWN = 10;
 export const MILESTONES_SHOWN = 3;
@@ -17,6 +18,41 @@ const lastOf = (events, task, kind) => rowsOf(events, task, kind).at(-1) ?? null
 const findingLine = row => row.finding
   ? {severity: row.finding.severity ?? null, file: row.finding.file ?? null, line: row.finding.line ?? null, title: cut(row.finding.title ?? row.finding.description, TITLE_MAX)}
   : {severity: null, file: null, line: null, title: cut(String(row.text ?? '').replace(/^FINDING:\s*/, ''), TITLE_MAX)};
+
+function gateView(events, task, candidate) {
+  const mine = events.filter(event => event.task === task);
+  const scoped = candidate ? mine.filter(event => {
+    if (event.candidateSeq != null && event.candidateSeq !== candidate.seq) return false;
+    return !Number.isFinite(candidate.seq) || !Number.isFinite(event.seq) || event.seq > candidate.seq;
+  }) : mine;
+  const dedicated = scoped.findLast(event => event.kind === 'review.blocked');
+  const ordinary = scoped.filter(event => event.kind === 'review.finished'
+    || event.kind === 'task.blocked' && isReviewGate(event)).at(-1);
+  const gate = ordinary?.kind === 'task.blocked' && dedicated ? dedicated
+    : !dedicated || ordinary && Number(ordinary.seq ?? -1) > Number(dedicated.seq ?? -1) ? ordinary : dedicated;
+  if (!gate) return null;
+  const started = scoped.filter(event => event.kind === 'review.started'
+    && (gate.seq == null || event.seq == null || event.seq <= gate.seq)).at(-1);
+  const jev = scoped.filter(event => event.kind === 'jev.verdict'
+    && (started?.seq == null || event.seq == null || event.seq >= started.seq)
+    && (gate.seq == null || event.seq == null || event.seq <= gate.seq)).at(-1);
+  const blocked = gate.kind === 'review.blocked' || gate.kind === 'task.blocked';
+  return {
+    state: blocked ? 'blocked' : gate.verdict ?? jev?.verdict ?? 'unavailable',
+    reason: gate.reason ?? jev?.reason ?? (blocked || gate.verdict === 'unavailable' || gate.verdict === 'unreadable' ? gate.text ?? null : null),
+    confidence: Number.isFinite(jev?.confidence) ? jev.confidence : Number.isFinite(gate.confidence) ? gate.confidence : null,
+    choice: jev?.choice ?? gate.choice ?? null,
+    fired: Array.isArray(jev?.fired) ? jev.fired.slice(0, 32).map(value => cut(value, TITLE_MAX)) : Array.isArray(gate.fired) ? gate.fired.slice(0, 32).map(value => cut(value, TITLE_MAX)) : [],
+    candidateSeq: gate.candidateSeq ?? (candidate && (gate.seq == null || candidate.seq == null || gate.seq > candidate.seq) ? candidate.seq : null),
+  };
+}
+
+function currentReview(events, task, candidate, kind) {
+  const mine = events.filter(event => event.task === task && event.kind === kind);
+  if (!candidate) return mine.at(-1) ?? null;
+  return mine.filter(event => (event.candidateSeq == null || event.candidateSeq === candidate.seq)
+    && (!Number.isFinite(candidate.seq) || !Number.isFinite(event.seq) || event.seq > candidate.seq)).at(-1) ?? null;
+}
 
 // One task: null when bounce never saw it (never an empty shape that reads as "nothing happened").
 // `report: true` is the one deliberate way to the whole verdict. Found live: a 12 KB FAIL report
@@ -32,11 +68,17 @@ export function taskView(events, task, {now = Date.now(), journal = null, report
   const milestones = rowsOf(events, task, 'task.milestone').slice(-MILESTONES_SHOWN)
     .map(row => ({phase: cut(row.phase, 80), text: cut(row.text, TEXT_MAX), next: cut(row.next, 120)}));
   const terminal = [...mine].reverse().find(e => ['task.accepted', 'task.rejected', 'task.completed', 'task.failed', 'task.cancelled', 'task.deadline', 'task.blocked'].includes(e.kind));
-  const verdict = lastOf(events, task, 'review.finished');
+  const result = candidateResult(events, task);
+  const verdict = currentReview(events, task, result, 'review.finished');
   const blocked = state.state === 'blocked' ? lastOf(events, task, 'task.blocked') : null;
   const leaseRow = attemptLease(events, task, {defaultDeadlineMs: submitted?.deadline ?? 3600000, ceilingMs: submitted?.deadline ?? 3600000, stage: 'turn'});
   const artifact = lastOf(events, task, 'task.artifact');
   const integrated = lastOf(events, task, 'task.integrated');
+  const invalid = lastOf(events, task, 'task.report.invalid');
+  const output = invalid?.outputSeq == null
+    ? lastOf(events, task, 'task.output')
+    : mine.find(event => event.kind === 'task.output' && event.seq === invalid.outputSeq) ?? lastOf(events, task, 'task.output');
+  const reviewGate = gateView(events, task, result);
   const seqs = mine.map(e => e.seq).filter(Number.isFinite);
   return {
     task, state: state.state, profile: state.profile ?? null, ai: started?.requested ?? null,
@@ -44,13 +86,32 @@ export function taskView(events, task, {now = Date.now(), journal = null, report
     elapsed: started ? minutes(now - Date.parse(started.time)) : null,
     lease: leaseRow ? {renewals: leaseRow.renewals, minutes: Math.round(leaseRow.leaseMs / 60000)} : null,
     rounds: state.rounds ?? 0,
-    reviewer: lastOf(events, task, 'review.started')?.profile ?? null,
+    reviewer: currentReview(events, task, result, 'review.started')?.profile ?? null,
     verdict: verdict ? {verdict: verdict.verdict, stage: verdict.stage ?? null} : null,
+    candidate: result ? {seq: result.seq, attempt: result.attempt, digest: result.digest, outcome: result.outcome, summary: cut(result.summary, SUMMARY_MAX) || null} : null,
+    reviewGate,
     milestones,
     findings: {shown: findings.slice(-FINDINGS_SHOWN).map(findingLine), total: findings.length, more: Math.max(0, findings.length - FINDINGS_SHOWN)},
     summary: cut(terminal?.summary ?? terminal?.text ?? state.summary, SUMMARY_MAX) || null,
     // Whole and unreflowed when asked for: a verdict's last line is where it puts its conclusion.
-    ...(report ? {report: (terminal?.summary ?? terminal?.text ?? state.summary ?? null)} : {}),
+    ...(report ? {
+      report: result ? JSON.stringify(result.report) : (terminal?.summary ?? terminal?.text ?? state.summary ?? null),
+      candidateReport: result?.report ?? null,
+      rawOutput: output?.text ?? null,
+      ...(invalid ? {invalidReport: {
+        ...(invalid.outputSeq != null ? {outputSeq: invalid.outputSeq} : {}),
+        diagnostic: invalid.diagnostic ?? null,
+        report: invalid.report ?? null,
+      }} : {}),
+    } : {}),
+    reportDiagnostic: invalid ? cut(invalid.diagnostic, TEXT_MAX) || null : null,
+    output: output ? {
+      seq: output.seq ?? null,
+      attempt: output.attempt ?? null,
+      chars: output.chars ?? String(output.text ?? '').length,
+      digest: output.digest ?? null,
+      status: output.status ?? null,
+    } : null,
     reason: terminal?.reason ?? null,
     blocker: blocked ? cut(blocked.text, TEXT_MAX) : null,
     artifact: lastOf(events, task, 'artifact.captured')?.artifact ?? (artifact ? {id: artifact.artifactId, digest: artifact.digest, resultHash: artifact.resultHash} : null),

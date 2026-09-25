@@ -36,7 +36,8 @@ export function agentRow(pane, now = Date.now(), width = 30) {
   const head = `${glyph(pane.state, now)} ${name}`;
   const fits = extra => [...head].length + 1 + [...model].length + extra <= width;
   // A finished row that is too long drops the word before it shortens the model: ✓ and ✗ already say it.
-  if (!isWorking(pane.state) && model && !fits([...tail].length + 1) && FIXED[pane.state] && fits(0)) return `${head} ${model}`;
+  // `!` and `?` do not: a blocked row without its word read as a crash (observed live), so it keeps it.
+  if (!isWorking(pane.state) && !WAITING.has(pane.state) && model && !fits([...tail].length + 1) && FIXED[pane.state] && fits(0)) return `${head} ${model}`;
   const room = width - [...head].length - 1 - (tail ? [...tail].length + 1 : 0);
   const shown = [...model].length <= room ? model : room >= 4 ? `${[...model].slice(0, room - 1).join('')}…` : '';
   return [head, shown, tail].filter(Boolean).join(' ');
@@ -55,12 +56,28 @@ export function progressRow(pane, now = Date.now(), width = 30) {
   return `  └ ${phase}${tail ? ` · ${tail}` : ''}`;
 }
 
+// Under a blocked or input-required row: what it waits on, in words. Blocked is a decision someone
+// owes, not a failure; the reason is the task.blocked row's own.
+const WAITING = new Set(['blocked', 'input_required']);
+const WAITING_ON = {
+  review_not_accepted: "review didn't accept", review_uncertain: 'review unsure',
+  review_unavailable: 'no review verdict', report_repair_unavailable: 'report not repaired',
+  report_incomplete: 'reported work left', repeated_findings: 'same findings twice',
+  termination_unverified: 'process may still run', rounds: 'review rounds used up',
+};
+export function waitingRow(pane, width = 30) {
+  if (!WAITING.has(pane.state)) return '';
+  const text = pane.state === 'input_required' ? 'needs your input' : WAITING_ON[pane.reason] ?? 'needs a decision';
+  const room = width - 4;
+  return `  └ ${[...text].length <= room ? text : `${[...text].slice(0, room - 1).join('')}…`}`;
+}
+
 // The colour of a row. A worker that is "working" but has said nothing for two minutes is the one
 // to look at: that, not the word running, is what a stall looks like.
 export const STALL_MS = 120_000;
 export function rowColor(pane, now = Date.now()) {
   if (isWorking(pane.state)) { const quiet = Number(now) - Date.parse(pane.activityAt ?? pane.updatedAt ?? pane.startedAt); return quiet >= STALL_MS ? 'red' : 'yellow'; }
-  return {completed: 'green', accepted: 'green', failed: 'red', cancelled: 'red', timed_out: 'red', rejected: 'red', blocked: 'red', input_required: 'magenta', queued: 'gray'}[pane.state];
+  return {completed: 'green', accepted: 'green', failed: 'red', cancelled: 'red', timed_out: 'red', rejected: 'red', blocked: 'magenta', input_required: 'magenta', queued: 'gray'}[pane.state];
 }
 
 // "What is it doing right now?" for any worker, the main one included, from what is already
