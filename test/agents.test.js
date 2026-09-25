@@ -62,11 +62,11 @@ test('serializeAgent round-trips through agentMetadata, and writeAgent refuses t
 
 test('the shipped agents come from the orchestration skill and are present with no file on disk', t => {
   const roles = loadAgents(root(t));
-  assert.deepEqual([...roles.keys()].sort(), ['analyst', 'builder', 'integrator', 'reviewer']);
+  assert.deepEqual([...roles.keys()].sort(), ['analyst', 'builder', 'debugger', 'reviewer']);
   assert.equal(roles.get('reviewer').source, 'skill');
-  assert.deepEqual([...readOnlyRoles(roles)].sort(), ['analyst', 'reviewer']);
+  assert.deepEqual([...readOnlyRoles(roles)].sort(), ['analyst', 'debugger', 'reviewer']);
   assert.deepEqual(roles.get('builder').models, ['auto'], 'shipped agents name no AI: Jev picks one per task when it is on, else any signed-in AI plays them');
-  assert.equal(roles.get('integrator').policy, 'write');
+  assert.equal(roles.get('builder').policy, 'write');
 });
 
 test('later layers shadow by name: adopted skill, then user, then project; a broken file is reported, not hidden', t => {
@@ -115,17 +115,13 @@ test('agents become profiles: one hidden backend per models entry, chained as fa
   assert.equal(Object.hasOwn(local, 'writePaths') || Object.hasOwn(local, 'localOnly'), false, 'no scope to carry: it works in the project like any worker');
 });
 
-test('an agent with no models may be played by every signed-in provider in order, then local auto', t => {
+test('probe agents keep only command-capable providers rather than losing their tools', t => {
   const view = validateOrchestration(orchestration(), undefined, {roles: loadAgents(root(t))});
-  const chain = ['reviewer', 'reviewer~2', 'reviewer~3', 'reviewer~4'].map(name => view.profiles[name]);
-  assert.deepEqual(chain.map(p => [p.adapter, p.model]), [['claude', 'sonnet'], ['codex', 'gpt-5.6-terra'], ['muse', ''], ['opencode', 'auto']]);
-  assert.deepEqual(chain.map(p => p.fallback), [['reviewer~2'], ['reviewer~3'], ['reviewer~4'], []]);
-  assert.equal(view.profiles.reviewer.policy, 'read-only', 'the policy comes from reviewer.md');
-  assert.equal(view.profiles['reviewer~4'].policy, 'probe', 'the shipped reviewer probes where the AI can enforce it (local, codex)');
-  assert.deepEqual(['reviewer~2', 'reviewer~3'].map(name => view.profiles[name].policy), ['probe', 'read-only']);
-  // A write agent runs locally like any other: no scope to declare, nothing skipped.
+  const chain = ['reviewer', 'reviewer~2'].map(name => view.profiles[name]);
+  assert.deepEqual(chain.map(p => [p.adapter, p.model, p.policy]), [['codex', 'gpt-5.6-terra', 'probe'], ['opencode', 'auto', 'probe']]);
+  assert.deepEqual(chain.map(p => p.fallback), [['reviewer~2'], []]);
   assert.deepEqual([view.profiles['builder~4'].adapter, view.profiles['builder~4'].policy], ['opencode', 'write']);
-  assert.deepEqual(view.skipped, []);
+  assert.deepEqual(view.skipped.map(s => [s.agent, s.ref]), [['analyst', 'claude/sonnet'], ['analyst', 'muse/'], ['debugger', 'claude/sonnet'], ['debugger', 'muse/'], ['reviewer', 'claude/sonnet'], ['reviewer', 'muse/']]);
 });
 
 test('models naming providers this machine has no adapter for are skipped, and an unplayable agent is not offered', t => {
@@ -164,7 +160,7 @@ test('the orchestrator profile is never derived from an agent, and a plan sessio
   assert.equal(view.profiles.main.adapter, 'claude', 'the config orchestrator stays; main.md is ignored for it');
   assert.equal(view.profiles['main~2'], undefined);
   const plan = validateOrchestration(orchestration({}, {mode: 'plan'}), undefined, {roles: loadAgents(root(t))});
-  assert.deepEqual([...new Set(Object.values(plan.profiles).filter(p => p.derived).map(p => p.role))].sort(), ['analyst', 'reviewer'], 'builder and integrator are not offered in a plan session');
+  assert.deepEqual([...new Set(Object.values(plan.profiles).filter(p => p.derived).map(p => p.role))].sort(), ['analyst', 'debugger', 'reviewer'], 'builder is not offered in a plan session');
   assert.equal(plan.skipped.filter(item => item.agent === 'builder').length, 4, 'one skip per backend the write agent would have had');
   assert.equal(plan.skipped.find(item => item.agent === 'builder').reason, 'a plan session runs read-only agents only');
 });
@@ -222,7 +218,7 @@ test('agents set validates the file against this machine, writes it in the chose
   // list and show read the layered set; remove takes only a file in a writable store.
   const list = agentsCommand(['list'], options());
   assert.match(list.text, /^  coder · write · project · claude\/sonnet, lmstudio\/auto \(via opencode\)$/m);
-  assert.match(list.text, /^  reviewer · probe · skill · auto \(Jev\), claude\/sonnet, codex\/gpt-5.6-terra, muse, lmstudio\/auto \(via opencode\)$/m);
+  assert.match(list.text, /^  reviewer · probe · skill · auto \(Jev\), codex\/gpt-5.6-terra, lmstudio\/auto \(via opencode\)$/m);
   assert.equal(agentsCommand(['show', 'coder'], options()).text, fs.readFileSync(set.report.file, 'utf8'));
   assert.throws(() => agentsCommand(['show', 'nope'], options()), /no agent named nope/);
   assert.throws(() => agentsCommand(['remove', 'reviewer'], options()), /shipped with skill agent-orchestrator/);

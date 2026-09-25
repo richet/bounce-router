@@ -7,32 +7,23 @@ to use it. Do not read bounce's own source to learn the bridge.
 
 ## Workers
 
-Workers are **profiles**, declared in `config.json` and listed in your ORDERS.md as
-`name → adapter/model (role)`:
+Submit to an **agent** — a job from the team (`team/*.md`, specialised per user or project; see
+`references/team.md`): `analyst`, `builder`, `debugger`, `reviewer`, or whatever this
+repository defined. The agent's `models:` list, Jev routing and the provider order decide which AI
+plays it; you never pick the model. ORDERS.md lists the team in force and the AIs on this machine.
 
-- `adapter` is `claude`, `codex`, `muse`, `local` or `typesafe`; `model` is passed through to
-  that CLI. A `typesafe` profile is Jev, a decision model: it can only ever be a completion
-  reviewer, never carry out a task.
-- `role` is a free label, default `builder`. `critic`, `verifier` and `analyst` default to
-  `policy: read-only`, and so does every `local` or `typesafe` profile whatever its role;
-  anything else defaults to `write`. A profile may also declare a cost `tier`
-  (`cheapest`, `mid`, `strongest`), shown in the roster as `[tier …]`.
+Underneath, each AI is a **profile** (`name → adapter/model (role)` in ORDERS.md). Name a profile
+only when the user asks for that specific AI, or an agent's list is exhausted:
+
+- `adapter` is `claude`, `codex`, `muse`, `local` or `typesafe`. A `typesafe` profile is Jev, a
+  decision model: it can only ever be a completion reviewer, never carry out a task.
+- `critic` profiles are read-only; `analyst` and `verifier` profiles probe (run commands in a
+  disposable workspace, never change the tree); anything else writes unless it says otherwise.
 - The profile named by `orchestrator` is you. You cannot submit to yourself.
-- `auto` is a routing pseudo-profile, listed in the roster when the session can resolve it:
-  with Jev routing on (`/jev routing on`), bounce classifies the orders against the roster
-  and picks the profile whose adapter/model/role/policy/tier fits, falling back to the named
-  default builder when unconfident or when the pick cannot write what the orders need; with
-  routing off, `auto` simply resolves to that default builder, so it never breaks a submit.
+- `auto` is a routing pseudo-profile: with Jev routing on it picks the fitting AI for the orders,
+  otherwise it resolves to the default agent, so it never breaks a submit.
 
-Map the skill's tiers onto the roster you were given:
-
-| Tier | Where it usually lands |
-|---|---|
-| Cheapest | a `local` profile, or the smallest model on the roster |
-| Mid | the default `builder` profile |
-| Strongest | a `critic` / `verifier` profile, and the largest model for debugging |
-
-A read-only profile is never escalated. A task that needs writes goes to a writing profile
+A read-only or probing agent is never escalated. A task that needs writes goes to a writing agent
 or is refused — bounce will not downgrade it for you.
 
 `local` profiles run an LM Studio model on this machine. They read under `readPaths`, write

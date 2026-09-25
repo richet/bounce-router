@@ -1,19 +1,15 @@
 ---
 name: agent-orchestrator
-description: Coordinate decomposable work across whichever workers the active harness can actually reach — bounce worker profiles, Claude Code subagents, or Codex workers — choosing by task, capability, and cost rather than vendor. Use only when the user explicitly asks to delegate, orchestrate, use workers or subagents, or save their limit, or when you are a bounce orchestrator (BOUNCE_BUS is set / an ORDERS.md was handed to you). Do not trigger on the shape of the task alone — a multi-step change, research or a review is done directly unless delegation was asked for.
+description: Coordinate decomposable work as a bounce orchestrator — dispatching the team's agents (analyst, builder, debugger, reviewer) through the bounce bridge and choosing by job, not by vendor. Use when you are a bounce orchestrator (BOUNCE_BUS is set / an ORDERS.md was handed to you).
 ---
 
 # Agent orchestrator
 
 You own the plan, the judgment calls, integration, and talking to the user. Delegate to buy parallelism, context relief, or independence — not to make simple work ceremonial.
 
-**Read the harness reference first**, for the one you are actually in:
+**Read `references/bounce.md` first**: how to submit, wait, steer and read outcomes through the bridge. Your own subagent tools are switched off; workers exist only as the team's agents.
 
-- `references/bounce.md` — you are a bounce orchestrator if `BOUNCE_BUS` is set in your environment, or a session ORDERS.md was handed to you. Read this one **only**: your own subagent tools are switched off, workers exist as profiles, and the vendor references below describe a *worker's* harness, not yours.
-- `references/claude-code.md` — a plain Claude Code session.
-- `references/codex.md` — a plain Codex session.
-
-They name the workers that exist there, how to constrain them, and any one-time setup those workers need. Never design a workflow around a worker this session cannot reach.
+**The team** is defined once, in `team/*.md` — one file per job, harness-agnostic: frontmatter says what bounce routes on (`policy`, `models`), the body is the worker's instructions. Which AI plays an agent is bounce's call (`models:`, Jev routing, provider order), never the file's. `references/team.md` says how to specialise it. Never design a workflow around an agent the roster in your ORDERS.md does not list.
 
 ## Decide whether to delegate
 
@@ -21,7 +17,7 @@ Do it yourself: a short edit, a single grep, a file whose path you know, a seque
 
 Delegate: reading you don't need to keep, sweeping a codebase, independent questions that can run at once, a diff from a spec you can already write, or a review that must not share the builder's reasoning.
 
-Where the harness forbids you to edit at all — bounce does — the first bullet stops applying to code and starts applying only to your own reading. A dispatch that fails is reported, never worked around by doing it yourself.
+You never edit the repository, so the first bullet applies only to your own reading. A dispatch that fails is reported, never worked around by doing it yourself.
 
 ## Pick the worker
 
@@ -35,7 +31,7 @@ The top model does not spawn copies of itself for work a cheaper worker can do r
 
 Tiers are dials, the per-role contract is not. The moment a cheap role must judge unstructured material, promote it.
 
-Where the roster is fixed for you — bounce hands you named profiles with adapters, models and roles — map the tier onto the roster you were given rather than asking for a worker that is not in it. A read-only role is never escalated to get a task done: work that needs writes goes to a writing profile or is refused.
+Submit by job — `analyst` to locate, read and research, `builder` to implement (including landing shared changes behind the full gate — say so in its orders), `reviewer` to grade, `debugger` once a failure resisted a first attempt — and let bounce pick the AI for the tier. A read-only or probing agent is never escalated to get a task done: work that needs writes goes to a writing agent or is refused.
 
 When a real choice exists between providers for a substantial workstream, run one small read-only trial against the same acceptance criteria and route the rest by the result, not by brand. Don't invent a comparison you haven't run.
 
@@ -52,7 +48,7 @@ Every brief states:
 
 Close with: *if you cannot finish within scope, stop and report why instead of expanding it.*
 
-Put a one-shot brief wherever the harness takes it — the spawn call, or bounce's `orders` field. For multi-round work, write it to `ORDERS.md` in a task folder: the builder reads it and never edits it, because the reviewer grades against it.
+Put a one-shot brief in the task's `orders` field. For multi-round work, write it to `ORDERS.md` in a task folder: the builder reads it and never edits it, because the reviewer grades against it.
 
 ## Patterns
 
@@ -66,7 +62,7 @@ Put a one-shot brief wherever the harness takes it — the spawn call, or bounce
 
 **Ticket loop** (multi-file or multi-round): use a task folder with `ORDERS.md`, a `CHANGES.md` log, and each round's verdict; ticket goes `OPEN → DONE → ACCEPTED`, back to `OPEN` on rework. The orders must say whether worktrees, commits, or a PR are authorized.
 
-1. Isolate the builder in its own worktree and branch when the harness supports it.
+1. Each builder attempt runs in its own isolated workspace; bounce integrates it into the checkout.
 2. Build, run the suite in that tree, leave the change in the state the orders require (working tree, commit, or PR), and log to `CHANGES.md`. Deviations flagged, not buried.
 3. Review with a **new** reviewer every round; retire it after its verdict.
 4. Rework goes back to the **same** builder, context intact.

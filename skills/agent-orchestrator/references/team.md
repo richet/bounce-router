@@ -25,7 +25,8 @@ You build. Own only the paths you were given; verify red-first; report with evid
   agent runs on otherwise. The shipped agents are `models: [auto]`. A list without `auto` is never overridden.
   `provider/default` is the provider's own default model. With no `models:`, every signed-in provider
   plays it in `order`, then the local endpoint on `auto`.
-- Layers, later shadowing by name: this skill's `team/` (not `agents/`, which holds the vendor subagent role files) → `~/.bounce/agents/` → `<project>/.bounce/agents/`.
+- Layers, later shadowing by name: this skill's `team/` → `~/.bounce/agents/` → `<project>/.bounce/agents/`.
+- One file is the whole definition. Never write per-vendor copies of an agent (Claude subagent files, Codex TOML): the AI that plays it is chosen by `models:`, not by the file.
 - A file that fails to parse is reported as INVALID, never silently replaced by a default.
 
 ## Commands

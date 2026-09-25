@@ -11,7 +11,7 @@ import {normalizeLocalSettings} from './local-models.js';
 // different policy or scope. Kept in one place the way skills are, in override order:
 //   shipped with the orchestration skill  →  the adopted/edited skill in the data root
 //   →  <root>/agents/  →  <workspace>/.bounce/agents/
-// The orchestration skill ships the defaults (builder, integrator, reviewer, analyst), so a fresh
+// The orchestration skill ships the defaults (analyst, builder, debugger, reviewer), so a fresh
 // install has a working team with no file on disk; nothing but `orchestrator` is built in.
 //
 // `policy` is an attribute the file opts into, not what an agent is. `maxSteps` reaches runtimes
@@ -20,8 +20,6 @@ export const SKILL = 'agent-orchestrator';
 export const agentStore = root => path.join(root, 'agents');
 export const projectAgentStore = cwd => path.join(cwd, '.bounce', 'agents');
 export const installedSkillAgents = root => path.join(root, 'skills', SKILL, 'team');
-// `team/`, not `agents/`: the skill's `agents/` directory holds the vendor subagent role files
-// (orch-*.md for Claude Code, orch-*.toml for Codex), which are a different thing.
 const SHIPPED = fileURLToPath(new URL(`../skills/${SKILL}/team/`, import.meta.url));
 const LISTS = ['models', 'readPaths', 'writePaths', 'commands'];
 export const AUTO_MODEL = 'auto';
