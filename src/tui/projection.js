@@ -53,6 +53,10 @@ export function createWorkspaceProjection({activityLimit = 400, transcriptLimit 
   function addTask(event) {
     submittedRows.set(event.task, event);
     const logicalTask = event.replaces ? (lineages.get(event.replaces) ?? event.replaces) : event.task;
+    // The replacement takes over the pane of a task still on the rail (found live: a replacement for a
+    // blocked task became a second pane with the same id, and React's duplicate-key warning broke the frame).
+    const replaced = event.replaces ? tasks.get(event.replaces) : null;
+    if (replaced) removeTask(replaced);
     lineages.set(event.task, logicalTask);
     lineageOrder.push(event.task);
     if (lineageOrder.length > dedupeCap) lineages.delete(lineageOrder.shift());

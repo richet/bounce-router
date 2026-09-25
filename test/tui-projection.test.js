@@ -129,6 +129,24 @@ test('verified replacement keeps the logical pane identity and exposes recovery 
   assert.equal(projection.snapshot().panes[0].recovery, 'replacement for original');
 });
 
+// Found live (session 159f4746): a replacement for a task still BLOCKED (integration refused) was added
+// as a second pane with the same `worker:<original>` id; React warned about the duplicate key on the
+// terminal, under Ink's frame, and the screen twitched. The replacement takes over the pane.
+test('a replacement for a task that is still blocked takes over its pane instead of adding a second one', () => {
+  const projection = createWorkspaceProjection();
+  projection.replay([
+    {kind: 'task.submitted', id: '1', seq: 1, task: 'original', profile: 'builder'},
+    {kind: 'task.blocked', id: '2', seq: 2, task: 'original', reason: 'integration_conflict', text: 'Isolated artifact cannot be integrated'},
+    {kind: 'task.submitted', id: '3', seq: 3, task: 'replacement', replaces: 'original', profile: 'builder'},
+  ]);
+  assert.deepEqual(projection.paneIds(), ['orchestrator', 'worker:original']);
+  assert.equal(projection.snapshot().panes.length, 1);
+  assert.equal(projection.snapshot().panes[0].task, 'replacement');
+  // A late row for the replaced task no longer drives a pane.
+  projection.ingest({kind: 'task.milestone', id: '4', seq: 4, task: 'original', text: 'stale'});
+  assert.equal(projection.snapshot().panes[0].text, undefined);
+});
+
 test('sustained-output projection stays below the 100ms local input-frame budget', () => {
   const projection = createWorkspaceProjection({activityLimit: 400, transcriptLimit: 2000});
   for (let index = 0; index < 4; index++) projection.ingest({kind: 'task.submitted', id: `task-${index}`, seq: index, task: `w${index}`, profile: 'build'});
