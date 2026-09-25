@@ -13,7 +13,7 @@ const UNCONFIDENT_GATES = new Set(['review_not_accepted', 'review_uncertain', 'r
 
 // Peers publish from a positive allowlist: everything a session, the scheduler or the daemon writes is refused regardless of `from`,
 // because handoff() folds user/note rows into every later prompt and Router reads cooldown rows.
-const PEER_KINDS = new Set(['plan.submitted', 'task.submitted', 'task.milestone', 'task.blocked', 'task.input_required', 'task.usage', 'task.activity', 'message', 'task.accepted', 'agents.defined', 'state']);
+const PEER_KINDS = new Set(['plan.submitted', 'task.submitted', 'task.milestone', 'task.blocked', 'task.input_required', 'task.usage', 'task.activity', 'message', 'task.accepted', 'task.rework', 'agents.defined', 'state']);
 const USER_ONLY_PREFIX = 'control.';
 // The scheduler alone owns task lifecycle transitions; a peer may report progress
 // (milestone/blocked/input_required/usage/activity), ask for work (submitted) or
@@ -101,7 +101,7 @@ export async function reapStaleSockets({platform = process.platform, uid = proce
 
 // Resolves once actually listening; rejects (never throws async/uncaught) on any
 // bind/chmod failure — a stale non-socket file at the chosen path, EADDRINUSE, etc.
-export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = AUTH_TIMEOUT, validate = () => null, prepare = null, report: receiveReport = null, accept: acceptOverride = null, commandCampaign = campaignCommand}) {
+export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = AUTH_TIMEOUT, validate = () => null, prepare = null, report: receiveReport = null, accept: acceptOverride = null, rework: reworkOverride = null, reworkAvailable = null, commandCampaign = campaignCommand}) {
   const grants = new Map(); // peer -> {peer, tasks, canSubmit, context, token, file, sockets}
   const tokenToPeer = new Map();
   const tokensDir = path.join(dir, 'tokens');
@@ -236,6 +236,18 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
             if (typeof e.text !== 'string' || !e.text.trim()) return refuse(id, -32602, 'invalid event: review: accepting over the review gate needs text naming what you checked and why you accept it');
             e = {...e, overrides: blocked.reason};
           }
+        } else if (e.kind === 'task.rework') {
+          // The symmetric "send back" for the same gate task.accepted's override opens: the owner
+          // may resume the SAME worker with its own must-fix findings instead of accepting work it
+          // disagrees with. Same admission as the accept override — orchestrator only, only while
+          // blocked at an unconfident gate — plus text (what must be fixed) and remaining round budget.
+          if (peer !== 'orchestrator') return refuse(id, -32001, 'unauthorized');
+          const blocked = tasks(session.events)[e.task]?.state === 'blocked'
+            ? session.events.findLast(row => row.kind === 'task.blocked' && row.task === e.task) : null;
+          if (!UNCONFIDENT_GATES.has(blocked?.reason)) return refuse(id, -32602, 'invalid event: review: only while it is blocked at an unconfident review gate (review_not_accepted, review_uncertain or review_unavailable) can task.rework send it back by hand; otherwise its review decides');
+          if (typeof e.text !== 'string' || !e.text.trim()) return refuse(id, -32602, 'invalid event: review: sending work back needs text naming what must be fixed');
+          if (typeof reworkAvailable === 'function' && !reworkAvailable(e.task)) return refuse(id, -32602, 'invalid event: rework_rounds_exhausted');
+          e = {...e, overrides: blocked.reason};
         }
       } else if (e.kind === 'message') {
         if (typeof e.to !== 'string' || !e.to) return refuse(id, -32602, 'invalid event');
@@ -250,7 +262,8 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
           ? {actionId: `dispatch:${e.task}:0`, type: 'dispatch', task: e.task}
           : {actionId: `plan:${e.plan}`, type: 'plan', payload: {plan: e.plan}}, [e]);
         row = session.events.findLast(event => event.kind === e.kind && (e.task ? event.task === e.task : event.plan === e.plan));
-      } else if (e.overrides && typeof acceptOverride === 'function') row = acceptOverride(e);
+      } else if (e.kind === 'task.accepted' && e.overrides && typeof acceptOverride === 'function') row = acceptOverride(e);
+      else if (e.kind === 'task.rework' && e.overrides && typeof reworkOverride === 'function') row = reworkOverride(e);
       else row = session.publish(e);
       send({jsonrpc: '2.0', id, result: row});
     }

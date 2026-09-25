@@ -446,7 +446,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const previousTask = spec.retryOf ?? spec.replaces;
     if (previousTask && view[previousTask]?.state === 'blocked'
       && isReviewGate(session.events.findLast(e => e.task === previousTask && e.kind === 'task.blocked'))
-      && candidateResult(session.events, previousTask)) return 'review gate unresolved; preserved candidate must be reviewed, not rerun';
+      && candidateResult(session.events, previousTask)) return 'review gate unresolved; preserved candidate must be reviewed, not rerun — accept it (task.accepted with overrides and text) or send it back for rework (task.rework with text) instead';
     if (spec.campaignId) {
       const campaign = campaigns(session.events)[spec.campaignId];
       if (!campaign || campaign.state !== 'active') return 'campaign is not active';
@@ -689,6 +689,28 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (!publishArtifact(row.task, row)) return session.events.findLast(e => e.kind === 'task.integration.requested' && e.task === row.task);
     append(row);
     return session.events.findLast(e => e.kind === 'task.accepted' && e.task === row.task);
+  }
+
+  // Whether a rework round remains for this task's root, for the bus to refuse a hand-authored
+  // task.rework before it spends anything (rework_rounds_exhausted).
+  function roundsAvailable(task) { return api.roundsUsed(task) < api.roundsCap(task); }
+
+  // The symmetric "send back": an owner's rework verdict over an unconfident review gate. This IS a
+  // rework round in substance — the same effect a CONFIDENT Jev rework has (applyVerdictIntent's
+  // 'rework' branch) — so it reserves the same budget and resumes the same worker through the same
+  // resumeWorker(), just with the orchestrator's own findings instead of a reviewer's.
+  function reworkOverride(event) {
+    const task = event.task;
+    const row = submittedRow(task);
+    if (!row) return null;
+    const context = event.context ?? row.context;
+    const root = budgetRootOf(task, reducers.tasks(session.events));
+    const round = api.roundsUsed(task) + 1;
+    const findings = [event.text];
+    append({kind: 'budget.reserved', task, root, amount: {rounds: 1}, context});
+    append({kind: 'task.rework', task, round, findings, overrides: event.overrides, context});
+    void resumeWorker({task, row, round, findings, context});
+    return session.events.findLast(e => e.kind === 'task.rework' && e.task === task);
   }
 
   function maybeFallback(row) {
@@ -2425,7 +2447,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     validate: spec => validate(spec, reducers.tasks(session.events)),
     // The submit decoration the bus applies before journaling a peer's task.submitted (Jev review).
     prepare,
-    submit, report, acceptOverride, cancel, stop, tick, reconcile,
+    submit, report, acceptOverride, reworkOverride, roundsAvailable, cancel, stop, tick, reconcile,
     tasks: () => reducers.tasks(session.events),
     budgets: () => reducers.budgets(session.events),
     spend: () => reducers.spend(session.events),

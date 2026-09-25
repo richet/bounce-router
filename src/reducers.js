@@ -113,7 +113,11 @@ export function tasks(events) {
         if (t.state === 'queued') { t.state = 'rejected'; settleParent(t.parent); }
         break;
       case 'task.rework':
-        if (t.state === 'reviewing') { t.state = 'running'; t.rounds = (t.rounds || 0) + 1; }
+        // An owner's own rework verdict over an unconfident review gate (bus.js admits it only then,
+        // and marks it `overrides`, the same shape task.accepted's override uses) is the other exit
+        // from that gate's `blocked`, symmetric to the accept override; a plain rework row never
+        // moves a blocked task — only a confident review's own rework, which arrives while reviewing.
+        if (t.state === 'reviewing' || (t.state === 'blocked' && e.overrides)) { t.state = 'running'; t.rounds = (t.rounds || 0) + 1; }
         break;
       case 'task.accepted':
         if (e.stage === 'prelaunch') { if (t.state === 'queued') t.prelaunch = 'accepted'; break; }
