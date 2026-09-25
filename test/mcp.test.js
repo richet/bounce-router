@@ -150,7 +150,8 @@ test('task_submit declares and forwards inPlace', async () => {
   const s = server({ops: {submit: async event => {submitted = event; return {ok: true, row: event};}}});
   const list = await s.handle({jsonrpc: '2.0', id: 1, method: 'tools/list'});
   const schema = list.result.tools.find(tool => tool.name === 'task_submit').inputSchema.properties.inPlace;
-  assert.deepEqual(schema, {type: 'object', properties: {authorizedBy: {type: 'number'}}, required: ['authorizedBy']});
+  assert.deepEqual(schema.properties, {authorizedBy: {type: 'number'}});
+  assert.equal(schema.required, undefined, 'omitting authorizedBy cites the latest user message');
   await call(s, 'task_submit', {profile: 'builder', orders: 'commit it', requires: ['read', 'exec', 'write'], inPlace: {authorizedBy: 42}});
   assert.deepEqual(submitted.inPlace, {authorizedBy: 42});
 });

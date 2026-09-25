@@ -464,8 +464,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // Structural check (docs/plans/in-place-tasks.md §1, always): the cited row must exist and
       // be a `user` row — only the keyboard path writes those, and bus.js already refuses `user`
       // from a peer, so a row that IS one was typed by the person, not asserted by any AI.
-      if (!spec.inPlace || typeof spec.inPlace !== 'object' || typeof spec.inPlace.authorizedBy !== 'number'
-        || !session.events.some(e => e.kind === 'user' && e.seq === spec.inPlace.authorizedBy)) return 'in_place_unauthorized';
+      const cited = inPlaceCitation(spec.inPlace);
+      if (cited === null || !session.events.some(e => e.kind === 'user' && e.seq === cited)) return 'in_place_unauthorized';
       if (!Array.isArray(spec.requires) || !spec.requires.includes('write') || !spec.requires.includes('exec')) return 'in_place_requires';
       const profile = profiles[spec.profile];
       if (profile && effectivePolicy(profile) !== 'yolo') return 'in_place_ineligible_profile';
@@ -519,7 +519,16 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // through the exported `prepare` for a peer's task.submitted), so the reducer, `wait` and the
   // strategy all see an ordinary completion review. An explicit review.completion always wins;
   // with Jev disabled or off for review, the row is untouched and behaviour is exactly today's.
+  // `inPlace: true` or `{}` cites the user's latest message (found live: an orchestrator had no seq to
+  // cite and was refused twice); an explicit authorizedBy is taken as given. Null: nothing to cite.
+  function inPlaceCitation(inPlace) {
+    if (inPlace !== true && (!inPlace || typeof inPlace !== 'object')) return null;
+    if (typeof inPlace?.authorizedBy === 'number') return inPlace.authorizedBy;
+    return session.events.findLast(e => e.kind === 'user')?.seq ?? null;
+  }
+
   function prepare(spec) {
+    if (spec.inPlace !== undefined && inPlaceCitation(spec.inPlace) !== null) spec = {...spec, inPlace: {authorizedBy: inPlaceCitation(spec.inPlace)}};
     const predecessor = spec.retryOf ?? spec.replaces;
     const original = predecessor ? rawSubmittedRow(predecessor) : null;
     const activeCampaign = Object.values(campaigns(session.events)).filter(c => c.state === 'active');

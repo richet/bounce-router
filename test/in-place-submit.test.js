@@ -54,6 +54,23 @@ test('an authorized in-place submit runs the worker with cwd = the session check
   await waitFor(() => scheduler.tasks()[row.task]?.state === 'completed');
 });
 
+// Found live (phase 5): the orchestrator's first two in-place submits were refused because it had no
+// seq to cite. Omitting authorizedBy now means "the user's latest message"; Jev still risk-checks it.
+test('an in-place submit without authorizedBy cites the latest user message, and needs one to exist', async t => {
+  const {root, session} = tmpSession('bounce-inplace-latest-');
+  const adapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'x'}]);
+  const scheduler = createScheduler({session, adapters: {worker: adapter}, profiles: {A: writer}, gitHead: () => null});
+  teardown(t, scheduler, root);
+  assert.throws(() => scheduler.submit({parent: null, profile: 'A', orders: 'git commit', deadline: null,
+    requires: ['write', 'exec'], inPlace: {}}), /in_place_unauthorized/);
+  session.append({kind: 'user', text: 'fix the bug'});
+  const latest = session.append({kind: 'user', text: 'commit it'});
+  for (const inPlace of [{}, true]) {
+    const row = scheduler.submit({parent: null, profile: 'A', orders: 'git commit', deadline: null, requires: ['write', 'exec'], inPlace});
+    assert.deepEqual(row.inPlace, {authorizedBy: latest.seq});
+  }
+});
+
 test('an in-place submit citing a seq with no row is refused in_place_unauthorized', async t => {
   const {root, session} = tmpSession('bounce-inplace-missing-');
   const adapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'x'}]);
