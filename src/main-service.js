@@ -71,9 +71,12 @@ export function handoffBlock(session, ended) {
   return lines.join('\n');
 }
 
+// `onFirstUserPrompt` fires once, fire-and-forget, right after a NEW session's first `user` row
+// lands (src/session-title.js); a no-op by default so tests never title a session unless they
+// inject one — see reload.js for the live wiring.
 export function createMainService({session, adapters, profile, settings, profiles = {}, readRouting = () => settings,
   orchestratorEnv = {}, brief = '', handoffDelayMs = HANDOFF_DELAY_MS, continuationState,
-  clock = {}, watchdog = {}}) {
+  clock = {}, watchdog = {}, onFirstUserPrompt = () => {}}) {
   const now = clock.now ?? Date.now;
   const setTimer = clock.setTimeout ?? setTimeout;
   const clearTimer = clock.clearTimeout ?? clearTimeout;
@@ -431,6 +434,29 @@ export function createMainService({session, adapters, profile, settings, profile
     let images;
     try { images = params.savedImages ?? saveImages([...new Set([...(params.files ?? []), ...imagePaths(params.text, session.cwd)])], session); }
     catch (error) { return {accepted: false, reason: error.message}; }
+    // A wake never journals a `user` row (see below), so it can never be the first one — only a
+    // genuine new session's very first typed/queued prompt fires onFirstUserPrompt.
+    const isFirstPrompt = !wake && !session.events.some(e => e.kind === 'user');
+    if (current) {
+      // A USER prompt (wake:false) landing while a run is current: queued instead of refused.
+      // Its `user` row is journaled right away, so it shows in the transcript immediately even
+      // though its turn has not started; finish()/block() above dispatch it — back through this
+      // same function, `fromQueue: true` — the instant the current run frees up, ahead of any
+      // automatic wake. `id` is stable across a resend so a retry never queues a second copy.
+      const id = params.id ?? randomUUID();
+      if (queuedIds.has(id)) return {accepted: true, queued: true, requestId: id};
+      queuedIds.add(id);
+      queuedPrompts.push({...params, id, savedImages: images});
+      // requestId plus whatever of provider/model/mode/routing the caller set is journaled on the
+      // row itself: a daemon restart rebuilds queuedPrompts from the journal (below), not from this
+      // in-memory array, and needs enough here to call start() again unchanged.
+      session.append({kind: 'user', text: params.text, queued: true, requestId: id,
+        ...(params.typed ? {typed: params.typed} : {}), ...(images.length ? {images} : {}),
+        ...(params.provider ? {provider: params.provider} : {}), ...(params.model ? {model: params.model} : {}),
+        ...(params.mode ? {mode: params.mode} : {}), ...(params.routing ? {routing: params.routing} : {})});
+      if (isFirstPrompt) { try { onFirstUserPrompt(session, settings); } catch {} }
+      return {accepted: true, queued: true, requestId: id};
+    }
     let routes;
     try { routes = fallbackRoutes(params.routing ?? readRouting()); }
     catch (error) { return {accepted: false, reason: error.message}; }
@@ -456,12 +482,14 @@ export function createMainService({session, adapters, profile, settings, profile
       attempt: wake && actionKey ? wakeAttempts(session.events, actionKey) + 1 : 1,
       dueAt: wake ? now() : null, ...(params.recoveryOf ? {recoveryOf: params.recoveryOf, rootRequestId: run.rootRequestId} : {})};
     const committed = [requested];
-    if (!wake) committed.unshift({kind: 'user', text: params.text, ...(params.typed ? {typed: params.typed} : {}), ...(images.length ? {images} : {})});
+    // A dispatch drained from the queue already journaled its `user` row when it was queued.
+    if (!wake && !fromQueue) committed.unshift({kind: 'user', text: params.text, ...(params.typed ? {typed: params.typed} : {}), ...(images.length ? {images} : {})});
     if (actions.length) committed.push({kind: 'handoff', wake, requestId: run.id,
       actionIds: run.actionIds, outcomeSeqs: run.outcomeSeqs, tasks: actions.filter(action => action.task).map(action => action.task),
       text: wake ? `${run.outcomes}\n\n${params.text}` : run.outcomes, from: 'bounce'});
     const rows = session.commit(committed, {ref: `main-request:${run.id}`, version: 2});
     run.requestedSeq = rows.find(row => row.kind === 'main.requested').seq;
+    if (!wake && !fromQueue && isFirstPrompt) { try { onFirstUserPrompt(session, settings); } catch {} }
     current = run;
     blockedState = null;
     if (!wake) autoWakeSuppressed = false;

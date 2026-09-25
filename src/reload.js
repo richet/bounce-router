@@ -18,6 +18,7 @@ import {Session, config, dataRoot, pidAlive} from './core.js';
 import {seedSkills, seedSummary} from './skills.js';
 const SEED_NOTABLE = ['invalid', 'unmanaged', 'modified', 'withdrawn', 'failed'];
 import {resolveSessionRef} from './sessions.js';
+import {titleSession, createAsk} from './session-title.js';
 export {pidAlive};
 import {createBus, connectBus} from './bus.js';
 import {validateOrchestration, LOCAL_ADAPTERS} from './profiles.js';
@@ -521,7 +522,9 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   const bridgeEnv = orchestrating ? orchestratorBridgeEnv({session, bus, grant: orchestratorGrant, profile: orchestratorProfile}) : null;
   const main = orchestrating && positionals[0] !== 'run' ? createMainService({session, adapters, profile: orchestratorProfile, settings, profiles: orchestration.profiles, readRouting: () => config(root),
     orchestratorEnv: bridgeEnv, continuationState: () => campaignContinuationState(session.events),
-    brief: `Read and follow ${path.join(session.dir, 'orchestrator', 'ORDERS.md')}.`}) : null;
+    brief: `Read and follow ${path.join(session.dir, 'orchestrator', 'ORDERS.md')}.`,
+    // Fire-and-forget: a new session's first prompt gets a model-given title once (src/session-title.js).
+    onFirstUserPrompt: (s, cfg) => { titleSession({session: s, settings: cfg, ask: createAsk({executables: cfg.executables})}).catch(() => {}); }}) : null;
   const closeCampaignContinuation = main ? installCampaignContinuation({session}) : () => {};
   const closeLocalActivation = createLocalActivation({session, scheduler, profiles, settings, roles, readRoles,
     readSettings: () => config(root),

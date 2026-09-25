@@ -40,6 +40,7 @@ import * as reducers from './reducers.js';
 import {providers, runProcess} from './providers.js';
 import {projectRoot, fingerprint, validate, supervise, pidAlive} from './reload.js';
 import {listSessions, resolveSessionRef, sessionsTable, sessionAge} from './sessions.js';
+import {titleSession, createAsk} from './session-title.js';
 import {createRemoteSession} from './remote.js';
 import {version, checkUpdate, globalInstall, installUpdate} from './update.js';
 import {helpText, helpRows} from './help.js';
@@ -346,7 +347,9 @@ async function main() {
   // Agent and the AGENTS pane stayed empty). Claude Code exposes --disallowedTools for exactly
   // this; other vendors' subagent features have no such switch here yet, so ORDERS.md forbids them.
   const noOwnSubagents = provider => provider === 'claude' ? ['--disallowedTools', 'Agent,Task'] : [];
-  const routerOptions = orchestrating ? {runner: options => runProcess({...options, keepBus: true}), extraArgs: noOwnSubagents} : {};
+  // Fire-and-forget: a new session's first prompt gets a model-given title once (src/session-title.js).
+  const onFirstUserPrompt = (s, cfg) => { titleSession({session: s, settings: cfg, ask: createAsk({executables: cfg.executables})}).catch(() => {}); };
+  const routerOptions = {onFirstUserPrompt, ...(orchestrating ? {runner: options => runProcess({...options, keepBus: true}), extraArgs: noOwnSubagents} : {})};
   const remoteMain = orchestrating && positionals[0] !== 'run' && typeof session.runMain === 'function';
   if (remoteMain && session.main?.provider) {
     settings.models[session.main.provider] = session.main.model ?? '';
@@ -709,8 +712,9 @@ async function main() {
       menu: menu.map(([text, paint]) => paint(clean(text))),
       metadata: {
         ...headerProvider({settings, orchestration, active: session.active}), mode: settings.mode,
-        cwd: session.cwd, sessionId: session.id, operation: sessionOperation, pendingOperation: pendingOperation(), jev: jevSidebarLabel(settings.jev),
+        cwd: session.cwd, sessionId: session.id, name: reducers.sessionName(session.events), operation: sessionOperation, pendingOperation: pendingOperation(), jev: jevSidebarLabel(settings.jev),
         orchestrator: orchestration.orchestrator ?? 'main', pendingTurns: pendingTurns.length,
+        ownQueued: remoteMain ? reducers.queuedPrompts(session.events).length : 0,
         // The sidebar spends 11 rows on the header block, the AGENTS list and the two gaps, plus
         // one per worker; whatever is left (sidebarRows) is split between MODELS and quota, with
         // MODELS capped at 40% (and its own blank separator row when non-empty) so quota never
@@ -1023,7 +1027,7 @@ async function main() {
           if (arg.trim()) { await switchSession(resolveSessionRef(root, arg.trim())); return; }
           const rows = listSessions(root).filter(r => r.cwd === session.cwd && r.id !== session.id).slice(0, 30);
           if (!rows.length) throw new Error('No other sessions in this workspace');
-          picker = {kind: 'session', index: 0, notes: [], entries: rows.map(r => ({id: r.id, label: `${r.name ?? r.id.slice(0, 8)} · ${sessionAge(r.updated)} ago · ${r.operation}${r.live ? ' · live' : ''} · ${r.id.slice(0, 8)}`}))};
+          picker = {kind: 'session', index: 0, notes: [], entries: rows.map(r => ({id: r.id, label: `${r.name ?? r.derivedName} · ${sessionAge(r.updated)} ago · ${r.operation}${r.live ? ' · live' : ''} · ${r.id.slice(0, 8)}`}))};
           notice = 'Pick a session to resume. Esc cancels.';
           return;
         } else if (command === 'btw') {

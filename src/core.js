@@ -330,8 +330,12 @@ export function handoff(session, prompt, budget = 48000) {
 export class Router {
   // `extraArgs(provider)` appends argv to a provider's invocation for this router only — the
   // orchestrator's TUI uses it to switch the vendor's own subagent tools off (see cli.js).
-  constructor(session, settings, {runner = runProcess, extraArgs = () => []} = {}) {
+  // `onFirstUserPrompt(session, settings)` fires once, fire-and-forget, right after a NEW
+  // session's first `user` row lands (src/session-title.js); a no-op by default so tests never
+  // title a session unless they inject one — see cli.js for the live wiring.
+  constructor(session, settings, {runner = runProcess, extraArgs = () => [], onFirstUserPrompt = () => {}} = {}) {
     this.session = session; this.settings = settings; this.runner = runner; this.extraArgs = extraArgs;
+    this.onFirstUserPrompt = onFirstUserPrompt;
     this.cooldowns = {}; this.selectionVersion = 0;
     for (const e of session.events) if (e.kind === 'cooldown') this.cooldowns[e.provider] = e.until;
   }
@@ -354,7 +358,9 @@ export class Router {
     const selectionVersion = this.selectionVersion;
     try {
       const images = saveImages([...new Set([...imagePaths(prompt, s.cwd), ...files.map(file => path.resolve(s.cwd, file))])], s);
+      const isFirstPrompt = !s.events.some(e => e.kind === 'user');
       s.append({kind: 'user', text: prompt, ...(typed ? {typed} : {}), ...(images.length ? {images} : {})});
+      if (isFirstPrompt) { try { this.onFirstUserPrompt(s, this.settings); } catch {} }
       s.append({kind: 'checkpoint', ...gitSnapshot(s.cwd)});
       const first = s.active && cfg.order.includes(s.active) ? s.active : cfg.order[0];
       const order = [first, ...cfg.order.filter(p => p !== first)];

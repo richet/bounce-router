@@ -384,11 +384,14 @@ export function modelUsage(events) {
   return [...entries.values()].sort((a, b) => b.tokens - a.tokens || a.model.localeCompare(b.model));
 }
 
-// A session's name: the last `session.renamed` row wins; otherwise the first line of its first
+// A session's name: an explicit `session.renamed` wins, else a model-given `session.titled`
+// (src/session-title.js — asked once, from the first prompt), else the first line of its first
 // prompt (the orchestrator brief line stripped), cut to 48 characters; null for an empty log.
 export function sessionName(events) {
   const renamed = events.findLast(e => e.kind === 'session.renamed' && typeof e.name === 'string' && e.name.trim());
   if (renamed) return renamed.name.trim();
+  const titled = events.findLast(e => e.kind === 'session.titled' && typeof e.name === 'string' && e.name.trim());
+  if (titled) return titled.name.trim();
   const first = events.find(e => e.kind === 'user' && typeof e.text === 'string');
   if (!first) return null;
   const line = first.text.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('You are the orchestrator peer of session'))[0];
