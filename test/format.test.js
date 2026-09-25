@@ -11,6 +11,20 @@ test('main start is not labelled finished and internal transport rows stay hidde
   assert.match(plain.event({kind: 'main.started', state: 'running'}, 80).join('\n'), /Running/);
   assert.match(plain.event({kind: 'policy.fallback.skipped', reason: 'no_profile_configured'}, 80).join('\n'), /no_profile_configured/);
 });
+// /btw renders as its own side exchange — the question labelled "btw · …", the answer under it —
+// and never as a plain "You · By the way" row (that's /steer's aside).
+test('btw.asked/btw.answered/btw.failed render as a side exchange, both compact and classic', () => {
+  for (const formatter of [plain, createFormatter({color: false, compact: true})]) {
+    const asked = formatter.event({kind: 'btw.asked', text: 'why is docker empty?', id: 'a1'}, 80).join('\n');
+    assert.match(asked, /btw · why is docker empty\?/);
+    const answered = formatter.event({kind: 'btw.answered', id: 'a1', text: 'bounce runs its own compose scope', model: 'codex'}, 80).join('\n');
+    assert.match(answered, /bounce runs its own compose scope/);
+    assert.match(answered, /codex/);
+    const failed = formatter.event({kind: 'btw.failed', id: 'a2', reason: 'no_agent'}, 80).join('\n');
+    assert.match(failed, /btw · no answer \(no_agent\)/);
+  }
+});
+
 const color = createFormatter({color: true});
 test('Markdown preserves content while formatting headings, lists, links and emphasis', () => {
   const out = plain.markdown('# Heading\n\n**bold** and `code`\n\n- first\n- second\n\n[Docs](https://example.com)', 60).join('\n');

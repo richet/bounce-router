@@ -4,13 +4,13 @@ import {completions, typedCommand, frameDiff} from '../src/terminal.js';
 import {commandCatalog} from '../src/commands.js';
 import {resolveExecutable} from '../src/executable.js';
 test('slash shows all commands; prefixes narrow and arguments dismiss',()=>{
- assert.equal(completions('/').length,30);
+ assert.equal(completions('/').length,31);
  assert.deepEqual(completions('/re').map(x=>x[0]),['rename','resume','review','retry','restart']);
  assert.deepEqual(completions('/je').map(x=>x[0]),['jev']);
  assert.deepEqual(completions('/b').map(x=>x[0]),['btw']);
  assert.deepEqual(completions('/ag').map(x=>x[0]),['agents']);
  assert.deepEqual(completions('/co').map(x=>x[0]),['continue']);
- assert.deepEqual(completions('/st').map(x=>x[0]),['stop']);
+ assert.deepEqual(completions('/st').map(x=>x[0]),['steer','stop']);
  assert.deepEqual(completions('/sk').map(x=>x[0]),['skills']);
  assert.deepEqual(completions('/mo').map(x=>x[0]),['model','mode']);
  assert.deepEqual(completions('/q').map(x=>x[0]),['quota','quit']);

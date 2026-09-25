@@ -763,7 +763,7 @@ test('publish applies the scheduler\'s prepare hook to a valid task.submitted an
   assert.deepEqual(explicit.review, {completion: 'C'});
 });
 
-// A /btw delivered live lands in the orchestrator's turn, but the orchestrator only reads it when
+// A /steer delivered live lands in the orchestrator's turn, but the orchestrator only reads it when
 // its current tool call returns. Observed: a message acknowledged at 07:01 and read at 07:08, when
 // a 7-minute `bounce wait` came back. So a live delivery ends every pending orchestrator wait
 // with a row saying why; a worker's wait is not the orchestrator's and keeps waiting.

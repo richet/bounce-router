@@ -4,7 +4,7 @@ import {commandCatalog, classifyInput, inputDisposition} from '../src/commands.j
 
 test('classifyInput classifies every TUI command exactly once', () => {
   const expected = {
-    immediate: ['provider', 'model', 'local', 'order', 'mode', 'note', 'btw', 'rename', 'sessions', 'skills', 'review', 'quota', 'retry', 'operation', 'stop', 'msg', 'agents', 'tasks', 'help', 'detach', 'details', 'sidebar', 'jev'],
+    immediate: ['provider', 'model', 'local', 'order', 'mode', 'note', 'btw', 'steer', 'rename', 'sessions', 'skills', 'review', 'quota', 'retry', 'operation', 'stop', 'msg', 'agents', 'tasks', 'help', 'detach', 'details', 'sidebar', 'jev'],
     turn: ['continue'],
     lifecycle: ['login', 'new', 'resume', 'update', 'restart', 'quit'],
   };
@@ -19,7 +19,7 @@ test('classifyInput classifies every TUI command exactly once', () => {
     }
   }
   assert.equal(new Set(seen).size, seen.length);
-  assert.equal(seen.length, 30);
+  assert.equal(seen.length, 31);
 });
 
 test('classifyInput folds /typesafe into /jev, keeping its arguments', () => {
@@ -51,6 +51,9 @@ test('inputDisposition queues only turn-starting input while busy', () => {
   });
   assert.deepEqual(inputDisposition('/btw keep going', {busy: true}), {
     kind: 'immediate', command: 'btw', parts: ['keep', 'going'], arg: 'keep going', action: 'run-command',
+  });
+  assert.deepEqual(inputDisposition('/steer keep going', {busy: true}), {
+    kind: 'immediate', command: 'steer', parts: ['keep', 'going'], arg: 'keep going', action: 'run-command',
   });
   assert.deepEqual(inputDisposition('/continue build', {busy: true}), {
     kind: 'turn', command: 'continue', parts: ['build'], arg: 'build', action: 'queue-turn',

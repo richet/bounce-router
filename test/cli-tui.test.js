@@ -143,7 +143,7 @@ test('CLI commands and live steering work while the daemon main turn is held', {
   child.stdin.write('/sidebar on\r');
   await waitFor(() => output.includes('Sidebar shown'));
   assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'config.json'))).sidebar, true);
-  child.stdin.write('/btw urgent correction\r');
+  child.stdin.write('/steer urgent correction\r');
   await waitFor(() => calls.some(([kind]) => kind === 'deliver'));
   const delivery = calls.find(([kind]) => kind === 'deliver')[1];
   assert.equal(delivery.text, 'urgent correction');

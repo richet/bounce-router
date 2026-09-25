@@ -56,7 +56,7 @@ test('the orders tell the orchestrator to hand off what it dispatched instead of
 
 // Found live (ACE session): the orchestrator spent 1560 s of a 2115 s turn inside seven `bounce wait`
 // calls — a 35-minute turn held open, its whole context live, doing nothing bounce would not have
-// done for it with a handoff. And a /btw delivered into that turn was read only when the wait returned.
+// done for it with a handoff. And a /steer delivered into that turn was read only when the wait returned.
 test('the orders make ending the turn the rule after dispatch, and a wait short and for a dependent step only', () => {
   const choosing = choosingOrders({agents: true, routingOn: true, localOn: true}).join('\n');
   assert.equal(choosing.includes('Do not hold your turn open in `bounce wait` while workers run'), true);
