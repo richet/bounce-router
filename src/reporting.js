@@ -27,9 +27,14 @@ const text = value => typeof value === 'string' && value.length <= TEXT_MAX;
 const NOTHING_REMAINS = /^(?:none|n\/?a|nothing|-+|—)\.?$/i;
 // …or leads with it and explains ("None — all three steps completed"); "None of the probes ran" still owes work.
 const NOTHING_REMAINS_LEAD = /^(?:none|nothing|n\/?a)\s*[—–:;.-]/i;
+// …or scopes it ("None for the assigned scope.", found live on a finished sonnet task), unless the
+// sentence then turns: "None for now, but the lint step still fails" still owes work.
+const NOTHING_REMAINS_SCOPED = /^(?:none|nothing)\s+(?:for|in|within|left|remaining|outstanding|pending)\b/i;
+const TURNS = /\b(?:but|except|however|still|yet|although)\b/i;
 export const remainingWork = value => {
   const text = typeof value === 'string' ? value.trim() : '';
-  return NOTHING_REMAINS.test(text) || NOTHING_REMAINS_LEAD.test(text) ? '' : text;
+  const nothing = NOTHING_REMAINS.test(text) || NOTHING_REMAINS_LEAD.test(text) || (NOTHING_REMAINS_SCOPED.test(text) && !TURNS.test(text));
+  return nothing ? '' : text;
 };
 
 export function validateReport(report) {

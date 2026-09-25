@@ -155,7 +155,8 @@ test('a report-only timeout with no acknowledged report still fails with preserv
 });
 
 // Observed live (reviewer c33dcf6b): a PASS verdict reported with remaining "None." was blocked as unfinished work.
-for (const nothing of ['None.', 'N/A', 'nothing', '-', 'None — all three steps completed and the scratch test was removed.']) test(`a completed report whose remaining says "${nothing}" completes, by text and by tool`, {timeout: 3000}, async t => {
+// Found live (159f4746 eeebd5b9, sonnet): "None for the assigned P3 steps 1 and 3 scope." was read as owed work.
+for (const nothing of ['None.', 'N/A', 'nothing', '-', 'None — all three steps completed and the scratch test was removed.', 'None for the assigned P3 steps 1 and 3 scope.', 'Nothing within this task\'s scope.', 'None in scope.']) test(`a completed report whose remaining says "${nothing}" completes, by text and by tool`, {timeout: 3000}, async t => {
   const byText = setup(t, fakeAdapter(() => [{kind: 'result', status: 'completed', text: JSON.stringify({...valid, remaining: nothing})}]));
   submit(byText.scheduler);
   assert.equal((await byText.terminal).kind, 'task.completed');
@@ -164,7 +165,7 @@ for (const nothing of ['None.', 'N/A', 'nothing', '-', 'None — all three steps
   assert.equal((await byTool.terminal).kind, 'task.completed');
 });
 
-for (const owed of ['Re-run the corrupt-tail probes.', 'None of the Docker probes ran.']) test(`a completed report that names unfinished work still blocks: "${owed}"`, {timeout: 3000}, async t => {
+for (const owed of ['Re-run the corrupt-tail probes.', 'None of the Docker probes ran.', 'None for now, but the lint step still fails.']) test(`a completed report that names unfinished work still blocks: "${owed}"`, {timeout: 3000}, async t => {
   const {scheduler, terminal} = setup(t, fakeAdapter(() => [{kind: 'result', status: 'completed', text: JSON.stringify({...valid, remaining: owed})}]));
   submit(scheduler);
   const ended = await terminal;
