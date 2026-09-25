@@ -18,10 +18,14 @@ export function formatTaskView(view) {
     if (view.findings.more) rows.push(`  … ${view.findings.more} more`);
   }
   if (!view.report && view.summary) rows.push('summary:', `  ${view.summary}`);
+  if (view.reportDiagnostic) rows.push(`report diagnostic: ${view.reportDiagnostic}`);
   if (view.journal) rows.push(`journal: ${view.journal.path} · rows ${view.journal.fromSeq}–${view.journal.toSeq} of this task`);
   // Last, and unindented: a verdict puts its conclusion at the end, so nothing follows it that would push
   // that conclusion out of view or invite it to be read as part of the report.
   if (view.report) rows.push('report:', view.report);
+  if (view.rawOutput !== null && view.rawOutput !== undefined) {
+    rows.push(`unvalidated raw output (${view.reportDiagnostic ?? 'invalid report'}):`, view.rawOutput);
+  }
   return rows.join('\n');
 }
 

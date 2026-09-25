@@ -1,18 +1,20 @@
-import {randomUUID} from 'node:crypto';
+import {validateRequirements, missingCapabilities} from './task-capabilities.js';
+import {candidateResult, isReviewGate, REVIEW_GATE_REASONS} from './task-result.js';
+import {randomUUID, createHash} from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import {createAttemptWorkspace, captureArtifact, integrateArtifact} from './workspace-artifacts.js';
+import {createAttemptWorkspace, captureArtifact, integrateArtifact, advanceBaseline} from './workspace-artifacts.js';
 import * as reducers from './reducers.js';
 import {takeCheckpoint, sameTree} from './checkpoint.js';
 import {POLICY_RANK, effectivePolicy, LOCAL_ADAPTERS, playedBy, READ_ONLY_ROLES as READONLY_ROLES} from './profiles.js';
 import {defaultStrategy} from './strategy.js';
-import {reportEvent, validateReport} from './reporting.js';
-import {parseFinalReport, FINAL_REPORT_INSTRUCTION} from './final-report.js';
+import {reportEvent, validateReport, remainingWork} from './reporting.js';
+import {inspectFinalReport, FINAL_REPORT_INSTRUCTION} from './final-report.js';
 import {actionState, campaigns, createActionRunner, requestAction} from './orchestration.js';
 import {normalizeLocalSettings} from './local-models.js';
 import {createLocalResolver} from './local-resolve.js';
-import {createResources, residentModels, sizeOf, fitLocal, gb, DEFAULT_RESERVE_BYTES} from './resources.js';
+import {createResources, residentModels, sizeOf, fitLocal, gb, pressureName, DEFAULT_RESERVE_BYTES} from './resources.js';
 import {concludeAsk} from './adapters/live-common.js';
 import {failedAttempts, repeatRefusal, REPEAT_LIMIT} from './loop-guard.js';
 import {discoverLocalModels} from './local-models.js';
@@ -32,7 +34,10 @@ const SIZE_FIELDS = ['lines', 'probes', 'minutes'];
 // step of the local 27B at 77k tokens of context took up to three minutes of prefill (live).
 // concludeCap: the most a conclusion that keeps showing activity is waited for. Found live: a 27B was
 // still generating its answer 284 s into a fixed 300 s grace, and a whole 60 min review was lost.
-export const WATCHDOG_DEFAULTS = {interval: 5000, startupMs: 120_000, silence: 300_000, stall: 600_000, grace: 120_000, concludeGrace: 300_000, concludeCap: 900_000};
+// `reportOnly` is how long a report-only continuation (a resumed worker asked only for its missing
+// final report) may take. It was 10 s, less than a resumed CLI's own startup plus one tool call:
+// observed on fb9181d5, every such continuation timed out and finished work was journaled as failed.
+export const WATCHDOG_DEFAULTS = {interval: 5000, startupMs: 120_000, silence: 300_000, stall: 600_000, grace: 120_000, concludeGrace: 300_000, concludeCap: 900_000, reportOnly: 120_000};
 const DEFAULT_DEADLINE_MINUTES = 60; // a worker with no declared deadline; the watchdog ladder still catches silence
 const DEFAULT_CEILING_MINUTES = 60; // no lease is renewed past this, measured from the lineage's first start
 const CALL_MEMORY = 200; // tool calls remembered per running task, to tell new work from repeated work
@@ -51,14 +56,10 @@ const AUTO_PROFILE = 'auto';
 
 const isNonNegativeInt = n => Number.isInteger(n) && n >= 0;
 const isPositiveInt = n => Number.isInteger(n) && n > 0;
-// How long a report-only continuation (a resumed worker asked only for its missing final report)
-// may take. It was 10 s, less than a resumed CLI's own startup plus one tool call: observed on
-// fb9181d5, every such continuation timed out and finished work was journaled as failed.
-const REPORT_ONLY_WINDOW_MS = 120000;
-// `opencode` workers report by answering (or `bounce report` when they can run commands); it must be
-// told to CALL it, not to run `bounce report`, because the opencode tier has no shell (Q3).
+// A final-text envelope is a compatibility fallback when no scoped report tool is available.
 const LOCAL_REPORT_LINE = FINAL_REPORT_INSTRUCTION;
-const reportInstruction = profile => profile?.adapter === 'codex'
+const reportsByTool = profile => ['codex', 'opencode'].includes(profile?.adapter);
+const reportInstruction = profile => reportsByTool(profile)
   ? 'call the bounce_report tool with the report object'
   : 'use bounce report --report <json>';
 // The whole report schema rides with the orders. A worker that is only told "final reports
@@ -69,7 +70,9 @@ const reportContract = profile => [
   `To report progress, ${reportInstruction(profile)} using your scoped report endpoint (it is the only bounce command you need; \`bounce\` alone starts nothing useful here).`,
   'Every report is a JSON object with op ("milestone" | "blocked" | "input_required" | "final"), phase ("inspect" | "plan" | "implement" | "test" | "verify" | "review" | "document" | "done"),',
   'text (what changed), next (what happens next) — all strings, all required — and optional evidence (an array of up to 32 strings naming files, commands or results).',
+  'Evidence for a command quotes the command and its actual output lines (for example `deno test -A tests/x_test.ts` then `ok | 3 passed | 0 failed`), not a description of them: a review cannot accept a result it cannot see.',
   'A final report additionally requires outcome ("completed" | "failed" | "blocked" | "input_required") and summary, and may carry remaining (a string).',
+  'Completion is relative to your assigned scope. Findings about future project work belong in evidence and next, not remaining. Use remaining for unfinished obligations in this assignment; never hide unfinished assigned work to claim completion.',
   'Report a milestone after initial inspection and at each phase change; report blocked the moment progress stops; end with one final report. Do not publish task completion directly.',
   'You run headless, as one turn: ending your turn ends your process, and nothing re-invokes you. Never background a command, set a',
   'monitor, or stop to "pick up when it finishes" — run long commands (deploys, test suites) in the foreground with a generous timeout,',
@@ -112,7 +115,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   const ceilingMs = (limits.ceiling ?? Math.max(DEFAULT_CEILING_MINUTES, limits.minutes ?? DEFAULT_DEADLINE_MINUTES)) * 60000;
   const watchdogConfig = {...WATCHDOG_DEFAULTS, ...suppliedWatchdog};
   const intervalOk = watchdogConfig.interval === null || isPositiveInt(watchdogConfig.interval);
-  if (!intervalOk || !isPositiveInt(watchdogConfig.startupMs) || !isPositiveInt(watchdogConfig.silence) || !isPositiveInt(watchdogConfig.stall) || !isPositiveInt(watchdogConfig.grace) || !isPositiveInt(watchdogConfig.concludeGrace) || !isPositiveInt(watchdogConfig.concludeCap)) throw new Error('malformed: watchdog');
+  if (!intervalOk || !isPositiveInt(watchdogConfig.startupMs) || !isPositiveInt(watchdogConfig.silence) || !isPositiveInt(watchdogConfig.stall) || !isPositiveInt(watchdogConfig.grace) || !isPositiveInt(watchdogConfig.concludeGrace) || !isPositiveInt(watchdogConfig.concludeCap) || !isPositiveInt(watchdogConfig.reportOnly)) throw new Error('malformed: watchdog');
   const handles = new Map(); // task -> {adapter, handle}
   let closed = false;
   const planController = new AbortController();
@@ -139,7 +142,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   }
   // Local workers waiting for a slot: `local.endpoints.<name>.maxConcurrent` is how many the endpoint
   // runs at once (LM Studio is loaded with that many parallel slots; more would queue inside it and
-  // look stalled, and each running model turn holds memory — observed live as a swapping machine).
+  // look stalled, and each running model turn holds memory — observed live as a machine under memory pressure).
   // A task past the limit stays queued, says so once, and dispatches when a local turn ends.
   const slotWaiters = new Set();
   const localEndpoint = endpoint => { try { return normalizeLocalSettings(localSettings).endpoints[endpoint] ?? {}; } catch { return {}; } };
@@ -150,7 +153,14 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // resolves, and several dispatches can pass the check before the first one does).
   const localEndpointOf = task => { const p = profiles[reducers.tasks(session.events)[task]?.profile]; return p && LOCAL_ADAPTERS.has(p.adapter) ? p.endpoint ?? 'lmstudio' : null; };
   const localModelOf = task => profiles[reducers.tasks(session.events)[task]?.profile]?.model ?? null;
-  const localRunning = (endpoint, model = null) => new Set([...[...handles.entries()].filter(([t, h]) => h.local === endpoint && (model === null || localModelOf(t) === model)).map(([t]) => t), ...[...launchingAttempts.keys()].filter(t => localEndpointOf(t) === endpoint && (model === null || localModelOf(t) === model))]).size;
+  const localRunning = (endpoint, model = null) => new Set([
+    ...[...handles.entries()].filter(([task, entry]) => entry.local === endpoint
+      && (model === null || localModelOf(task) === model)).map(([task]) => task),
+    ...[...launchingAttempts.keys()].filter(task => localEndpointOf(task) === endpoint
+      && (model === null || localModelOf(task) === model)),
+    ...[...reviews.entries()].filter(([, entry]) => entry.local === endpoint
+      && (model === null || entry.model === model)).map(([peer]) => peer),
+  ]).size;
   const launchingAttempts = new Map(); // task -> {attempt, reports}; grants exist before task.started
   const resolvedLocalProfiles = new Map();
   // Live activity, never journaled (task.activity is a LIVE_KIND): task -> {at, expectUntil}.
@@ -175,6 +185,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // restart, from the rows that named it — it is never part of the validated table.
   // `local` ({endpoint, model}) when the AI is a local model, which has no profile of its own.
   const compose = (agent, ai, local = null) => {
+    const selectedAdapter = local ? 'opencode' : profiles[ai]?.adapter;
+    const policies = adapters[selectedAdapter]?.capabilities?.().executionPolicies;
+    if (Array.isArray(policies) && !policies.includes(effectivePolicy(profiles[agent] ?? {}))) return null;
     const name = `${agent}@${ai}`;
     if (profiles[agent]?.auto === true && (local || profiles[ai])) profiles[name] = playedBy(profiles[agent], ai, profiles[ai], local);
     return profiles[name] ? name : null;
@@ -221,7 +234,53 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // The one local-specific step of a dispatch: pick the model and build OpenCode's provider config.
   // Bounded by the task's own deadline (discovery may wait on a model being loaded on demand) and
   // cancellable while pending; after it, the worker is launched like any other.
-  async function admitLocal(profile, task, attempt, context, launchState) {
+  function reserveReviewSlot(profile, entry, signal) {
+    const endpoint = profile.endpoint ?? 'lmstudio';
+    return new Promise((resolve, reject) => {
+      let unsubscribe = () => {};
+      const cleanup = () => { unsubscribe(); signal.removeEventListener('abort', cancelled); };
+      const cancelled = () => { cleanup(); reject(signal.reason ?? new Error('Review admission cancelled')); };
+      const tryReserve = () => {
+        if (signal.aborted) { cancelled(); return; }
+        if (localRunning(endpoint) >= localSlots(endpoint)
+          || localRunning(endpoint, profile.model) >= modelSlots(endpoint)) return;
+        // Reserve synchronously before resolving: two release listeners cannot claim one slot.
+        entry.local = endpoint;
+        entry.model = profile.model;
+        cleanup();
+        resolve();
+      };
+      unsubscribe = session.subscribe(row => { if (row.kind === 'task.slot.released') tryReserve(); });
+      signal.addEventListener('abort', cancelled, {once: true});
+      tryReserve();
+    });
+  }
+
+  function releaseReview(peer, entry, context) {
+    if (reviews.get(peer) !== entry) return;
+    reviews.delete(peer);
+    if (!entry.local || closed) return;
+    const released = append({kind: 'task.slot.released', task: entry.task,
+      endpoint: entry.local, stage: 'review', from: peer, context});
+    if (slotWaiters.size) queueMicrotask(() => wakeSlotWaiters(released.seq));
+  }
+
+  // A launch or resume that ends without adopting a handle stops counting against its local slot
+  // (localRunning counts launchingAttempts): say so, with a fresh dispatch identity for waiters.
+  // A launch whose process might still be running announces no release (`verified: false`),
+  // and a report-only resume still inside its previous handle leaves the release to that handle.
+  function abandonLaunch(task, context, {verified = true} = {}) {
+    const launching = launchingAttempts.get(task);
+    if (!launching) return null;
+    launchingAttempts.delete(task);
+    const endpoint = localEndpointOf(task);
+    if (!endpoint || !verified || closed || handles.has(task)) return launching;
+    const released = append({kind: 'task.slot.released', task, attempt: launching.attempt, endpoint, stage: 'launch', context});
+    if (slotWaiters.size) queueMicrotask(() => wakeSlotWaiters(released.seq));
+    return launching;
+  }
+
+  async function admitLocal(profile, task, attempt, context, launchState, {waitOnPressure = false} = {}) {
     const controller = new AbortController();
     const launching = launchState ?? launchingAttempts.get(task);
     launching.localController = controller;
@@ -229,10 +288,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const deadline = deadlineAtFor(task) ?? clock() + taskDeadlineMs(submittedRow(task));
     const timer = setTimeout(() => controller.abort(new Error('Local task deadline exceeded')), Math.max(1, deadline - clock()));
     try {
+      if (launchState) await reserveReviewSlot(profile, launchState, controller.signal);
       const resolved = await localResolver.resolve({profile, signal: controller.signal,
         onStatus: text => append({kind: 'task.milestone', task, attempt, phase: 'admission', text, next: 'launch worker', context})});
       controller.signal.throwIfAborted();
-      await admitMemory({profile: resolved, task, attempt, context, signal: controller.signal});
+      await admitMemory({profile: resolved, task, attempt, context, signal: controller.signal, waitOnPressure});
       controller.signal.throwIfAborted();
       launching.phase = 'launch';
       launching.requestedAt = clock();
@@ -243,21 +303,29 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
 
   // The memory gate, between resolving the model and launching it. Greedy by decision: the budget is
   // what is actually free. A machine bounce cannot read has no opinion and nothing below runs.
-  async function admitMemory({profile, task, attempt, context, signal}) {
+  async function admitMemory({profile, task, attempt, context, signal, waitOnPressure = false}) {
     const endpoint = profile.endpoint ?? 'lmstudio';
     const cfg = localEndpoint(endpoint);
     const reserve = Number.isFinite(cfg.reserveGb) ? cfg.reserveGb * 1024 ** 3 : DEFAULT_RESERVE_BYTES;
     const waitMs = (Number.isFinite(cfg.waitMinutes) ? cfg.waitMinutes : 10) * 60000;
     const pollMs = Number.isFinite(cfg.pollMs) ? cfg.pollMs : 5000;
     const startedAt = clock();
-    let said = false, escalated = false;
+    let said = false, saidPressure = false, escalated = false;
     for (;;) {
       signal?.throwIfAborted();
       const machine = resources.read();
       if (!machine?.known) return;
-      // Swapping is the one state bounce does not wait out: the machine is already too slow, and the
-      // agent's next AI (the cloud) can take the task now.
-      if (resources.swapping()) throw Object.assign(new Error('the machine is swapping: a local worker would make it worse'), {code: 'LOCAL_SWAPPING'});
+      // Memory pressure (macOS's own verdict) is not waited out for new work: the machine is already too
+      // slow, and the agent's next AI (the cloud) can take the task now. A report repair continues this
+      // local session, which no other AI can, so it waits until the task's deadline.
+      if (resources.underPressure()) {
+        const level = pressureName(machine);
+        if (!waitOnPressure) throw Object.assign(new Error(`the machine is under ${level} memory pressure: a local worker would make it worse`), {code: 'LOCAL_MEMORY_PRESSURE'});
+        if (!saidPressure) { saidPressure = true; append({kind: 'task.milestone', task, attempt, phase: 'queued', next: 'repair the report when memory pressure eases', context,
+          text: `Waiting for ${level} memory pressure to ease before repairing the report on ${endpoint}`}); }
+        await new Promise(resolve => setTimeout(resolve, pollMs));
+        continue;
+      }
       const fleet = await localFleet({signal}).catch(() => null);
       if (!fleet) return;
       const busy = [...handles.keys()].filter(id => id !== task).map(id => localModelOf(id)).filter(Boolean);
@@ -294,23 +362,30 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (session.events.some(event => event.kind === 'task.attempt.ended' && event.task === task && event.attempt === attempt)) throw new Error('stale report');
     const launching = launchingAttempts.get(task);
     if (launching?.attempt === attempt && current && current.attempt !== attempt && !reducers.TERMINAL.has(current.state)) {
-      const staged = append({kind: 'task.report.staged', task, attempt, phase: payload.phase, text: payload.text, next: payload.next, from: from ?? workerFrom(task), context: context ?? current.context});
+      const staged = append({kind: 'task.report.staged', task, attempt, phase: payload.phase, text: payload.text, next: payload.next, report: structuredClone(payload), from: from ?? workerFrom(task), context: context ?? current.context});
       launching.reports.push({payload, from, context});
       return staged;
     }
     if (!current || current.attempt !== attempt || reducers.TERMINAL.has(current.state)) throw new Error('stale report');
     const event = reportEvent({task, attempt, report: payload, from: from ?? workerFrom(task), context: context ?? current.context});
-    append(event);
+    // Tagged here, not in reportEvent (reporting.js owns the vendor-facing shape, not scheduler
+    // policy): a `reason` on the worker's own op:blocked is what lets a later message resume
+    // this exact worker (T3c) instead of being mistaken for a review gate or an infra signal,
+    // both of which also land as task.blocked with no reason of their own.
+    append(event.kind === 'task.blocked' ? {...event, reason: 'worker_blocked'} : event);
     return event;
   }
 
   function finalizeReport({task, attempt, from, context}) {
     const final = session.events.findLast(e => e.kind === 'task.reported' && e.task === task && e.attempt === attempt);
     if (!final) return false;
-    if (final.outcome === 'completed' && final.remaining?.trim()) { append({kind: 'task.failed', task, reason: 'incomplete_report', text: final.remaining, from, context}); return true; }
+    if (final.outcome === 'completed' && remainingWork(final.remaining)) {
+      append({kind: 'task.report.invalid', task, attempt, report: final, diagnostic: 'report_incomplete', from, context});
+      append({kind: 'task.blocked', task, reason: 'report_incomplete', text: final.remaining, from, context}); return true;
+    }
     if (final.outcome === 'completed') append({kind: 'task.completed', task, summary: final.summary, artifacts: final.evidence, from, context});
     else if (final.outcome === 'failed') append({kind: 'task.failed', task, reason: 'reported_failure', text: final.summary, from, context});
-    else if (final.outcome === 'blocked') append({kind: 'task.blocked', task, text: final.summary, from, context});
+    else if (final.outcome === 'blocked') append({kind: 'task.blocked', task, reason: 'worker_blocked', text: final.summary, from, context});
     else append({kind: 'task.input_required', task, text: final.summary, from, context});
     return true;
   }
@@ -343,6 +418,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       if (!admission.ok) return admission.reason;
     }
     if (spec.retryOf !== undefined && !view[spec.retryOf]) return 'retryOf';
+    const previousTask = spec.retryOf ?? spec.replaces;
+    if (previousTask && view[previousTask]?.state === 'blocked'
+      && isReviewGate(session.events.findLast(e => e.task === previousTask && e.kind === 'task.blocked'))
+      && candidateResult(session.events, previousTask)) return 'review gate unresolved; preserved candidate must be reviewed, not rerun';
     if (spec.campaignId) {
       const campaign = campaigns(session.events)[spec.campaignId];
       if (!campaign || campaign.state !== 'active') return 'campaign is not active';
@@ -353,6 +432,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       if (previous.length && !spec.replaces && !spec.retryOf) return 'job already exists; use retryOf';
     }
     if (spec.profile === AUTO_PROFILE ? !routingFallback(profiles) : !profiles[spec.profile]) return 'profile';
+    if (requireFinalReport && spec.from === 'orchestrator' && spec.requires === undefined) return 'requires: declare read, exec and/or write capabilities for this assignment';
+    const requirementProblem = validateRequirements(spec.requires);
+    if (requirementProblem) return requirementProblem;
+    const requestedProfile = profiles[spec.profile];
+    if (requestedProfile && missingCapabilities(requestedProfile, spec.requires).length) return `capability mismatch: ${missingCapabilities(requestedProfile, spec.requires).join(', ')} unavailable on ${spec.profile}; split analysis from command verification`;
     if (typeof spec.orders !== 'string' || !spec.orders) return 'orders';
     if (spec.deadline !== null && spec.deadline !== undefined && !Number.isFinite(spec.deadline)) return 'deadline';
     if (spec.parent != null && !view[spec.parent]) return 'parent';
@@ -406,7 +490,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const jobId = original?.jobId ?? spec.jobId ?? (spec.planId && spec.chunkId ? `plan:${spec.planId}:${spec.chunkId}` : `job:${task}`);
     spec = {...spec, task, jobId, ...(campaignId ? {campaignId} : {}),
       ...(original ? {replaces: predecessor, retryOf: predecessor, parent: original.parent ?? null,
-        deadline: original.deadline, budget: undefined, owns: original.owns, review: original.review ?? undefined,
+        deadline: original.deadline, requires: original.requires ?? spec.requires, budget: undefined, owns: original.owns, review: original.review ?? undefined,
         gate: original.gate, planId: original.planId, chunkId: original.chunkId, depends_on: original.depends_on ?? []} : {})};
     const reviewer = jev && profiles[jev.reviewer];
     if (!reviewer || reviewer.adapter !== 'typesafe' || !READONLY_ROLES.has(reviewer.role) || strategy !== defaultStrategy) return spec;
@@ -431,6 +515,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       context: spec.context,
       profile: spec.profile,
       orders: spec.orders,
+      ...(spec.requires !== undefined ? {requires: spec.requires} : {}),
       deadline: spec.deadline ?? null,
       budget: spec.budget,
       replaces: spec.replaces ?? null,
@@ -486,25 +571,46 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     : error.code === 'limited' ? {reason: 'limited', text: error.message}
     : {reason: 'error', text: error.message};
 
+  const probeOrders = workspace => `Run commands in your current disposable workspace (${workspace.cwd}). Tests may write caches and output here; none of these changes are integrated into the source. Do not edit source files to make checks pass. Source checkout: ${workspace.source}. For original Git status/history use git --no-optional-locks -C ${JSON.stringify(session.cwd)}; the copy has no Git metadata. Report observed commands and results.`;
+  // An isolated write worker works in a copy; orders that name the real checkout by absolute path would
+  // send it there (observed live: a heredoc appended to the real file, the copy stayed unchanged and
+  // review saw an empty diff). Paths into the checkout are rewritten to the copy, and the adapter fences
+  // the checkout itself (`writeFence`).
+  const inWorkingCopy = (text, workspace) => {
+    const source = fs.realpathSync(session.cwd);
+    // session.cwd is already resolved; macOS also spells /private/{var,tmp,etc} without the prefix.
+    const spellings = [source, source.replace(/^\/private(?=\/(?:var|tmp|etc)\/)/, '')];
+    const rewritten = [...new Set(spellings)].sort((a, b) => b.length - a.length)
+      .reduce((value, root) => value.split(root).join(workspace.cwd), text);
+    return `${rewritten}\n\nYour working copy is ${workspace.cwd}: it is a copy of the project, and only changes made there are your work. Writes to the original checkout (${source}) are refused.`;
+  };
   const workspaces = new Map();
-  function workspaceFor(task, profile, attempt) {
-    if (POLICY_RANK[effectivePolicy(profile)] < POLICY_RANK.write) return null;
+  // Shared by workspaceFor and the integrate handler: the in-memory map first (same process,
+  // possibly already advanced by a prior integration), then the persisted metadata written at
+  // creation time (restart replay reads the same file, which advanceBaseline keeps current).
+  function existingWorkspace(task) {
     const prior = workspaces.get(task) ?? workspaces.get(submittedRow(task)?.replaces);
-    if (prior) { workspaces.set(task, prior); return {...prior, attemptId: `${task}-${attempt}`}; }
+    if (prior) return prior;
     const previous = session.events.findLast(e => e.kind === 'task.workspace' && (e.task === task || e.task === submittedRow(task)?.replaces));
-    if (previous) {
-      const workspace = JSON.parse(fs.readFileSync(previous.metadata, 'utf8'));
-      workspace.cwd = previous.cwd;
-      workspaces.set(task, workspace);
-      return {...workspace, attemptId: `${task}-${attempt}`};
+    if (!previous) return null;
+    const workspace = JSON.parse(fs.readFileSync(previous.metadata, 'utf8'));
+    workspace.cwd = previous.cwd;
+    return workspace;
+  }
+  function workspaceFor(task, profile, attempt) {
+    if (effectivePolicy(profile) !== 'probe' && POLICY_RANK[effectivePolicy(profile)] < POLICY_RANK.write) return null;
+    const prior = existingWorkspace(task);
+    if (prior) {
+      if (Boolean(prior.disposable) !== (effectivePolicy(profile) === 'probe')) throw new Error('workspace policy changed; submit a new scoped task');
+      workspaces.set(task, prior); return {...prior, attemptId: `${task}-${attempt}`};
     }
     const relative = path.relative(fs.realpathSync(session.cwd), fs.realpathSync(session.dir));
     const nested = relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
     const dir = nested ? path.join(os.tmpdir(), 'bounce-workspaces', session.id, task) : path.join(session.dir, 'tasks', task);
     fs.mkdirSync(dir, {recursive: true, mode: 0o700});
-    const workspace = createAttemptWorkspace({cwd: session.cwd, dir, owns: submittedRow(task)?.owns?.length ? submittedRow(task).owns : ['**'], attemptId: `${task}-${attempt}`});
+    const workspace = createAttemptWorkspace({cwd: session.cwd, dir, owns: submittedRow(task)?.owns?.length ? submittedRow(task).owns : ['**'], attemptId: `${task}-${attempt}`, disposable: effectivePolicy(profile) === 'probe'});
     workspaces.set(task, workspace);
-    append({kind: 'task.workspace', task, attempt, cwd: workspace.cwd, metadata: path.join(workspace.cwd, '.attempt-workspace.json'), baselineHash: workspace.baselineHash});
+    append({kind: 'task.workspace', task, attempt, purpose: workspace.disposable ? 'probe' : 'publish', cwd: workspace.cwd, metadata: path.join(workspace.cwd, '.attempt-workspace.json'), baselineHash: workspace.baselineHash});
     return workspace;
   }
   function artifactFor(task) {
@@ -520,6 +626,17 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       payload: {artifactId: artifact.id, file: row.file, dir: row.dir, continuation}},
     [{kind: 'task.integration.requested', task, artifactId: artifact.id, digest: artifact.digest, time: stamp()}]);
     return false;
+  }
+
+  // An owner's accept over an unconfident review gate closes the task the way a confident review does:
+  // the isolated work integrates into the checkout first and the accepted row lands after it, or the
+  // task blocks on the integration failure. Observed live: the row journaled directly left the task
+  // blocked and its fix unintegrated.
+  function acceptOverride(event) {
+    const row = {...event, stage: 'completion', context: event.context ?? submittedRow(event.task)?.context};
+    if (!publishArtifact(row.task, row)) return session.events.findLast(e => e.kind === 'task.integration.requested' && e.task === row.task);
+    append(row);
+    return session.events.findLast(e => e.kind === 'task.accepted' && e.task === row.task);
   }
 
   function maybeFallback(row) {
@@ -547,7 +664,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const maximumPolicy = POLICY_RANK[effectivePolicy(profiles[view[lineageRoot].profile])];
     const next = (profile.fallback ?? []).find(name => !tried.has(name) && profiles[name]
       && profiles[name].role !== 'orchestrator'
-      && POLICY_RANK[effectivePolicy(profiles[name])] <= maximumPolicy && !policyRefusal(profiles[name]));
+      && POLICY_RANK[effectivePolicy(profiles[name])] <= maximumPolicy && !policyRefusal(profiles[name])
+      && !missingCapabilities(profiles[name], submittedRow(row.task)?.requires).length);
     if (!next) {
       const reason = profile.fallback?.length ? 'no_compatible_profile' : 'no_profile_configured';
       append({kind: 'policy.fallback.skipped', task: row.task, reason, text: reason === 'no_profile_configured' ? 'No fallback profile configured' : 'No untried fallback profile satisfies the task policy', context: submittedRow(row.task)?.context});
@@ -561,6 +679,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       parent: original.parent, context: original.context, profile: next,
       orders: `${original.orders}\n\nRecovery from ${row.task}: ${row.reason}. ${row.text ?? ''}\nInspect existing work before continuing; do not repeat side effects blindly.\nLast progress: ${JSON.stringify(t.lastMilestone ?? null)}\nPartial report: ${JSON.stringify(session.events.findLast(event => event.kind === 'task.reported' && event.task === row.task) ?? null)}`,
       deadline: original.deadline,
+      ...(original.requires ? {requires: original.requires} : {}),
       ...(original.depends_on?.length ? {depends_on: original.depends_on} : {}),
       ...(original.review ? {review: original.review} : {}), ...(original.steps ? {steps: original.steps} : {}),
       ...(original.checkpoint ? {checkpoint: original.checkpoint} : {}), ...(original.risk ? {risk: original.risk} : {}),
@@ -595,14 +714,14 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     for (const [task, t] of Object.entries(reducers.tasks(session.events))) {
       if (t.state !== 'queued' || handles.has(task) || heldTasks.has(task) || routing.has(task)) continue;
       const row = submittedRow(task);
-      if (row) requestDispatch(row, session.events.findLast(e => TERMINAL_ROW_KINDS.has(e.kind))?.seq ?? 0);
+      if (row) requestDispatch(row, `reconcile:${session.nextSeq}`);
     }
   }
-  function wakeSlotWaiters() {
+  function wakeSlotWaiters(cause) {
     for (const task of [...slotWaiters]) {
       if (!reducers.tasks(session.events)[task] || reducers.tasks(session.events)[task].state !== 'queued') { slotWaiters.delete(task); continue; }
       const row = submittedRow(task);
-      if (row) requestDispatch(row, session.events.findLast(e => TERMINAL_ROW_KINDS.has(e.kind))?.seq ?? 0);
+      if (row) requestDispatch(row, cause);
     }
   }
   function reevaluateHeld() {
@@ -679,23 +798,30 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         if (closed) return;
         if (requireFinalReport && ['tool', 'assistant', 'progress'].includes(event.kind) && clock() - observedAt >= 5000) {
           observedAt = clock();
-          append({kind: 'task.observed', task, text: String(event.text ?? '').slice(0, 16000), from, context});
+          append({kind: 'task.observed', task, text: String(event.text ?? '').slice(0, 16000), source: event.kind, from, context});
         }
         switch (event.kind) {
-          case 'activity': publish({kind: 'task.activity', task, text: event.text, ...(typeof event.call === 'string' ? {call: event.call.slice(0, 300), change: event.change === true} : {}), from, context}); break;
-          case 'assistant': recordFindings(task, event.text, context); publish({kind: 'task.activity', task, text: event.text, from, context}); break;
-          case 'tool': case 'progress': publish({kind: 'task.activity', task, text: event.text, from, context}); break;
-          case 'error': publish({kind: 'task.activity', task, text: `error: ${event.text}`, from, context}); break;
-          case 'diagnostic': case 'status': publish({kind: 'task.activity', task, text: event.text, from, context}); break;
+          case 'activity': publish({kind: 'task.activity', task, text: event.text, source: event.kind, ...(typeof event.call === 'string' ? {call: event.call.slice(0, 300), change: event.change === true} : {}), from, context}); break;
+          case 'assistant': recordFindings(task, event.text, context); publish({kind: 'task.activity', task, text: event.text, source: event.kind, from, context}); break;
+          case 'tool': case 'progress': publish({kind: 'task.activity', task, text: event.text, source: event.kind, from, context}); break;
+          case 'error': publish({kind: 'task.activity', task, text: `error: ${event.text}`, source: event.kind, from, context}); break;
+          case 'status': publish({kind: 'task.activity', task, text: event.text, source: event.kind, from, context}); break;
           case 'delta': break; // streaming fragments; the assembled text arrives as 'assistant'
           case 'raw': append({kind: 'raw', raw: event.raw ?? null, provider: profile.adapter, task, from, context}); break;
           case 'model': append({kind: 'model', model: String(event.model), provider: profile.adapter, task, from, context}); break;
           case 'milestone': append({kind: 'task.milestone', task, text: event.text, evidence: event.evidence, from, context}); break;
-          case 'blocked': append({kind: 'task.blocked', task, text: event.text, from, context}); break;
+          case 'blocked': append({kind: 'task.blocked', task, reason: 'worker_blocked', text: event.text, from, context}); break;
+          case 'diagnostic': append({kind: 'task.diagnostic', task, text: String(event.text ?? '').slice(0, 2000), ...(event.reason ? {reason: event.reason} : {}), ...(event.phase ? {phase: event.phase} : {}), ...(event.toolsDisabled ? {toolsDisabled: true} : {}), from, context}); break;
           case 'usage': append({kind: 'task.usage', task, usage: event.usage, from, context}); break;
           case 'native': append({kind: 'peer.native', from, provider: event.provider, sessionId: event.sessionId, ...(event.cwd ? {cwd: event.cwd} : {}), context}); break;
           case 'jev': append({kind: `jev.${event.name}`, ...(event.data ?? {}), text: event.text, task, from, context}); break;
           case 'result':
+            if (handles.get(task)?.handle !== handle || reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) return;
+            const rawText = String(event.text ?? '');
+            const output = append({kind: 'task.output', task,
+              attempt: reducers.tasks(session.events)[task]?.attempt, status: event.status,
+              text: rawText, chars: rawText.length,
+              digest: createHash('sha256').update(rawText).digest('hex'), from, context});
             // A terminal provider row is not a licence to overlap writers: prove the process
             // has exited before publishing a lifecycle event that can release dependents or
             // create a fallback. An unverifiable process stays visibly blocked.
@@ -707,8 +833,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
               return;
             }
             if (handles.get(task)?.handle !== handle || reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) return;
-            append({kind: 'task.attempt.ended', task, attempt: reducers.tasks(session.events)[task]?.attempt, verifiedTermination: true, from, context});
-            if (owned) {
+            // A report-only timer that stopped this same attempt already settled it.
+            const endedAttempt = reducers.tasks(session.events)[task]?.attempt;
+            if (session.events.some(e => e.kind === 'task.attempt.ended' && e.task === task && e.attempt === endedAttempt)) return;
+            append({kind: 'task.attempt.ended', task, attempt: endedAttempt, verifiedTermination: true, from, context});
+            if (owned && !owned.disposable) {
               const artifact = captureArtifact(owned);
               append({kind: 'task.artifact', task, attempt: reducers.tasks(session.events)[task]?.attempt,
                 artifactId: artifact.id, digest: artifact.digest, resultHash: artifact.resultHash,
@@ -726,11 +855,18 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
                 // A local worker's answer IS its report: asking a small model to also drive a report
                 // protocol is the step it fails most, and the continuation that chased it never once
                 // succeeded. Only `completed` is inferred, and the row says it was.
-                const envelope = parseFinalReport(event.text);
-                if (envelope) {
+                const inspected = inspectFinalReport(event.text);
+                const envelope = inspected.diagnostic ? null : inspected.report;
+                if (inspected.diagnostic === 'report_incomplete') {
+                  append({kind: 'task.report.invalid', task, attempt, report: inspected.report, diagnostic: inspected.diagnostic, outputSeq: output.seq, from, context});
+                  append({kind: 'task.blocked', task, reason: 'report_incomplete', text: inspected.report.remaining, from, context});
+                } else if (envelope) {
                   append(reportEvent({task, attempt, report: envelope, from, context}));
                   finalizeReport({task, attempt, from, context});
-                } else await requestFinalReport({task, attempt, context, adapter});
+                } else {
+                  append({kind: 'task.report.invalid', task, attempt, report: inspected.report, diagnostic: inspected.diagnostic, outputSeq: output.seq, from, context});
+                  await requestFinalReport({task, attempt, context, adapter, diagnostic: inspected.diagnostic});
+                }
               }
             } else if (event.status === 'completed') append({kind: 'task.completed', task, summary: event.text, from, context});
             else {
@@ -743,6 +879,19 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
             return;
         }
       }
+      // A closed event stream cannot produce more progress. Settle it now instead of
+      // leaving a running task with no handle until the silence watchdog eventually fires.
+      if (closed || cancellationRequests.has(task) || handles.get(task)?.handle !== handle) return;
+      if (reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) return;
+      const stopped = await adapter.cancel(handle).catch(() => ({verified: false}));
+      if (closed || cancellationRequests.has(task) || handles.get(task)?.handle !== handle) return;
+      if (reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) return;
+      // A worker that already said it is blocked or needs input keeps that answer once its
+      // process is proven gone, exactly as a result with that outcome does.
+      if (stopped?.verified === true && ['blocked', 'input_required'].includes(reducers.tasks(session.events)[task]?.state)) return;
+      append(stopped?.verified === true
+        ? {kind: 'task.failed', task, reason: 'worker_runtime', text: 'Worker event stream ended without a terminal result', from, context}
+        : {kind: 'task.blocked', task, reason: 'termination_unverified', text: 'termination unverified', from, context});
     } catch (error) {
       // A broken adapter stream (or anything else unexpected past this point) must never
       // escape the subscriber as an unhandled rejection: it becomes this task's own failure.
@@ -752,20 +901,46 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       if (stopped?.verified === true) append({kind: 'task.failed', task, reason: 'error', text: error.message, from, context});
       else append({kind: 'task.blocked', task, text: 'termination unverified', from, context});
     } finally {
-      if (handles.get(task)?.handle === handle && reducers.tasks(session.events)[task]?.blocker !== 'termination unverified') handles.delete(task);
-      if (slotWaiters.size) queueMicrotask(wakeSlotWaiters); // a local slot may have freed: the handle is gone only now
+      if (reducers.tasks(session.events)[task]?.blocker !== 'termination unverified') dropHandle(task, handle, context);
     }
   }
 
-  async function requestFinalReport({task, attempt, context, adapter}) {
-    const previous = session.events.some(event => event.kind === 'task.report_requested' && event.task === task);
+  // The worker answered but its report cannot be repaired: the answer is the outcome to decide on, so the
+  // task blocks on it (quoted, with where to read it whole) rather than failing as if nothing came back.
+  function repairUnavailable(task, reason, context) {
+    const output = session.events.findLast(e => e.kind === 'task.output' && e.task === task && e.status === 'completed' && e.text?.trim());
+    const flat = output ? output.text.replace(/\s+/g, ' ').trim() : '';
+    const answer = output ? `The worker answered (${output.chars} chars, output seq ${output.seq}): "${flat.length > 240 ? `${flat.slice(0, 240)}…` : flat}". ` : '';
+    append({kind: 'task.blocked', task, reason: 'report_repair_unavailable', from: workerFrom(task), context,
+      text: `${answer}Its report could not be repaired: ${String(reason).replace(/\.$/, '')}. Read it with task_get full; accept it, resubmit it, or continue it on a cloud AI if the user agrees.`});
+  }
+
+  // Capacity release is distinct from task completion: blocked/input-required results also free a
+  // slot. Each release must get a fresh dispatch identity.
+  function dropHandle(task, handle, context) {
+    const entry = handles.get(task);
+    if (entry?.handle !== handle) return;
+    handles.delete(task);
+    if (!entry.local || closed) return;
+    const released = append({kind: 'task.slot.released', task,
+      attempt: reducers.tasks(session.events)[task]?.attempt, endpoint: entry.local, context});
+    if (slotWaiters.size) queueMicrotask(() => wakeSlotWaiters(released.seq));
+  }
+
+  async function requestFinalReport({task, attempt, context, adapter, diagnostic}) {
+    const jobId = submittedRow(task)?.jobId;
+    const previous = session.events.some(event => event.kind === 'task.report_requested' && (jobId ? event.jobId === jobId : event.task === task));
     const root = budgetRootOf(task, reducers.tasks(session.events));
     const remaining = reducers.budgets(session.events).roots[root]?.remaining?.starts;
     const deadline = deadlineAtFor(task);
     const native = session.events.findLast(event => event.kind === 'peer.native' && event.from === workerFrom(task));
-    if (!previous) append({kind: 'task.report_requested', task, attempt, text: 'Requesting the missing final report', context});
-    if (previous || !adapter.resume || !native || remaining === 0 || (deadline !== null && deadline <= clock())) {
-      append({kind: 'task.failed', task, reason: 'incomplete_report', text: previous ? 'Report-only continuation returned no final report' : 'Cannot request final report: no resumable session, start allowance or deadline remaining', context});
+    if (!previous) append({kind: 'task.report_requested', task, attempt, text: `Requesting a valid final report: ${diagnostic}`, diagnostic, context});
+    if (previous) {
+      append({kind: 'task.failed', task, reason: 'incomplete_report', text: `Final report validation failed after one repair: ${diagnostic}. Worker output is preserved; use task_get full.`, context});
+      return;
+    }
+    if (!adapter.resume || !native || remaining === 0 || (deadline !== null && deadline <= clock())) {
+      repairUnavailable(task, `${diagnostic}, and no resumable session, start allowance or deadline remains`, context);
       return;
     }
     append({kind: 'budget.reserved', task, root, amount: {starts: 1}, context});
@@ -807,16 +982,17 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // gets the role's prompt ahead of the orders instead, so the role means the same thing whoever
       // answers the dispatch.
       const roleLead = profile.agent?.prompt && profile.adapter !== 'opencode' ? `${profile.agent.prompt}\n\n---\n\n` : '';
-      // A local worker reports by answering, and is told so. Observed live: told to use `bounce report`,
-      // three local workers opened their reports with "the bounce API endpoint is not reachable" and
-      // had spent their turn on it. A cloud worker keeps the report protocol.
-      const canReport = reportEnv && !LOCAL_ADAPTERS.has(profile.adapter);
-      let workerOrders = canReport ? `${roleLead}${row.orders}\n\nTo report progress, ${reportInstruction(profile)} using your scoped report endpoint. Final reports require op:\"final\", outcome, summary, phase, text and next; do not publish task completion directly.`
+      // Prefer the acknowledged report endpoint, including OpenCode's dedicated MCP tool.
+      // Final-answer parsing remains a compatibility path for workers without a grant.
+      const canReport = Boolean(reportEnv);
+      let workerOrders = canReport ? `${roleLead}${row.orders}\n\n${reportContract(profile)}`
         : LOCAL_ADAPTERS.has(profile.adapter) ? `${roleLead}${row.orders}\n\n${LOCAL_REPORT_LINE}` : `${roleLead}${row.orders}`;
-      if (!campaignActive(task) && !await waitForCampaign(task)) return;
+      if (!campaignActive(task) && !await waitForCampaign(task)) { abandonLaunch(task, context); return; }
       owned = workspaceFor(task, profile, attempt);
+      if (owned?.disposable) profile = {...profile, probeSource: fs.realpathSync(session.cwd)};
+      else if (owned) profile = {...profile, writeFence: fs.realpathSync(session.cwd)};
       append({kind: 'task.launch.requested', task, attempt, executionKey: `${task}:${attempt}`, context});
-      handle = await adapter.launch({peer: workerFrom(task), profile, orders: workerOrders, cwd: owned?.cwd ?? session.cwd, dir,
+      handle = await adapter.launch({peer: workerFrom(task), profile, orders: owned?.disposable ? `${workerOrders}\n\n${probeOrders(owned)}` : owned ? inWorkingCopy(workerOrders, owned) : workerOrders, cwd: owned?.cwd ?? session.cwd, dir,
         task, attempt, context, signal: admission?.signal,
         onActivity: LOCAL_ADAPTERS.has(profile.adapter) ? localActivity(task, attempt, context) : undefined,
         report: requireFinalReport ? ({report: payload}) => report({task, attempt, context, report: payload}) : undefined});
@@ -825,8 +1001,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       const verified = admission ? admission.failed(error) : true;
       // The reservation this launch was going to consume never ran a process: release it (§4).
       append({kind: 'budget.released', task, root, amount: {starts: 1}, text: error.code ?? error.message, context});
-      const cancelled = launchingAttempts.get(task)?.cancelReason;
-      launchingAttempts.delete(task);
+      const cancelled = abandonLaunch(task, context, {verified})?.cancelReason;
       if (reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) return;
       if (cancelled) {
         append({kind: verified ? 'task.cancelled' : 'task.blocked', task, reason: verified ? cancelled : 'termination_unverified', text: verified ? 'Pending launch cancelled' : 'termination unverified after cancelled launch', from: workerFrom(task), context});
@@ -841,7 +1016,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : {})});
       const reason = launchingAttempts.get(task)?.cancelReason ?? 'user';
       launchingAttempts.delete(task);
-      await cancelOne(task, reducers.tasks(session.events), reason);
+      // Nothing consumes this handle's events, so its slot is given back here once it is stopped.
+      if (await cancelOne(task, reducers.tasks(session.events), reason)) dropHandle(task, handle, context);
       return;
     }
     handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : {})});
@@ -867,7 +1043,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
 
   async function resumeWorker({task, row, round, findings, context, reportOnly = false}) {
     if (!campaignActive(task) && !await waitForCampaign(task)) return;
-    if (!admitAttempt(task, context)) {
+    if (!admitAttempt(task, context, {reportOnly})) {
       append({kind: 'budget.released', task, root: budgetRootOf(task, reducers.tasks(session.events)), amount: reportOnly ? {starts: 1} : {rounds: 1}, text: 'attempt admission refused', context});
       return;
     }
@@ -880,21 +1056,26 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const nativeRow = session.events.filter(e => e.kind === 'peer.native' && e.from === workerFrom(task)).at(-1);
     const native = nativeRow ? {provider: nativeRow.provider, sessionId: nativeRow.sessionId, ...(nativeRow.cwd ? {cwd: nativeRow.cwd} : {})} : {};
     const pending = reportOnly ? [] : pendingMessages(task);
-    const message = reportOnly
-      ? `Return the missing final report now: ${reportInstruction(profile)}. Do not perform additional implementation. Include op:final, outcome, phase, text, next, summary, evidence and remaining. Report blockers honestly.`
+    const invalidReport = session.events.findLast(event => event.kind === 'task.report.invalid' && event.task === task);
+    let message = reportOnly
+      ? `Your previous report was rejected: ${invalidReport?.diagnostic ?? 'missing_report'}. Its complete output is retained by Bounce. Correct that exact format error. Return a structurally valid final report of the work actually performed: ${reportInstruction(profile)}. Do not perform additional implementation. Include op:final, outcome, phase, text, next, summary, evidence and remaining. Report blockers honestly. If required work remains, use outcome blocked and retain the remaining work; this formatting-only turn cannot complete it.`
       : [`Rework round ${round}:`, ...findings.map(f => `- ${f}`), ...pending.map(m => m.text)].join('\n');
     let adapter = adapters[profile.adapter];
     let admission;
     let handle, owned = null;
     try {
       if (LOCAL_ADAPTERS.has(profile.adapter) && profile.backend === 'lmstudio') {
-        admission = await admitLocal(profile, task, attempt, context);
+        admission = await admitLocal(profile, task, attempt, context, undefined, {waitOnPressure: reportOnly});
         ({profile, adapter} = admission);
       }
-      if (!campaignActive(task) && !await waitForCampaign(task)) return;
+      if (!campaignActive(task) && !await waitForCampaign(task)) { abandonLaunch(task, context); return; }
       owned = workspaceFor(task, profile, attempt);
+      if (owned?.disposable) profile = {...profile, probeSource: fs.realpathSync(session.cwd)};
+      else if (owned) profile = {...profile, writeFence: fs.realpathSync(session.cwd)};
       append({kind: 'task.launch.requested', task, attempt, executionKey: `${task}:${attempt}`, resumed: true, context});
-      handle = await adapter.resume({peer: workerFrom(task), profile, native, message: reportEnv && !LOCAL_ADAPTERS.has(profile.adapter) ? `${message}\n\nTo report, ${reportInstruction(profile)}; finals require outcome, summary, phase, text and next.` : LOCAL_ADAPTERS.has(profile.adapter) ? `${message}\n\n${LOCAL_REPORT_LINE}` : message, cwd: owned?.cwd ?? session.cwd, dir, checkpoint: row.checkpoint,
+      if (owned?.disposable) message = `${message}\n\n${probeOrders(owned)}`;
+      else if (owned) message = inWorkingCopy(message, owned);
+      handle = await adapter.resume({peer: workerFrom(task), profile, native, message: reportEnv ? `${message}\n\n${reportContract(profile)}` : LOCAL_ADAPTERS.has(profile.adapter) ? `${message}\n\n${LOCAL_REPORT_LINE}` : message, cwd: owned?.cwd ?? session.cwd, dir, checkpoint: row.checkpoint,
         task, attempt, context, signal: admission?.signal,
         onActivity: LOCAL_ADAPTERS.has(profile.adapter) ? localActivity(task, attempt, context) : undefined,
         report: requireFinalReport ? ({report: payload}) => report({task, attempt, context, report: payload}) : undefined});
@@ -905,8 +1086,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // resume) never ran a turn: release it (§4).
       const root = budgetRootOf(task, reducers.tasks(session.events));
       append({kind: 'budget.released', task, root, amount: reportOnly ? {starts: 1} : {rounds: 1}, text: error.message, context});
-      const cancelled = launchingAttempts.get(task)?.cancelReason;
-      launchingAttempts.delete(task);
+      const cancelled = abandonLaunch(task, context, {verified})?.cancelReason;
       if (reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) return;
       if (cancelled) {
         append({kind: verified ? 'task.cancelled' : 'task.blocked', task, reason: verified ? cancelled : 'termination_unverified', text: verified ? 'Pending resume cancelled' : 'termination unverified after cancelled resume', from: workerFrom(task), context});
@@ -915,7 +1095,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // A worker that cannot be RESUMED is classified exactly as one that cannot be launched, so the
       // task's next AI is tried. It used to be a bare `error`, which no fallback follows (found live:
       // a codex thread/resume timed out after a Jev rework and the session stopped).
-      append({kind: 'task.failed', task, ...(reportOnly ? {reason: 'incomplete_report', text: error.message} : startFailure(error)), from: workerFrom(task), context});
+      if (reportOnly) { repairUnavailable(task, error.message, context); return; }
+      append({kind: 'task.failed', task, ...startFailure(error), from: workerFrom(task), context});
       return;
     }
     // A resume that resolves is deemed to have delivered every message it folded in: journal
@@ -927,23 +1108,87 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : {})});
       const reason = launchingAttempts.get(task)?.cancelReason ?? 'user';
       launchingAttempts.delete(task);
-      await cancelOne(task, reducers.tasks(session.events), reason);
+      // Nothing consumes this handle's events, so its slot is given back here once it is stopped.
+      if (await cancelOne(task, reducers.tasks(session.events), reason)) dropHandle(task, handle, context);
       return;
     }
     handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : {})});
-    append({kind: 'task.started', task, attempt, resumed: true, requested: profile.model ?? '', from: workerFrom(task), context});
+    append({kind: 'task.started', task, attempt, resumed: true, ...(reportOnly ? {purpose: 'report'} : {}), requested: profile.model ?? '', from: workerFrom(task), context});
     for (const staged of launchingAttempts.get(task)?.reports ?? []) report({task, attempt, report: staged.payload, from: staged.from, context: staged.context});
     launchingAttempts.delete(task);
+    const attemptEnded = () => session.events.some(e => e.kind === 'task.attempt.ended' && e.task === task && e.attempt === attempt);
     const reportTimer = reportOnly ? setTimeout(async () => {
       if (handles.get(task)?.handle !== handle) return;
       const stopped = await adapter.cancel(handle).catch(() => ({verified: false}));
-      if (handles.get(task)?.handle !== handle) return;
-      append(stopped?.verified === true
-        ? {kind: 'task.failed', task, reason: 'incomplete_report', text: 'Final report request timed out', context}
-        : {kind: 'task.blocked', task, text: 'termination unverified', context});
-    }, Math.max(1, Math.min(REPORT_ONLY_WINDOW_MS, (deadlineAtFor(task) ?? (clock() + REPORT_ONLY_WINDOW_MS)) - clock()))) : null;
+      if (handles.get(task)?.handle !== handle || reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state) || attemptEnded()) return;
+      if (stopped?.verified !== true) { append({kind: 'task.blocked', task, text: 'termination unverified', context}); return; }
+      // A report acknowledged before the timer fired is the answer this turn was asked for; the
+      // attempt ends first, so no later report from it can be accepted.
+      append({kind: 'task.attempt.ended', task, attempt, verifiedTermination: true, from: workerFrom(task), context});
+      if (finalizeReport({task, attempt, from: workerFrom(task), context})) return;
+      append({kind: 'task.failed', task, reason: 'incomplete_report', text: 'Final report request timed out; original worker output is preserved; use task_get full.', context});
+    }, Math.max(1, Math.min(watchdogConfig.reportOnly, (deadlineAtFor(task) ?? (clock() + watchdogConfig.reportOnly)) - clock()))) : null;
     try { await consumeWorkerEvents({adapter, handle, task, context, profile, owned}); }
     finally { clearTimeout(reportTimer); }
+  }
+
+  // T3c: a message answering a worker's OWN blocked/input-required state — it asked a question or
+  // reported unfinished work — resumes that same worker instead of sitting queued forever (the only
+  // thing that ever folded a queued message in before this was a REVIEW-triggered rework round).
+  // Never a review gate (REVIEW_GATE_REASONS / applyEscalate's intent.reason), never an infra/
+  // termination signal, ownership/integration failure, or report-repair dead end: those still need a
+  // human decision on the review/verdict, not the worker resumed with a reply. `report_incomplete` is
+  // included: the worker's own claim that work remains is exactly the shape a message answers.
+  const RESUMABLE_BLOCK_REASONS = new Set(['worker_blocked', 'report_incomplete']);
+  function ownBlockResumable(task) {
+    const t = reducers.tasks(session.events)[task];
+    if (!t) return false;
+    if (t.state === 'input_required') return true; // only ever worker-authored (no other kind of row uses it)
+    if (t.state !== 'blocked') return false;
+    return RESUMABLE_BLOCK_REASONS.has(session.events.findLast(e => e.kind === 'task.blocked' && e.task === task)?.reason);
+  }
+
+  // Why the worker couldn't be resumed, for the orchestrator: the message itself is already
+  // visible as `task.delivered` tier 'queued' — this is the part that would otherwise be silent.
+  function blockedResumeUnavailable(task, reason, context) {
+    append({kind: 'policy.escalated', task, reason: 'blocked_message_unresumable', context,
+      text: `A message answering task ${task}'s blocked/input-required state could not resume its worker (${reason}); the message stays queued until a rework round or resubmission.`});
+  }
+
+  // One resume per blocked task, ever in flight: `resumingBlocked` is claimed synchronously, before
+  // this function's first await, so a second message processed in the very next microtask (see the
+  // `message` subscriber below) always observes the claim and does nothing — never a second resume.
+  // The claiming call defers its own read of `deliveryTails` behind a microtask (queueMicrotask in
+  // the subscriber) so that every message appended in the same synchronous burst has already been
+  // enqueued for delivery — and thus is included in whichever delivery tail we end up awaiting —
+  // before we read it: two messages back to back fold into the one resume this function makes.
+  const resumingBlocked = new Set();
+  async function resumeOnMessage(task, context) {
+    if (handles.has(task) || resumingBlocked.has(task) || !ownBlockResumable(task)) return;
+    resumingBlocked.add(task);
+    try {
+      await deliveryTails.get(task); // wait out every delivery already enqueued for this task
+      if (!ownBlockResumable(task)) return; // settled (or already resumed) while we waited
+      const row = submittedRow(task);
+      if (!row) return;
+      const native = session.events.findLast(e => e.kind === 'peer.native' && e.from === workerFrom(task));
+      const adapter = adapters[(resolvedLocalProfiles.get(task) ?? profiles[row.profile])?.adapter];
+      const deadline = deadlineAtFor(task);
+      if (!adapter?.resume || !native) { blockedResumeUnavailable(task, 'no resumable native session', context); return; }
+      if (deadline !== null && deadline <= clock()) { blockedResumeUnavailable(task, 'task deadline has passed', context); return; }
+      if (!(api.roundsUsed(task) < api.roundsCap(task))) { blockedResumeUnavailable(task, 'no round budget remains', context); return; }
+      // Same reservation a rework round makes (§ applyVerdictIntent): this IS a rework round in
+      // substance — another turn on the same worker, admitted the same way (admitAttempt inside
+      // resumeWorker, admitLocal for a local backend) — just triggered by a message instead of a
+      // review verdict. `starts`/report-repair's budget does not fit: nothing here is a fresh
+      // attempt or a formatting-only retry of an already-rejected final report.
+      const root = budgetRootOf(task, reducers.tasks(session.events));
+      const round = api.roundsUsed(task) + 1;
+      append({kind: 'budget.reserved', task, root, amount: {rounds: 1}, context});
+      await resumeWorker({task, row, round, findings: [], context});
+    } finally {
+      resumingBlocked.delete(task);
+    }
   }
 
   // A review worker: read-only, never journals task.activity's siblings as anything but
@@ -954,33 +1199,47 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // the same way a broken worker stream does — unreadable, handle cancelled, never left open.
   async function runReview({task, stage, round, profileName, profile, orders, dir, context, peer = reviewFrom(task), review = {stage, round, orders}}) {
     if (!campaignActive(task) && !await waitForCampaign(task)) return {verdict: 'unreadable', cancelled: true};
-    append({kind: 'review.started', task, stage, round, profile: profileName, from: peer, context});
+    append({kind: 'review.started', task, stage, round, profile: profileName, candidateSeq: review.candidateSeq ?? null, candidateDigest: review.candidateDigest ?? null, from: peer, context});
     let adapter = adapters[profile.adapter];
     let admission;
     const launchState = {task, pending: true, requestedAt: clock()};
     reviews.set(peer, launchState);
     let handle, owned = null;
     try {
-      if (LOCAL_ADAPTERS.has(profile.adapter) && profile.backend === 'lmstudio') {
+      if (LOCAL_ADAPTERS.has(profile.adapter)) {
         reviews.set(peer, launchState);
         admission = await admitLocal(profile, task, round, context, launchState);
         ({profile, adapter} = admission);
       }
-      if (!campaignActive(task) && !await waitForCampaign(task)) return {verdict: 'unreadable', cancelled: true};
+      if (!campaignActive(task) && !await waitForCampaign(task)) {
+        releaseReview(peer, launchState, context);
+        return {verdict: 'unreadable', cancelled: true};
+      }
       const captured = artifactFor(task);
-      const reviewState = captured ? {orders: review.orders, report: review.report, diff: captured.artifact.diff, files: captured.artifact.files, baseHead: captured.artifact.baselineHash} : null;
-      handle = await adapter.launch({peer, profile, orders, cwd: captured?.row.cwd ?? session.cwd, dir, task, attempt: round, context, signal: admission?.signal, review, reviewState});
-      if (closed) { await adapter.cancel(handle); return {verdict: 'unreadable', cancelled: true}; }
+      const workerProfile = profiles[submittedRow(task)?.profile];
+      const reportOnly = stage === 'completion' && workerProfile && POLICY_RANK[effectivePolicy(workerProfile)] < POLICY_RANK.write;
+      const reviewState = captured ? {orders: review.orders, report: review.report, diff: captured.artifact.diff, files: captured.artifact.files, baseHead: captured.artifact.baselineHash}
+        : reportOnly ? {kind: 'report', orders: review.orders, report: review.report, diff: '', files: [], baseHead: null} : null;
+      if (effectivePolicy(profile) === 'probe') {
+        const source = captured?.row.cwd ?? session.cwd;
+        const probeDir = path.join(os.tmpdir(), 'bounce-review-workspaces', session.id, task);
+        fs.mkdirSync(probeDir, {recursive: true, mode: 0o700});
+        owned = createAttemptWorkspace({cwd: source, dir: probeDir, owns: ['**'], attemptId: `review-${stage}-${round}`, disposable: true});
+        profile = {...profile, probeSource: fs.realpathSync(source)};
+        orders = `${orders}\n\n${probeOrders(owned)}`;
+      }
+      handle = await adapter.launch({peer, profile, orders, cwd: owned?.cwd ?? captured?.row.cwd ?? session.cwd, dir, task, attempt: round, context, signal: admission?.signal, review, reviewState});
+      if (closed) { await adapter.cancel(handle); releaseReview(peer, launchState, context); return {verdict: 'unreadable', cancelled: true}; }
       if (launchState.cancelReason) {
         const stopped = await adapter.cancel(handle);
-        if (stopped?.verified === true) reviews.delete(peer);
-        else reviews.set(peer, {adapter, handle, task});
+        if (stopped?.verified === true) releaseReview(peer, launchState, context);
+        else reviews.set(peer, {adapter, handle, task, local: launchState.local, model: launchState.model});
         append({kind: stopped?.verified === true ? 'task.cancelled' : 'task.blocked', task, reason: stopped?.verified === true ? launchState.cancelReason : 'termination_unverified', text: 'Pending review cancelled', from: peer, context});
         return {verdict: 'unreadable', cancelled: true};
       }
     } catch (error) {
       const verified = admission ? admission.failed(error) : true;
-      if (reviews.get(peer) === launchState) reviews.delete(peer);
+      releaseReview(peer, launchState, context);
       if (launchState.cancelReason) {
         append({kind: verified ? 'task.cancelled' : 'task.blocked', task, reason: verified ? launchState.cancelReason : 'termination_unverified', text: verified ? 'Pending review cancelled' : 'termination unverified after cancelled review', from: peer, context});
         return {verdict: 'unreadable', cancelled: true, launchFailed: true};
@@ -993,7 +1252,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // Keyed by peer (not task): the CORE runs multi-reviewer rounds one reviewer at a time
     // (CONTRACT §5), so at most one entry per task ever exists at once — for the single-
     // reviewer default this key IS `review:${task}`, byte-identical to before Phase 8.
-    const reviewEntry = {adapter, handle, task};
+    const reviewEntry = {adapter, handle, task, local: launchState.local, model: launchState.model};
     reviews.set(peer, reviewEntry);
     let resultStatus = null, resultText = null, streamError = null;
     try {
@@ -1024,10 +1283,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       append({kind: 'task.blocked', task, reason: 'termination_unverified', text: 'termination unverified', from: peer, context});
       return {verdict: 'unreadable', cancelled: true};
     }
-    reviews.delete(peer);
+    releaseReview(peer, reviewEntry, context);
     const verdict = streamError ? {verdict: 'unreadable'} : parseVerdict(resultStatus, resultText);
     if (streamError) resultText = streamError.message;
-    append({kind: 'review.finished', task, stage, round, verdict: verdict.verdict, text: resultText ?? null, from: peer, context});
+    append({kind: 'review.finished', task, stage, round, candidateSeq: review.candidateSeq ?? null, candidateDigest: review.candidateDigest ?? null, verdict: verdict.verdict, text: resultText ?? null, from: peer, context});
     return verdict;
   }
 
@@ -1055,7 +1314,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // verdict — what the repeated-findings rule compares and names.
     lastRework: id => session.events.findLast(e => e.kind === 'task.rework' && e.task === id) ?? null,
     // Whether this task's review has already been asked again for a readable verdict (once is the cap).
-    reAsked: id => session.events.some(e => e.kind === 'review.reasked' && e.task === id),
+    reAsked: id => {
+      const candidate = candidateResult(session.events, id);
+      return session.events.some(e => e.kind === 'review.reasked' && e.task === id && (!e.candidateSeq || e.candidateSeq === candidate?.seq));
+    },
     lastFired: id => session.events.findLast(e => e.kind === 'jev.verdict' && e.task === id)?.fired ?? null,
     roundsCap: id => {
       const root = budgetRootOf(id, reducers.tasks(session.events));
@@ -1089,7 +1351,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (intent.findings !== undefined) row.findings = intent.findings;
     append(row);
     const blockedText = intent.text ?? (intent.reason === 'rounds' ? 'rounds exhausted' : `${intent.reason} escalated`);
-    append({kind: 'task.blocked', task, text: blockedText, context});
+    const candidate = candidateResult(session.events, task);
+    if (REVIEW_GATE_REASONS.has(intent.reason) && candidate) append({kind: 'review.blocked', task, stage: 'completion', reason: intent.reason,
+      candidateSeq: candidate.seq, candidateDigest: candidate.digest, text: blockedText, context});
+    append({kind: 'task.blocked', task, reason: intent.reason, text: blockedText, context});
   }
 
   // Runs a strategy hook and turns a throw into the fixed invariant every hook shares
@@ -1117,6 +1382,20 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     for (let i = 0; i < reviewers.length; i++) {
       const profileName = reviewers[i];
       const reviewProfile = profiles[profileName];
+      const candidate = candidateResult(session.events, task);
+      const peer = reviewers.length === 1 ? reviewFrom(task) : `${reviewFrom(task)}:${i}`;
+      const retryBoundary = session.events.findLast(e => e.task === task && e.kind === 'review.reasked'
+        && e.stage === stage && e.candidateSeq === candidate?.seq)?.seq ?? 0;
+      // A completed review is durable work too. Reuse only this candidate's current review
+      // cycle and this reviewer slot; a retry marker invalidates the preceding verdict.
+      const recovered = stage === 'completion' && candidate && session.events.findLast(e =>
+        e.kind === 'review.finished' && e.task === task && e.stage === stage && e.from === peer
+        && e.seq > retryBoundary && e.candidateSeq === candidate.seq && e.candidateDigest === candidate.digest);
+      if (recovered) {
+        const verdict = parseVerdict('completed', recovered.text);
+        verdicts.push(verdict.verdict === recovered.verdict ? verdict : {verdict: recovered.verdict});
+        continue;
+      }
       // A review profile is a profile too (CONTRACT.md §3): the same shared check runs before
       // its launch. The first reviewer's refusal handling differs by stage (matches pre-Phase-8
       // behavior exactly): prelaunch (`reserveFirst: false`) releases its already-made shared
@@ -1164,7 +1443,6 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       const single = reviewers.length === 1;
       const dir = path.join(session.dir, 'tasks', task, single ? `review-${stage}-${round}` : `review-${stage}-${round}-${i}`);
       fs.mkdirSync(dir, {recursive: true, mode: 0o700});
-      const peer = single ? reviewFrom(task) : `${reviewFrom(task)}:${i}`;
       const orders = stage === 'completion'
         ? (reviewProfile.role === 'verifier' ? row.steps : `${row.orders}\n\n--- worker report ---\n${reducers.tasks(session.events)[task]?.summary ?? ''}`)
         : row.orders;
@@ -1172,8 +1450,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // report and the tree's HEAD when the lineage's first worker started — the diff base.
       const reported = session.events.findLast(e => e.kind === 'task.reported' && e.task === task);
       const lineageRoot = lineageRootOf(task, reducers.tasks(session.events));
-      const review = {stage, round, orders: row.orders, summary: reducers.tasks(session.events)[task]?.summary ?? null,
-        report: reported ? {summary: reported.summary, text: reported.text, evidence: reported.evidence, remaining: reported.remaining, phase: reported.phase} : null,
+      const review = {stage, round, candidateSeq: candidate?.seq ?? null, candidateDigest: candidate?.digest ?? null, orders: row.orders, summary: reducers.tasks(session.events)[task]?.summary ?? null,
+        report: reported ? {summary: reported.summary, text: reported.text, next: reported.next, outcome: reported.outcome, evidence: reported.evidence, remaining: reported.remaining, phase: reported.phase} : null,
         head: session.events.find(e => e.kind === 'task.started' && e.task === lineageRoot)?.head ?? null};
       const verdict = await runReview({task, stage, round, profileName, profile: reviewProfile, orders: note ? `${orders}\n\n${note}` : orders, dir, context, peer, review: note ? {...review, note} : review});
       if (verdict.launchFailed && !exempt) append({kind: 'budget.released', task, root, amount: {starts: 1}, text: 'review launch failed', context});
@@ -1194,7 +1472,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (intent.action === 'escalate') { applyEscalate(task, intent, context); return; }
     // One more ask for a verdict bounce can read; `review.reasked` on record is what caps it at one.
     if (intent.action === 'rereview') {
-      append({kind: 'review.reasked', task, stage, round, text: intent.text ?? '', context});
+      append({kind: 'review.reasked', task, stage, round, candidateSeq: candidateResult(session.events, task)?.seq ?? null, reason: intent.reason, text: intent.text ?? '', context});
       await runCompletionReview(task, reviewIntent, {note: intent.text ?? ''});
       return;
     }
@@ -1240,11 +1518,13 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       return;
     }
 
+    const candidate = candidateResult(session.events, task);
     const verdicts = await runReviewers({task, stage: 'completion', round, reviewers, row, context, root, reserveFirst: true, note});
     if (!verdicts) return;
     // Same guard as the prelaunch path: a review that finishes after the task left `reviewing`
     // for an unrelated reason journals its verdict but drives no accept/reject/rework (A3).
-    if (reducers.tasks(session.events)[task]?.state !== 'reviewing') return;
+    if (closed || reducers.tasks(session.events)[task]?.state !== 'reviewing') return;
+    if (candidate && (candidateResult(session.events, task)?.digest !== candidate.digest || candidateResult(session.events, task)?.seq !== candidate.seq)) return;
 
     const hook = invokeHook(() => strategy.onReviewVerdict(task, verdicts, reducers.tasks(session.events), api), task, context);
     if (!hook.ok) return;
@@ -1255,7 +1535,18 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     await applyVerdictIntent(hook.intent, {task, stage: 'completion', row, round, context, root, reviewIntent});
   }
 
+  // One dispatch per task at a time. The handle/launch/review guard below is only set after the
+  // first await (a checkpoint re-check, a campaign wait, a cloud review launch); after a restart the
+  // retried action and reconcile's own request both reach that window and would launch twice.
+  const dispatching = new Set();
   async function dispatch(row) {
+    if (dispatching.has(row.task)) return;
+    dispatching.add(row.task);
+    try { return await dispatchOnce(row); }
+    finally { dispatching.delete(row.task); }
+  }
+
+  async function dispatchOnce(row) {
     if (closed) return;
     if (row.campaignId && campaigns(session.events)[row.campaignId]?.state !== 'active') { heldTasks.add(row.task); return; }
     const {task, parent, context} = row;
@@ -1279,7 +1570,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     }
     // The same job, failed the same way this many times, is a loop: bounce stops rather than running it
     // again, and says what to change. Found live: ten identical reviewer tasks, each killed at the ceiling.
-    const jobStarts = session.events.filter(e => e.kind === 'task.started' && e.jobId === row.jobId);
+    const jobStarts = session.events.filter(e => e.kind === 'task.started' && e.purpose !== 'report' && e.jobId === row.jobId);
     if (row.jobId && jobStarts.length >= (suppliedLimits.attempts ?? 3)) {
       append({kind: 'task.failed', task, reason: 'attempts_exhausted', text: 'Logical job attempt allowance exhausted', context}); return;
     }
@@ -1301,7 +1592,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // Say what happened, not just which rule fired: this row is all the rail shows, and a task that was
       // refused in the same second it was submitted otherwise reads as one queued forever.
       append({kind: 'task.failed', task, reason: 'depth', context,
-        text: `delegation under ${String(parent).slice(0, 8)} exceeds depth cap ${depthCap}; use retryOf for a continuation of existing work`});
+        // A retry inherits its predecessor's parent, so retrying this refused task is refused again
+        // (observed live, 3c7e7d25 seq 948); what continues the work is a retry of the parent's job.
+        text: `delegation under ${String(parent).slice(0, 8)} exceeds depth cap ${depthCap}; continue the work with retryOf ${parent} (its job, at an allowed depth), or submit it as a new root task (parent null, no retryOf)`});
       return;
     }
     // `profile: "auto"`: route before anything reads the profile. Jev picks (when enabled for
@@ -1350,6 +1643,12 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const profile = profiles[row.profile];
     if (!profile) {
       append({kind: 'task.failed', task, reason: 'error', text: `malformed: profile`, context});
+      return;
+    }
+    const capabilityProblem = validateRequirements(row.requires);
+    const missing = capabilityProblem ? [] : missingCapabilities(profile, row.requires);
+    if (capabilityProblem || missing.length) {
+      append({kind: 'task.failed', task, reason: 'capability_mismatch', text: capabilityProblem ?? `Required capabilities unavailable: ${missing.join(', ')}`, context});
       return;
     }
     if (Object.values(view).some(t => t.state === 'blocked' && session.events.findLast(e => e.task === t.id && e.kind === 'task.blocked')?.reason === 'orphaned')
@@ -1751,6 +2050,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
           return;
         }
         if (!session.events.some(e => e.kind === 'task.integrated' && e.task === action.task && e.artifactId === artifactId)) append({kind: 'task.integrated', task: action.task, artifactId, resultHash: artifact.resultHash});
+        // A follow-up (retryOf) reusing this same workspace diffs against what's now in the
+        // checkout, not the pre-integration copy it started from — see advanceBaseline.
+        const workspace = existingWorkspace(action.task);
+        if (workspace && !workspace.disposable) workspaces.set(action.task, advanceBaseline(workspace, artifact));
         append(continuation);
       } catch (error) {
         append({kind: 'task.blocked', task: action.task, reason: 'integration_interrupted', text: `Artifact integration interrupted: ${error.message}; durable manifest retained for restart recovery`});
@@ -1769,10 +2072,17 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       const row = session.events.find(e => e.kind === 'plan.submitted' && e.plan === action.payload.plan);
       if (!row || session.events.some(e => ['plan.accepted', 'plan.rejected', 'plan.unavailable'].includes(e.kind) && e.plan === row.plan)) return;
       if (!campaignActive(null, row.campaignId) && !await waitForCampaign(null, row.campaignId)) return;
+      const capabilityFindings = (row.chunks ?? []).flatMap(chunk => {
+        const required = requireFinalReport && row.from === 'orchestrator' && chunk.requires === undefined
+          ? 'declare requires for this chunk' : validateRequirements(chunk.requires);
+        const missing = !required && profiles[chunk.profile] ? missingCapabilities(profiles[chunk.profile], chunk.requires) : [];
+        return required || missing.length ? [{chunk: chunk.id, check: 'capabilities', confidence: 1,
+          fix: required ?? `Profile ${chunk.profile} lacks ${missing.join(', ')}; split source analysis from command verification`}] : [];
+      });
       const result = await supervisePlan({events: session.events, plan: row.plan, now: clock,
         startupMs: watchdogConfig.startupMs, signal: planController.signal,
         append: event => append({...event, planId: row.plan, phase: row.phase, campaignId: row.campaignId, context: row.context}),
-        run: ({signal}) => jev?.plan ? jev.plan({plan: row, ceilingMinutes: ceilingMs / 60000, signal})
+        run: ({signal}) => capabilityFindings.length ? {verdict: 'reject', findings: capabilityFindings} : jev?.plan ? jev.plan({plan: row, ceilingMinutes: ceilingMs / 60000, signal})
           : judgePlan({plan: row, settings: {enabled: false}, ceilingMinutes: ceilingMs / 60000, signal})});
       if (result.status !== 'decision' || closed) return;
       const decision = result.decision ?? {verdict: 'unavailable', reason: 'empty_decision'};
@@ -1829,7 +2139,13 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     else if (['task.failed', 'task.cancelled', 'task.deadline', 'task.accepted', 'task.rejected'].includes(row.kind)) requestTerminal(row);
     // Messages to `user`/`orchestrator`/anyone else — and a malformed empty worker
     // address — are not this subscriber's business.
-    else if (row.kind === 'message' && typeof row.to === 'string' && /^(worker|review):.+/.test(row.to)) enqueueDelivery(row.to.slice(row.to.indexOf(':') + 1), row);
+    else if (row.kind === 'message' && typeof row.to === 'string' && /^(worker|review):.+/.test(row.to)) {
+      const target = row.to.slice(row.to.indexOf(':') + 1);
+      enqueueDelivery(target, row);
+      // Deferred a microtask (see resumeOnMessage): lets every message appended in this same
+      // synchronous burst enqueue its own delivery first.
+      if (row.to.startsWith('worker:')) queueMicrotask(() => resumeOnMessage(target, row.context));
+    }
     // task.activity is a LIVE_KIND (never journaled): the only way the watchdog ever learns
     // about it is right here, off the same subscriber every other peer-published row reaches.
     // An integer `expect` declares a bounded slow step; §2 caps it at the task's own deadline
@@ -1939,11 +2255,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return entry.stopping ??= Promise.resolve().then(() => entry.adapter.cancel(entry.handle)).catch(() => ({verified: false}));
   }
 
-  function admitAttempt(task, context) {
+  function admitAttempt(task, context, {reportOnly = false} = {}) {
     const submitted = submittedRow(task);
     const jobId = submitted?.jobId;
-    const starts = session.events.filter(e => e.kind === 'task.started' && (jobId ? submittedRow(e.task)?.jobId === jobId : e.task === task));
-    if (starts.length >= (limits.attempts ?? 3)) {
+    const starts = session.events.filter(e => e.kind === 'task.started' && e.purpose !== 'report' && (jobId ? submittedRow(e.task)?.jobId === jobId : e.task === task));
+    if (!reportOnly && starts.length >= (limits.attempts ?? 3)) {
       append({kind: 'task.failed', task, reason: 'attempts_exhausted', text: 'Logical job attempt allowance exhausted; retain progress and request a scope decision', context});
       return false;
     }
@@ -2003,12 +2319,12 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     validate: spec => validate(spec, reducers.tasks(session.events)),
     // The submit decoration the bus applies before journaling a peer's task.submitted (Jev review).
     prepare,
-    submit, report, cancel, stop, tick, reconcile,
+    submit, report, acceptOverride, cancel, stop, tick, reconcile,
     tasks: () => reducers.tasks(session.events),
     budgets: () => reducers.budgets(session.events),
     spend: () => reducers.spend(session.events),
     // Test-only observable for the live activity map's size (F2/A5) — never used by production code.
     _activitySize: () => activity.size,
-    close: () => { closed = true; planController.abort(); for (const wake of [...campaignWaiters]) wake(); effects.close(); unsubscribe(); if (watchdogInterval) clearInterval(watchdogInterval); },
+    close: () => { closed = true; planController.abort(); for (const entry of [...launchingAttempts.values(), ...reviews.values()]) entry.localController?.abort(); for (const wake of [...campaignWaiters]) wake(); effects.close(); unsubscribe(); if (watchdogInterval) clearInterval(watchdogInterval); },
   };
 }

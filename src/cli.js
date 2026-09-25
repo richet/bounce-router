@@ -172,7 +172,7 @@ async function main() {
     const machine = readMachine();
     const fleet = await discoverLocalModels(settings.local, {maxAge: 0}).catch(() => []);
     if (values.json) return console.log(JSON.stringify({machine, fleet}, null, 2));
-    return console.log(resourceReport({machine, fleet, busy: [], swapping: false}));
+    return console.log(resourceReport({machine, fleet, busy: []}));
   }
   if (positionals[0] === 'quota') {
     const store = await refreshQuota(settings, {root, cwd});

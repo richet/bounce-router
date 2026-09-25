@@ -22,7 +22,7 @@ const isLoopback = url => ['127.0.0.1', '::1', '[::1]', 'localhost'].includes(ur
 
 function endpointConfig(id, input) {
   if (!endpointIdPattern.test(id) || !isObject(input)) throw error(`Invalid local endpoint ${id}`);
-  const fields = new Set(['backend', 'url', 'apiKeyEnv', 'trusted', 'loadPolicy', 'maxConcurrent', 'contextTokens', 'slotsPerModel']);
+  const fields = new Set(['backend', 'url', 'apiKeyEnv', 'trusted', 'loadPolicy', 'maxConcurrent', 'contextTokens', 'slotsPerModel', 'reserveGb', 'waitMinutes', 'pollMs']);
   if (Object.keys(input).some(field => !fields.has(field))) throw error(`Endpoint ${id} has unsupported settings`);
   if (input.backend !== 'lmstudio') throw error(`Endpoint ${id} must use backend lmstudio`);
   if (Object.hasOwn(input, 'apiKey')) throw error(`Endpoint ${id} must use apiKeyEnv, not apiKey`);

@@ -4,7 +4,7 @@
 // machine: the reads are injected, so the numbers cannot drift under the assertions.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {parseVmStat, parseSwapUsage, readMachine, swapping, residentModels, sizeOf, fitLocal, createResources, gb, DEFAULT_RESERVE_BYTES} from '../src/resources.js';
+import {parseVmStat, parseSwapUsage, readMachine, underPressure, residentModels, sizeOf, fitLocal, createResources, gb, DEFAULT_RESERVE_BYTES} from '../src/resources.js';
 
 const VM_STAT = `Mach Virtual Memory Statistics: (page size of 16384 bytes)
 Pages free:                                1544971.
@@ -25,15 +25,16 @@ const run = (over = {}) => (cmd, args) => {
   if (cmd === 'sysctl' && args[1] === 'hw.memsize') return String(128 * GB);
   if (cmd === 'sysctl' && args[1] === 'vm.swapusage') return over.swap ?? SWAP;
   if (cmd === 'sysctl' && args[1] === 'iogpu.wired_limit_mb') { if (over.noCap) throw new Error('unknown oid'); return '92000'; }
+  if (cmd === 'sysctl' && args[1] === 'kern.memorystatus_vm_pressure_level') { if (over.noPressure) throw new Error('unknown oid'); return `${over.pressure ?? 1}\n`; }
   throw new Error(`unexpected ${cmd} ${args?.join(' ')}`);
 };
 
 test('R1 the machine is read, never guessed: page size from vm_stat, available = free + inactive + purgeable', () => {
-  assert.deepEqual(parseVmStat(VM_STAT), {pageSize: 16384, available: (1544971 + 2732464 + 42450) * 16384, wired: 388904 * 16384, swapouts: 23085999});
+  assert.deepEqual(parseVmStat(VM_STAT), {pageSize: 16384, available: (1544971 + 2732464 + 42450) * 16384, wired: 388904 * 16384});
   assert.equal(parseVmStat('nonsense'), null);
   assert.deepEqual(parseSwapUsage(SWAP), {used: 8505.88 * 1024 ** 2});
   const m = readMachine({run: run()});
-  assert.deepEqual([m.known, m.ramTotal, m.wiredLimit, m.swapouts], [true, 128 * GB, 92000 * 1024 ** 2, 23085999]);
+  assert.deepEqual([m.known, m.ramTotal, m.wiredLimit, m.pressure], [true, 128 * GB, 92000 * 1024 ** 2, 1]);
   assert.equal(gb(m.available), '65.9 GB');
   // no GPU cap on this machine: the total is the cap, and nothing throws
   assert.equal(readMachine({run: run({noCap: true})}).wiredLimit, 128 * GB);
@@ -42,12 +43,13 @@ test('R1 the machine is read, never guessed: page size from vm_stat, available =
   assert.equal(fitLocal({sizeBytes: 999 * GB, machine: {known: false}}).ok, true, 'unknown never blocks');
 });
 
-test('R2 swapping is a rising swapout counter, not a level: 8.5 GB already swapped is not pressure', () => {
-  const a = {known: true, swapouts: 100}, b = {known: true, swapouts: 100}, c = {known: true, swapouts: 101};
-  assert.equal(swapping(a, b), false);
-  assert.equal(swapping(a, c), true);
-  assert.equal(swapping(null, c), false);
-  assert.equal(swapping({known: true, swapouts: null}, c), false);
+test('R2 memory pressure is macOS\'s own verdict: warning or critical, never swap in use or a swapout counter', () => {
+  assert.equal(underPressure(readMachine({run: run()})), false, '8.3 GB already swapped at normal pressure is not pressure');
+  assert.equal(underPressure(readMachine({run: run({pressure: 2})})), true, 'warning');
+  assert.equal(underPressure(readMachine({run: run({pressure: 4})})), true, 'critical');
+  // a level bounce cannot read has no opinion
+  assert.deepEqual([readMachine({run: run({noPressure: true})}).pressure, underPressure(readMachine({run: run({noPressure: true})}))], [null, false]);
+  assert.equal(underPressure({known: false}), false);
 });
 
 test('R3 what is resident, what it costs, and what is idle', () => {
@@ -79,16 +81,16 @@ test('R4 the fit rule: greedy on what is free, a reserve beside the weights, idl
   assert.equal(DEFAULT_RESERVE_BYTES, 8 * GB);
 });
 
-test('R5 the reader caches briefly and compares consecutive reads for swapping', () => {
-  let now = 0, swapouts = 100;
-  const resources = createResources({clock: () => now, ttlMs: 3000, run: (cmd, args) => cmd === 'vm_stat' ? VM_STAT.replace('23085999', String(swapouts)) : run()(cmd, args)});
+test('R5 the reader caches briefly; pressure is judged on the latest read', () => {
+  let now = 0, pressure = 1;
+  const resources = createResources({clock: () => now, ttlMs: 3000, run: (cmd, args) => run({pressure})(cmd, args)});
   const first = resources.read();
-  swapouts = 200;
+  pressure = 4;
   assert.equal(resources.read(), first, 'inside the ttl the same read is reused');
-  assert.equal(resources.swapping(), false);
+  assert.equal(resources.underPressure(), false);
   now = 4000;
   resources.read();
-  assert.equal(resources.swapping(), true, 'the machine paged between the two reads');
+  assert.equal(resources.underPressure(), true, 'critical on the fresh read');
 });
 
 // `bounce resources`: the same numbers the gate uses, in one screen, so "why is it waiting" has an
@@ -99,9 +101,9 @@ test('R6 the report: what is free, what is resident, and what each model would c
     {id: 'qwen3.6-35b-a3b-mlx', ready: true, size: 20 * GB, ttl: 2368},
     {id: 'qwen3.8-27b-mlx@4bit', ready: false, size: 16 * GB, ttl: null},
     {id: 'minimax-m2-reap-139b-a10b', ready: false, size: 73 * GB, ttl: null}]}];
-  const text = resourceReport({machine: readMachine({run: run()}), fleet, busy: ['lmstudio/qwen3.6-35b-a3b-mlx'], swapping: false});
+  const text = resourceReport({machine: readMachine({run: run()}), fleet, busy: ['lmstudio/qwen3.6-35b-a3b-mlx']});
   assert.equal(text, [
-    'Machine: 128.0 GB total · 65.9 GB free · 8.3 GB swapped (not swapping) · GPU wiring cap 89.8 GB',
+    'Machine: 128.0 GB total · 65.9 GB free · 8.3 GB swapped · memory pressure normal · GPU wiring cap 89.8 GB',
     'Resident: lmstudio/qwen3.6-35b-a3b-mlx 20.0 GB (busy, 39 min left)',
     'Local models, with a reserve of 8.0 GB beside the weights:',
     '  lmstudio/qwen3.6-35b-a3b-mlx  20.0 GB  loaded',
