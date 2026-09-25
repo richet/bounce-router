@@ -273,3 +273,116 @@ test('unchanged mouse setting does not flood the terminal with mode escapes', as
   assert.equal(output.includes('\x1b[?1000l'), false);
   terminal.unmount();
 });
+
+test('scrolling past the beginning keeps the oldest transcript visible', async () => {
+  const stdin = new PassThrough(), stdout = new PassThrough();
+  stdin.setRawMode = () => {};
+  stdout.isTTY = true; stdout.columns = 80; stdout.rows = 12;
+  let output = '';
+  stdout.on('data', chunk => { output += chunk; });
+  const events = Array.from({length: 10}, (_, n) => ({kind: 'note', id: String(n), text: `scroll-boundary-${n}`}));
+  const terminal = createInkTerminal({stdin, stdout, history: () => events,
+    onScroll: amount => terminal.update({scroll: Math.max(0, terminal.snapshot().view.scroll + amount)}),
+  });
+  try {
+    await terminal.mount({events});
+    await new Promise(resolve => setTimeout(resolve, 60));
+    output = '';
+    stdin.write('\x1b[<64;10;5M'.repeat(34));
+    await new Promise(resolve => setTimeout(resolve, 60));
+    assert.match(stripAnsi(output), /scroll-boundary-0/);
+    assert.equal(terminal.snapshot().view.scroll, 2);
+    output = '';
+    stdin.write('\x1b[<65;10;5M');
+    await new Promise(resolve => setTimeout(resolve, 60));
+    assert.match(stripAnsi(output), /scroll-boundary-9/);
+    assert.doesNotMatch(stripAnsi(output), /scroll-boundary-0/);
+  } finally { terminal.unmount(); }
+});
+
+test('a wheel step in a short worker pane preserves its activity and resets its stored offset', async () => {
+  const stdin = new PassThrough(), stdout = new PassThrough();
+  stdin.setRawMode = () => {};
+  stdout.isTTY = true; stdout.columns = 58; stdout.rows = 16;
+  let output = '';
+  const clamps = [];
+  stdout.on('data', chunk => { output += chunk; });
+  const terminal = createInkTerminal({stdin, stdout, onScrollClamp: (id, value) => clamps.push([id, value])});
+  try {
+    await terminal.mount({agentsOpen: true, selectedId: 'worker:a', events: [
+      {kind: 'task.submitted', id: '1', seq: 1, task: 'a', profile: 'scout'},
+      {kind: 'task.activity', id: '2', seq: 2, task: 'a', text: 'worker activity remains visible'},
+    ]});
+    await new Promise(resolve => setTimeout(resolve, 60));
+    terminal.update({scroll: 3, paneScrolls: {'worker:a': 3}, notice: 'scroll boundary'});
+    await new Promise(resolve => setTimeout(resolve, 60));
+    assert.match(stripAnsi(output), /worker activity remains visible/);
+    assert.equal(terminal.snapshot().view.scroll, 0);
+    assert.equal(terminal.snapshot().view.paneScrolls['worker:a'], 0);
+    assert.deepEqual(clamps, [['worker:a', 0]]);
+  } finally { terminal.unmount(); }
+});
+
+test('live output does not move the history being read while scrolled up', async () => {
+  const stdin = new PassThrough(), stdout = new PassThrough();
+  stdin.setRawMode = () => {};
+  stdout.isTTY = true; stdout.columns = 80; stdout.rows = 12;
+  let output = '';
+  stdout.on('data', chunk => { output += chunk; });
+  const events = Array.from({length: 24}, (_, n) => ({kind: 'note', id: String(n), text: `anchored-history-${n}`}));
+  const terminal = createInkTerminal({stdin, stdout, history: () => events});
+  const visible = () => [...stripAnsi(output).matchAll(/anchored-history-\d+/g)].map(match => match[0]);
+  try {
+    await terminal.mount({events});
+    await new Promise(resolve => setTimeout(resolve, 60));
+    output = '';
+    terminal.update({scroll: 4});
+    await new Promise(resolve => setTimeout(resolve, 60));
+    const before = visible();
+    assert.deepEqual(before, Array.from({length: 8}, (_, n) => `anchored-history-${n + 12}`));
+    output = '';
+    for (let n = 24; n < 28; n++) {
+      const event = {kind: 'note', id: String(n), text: `anchored-history-${n}`};
+      events.push(event); terminal.ingest(event);
+    }
+    terminal.update({notice: 'new output arrived'});
+    await new Promise(resolve => setTimeout(resolve, 60));
+    assert.deepEqual(visible(), before);
+    output = '';
+    terminal.update({scroll: 0});
+    await new Promise(resolve => setTimeout(resolve, 60));
+    assert.match(stripAnsi(output), /anchored-history-27/);
+  } finally { terminal.unmount(); }
+});
+
+test('worker scrollback stays put during activity and returns to live output at the bottom', async () => {
+  const stdin = new PassThrough(), stdout = new PassThrough();
+  stdin.setRawMode = () => {};
+  stdout.isTTY = true; stdout.columns = 58; stdout.rows = 16;
+  let output = '';
+  stdout.on('data', chunk => { output += chunk; });
+  const terminal = createInkTerminal({stdin, stdout});
+  const visible = () => [...stripAnsi(output).matchAll(/worker-history-\d+/g)].map(match => match[0]);
+  try {
+    await terminal.mount({agentsOpen: true, selectedId: 'worker:a', events: [
+      {kind: 'task.submitted', id: 's', seq: 1, task: 'a', profile: 'scout'},
+      ...Array.from({length: 24}, (_, n) => ({kind: 'task.activity', id: `a${n}`, seq: n + 2, task: 'a', text: `worker-history-${n}`})),
+    ]});
+    await new Promise(resolve => setTimeout(resolve, 60));
+    output = '';
+    terminal.update({scroll: 4});
+    await new Promise(resolve => setTimeout(resolve, 60));
+    const before = visible();
+    // The operation heading stays live; the scrollable activity rows stay anchored.
+    assert.deepEqual(before.slice(1), Array.from({length: 6}, (_, n) => `worker-history-${n + 14}`));
+    output = '';
+    terminal.ingest({kind: 'task.activity', id: 'new', seq: 26, task: 'a', text: 'worker-history-24'});
+    await new Promise(resolve => setTimeout(resolve, 60));
+    assert.deepEqual(visible().slice(1), before.slice(1));
+    assert.equal(visible()[0], 'worker-history-24');
+    output = '';
+    terminal.update({scroll: 0});
+    await new Promise(resolve => setTimeout(resolve, 60));
+    assert.equal(visible().at(-1), 'worker-history-24');
+  } finally { terminal.unmount(); }
+});

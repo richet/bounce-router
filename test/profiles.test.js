@@ -34,7 +34,7 @@ test('overlay: a two-profile table sits on top of the whole shipped roster, in s
   assert.equal(view.profiles.main.model, 'opus', 'the user\'s main');
   assert.equal(view.profiles.claude_haiku.adapter, 'claude');
   assert.deepEqual(view.profiles.build.fallback, ['build_claude', 'claude_fable'], 'shipped fallbacks are kept');
-  assert.equal(view.profiles.scout.policy, 'read-only');
+  assert.equal(view.profiles.scout.policy, 'probe');
   // every shipped profile is validated like a user-written one: mode, policy and role defaults
   for (const name of shipped.slice(1)) assert.deepEqual([view.profiles[name].mode, view.profiles[name].policy, view.profiles[name].role], ['yolo', 'write', 'builder'], name);
   assert.equal(routingFallback(view.profiles), 'build');

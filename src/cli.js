@@ -1213,6 +1213,11 @@ async function main() {
       if (suspended || copyPaused || picker) return;
       ({input, cursor: inputCursor} = insertText(input, inputCursor, clean(text))); completionIndex = 0; menuDismissed = false; render();
     },
+    onScrollClamp: (id, value) => {
+      if (id === (agentsOpen ? selectedAgentPane : 'orchestrator')) scroll = value;
+      const saved = paneInputs.get(id);
+      if (saved) paneInputs.set(id, {...saved, scroll: value});
+    },
     onScroll: amount => { if (!copyPaused) { scroll = Math.max(0, scroll + amount); render(); } },
     onPress: () => { if (suspended || copyPaused || !mouseScroll || notice === selectionHint) return; notice = selectionHint; render(); },
     onResize: render,

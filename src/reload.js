@@ -309,7 +309,7 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     'Local discovery checks eligibility at dispatch. A downloaded model is not necessarily loaded or tool-capable.',
     'If the user asks for a LOCAL worker specifically and no agent can run on one, report that and point to /local on and /local setup; do not quietly substitute a cloud worker for that request.',
     'Capacity waits, progress and failures are journaled. Do not infer a worker crash from silence alone; inspect its latest task state.',
-    'A local worker (… via opencode) works in the project directly, like any other worker: read-only agents can change nothing, write agents edit files and run commands. Its answer is its report.',
+    'A local worker (… via opencode) uses the workspace and tools allowed by its policy: read-only agents read and search but cannot run commands; probe agents can run sandboxed verification commands; write agents edit files and run commands in their assigned workspace. Its answer is its report. Never ask a read-only analyst to claim it ran tests; delegate execution to a command-capable worker and cite its results.',
     'Require observed tests from local builders, and review their diff as you would any worker\'s.',
     ...(jev?.enabled && jev?.review ? ['Jev completion verdicts are on: a root task you submit without review.completion gets a fast Jev accept/rework check against its orders, report and diff before it is accepted; a confident rework sends the same worker one rework round. Name a review.completion profile yourself to replace it.'] : []),
     '',
