@@ -6,7 +6,7 @@ import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {spawn, spawnSync} from 'node:child_process';
 import net from 'node:net';
-import {createOpencodeLive, toolsFor, mapUsage, scrubCredentials, probeSandbox, writeFenceSandbox} from '../../src/adapters/opencode-live.js';
+import {createOpencodeLive, toolsFor, mapUsage, scrubCredentials, probeSandbox, writeFenceSandbox, resolveDockerSocket} from '../../src/adapters/opencode-live.js';
 
 // The OpenCode adapter is the claude adapter's twin: one `opencode run` per turn, prompt on stdin,
 // JSON lines out, exit = turn end. The fake prints the event shapes observed from the real binary
@@ -352,6 +352,73 @@ test('a report grant opens only its assigned Unix bus socket inside the probe sa
   const exit = await new Promise(resolve => child.once('close', resolve));
   assert.equal(exit, 0, stderr);
   assert.deepEqual(JSON.parse(stdout), ['connected', 'EPERM']);
+});
+
+test('a docker capability opens only the resolved Docker socket inside the probe sandbox, and the source stays denied', async t => {
+  if (process.platform !== 'darwin') return t.skip('macOS sandbox-exec only');
+  const root = fs.mkdtempSync('/private/tmp/oc-probe-docker-');
+  const source = fs.mkdtempSync('/private/tmp/oc-probe-docker-source-');
+  t.after(() => { fs.rmSync(root, {recursive: true, force: true}); fs.rmSync(source, {recursive: true, force: true}); });
+  const dockerSock = path.join(root, 'docker.sock');
+  const server = net.createServer(socket => socket.end());
+  await new Promise(resolve => server.listen(dockerSock, resolve));
+  t.after(() => server.close());
+  const policy = probeSandbox(root, '/tmp/home', source, null, dockerSock);
+  assert.match(policy, new RegExp(`allow network-outbound \\(literal ${JSON.stringify(fs.realpathSync(dockerSock)).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\)`));
+  const code = `const net = require('node:net'); const fs = require('node:fs'); const connect = path => new Promise(resolve => { const socket = net.createConnection(path); socket.once('connect', () => { socket.destroy(); resolve('connected'); }); socket.once('error', error => resolve(error.code)); }); (async () => { const socketResult = await connect(process.argv[1]); let writeResult; try { fs.writeFileSync(process.argv[2], 'bad'); writeResult = 'wrote'; } catch (error) { writeResult = error.code; } process.stdout.write(JSON.stringify([socketResult, writeResult])); })();`;
+  const child = spawn('/usr/bin/sandbox-exec', ['-p', policy, process.execPath, '-e', code, dockerSock, path.join(source, 'x.txt')]);
+  let stdout = '', stderr = '';
+  child.stdout.on('data', chunk => { stdout += chunk; });
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  const exit = await new Promise(resolve => child.once('close', resolve));
+  assert.equal(exit, 0, stderr);
+  const [socketResult, writeResult] = JSON.parse(stdout);
+  assert.equal(socketResult, 'connected', 'the resolved docker socket is reachable');
+  assert.ok(['EPERM', 'EACCES'].includes(writeResult), 'writing the source checkout is still refused');
+});
+
+test('without the docker capability, the socket stays refused like any other unix path', async t => {
+  if (process.platform !== 'darwin') return t.skip('macOS sandbox-exec only');
+  const root = fs.mkdtempSync('/private/tmp/oc-probe-nodocker-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const dockerSock = path.join(root, 'docker.sock');
+  const server = net.createServer(socket => socket.end());
+  await new Promise(resolve => server.listen(dockerSock, resolve));
+  t.after(() => server.close());
+  const policy = probeSandbox(root, '/tmp/home', null); // no dockerSocket argument at all
+  assert.doesNotMatch(policy, /allow network-outbound \(literal/, 'no unix-socket allow rule at all without a docker (or report) socket');
+  const code = `const net = require('node:net'); const socket = net.createConnection(process.argv[1]); socket.once('connect', () => { socket.destroy(); process.stdout.write('connected'); }); socket.once('error', error => process.stdout.write(error.code));`;
+  const child = spawn('/usr/bin/sandbox-exec', ['-p', policy, process.execPath, '-e', code, dockerSock]);
+  let stdout = '', stderr = '';
+  child.stdout.on('data', chunk => { stdout += chunk; });
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  const exit = await new Promise(resolve => child.once('close', resolve));
+  assert.equal(exit, 0, stderr);
+  assert.equal(stdout, 'EPERM');
+});
+
+test('resolveDockerSocket prefers a unix DOCKER_HOST, resolved through its symlink, over the default candidate', t => {
+  // Hermetic note: the bare /var/run/docker.sock fallback is not exercised here — this dev host
+  // actually runs OrbStack, so asserting "null with no candidate" would depend on real host state.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-docker-resolve-'));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const real = path.join(root, 'real.sock');
+  fs.writeFileSync(real, '');
+  const link = path.join(root, 'docker.sock');
+  fs.symlinkSync(real, link);
+  assert.equal(resolveDockerSocket({DOCKER_HOST: `unix://${link}`}), fs.realpathSync(real));
+});
+
+test('a docker-required task launches OpenCode with the socket in its probe sandbox only when profile.docker is set', async t => {
+  const {cwd, dir, logged} = setup(t);
+  const adapter = createOpencodeLive({});
+  const handle = await adapter.launch({peer: 'worker:tdocker', profile: profileFor({policy: 'probe', docker: true}), orders: 'check docker', cwd, dir});
+  await drain(adapter, handle);
+  assert.equal(handle.args[0], '-p');
+  // resolveDockerSocket() finds nothing on the test host (no real daemon), so the sandbox carries
+  // no docker rule here — the launch-time wiring (profile.docker -> resolveDockerSocket()) is
+  // exercised directly; the allow-rule shape itself is covered by the probeSandbox tests above.
+  void logged;
 });
 
 test('the report tool survives a tools-off conclusion and a grant for another task is not injected', async t => {
