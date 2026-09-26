@@ -316,7 +316,7 @@ test('a FAIL-verdict prose answer is synthesized directly, with no repair round'
   assert.equal(failed.text, 'FINDING 1 (blocker): Docker cancellation does not set report.childExitCode');
   assert.equal(adapter.calls.resume, 0, 'no repair round is ever requested for a non-empty answer');
   const synthesized = session.events.find(e => e.task === row.task && e.kind === 'task.report.synthesized');
-  assert.equal(synthesized.rule, 'first_block_failed');
+  assert.equal(synthesized.rule, 'status_failed');
 });
 
 test('the same FAIL-verdict answer synthesizes identically against a deadline that has already passed', {timeout: 3_000}, async t => {

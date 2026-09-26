@@ -84,10 +84,11 @@ test('a short plain-prose answer synthesizes into a completed report, by default
   assert.deepEqual(synthesis.sources, {outcome: 'answer', phase: 'answer', summary: 'answer', remaining: 'answer', next: 'answer', evidence: 'answer'});
 });
 
-test('the outcome rule reads only the first paragraph, and only its own small set of markers', () => {
+test('the outcome rule reads only an explicit status; a finished-sounding or prose answer goes to review as completed', () => {
   assert.equal(synthesizeReport('Blocked: cannot proceed without the API key.').report.outcome, 'blocked');
   assert.equal(synthesizeReport('❌ Blocked\n\nCould not reach the database.').report.outcome, 'blocked');
-  assert.equal(synthesizeReport('The build failed with three compile errors.').report.outcome, 'failed');
+  // Prose, not a status: counted completed and judged by the completion review, rather than thrown away.
+  assert.equal(synthesizeReport('The build failed with three compile errors.').report.outcome, 'completed');
   assert.equal(synthesizeReport('Implemented the fix.\n\nA prior attempt here had failed.').report.outcome, 'completed',
     'a later paragraph mentioning "failed" does not override a clean first paragraph');
 });
@@ -124,4 +125,18 @@ test('a candidate outcome synonym still wins over the answer-derived fallback', 
   const synthesis = synthesizeReport('All good here.', {outcome: 'Success'});
   assert.equal(synthesis.report.outcome, 'completed');
   assert.equal(synthesis.sources.outcome, 'worker');
+});
+
+// Only an explicit status decides; ordinary prose that mentions a failing test or an obstacle it got past
+// must not turn finished work into `failed`/`blocked` (the synthesized outcome drives the next step).
+test('a synthesized outcome follows an explicit status, not a word that happens to appear in the prose', () => {
+  const outcome = text => synthesizeReport(text).report.outcome;
+  assert.equal(outcome('Red confirmed — the new tests fail as expected, then pass after the fix.'), 'completed');
+  assert.equal(outcome('Unable to reproduce the flake; all 12 runs pass. Renamed the helper.'), 'completed');
+  assert.equal(outcome('The fence blocked my first write, so I wrote to the working copy instead. Done.'), 'completed');
+  assert.equal(outcome('**BLOCKED: Docker socket unreachable from the sandbox.**\n\nDetails…'), 'blocked');
+  assert.equal(outcome('Blocked: cannot proceed without the API key.'), 'blocked');
+  assert.equal(outcome('| Implementation | ❌ Blocked — cannot write to filesystem |'), 'blocked');
+  assert.equal(outcome('**Verdict: FAIL**\n\n1. The lock is not released.'), 'failed');
+  assert.equal(outcome('Status: failed — 3 tests still fail.'), 'failed');
 });

@@ -51,18 +51,17 @@ export function parseFinalReport(textValue) {
 // worker, and it asks in plain words this time (see requestPlainAnswer in scheduler.js).
 const firstBlock = text => text.split(/\n\s*\n/)[0] ?? '';
 
-// Kept deliberately small and literal — a handful of status words/marks a worker actually uses to
-// announce its own verdict up front, checked only against the first paragraph or heading, never
-// full-text sentiment analysis. Order matters: blocked is checked before failed.
-const BLOCKED_MARKERS = /\b(?:blocked|cannot proceed|unable to|not attempted)\b|❌\s*blocked/i;
-// `fail` alongside `failed`/`failure`: a reviewer's own verdict convention ("**Verdict: FAIL**",
-// observed live, reviewer 080b39ce) is a bare status word, not a sentence.
-const FAILED_MARKERS = /\b(?:failed|failure|fail)\b|❌\s*failed/i;
+// Only an explicit status decides: a line that starts with the status word ("Blocked: …", "**BLOCKED: …**"),
+// a labelled status line ("Verdict: FAIL", "Status: failed"), or a ❌ mark on it. A word inside ordinary
+// prose ("the new tests fail as expected", "the fence blocked my first write") must not turn finished work
+// into failed/blocked — the synthesized outcome drives what happens next; the review judges the rest.
+const statusLine = word => new RegExp(`^[\\s>*#_-]*(?:${word})\\s*[*_]*\\s*[:：—–]|^[\\s>*#_-]*(?:status|outcome|verdict|result)\\s*[:：]\\s*[*_]*\\s*(?:${word})\\b|❌\\s*(?:${word})\\b`, 'im');
+const BLOCKED_STATUS = statusLine('blocked');
+const FAILED_STATUS = statusLine('failed|fail');
 
 function synthesizedOutcome(text) {
-  const block = firstBlock(text);
-  if (BLOCKED_MARKERS.test(block)) return {outcome: 'blocked', rule: 'first_block_blocked'};
-  if (FAILED_MARKERS.test(block)) return {outcome: 'failed', rule: 'first_block_failed'};
+  if (BLOCKED_STATUS.test(text)) return {outcome: 'blocked', rule: 'status_blocked'};
+  if (FAILED_STATUS.test(text)) return {outcome: 'failed', rule: 'status_failed'};
   return {outcome: 'completed', rule: 'default_completed'};
 }
 
