@@ -548,22 +548,29 @@ export function decidePlan(answers, {plan, confidence = 0.8, ceilingMinutes = nu
   return {verdict: findings.length ? 'reject' : 'accept', findings, noted};
 }
 
-// Disabled model review uses explicit structural validation. An enabled but unavailable
-// reviewer cannot manufacture acceptance; preserve structural rejection when already known.
-export async function judgePlan({plan, settings, ask, ceilingMinutes = null, signal} = {}) {
+// Jev off, or unable to answer, the structural checks decide (Jev is never a requirement). Found live
+// (ACE d1bc0206): Jev answered HTTP 403 for ~40 s and P4's plan sat `unavailable` with nothing retried, so
+// a failure is retried once, then the structural verdict stands with a reason saying Jev was unavailable.
+export async function judgePlan({plan, settings, ask, ceilingMinutes = null, signal, retryDelayMs = 3000} = {}) {
   const s = normalizeJevSettings(settings);
   const structural = decidePlan({}, {plan, confidence: s.confidence, ceilingMinutes});
   const off = reason => ({...structural, reason, model: null});
-  const unavailable = reason => ({...structural, verdict: structural.verdict === 'reject' ? 'reject' : 'unavailable', reason, model: null});
+  const unavailable = code => off(`jev unavailable (${code}); structural checks only`);
   if (!s.enabled) return off('jev disabled');
-  if (typeof ask !== 'function') return unavailable('plan reviewer unavailable');
+  if (typeof ask !== 'function') return unavailable('no reviewer');
   const {state, questions} = planQuestions(plan);
   if (!Object.keys(questions).length) return off('no chunks');
-  try {
-    const result = await ask({state, questions, model: s.model, signal});
-    if (Object.keys(questions).some(name => !Number.isFinite(result.answers?.[name]?.noul))) return unavailable('incomplete plan review');
-    return {...decidePlan(result.answers, {plan, confidence: s.confidence, ceilingMinutes}), reason: null, model: result.model, latencyMs: result.latencyMs};
-  } catch (error) { return unavailable(error?.code ?? error?.message ?? 'error'); }
+  let failure = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt) await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+    if (signal?.aborted) break;
+    try {
+      const result = await ask({state, questions, model: s.model, signal});
+      if (Object.keys(questions).some(name => !Number.isFinite(result.answers?.[name]?.noul))) { failure = 'incomplete plan review'; continue; }
+      return {...decidePlan(result.answers, {plan, confidence: s.confidence, ceilingMinutes}), reason: null, model: result.model, latencyMs: result.latencyMs};
+    } catch (error) { failure = error?.code ?? error?.message ?? 'error'; }
+  }
+  return unavailable(failure ?? 'aborted');
 }
 
 // ---- the lease judge: is a running task still getting somewhere, at the end of its lease? --------

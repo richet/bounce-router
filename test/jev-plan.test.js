@@ -53,11 +53,18 @@ test('decidePlan: a confident finding rejects the plan naming the chunk and the 
   assert.equal(PLAN_CHECKS.phase_sized.instructions('c'), 'Chunk "c" describes a whole phase or several independent pieces of work, not one bounded piece with a single owner and a single acceptance.');
 });
 
-test('judgePlan keeps Jev-off structural acceptance, but records an enabled reviewer failure as unavailable', async () => {
+// Reversed 2026-09-25: found live (ACE d1bc0206), Jev answered HTTP 403 for ~40 s and P4's plan sat
+// `unavailable`, waiting on the user, with nothing retried. Jev is never a requirement: one retry, then
+// the structural checks decide, and the reason says Jev was unavailable.
+test('judgePlan retries a failing reviewer once, then falls back to the structural verdict', async () => {
   const off = await judgePlan({plan, settings: {enabled: false}, ask: async () => { throw new Error('no'); }});
   assert.deepEqual([off.verdict, off.reason], ['accept', 'jev disabled']);
-  const broken = await judgePlan({plan, settings: {enabled: true}, ask: async () => { throw Object.assign(new Error('boom'), {code: 'timeout'}); }});
-  assert.deepEqual([broken.verdict, broken.reason], ['unavailable', 'timeout']);
+  let calls = 0;
+  const broken = await judgePlan({plan, settings: {enabled: true}, retryDelayMs: 0, ask: async () => { calls++; throw Object.assign(new Error('boom'), {code: 'http_403'}); }});
+  assert.deepEqual([broken.verdict, broken.reason, calls], ['accept', 'jev unavailable (http_403); structural checks only', 2]);
+  let first = true;
+  const recovered = await judgePlan({plan, settings: {enabled: true}, retryDelayMs: 0, ask: async () => { if (first) { first = false; throw Object.assign(new Error('blip'), {code: 'http_403'}); } return {answers: {...answerFor('gate', {}), ...answerFor('fix', {})}, model: 'jev-1.13.0', latencyMs: 9}; }});
+  assert.deepEqual([recovered.verdict, recovered.model], ['accept', 'jev-1.13.0']);
   const asked = [];
   const judged = await judgePlan({plan, settings: {enabled: true}, ask: async request => { asked.push(request); return {answers: {...answerFor('gate', {}), ...answerFor('fix', {phase_sized: 0.9})}, model: 'jev-1.13.0', latencyMs: 12}; }});
   assert.deepEqual([judged.verdict, judged.findings[0].chunk, judged.model], ['reject', 'fix', 'jev-1.13.0']);

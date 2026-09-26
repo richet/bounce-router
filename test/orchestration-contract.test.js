@@ -10,10 +10,15 @@ import {sameJob} from '../src/loop-guard.js';
 import {fakeAdapter} from './helpers/fake-adapter.js';
 import {judgePlan} from '../src/jev.js';
 
-test('an enabled plan review failure never synthesizes plan acceptance', async () => {
+// Contract changed 2026-09-25 (Jev is never a requirement; found live, a transient Jev 403 parked P4): an
+// enabled review that cannot answer falls back to the structural checks, which still reject what they catch.
+test('an enabled plan review failure falls back to the structural checks, which still reject overlapping owners', async () => {
   const plan = {chunks: [{id: 'one', orders: 'Edit one owned file; verify with its focused test', owns: ['src/a']}]};
-  const verdict = await judgePlan({plan, settings: {enabled: true}, ask: async () => { throw new Error('unavailable'); }});
-  assert.equal(verdict.verdict, 'unavailable');
+  const failing = async () => { throw Object.assign(new Error('unavailable'), {code: 'http_403'}); };
+  const verdict = await judgePlan({plan, settings: {enabled: true}, retryDelayMs: 0, ask: failing});
+  assert.deepEqual([verdict.verdict, verdict.reason], ['accept', 'jev unavailable (http_403); structural checks only']);
+  const overlapping = {chunks: [{id: 'one', orders: 'a', owns: ['src/a']}, {id: 'two', orders: 'b', owns: ['src/a']}]};
+  assert.equal((await judgePlan({plan: overlapping, settings: {enabled: true}, retryDelayMs: 0, ask: failing})).verdict, 'reject');
   assert.equal((await judgePlan({plan, settings: {enabled: false}})).verdict, 'accept');
 });
 
