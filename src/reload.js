@@ -187,7 +187,8 @@ export const breakdownOrders = (minutes, {jevOn = false, ceiling = Math.max(TASK
   'with the same `requires`, `owns`, deadline, review constraints and `depends_on`, and copy the plan id and chunk id into each task as `planId` and `chunkId`.',
   'A review of a whole phase, or of more than one risk area, is heavy: split it into one reviewer per area (for example locking and journaling, ownership, the CLI), each with the verification commands for its area. Reviewers probe: they run commands but cannot change the tree.',
   'Review each phase before the next one starts: read what the chunks produced, integrate, run the gate, then submit the next',
-  'phase. A chunk that stops making progress or reaches the ceiling is asked for its conclusion and reported as is: resubmit what is left with that progress in its orders, or record the concrete campaign blocker after bounded recovery.', ''];
+  'phase. A chunk that stops making progress or reaches the ceiling is asked for its conclusion and reported as is: resubmit what is left with that progress in its orders, or record the concrete campaign blocker after bounded recovery.',
+  'bounce continues a worker that hits its step limit while progressing (up to 3 times); when a local worker still fails, read the actual cause in its outcome (step limit, blocked, or an error) before switching AI, and prefer retrying the same local worker when the cause was the step limit or a fixable command mistake.', ''];
 
 export function buildProfiles(settings) {
   return {main: {adapter: settings.order[0], mode: settings.mode, fallback: settings.order.slice(1)}};
