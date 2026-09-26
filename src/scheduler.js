@@ -2075,23 +2075,6 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       text: `${expiredHead(reason, row?.profile ?? 'the worker', r)} and gave no final answer within ${seconds(waited)} of being asked.${found.length ? ` Its ${found.length} recorded finding${found.length === 1 ? ' is' : 's are'} in the deadline row.` : ''} Its partial progress is in the journal: resubmit what is left with that progress in the orders, or drop it.`});
   }
 
-  // Nobody answered. The wait is ended the way a lease end is ended — bounce's decision, journaled as a
-  // deadline and a `deadline` cancellation, with the submitter told — never as a user cancellation, which
-  // the orders treat as final and which would stop the whole run.
-  async function expireParked(r) {
-    const view = reducers.tasks(session.events);
-    const t = view[r.task];
-    if (!t) return;
-    const row = submittedRow(r.task);
-    const waited = clock() - (r.parkedAt ?? clock());
-    const asked = t.blocker ?? session.events.findLast(e => e.task === r.task && e.kind === 'task.input_required')?.text ?? 'it asked for input';
-    append({kind: 'task.deadline', task: r.task, reason: 'unanswered', from: 'bounce', context: row?.context,
-      text: `parked ${seconds(waited)} with no answer: ${asked}`});
-    await cancel(r.task, {force: true, reason: 'deadline'});
-    append({kind: 'policy.escalated', task: r.task, reason: 'deadline', to: submitterOf(r.task), context: row?.context,
-      text: `${row?.profile ?? 'the worker'} parked ${seconds(waited)} ago and nothing answered it: ${asked}. Answer it and resubmit what is left, or drop it.`});
-  }
-
   async function handleSignature(r, reason, now) {
     const row = submittedRow(r.task);
     const since = lastProgressResetTime(r.task) ?? -Infinity;
@@ -2137,11 +2120,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     }
     const rows = reducers.watchdog(session.events, now, {activity, watchdog: {...watchdogConfig, defaultDeadlineMs: (limits.minutes ?? DEFAULT_DEADLINE_MINUTES) * 60000, ceilingMs}});
     for (const r of rows) {
-      // A parked task that outlived its lease with nobody answering ends here. The escalation still
-      // happens first (handleBlocked, once per blocker), so the owner was told before the clock ran out.
-      if (r.verdicts.includes('blocked')) await handleBlocked(r);
-      if (r.verdicts.includes('unanswered')) { await expireParked(r); continue; }
-      if (r.verdicts.includes('blocked')) continue;
+      // A parked task (blocked) never expires here — it holds no slot and is never killed by its
+      // lease/ceiling; this escalation (once per blocker) is only ever informational.
+      if (r.verdicts.includes('blocked')) { await handleBlocked(r); continue; }
       if (r.verdicts.includes('deadline')) { await handleLeaseEnd(r, now); continue; }
       for (const reason of ['silent', 'stalled']) if (r.verdicts.includes(reason)) await handleSignature(r, reason, now);
     }

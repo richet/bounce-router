@@ -332,11 +332,13 @@ test('modelUsage: unusable or empty usage rows are dropped, never crash, never r
   assert.deepEqual(modelUsage([]), []);
 });
 
-// A parked task has no lease at all: `blocked` yields only a ['blocked'] verdict and `input_required` is
-// skipped entirely, so neither can ever time out. Waking the orchestrator (main-service) lets it act; this
-// is the backstop for when nobody does. Measured from the moment it parked — the wait is the thing being
-// bounded, not the work that came before it.
-test('a parked task is leased from the moment it parked, and expires unanswered', () => {
+// A parked task holds no slot and has no lease: `blocked` yields only its existing ['blocked']
+// escalation verdict and `input_required` yields none at all, however long it has been parked —
+// neither can ever time out here. Found live (session 159f4746, 4 tasks): the previous lease,
+// measured from the moment a task parked, silently discarded a blocked worker's resumable context
+// after 60 minutes nobody was watching, even though parking is what freed its slot in the first
+// place. It stays parked until answered (a message, a task.rework, an accept) or cancelled.
+test('a parked task never expires here, however long nobody answers it', () => {
   const t0 = Date.parse('2026-09-23T05:00:00.000Z');
   const parkedAt = t0 + 600000; // it worked for ten minutes, then asked
   const cfg = {silence: 300000, stall: 600000, defaultDeadlineMs: 900000, ceilingMs: 3600000};
@@ -349,14 +351,12 @@ test('a parked task is leased from the moment it parked, and expires unanswered'
   const early = watchdog(base, parkedAt + 1800000, {activity: new Map(), watchdog: cfg});
   assert.deepEqual(early.find(r => r.task === 'ask'), undefined, 'half an hour parked is a wait, not a failure');
 
-  const late = watchdog(base, parkedAt + 3600001, {activity: new Map(), watchdog: cfg});
-  const row = late.find(r => r.task === 'ask');
-  assert.deepEqual(row.verdicts, ['unanswered']);
-  assert.equal(row.stage, 'parked');
-  assert.equal(row.parkedAt, parkedAt, 'the clock starts when it parked, not when the task did');
+  const late = watchdog(base, parkedAt + 36000000, {activity: new Map(), watchdog: cfg});
+  assert.deepEqual(late.find(r => r.task === 'ask'), undefined, 'ten hours parked on input_required is still no verdict at all');
 
-  // blocked keeps its existing escalation verdict, and gains the expiry beside it
+  // blocked keeps its existing escalation verdict, and never gains an expiry beside it
   const blocked = base.slice(0, 3).concat({kind: 'task.blocked', task: 'ask', time: new Date(parkedAt).toISOString(), text: 'unreadable review verdict'});
   assert.deepEqual(watchdog(blocked, parkedAt + 60000, {activity: new Map(), watchdog: cfg}).find(r => r.task === 'ask').verdicts, ['blocked']);
-  assert.deepEqual(watchdog(blocked, parkedAt + 3600001, {activity: new Map(), watchdog: cfg}).find(r => r.task === 'ask').verdicts, ['blocked', 'unanswered']);
+  assert.deepEqual(watchdog(blocked, parkedAt + 36000000, {activity: new Map(), watchdog: cfg}).find(r => r.task === 'ask').verdicts, ['blocked'],
+    'ten hours blocked is still just the one escalation verdict, never an expiry');
 });
