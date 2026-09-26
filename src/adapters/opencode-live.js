@@ -72,39 +72,22 @@ export function writeFenceSandbox(source) {
   return `(version 1)(allow default)(deny file-write* (subpath ${JSON.stringify(fs.realpathSync(source))}))`;
 }
 
-// Resolves the real Docker socket path a probe worker's sandbox may allow-list. `DOCKER_HOST`
-// wins when it names a Unix socket (a non-default daemon, e.g. a per-project context); otherwise
-// the conventional `/var/run/docker.sock` is tried, resolved through whatever it actually is (on
-// OrbStack, a symlink into `~/.orbstack/run/docker.sock`) — the sandbox rule must name the real
-// path, exactly as it already does for the report bus socket below. Returns null when neither
-// exists, so a `docker` task on a host with no daemon socket fails at connection time, not here.
-export function resolveDockerSocket(env = process.env) {
-  const host = typeof env.DOCKER_HOST === 'string' && env.DOCKER_HOST.startsWith('unix://') ? env.DOCKER_HOST.slice('unix://'.length) : null;
-  for (const candidate of [host, '/var/run/docker.sock'].filter(Boolean)) {
-    try { return fs.realpathSync(candidate); } catch { /* try the next candidate */ }
-  }
-  return null;
-}
-
-export function probeSandbox(cwd, home = os.homedir(), probeSource = null, reportSocket = null, dockerSocket = null) {
+export function probeSandbox(cwd, home = os.homedir(), probeSource = null, reportSocket = null) {
   const q = p => JSON.stringify(String(p));
   const isolated = fs.realpathSync(cwd);
   const source = probeSource === null ? null : fs.realpathSync(probeSource);
   // macOS resolves /tmp to /private/tmp before evaluating a Unix-socket literal.
-  const resolveSocket = value => value === null ? null : (() => {
-    try { return fs.realpathSync(value); }
-    catch { return path.join(fs.realpathSync(path.dirname(value)), path.basename(value)); }
+  const socket = reportSocket === null ? null : (() => {
+    try { return fs.realpathSync(reportSocket); }
+    catch { return path.join(fs.realpathSync(path.dirname(reportSocket)), path.basename(reportSocket)); }
   })();
-  const socket = resolveSocket(reportSocket);
-  const docker = resolveSocket(dockerSocket);
   if (source && (source === isolated || source.startsWith(`${isolated}${path.sep}`) || isolated.startsWith(`${source}${path.sep}`))) throw new Error('probeSource must be separate from cwd');
   const writable = ['/private/tmp', '/private/var/folders', `${home}/.local/share/opencode`, `${home}/.local/state/opencode`, `${home}/.cache/opencode`, `${home}/.config/opencode`, ...(source ? [isolated] : [])];
   return ['(version 1)', '(allow default)', '(deny file-write*)',
     `(allow file-write* ${writable.map(p => `(subpath ${q(p)})`).join(' ')} (literal "/dev/null") (literal "/dev/zero") (subpath "/dev/fd") (regex #"^/dev/tty") (regex #"^/dev/ptmx"))`,
     `(deny file-write* (subpath ${q(source ?? isolated)}))`,
     '(deny network*)', '(allow network* (local ip "localhost:*"))', '(allow network-outbound (remote ip "localhost:*"))',
-    ...(socket ? [`(allow network-outbound (literal ${q(socket)}))`] : []),
-    ...(docker ? [`(allow network-outbound (literal ${q(docker)}))`] : [])].join('');
+    ...(socket ? [`(allow network-outbound (literal ${q(socket)}))`] : [])].join('');
 }
 // Everything this adapter takes on faith from the opencode binary, in one place, so a test can hold
 // the installed binary to it (test/opencode-contract.test.js). Verified against 1.18.31 — a version
@@ -174,7 +157,7 @@ export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HE
       // rejected it and ended the turn. A worker's instructions are its agent file and its orders.
       OPENCODE_DISABLE_CLAUDE_CODE: '1', OPENCODE_DISABLE_CLAUDE_CODE_PROMPT: '1', OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: '1',
       OPENCODE_DISABLE_EXTERNAL_SKILLS: '1'};
-    const fence = effectiveTier(profile) === 'probe' ? probeSandbox(cwd, os.homedir(), profile.probeSource ?? null, grant?.BOUNCE_REPORT_BUS, profile.docker ? resolveDockerSocket() : null)
+    const fence = effectiveTier(profile) === 'probe' ? probeSandbox(cwd, os.homedir(), profile.probeSource ?? null, grant?.BOUNCE_REPORT_BUS)
       : profile.writeFence && process.platform === 'darwin' ? writeFenceSandbox(profile.writeFence) : null;
     const spawned = fence ? {executable: '/usr/bin/sandbox-exec', args: ['-p', fence, executable, ...args]} : {executable, args};
     const live = spawnLive({...spawned, cwd, env, stdin, ...(spawn ? {spawn} : {})});

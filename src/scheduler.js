@@ -1124,10 +1124,6 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // writeFence (docs/plans/in-place-tasks.md §3) — `owned` stays null, so the ordinary
       // cwd/orders fallbacks below already do the right thing with no further branching.
       owned = row.inPlace ? null : workspaceFor(task, profile, attempt);
-      // Capability mismatch already refused a docker requirement on an adapter/policy that
-      // cannot honor it (missingCapabilities, checked at submit) — this only ever flags a
-      // request the profile is known to be able to grant.
-      if (row.requires?.includes('docker')) profile = {...profile, docker: true};
       if (owned?.disposable) profile = {...profile, probeSource: fs.realpathSync(session.cwd)};
       else if (owned) profile = {...profile, writeFence: fs.realpathSync(session.cwd)};
       // OpenCode takes the agent text as its system prompt, apart from the orders (found live: an agent
@@ -1217,10 +1213,6 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // writeFence (docs/plans/in-place-tasks.md §3) — `owned` stays null, so the ordinary
       // cwd/orders fallbacks below already do the right thing with no further branching.
       owned = row.inPlace ? null : workspaceFor(task, profile, attempt);
-      // Capability mismatch already refused a docker requirement on an adapter/policy that
-      // cannot honor it (missingCapabilities, checked at submit) — this only ever flags a
-      // request the profile is known to be able to grant.
-      if (row.requires?.includes('docker')) profile = {...profile, docker: true};
       if (owned?.disposable) profile = {...profile, probeSource: fs.realpathSync(session.cwd)};
       else if (owned) profile = {...profile, writeFence: fs.realpathSync(session.cwd)};
       // OpenCode takes the agent text as its system prompt, apart from the orders (found live: an agent
