@@ -10,7 +10,7 @@ import {takeCheckpoint, sameTree} from './checkpoint.js';
 import {POLICY_RANK, effectivePolicy, LOCAL_ADAPTERS, playedBy, READ_ONLY_ROLES as READONLY_ROLES} from './profiles.js';
 import {defaultStrategy} from './strategy.js';
 import {reportEvent, validateReport, remainingWork} from './reporting.js';
-import {inspectFinalReport, FINAL_REPORT_INSTRUCTION} from './final-report.js';
+import {inspectFinalReport, synthesizeReport, FINAL_REPORT_INSTRUCTION} from './final-report.js';
 import {actionState, campaigns, createActionRunner, requestAction} from './orchestration.js';
 import {normalizeLocalSettings} from './local-models.js';
 import {createLocalResolver} from './local-resolve.js';
@@ -940,20 +940,33 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
               const state = reducers.tasks(session.events)[task]?.state;
               const attempt = state ? reducers.tasks(session.events)[task]?.attempt : null;
               if (!finalizeReport({task, attempt, from, context}) && !reducers.TERMINAL.has(state) && state !== 'blocked' && state !== 'input_required') {
-                // A local worker's answer IS its report: asking a small model to also drive a report
-                // protocol is the step it fails most, and the continuation that chased it never once
-                // succeeded. Only `completed` is inferred, and the row says it was.
+                // A worker's own final answer is the source of truth the moment no valid structured
+                // report survives parsing: the model does the work and loses it at the hand-off far
+                // more often than it fails the work itself (observed live, session 159f4746: 7/19
+                // tasks ended `task.report.invalid missing_report` over a complete, usable prose
+                // answer). Bounce synthesizes the report from that answer — merging in whatever valid
+                // fields a malformed `bounce_report` call already carried — instead of spending a
+                // repair turn asking the model to do the one thing it just failed to do. Only a
+                // literally empty answer still needs a turn back, and it asks in plain words.
                 const inspected = inspectFinalReport(event.text);
-                const envelope = inspected.diagnostic ? null : inspected.report;
+                const answer = String(event.text ?? '').trim();
                 if (inspected.diagnostic === 'report_incomplete') {
                   append({kind: 'task.report.invalid', task, attempt, report: inspected.report, diagnostic: inspected.diagnostic, outputSeq: output.seq, from, context});
                   append({kind: 'task.blocked', task, reason: 'report_incomplete', text: inspected.report.remaining, from, context});
-                } else if (envelope) {
-                  append(reportEvent({task, attempt, report: envelope, from, context}));
+                } else if (!inspected.diagnostic) {
+                  append(reportEvent({task, attempt, report: inspected.report, from, context}));
+                  finalizeReport({task, attempt, from, context});
+                } else if (answer) {
+                  const synthesis = synthesizeReport(answer, inspected.report);
+                  const problem = validateReport(synthesis.report);
+                  if (problem) throw new Error(`synthesized report invalid: ${problem}`);
+                  append({kind: 'task.report.invalid', task, attempt, report: inspected.report, diagnostic: inspected.diagnostic, outputSeq: output.seq, from, context});
+                  append({kind: 'task.report.synthesized', task, attempt, rule: synthesis.rule, sources: synthesis.sources, outputSeq: output.seq, from, context});
+                  append(reportEvent({task, attempt, report: synthesis.report, from, context}));
                   finalizeReport({task, attempt, from, context});
                 } else {
                   append({kind: 'task.report.invalid', task, attempt, report: inspected.report, diagnostic: inspected.diagnostic, outputSeq: output.seq, from, context});
-                  await requestFinalReport({task, attempt, context, adapter, diagnostic: inspected.diagnostic});
+                  await requestPlainAnswer({task, attempt, context, adapter});
                 }
               }
             } else if (event.status === 'completed') append({kind: 'task.completed', task, summary: event.text, from, context});
@@ -1015,20 +1028,24 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (slotWaiters.size) queueMicrotask(() => wakeSlotWaiters(released.seq));
   }
 
-  async function requestFinalReport({task, attempt, context, adapter, diagnostic}) {
+  // Only reached once (consumeWorkerEvents): the worker's final turn ended with no text at all, so
+  // there is nothing to synthesize a report from. One turn back, asked in plain words — never the
+  // JSON schema again, which is the instruction the worker just failed to follow. A second empty
+  // answer, or no way to ask again, blocks on it rather than failing the task for its formatting.
+  async function requestPlainAnswer({task, attempt, context, adapter}) {
     const jobId = submittedRow(task)?.jobId;
     const previous = session.events.some(event => event.kind === 'task.report_requested' && (jobId ? event.jobId === jobId : event.task === task));
     const root = budgetRootOf(task, reducers.tasks(session.events));
     const remaining = reducers.budgets(session.events).roots[root]?.remaining?.starts;
     const deadline = deadlineAtFor(task);
     const native = session.events.findLast(event => event.kind === 'peer.native' && event.from === workerFrom(task));
-    if (!previous) append({kind: 'task.report_requested', task, attempt, text: `Requesting a valid final report: ${diagnostic}`, diagnostic, context});
+    if (!previous) append({kind: 'task.report_requested', task, attempt, text: 'The worker gave no answer at all; asking once more, in plain words', diagnostic: 'no_answer', context});
     if (previous) {
-      append({kind: 'task.failed', task, reason: 'incomplete_report', text: `Final report validation failed after one repair: ${diagnostic}. Worker output is preserved; use task_get full.`, context});
+      repairUnavailable(task, 'the worker gave no answer, twice in a row', context);
       return;
     }
     if (!adapter.resume || !native || remaining === 0 || (deadline !== null && deadline <= clock())) {
-      repairUnavailable(task, `${diagnostic}, and no resumable session, start allowance or deadline remains`, context);
+      repairUnavailable(task, 'the worker gave no answer, and no resumable session, start allowance or deadline remains', context);
       return;
     }
     append({kind: 'budget.reserved', task, root, amount: {starts: 1}, context});
@@ -1150,9 +1167,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const nativeRow = session.events.filter(e => e.kind === 'peer.native' && e.from === workerFrom(task)).at(-1);
     const native = nativeRow ? {provider: nativeRow.provider, sessionId: nativeRow.sessionId, ...(nativeRow.cwd ? {cwd: nativeRow.cwd} : {})} : {};
     const pending = reportOnly ? [] : pendingMessages(task);
-    const invalidReport = session.events.findLast(event => event.kind === 'task.report.invalid' && event.task === task);
+    // reportOnly is only ever requestPlainAnswer's turn back after a literally empty answer
+    // (scheduler.js): ask in plain words, never the JSON schema the worker just failed to use —
+    // any non-empty answer, however malformed, is synthesized straight from the log instead.
     let message = reportOnly
-      ? `Your previous report was rejected: ${invalidReport?.diagnostic ?? 'missing_report'}. Its complete output is retained by Bounce. Correct that exact format error. Return a structurally valid final report of the work actually performed: ${reportInstruction(profile)}. Do not perform additional implementation. Include op:final, outcome, phase, text, next, summary, evidence and remaining. Report blockers honestly. If required work remains, use outcome blocked and retain the remaining work; this formatting-only turn cannot complete it.`
+      ? 'Your last turn ended with no answer at all. Say in plain words: what you did, whether it is done, and what is left. No JSON, no particular format — a plain answer is enough.'
       : [`Rework round ${round}:`, ...findings.map(f => `- ${f}`), ...pending.map(m => m.text)].join('\n');
     let adapter = adapters[profile.adapter];
     let admission;
@@ -1175,7 +1194,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       append({kind: 'task.launch.requested', task, attempt, executionKey: `${task}:${attempt}`, resumed: true, context});
       if (owned?.disposable) message = `${message}\n\n${probeOrders(owned)}`;
       else if (owned) message = inWorkingCopy(message, owned);
-      handle = await adapter.resume({peer: workerFrom(task), profile, native, message: reportEnv ? `${message}\n\n${reportContract(profile)}` : LOCAL_ADAPTERS.has(profile.adapter) ? `${message}\n\n${LOCAL_REPORT_LINE}` : message, cwd: owned?.cwd ?? session.cwd, dir, checkpoint: row.checkpoint,
+      // A reportOnly turn asks in plain words on purpose (requestPlainAnswer): the JSON schema
+      // reminder below is for every OTHER resume, never appended onto that one turn back.
+      handle = await adapter.resume({peer: workerFrom(task), profile, native, message: reportOnly ? message : reportEnv ? `${message}\n\n${reportContract(profile)}` : LOCAL_ADAPTERS.has(profile.adapter) ? `${message}\n\n${LOCAL_REPORT_LINE}` : message, cwd: owned?.cwd ?? session.cwd, dir, checkpoint: row.checkpoint,
         task, attempt, context, signal: admission?.signal,
         onActivity: LOCAL_ADAPTERS.has(profile.adapter) ? localActivity(task, attempt, context) : undefined,
         report: requireFinalReport ? ({report: payload}) => report({task, attempt, context, report: payload}) : undefined});

@@ -165,7 +165,7 @@ test('a failed report-only resume releases its slot once, after the worker handl
   const adapter = fakeAdapter(({orders, message}) => {
     const name = (orders ?? 'first-resume').split('\n')[0];
     launched.push(name);
-    if (name === 'first' && ++firstTurns === 1) return [{kind: 'native', sessionId: 'native-first'}, {kind: 'result', status: 'completed', text: '{"op":"final","outcome":'}];
+    if (name === 'first' && ++firstTurns === 1) return [{kind: 'native', sessionId: 'native-first'}, {kind: 'result', status: 'completed', text: ''}];
     if (message) return {launchError: 'resume refused'};
     return {never: true};
   });
@@ -291,44 +291,38 @@ test('a dispatch interrupted during its checkpoint is launched once after a rest
   assert.equal(reopened.events.filter(e => e.task === row.task && e.kind === 'task.started').length, 1);
 });
 
-// Observed live (reviewer 080b39ce): a 9 KB FAIL verdict needed its report repaired, the repair was refused
-// as "the machine is swapping", and the task failed incomplete_report.
-// A repair continues the same local session, so no cloud AI can take it: it waits, and if it never
-// runs the task is blocked with the answer it already gave.
-const finalReport = {op: 'final', phase: 'review', text: 'Reviewed.', next: 'None', evidence: [], outcome: 'completed', summary: 'Verdict: FAIL, one blocker.', remaining: ''};
-function pressureScenario(t, {deadline = null} = {}) {
+// Observed live (reviewer 080b39ce): a 9 KB FAIL verdict needed its report repaired, the repair was
+// refused as "the machine is swapping", and the task failed incomplete_report. Under synthesis
+// (src/final-report.js synthesizeReport), that answer needs no repair at all: it is substantive
+// prose read directly as the worker's own verdict — no resume, no repair round, whatever else
+// (memory pressure, a short deadline) might otherwise have stood between it and a report.
+function failVerdictScenario(t, {deadline = null} = {}) {
   const {root, session} = tmpSession('bounce-swap-repair-');
-  let pressured = false;
   const answer = '**Verdict: FAIL**\n\n## FINDING 1 (blocker): Docker cancellation does not set report.childExitCode';
-  const adapter = fakeAdapter(({message}) => {
-    if (!message) { pressured = true; return [{kind: 'native', sessionId: 'native-review'}, {kind: 'result', status: 'completed', text: answer}]; }
-    return [{kind: 'result', status: 'completed', text: JSON.stringify(finalReport)}];
-  });
-  const machine = {read: () => ({known: true, available: 64 * 1024 ** 3, total: 128 * 1024 ** 3, pressure: pressured ? 2 : 1}), underPressure: () => pressured};
-  const scheduler = createScheduler({...hostless, resources: machine, session, adapters: {opencode: adapter}, profiles: {worker: local('worker')}, localResolver: passResolver,
+  const adapter = fakeAdapter(() => [{kind: 'native', sessionId: 'native-review'}, {kind: 'result', status: 'completed', text: answer}]);
+  const scheduler = createScheduler({...hostless, session, adapters: {opencode: adapter}, profiles: {worker: local('worker')}, localResolver: passResolver,
     gitHead: () => null, requireFinalReport: true, watchdog: {interval: null}, localSettings: endpoints({pollMs: 5})});
   teardown(t, scheduler, root);
   const row = scheduler.submit({parent: null, profile: 'worker', orders: 'review it', deadline});
-  return {session, scheduler, row, adapter, answer, ease: () => { pressured = false; }};
+  return {session, scheduler, row, adapter, answer};
 }
 
-test('a report repair that meets memory pressure waits for it to ease, then completes', {timeout: 3_000}, async t => {
-  const {session, row, adapter, ease} = pressureScenario(t);
-  await waitFor(() => session.events.some(e => e.task === row.task && e.kind === 'task.milestone' && /^Waiting for warning memory pressure to ease before repairing the report on lmstudio$/.test(e.text)), {timeout: 1000});
-  assert.equal(adapter.calls.resume, 0);
-  ease();
-  await waitFor(() => session.events.some(e => e.task === row.task && e.kind === 'task.completed'), {timeout: 1000});
-  assert.equal(session.events.some(e => e.task === row.task && e.kind === 'task.failed'), false);
-  assert.equal(adapter.calls.resume, 1);
+test('a FAIL-verdict prose answer is synthesized directly, with no repair round', {timeout: 3_000}, async t => {
+  const {session, row, adapter} = failVerdictScenario(t);
+  await waitFor(() => session.events.some(e => e.task === row.task && e.kind === 'task.failed'), {timeout: 1000});
+  const failed = session.events.findLast(e => e.task === row.task && e.kind === 'task.failed');
+  assert.equal(failed.reason, 'reported_failure');
+  // The synthesized summary (its own first heading) is what a task.failed row carries as text.
+  assert.equal(failed.text, 'FINDING 1 (blocker): Docker cancellation does not set report.childExitCode');
+  assert.equal(adapter.calls.resume, 0, 'no repair round is ever requested for a non-empty answer');
+  const synthesized = session.events.find(e => e.task === row.task && e.kind === 'task.report.synthesized');
+  assert.equal(synthesized.rule, 'first_block_failed');
 });
 
-test('a report repair that never gets to run blocks with the answer the worker already gave', {timeout: 3_000}, async t => {
-  const {session, row, adapter} = pressureScenario(t, {deadline: 400});
-  const blocked = await waitFor(() => session.events.find(e => e.task === row.task && e.kind === 'task.blocked'), {timeout: 2_500});
-  const output = session.events.find(e => e.task === row.task && e.kind === 'task.output');
-  assert.equal(blocked.reason, 'report_repair_unavailable');
-  assert.match(blocked.text, new RegExp(`^The worker answered \\(${output.chars} chars, output seq ${output.seq}\\): "\\*\\*Verdict: FAIL\\*\\*`));
-  assert.match(blocked.text, /Its report could not be repaired: Local task deadline exceeded\. Read it with task_get full; accept it, resubmit it, or continue it on a cloud AI if the user agrees\.$/);
-  assert.equal(session.events.some(e => e.task === row.task && e.kind === 'task.failed'), false);
+test('the same FAIL-verdict answer synthesizes identically against a deadline that has already passed', {timeout: 3_000}, async t => {
+  const {session, row, adapter} = failVerdictScenario(t, {deadline: 400});
+  const failed = await waitFor(() => session.events.find(e => e.task === row.task && e.kind === 'task.failed'), {timeout: 2_500});
+  assert.equal(failed.reason, 'reported_failure');
+  assert.equal(session.events.some(e => e.task === row.task && e.kind === 'task.blocked'), false);
   assert.equal(adapter.calls.resume, 0);
 });

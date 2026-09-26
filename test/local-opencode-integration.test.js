@@ -44,14 +44,16 @@ test('under a required final report, a local worker completes only with its vali
   assert.equal(session.events.filter(e => e.kind === 'task.started' && e.task === row.task).length, 1);
 });
 
-test('under a required final report, arbitrary local prose is refused as incomplete_report', async t => {
+test('under a required final report, arbitrary local prose is synthesized into a completed report', async t => {
   const {session} = setup(t, {FAKE_OC_SCENARIO: 'prose'});
   const scheduler = createScheduler({session, adapters: {opencode: createOpencodeLive({})}, profiles: {analyst: local({policy: 'read-only'})}, requireFinalReport: true});
   t.after(() => scheduler.close());
   const row = scheduler.submit({parent: null, profile: 'analyst', orders: 'scout'});
-  await waitFor(() => scheduler.tasks()[row.task].state === 'failed');
-  assert.equal(scheduler.tasks()[row.task].reason, 'incomplete_report');
-  assert.equal(session.events.some(e => e.kind === 'task.completed' && e.task === row.task), false);
+  await waitFor(() => scheduler.tasks()[row.task].state === 'completed');
+  const completed = session.events.findLast(e => e.kind === 'task.completed' && e.task === row.task);
+  assert.equal(completed.summary, 'echo: scout');
+  assert.equal(session.events.some(e => e.kind === 'task.report.synthesized' && e.task === row.task), true);
+  assert.equal(session.events.some(e => e.kind === 'task.failed' && e.task === row.task), false);
 });
 
 test('a local runtime failure is recoverable: the same job falls back to the next AI in its chain', async t => {

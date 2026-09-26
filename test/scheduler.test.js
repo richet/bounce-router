@@ -73,17 +73,35 @@ test('final report is staged until the provider terminal outcome', async t => {
   assert.equal(session.events.some(e => e.kind === 'task.completed'), false);
 });
 
-// A report that cannot be repaired (here: no resumable session) blocks on the answer the worker gave,
-// quoted, so the orchestrator decides on it instead of reading "failed" as "nothing came back".
-test('a clean worker exit without final report requests it once, then blocks on the answer it gave', async t => {
+// A clean exit with no structured report but a real answer is synthesized straight into a
+// completed report: the worker's own answer is the source of truth (src/final-report.js
+// synthesizeReport), never a reason to spend a repair turn or fail the task.
+test('a clean worker exit with prose but no final report is synthesized into a completed report', async t => {
   const {session} = setup(t);
   const adapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'opening intention'}]);
+  const scheduler = createScheduler({session, adapters: {A: adapter}, profiles: {A: {adapter: 'A', mode: 'yolo', fallback: []}}, requireFinalReport: true});
+  const submitted = scheduler.submit({parent: null, profile: 'A', orders: 'inspect'});
+  await waitFor(() => scheduler.tasks()[submitted.task]?.state === 'completed');
+  const completed = session.events.findLast(e => e.kind === 'task.completed' && e.task === submitted.task);
+  assert.equal(completed.summary, 'opening intention');
+  const synthesized = session.events.findLast(e => e.kind === 'task.report.synthesized' && e.task === submitted.task);
+  assert.equal(synthesized.rule, 'default_completed');
+  assert.equal(session.events.some(e => e.kind === 'task.report_requested' && e.task === submitted.task), false);
+  assert.equal(session.events.some(e => e.kind === 'task.blocked' && e.task === submitted.task), false);
+});
+
+// Only a literally empty answer still needs a turn back, and when nothing can ask for it (here: no
+// resumable session), it blocks on that — quoted, when there is anything to quote — rather than
+// failing the task for its formatting.
+test('a clean worker exit with no answer at all, and no resumable session, blocks rather than fails', async t => {
+  const {session} = setup(t);
+  const adapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: ''}]);
   const scheduler = createScheduler({session, adapters: {A: adapter}, profiles: {A: {adapter: 'A', mode: 'yolo', fallback: []}}, requireFinalReport: true});
   const submitted = scheduler.submit({parent: null, profile: 'A', orders: 'inspect'});
   await waitFor(() => scheduler.tasks()[submitted.task]?.state === 'blocked');
   const blocked = session.events.findLast(e => e.kind === 'task.blocked' && e.task === submitted.task);
   assert.equal(blocked.reason, 'report_repair_unavailable');
-  assert.match(blocked.text, /^The worker answered \(17 chars, output seq \d+\): "opening intention"\. Its report could not be repaired: missing_report, and no resumable session/);
+  assert.match(blocked.text, /the worker gave no answer, and no resumable session, start allowance or deadline remains/);
   assert.equal(session.events.filter(e => e.kind === 'task.report_requested' && e.task === submitted.task).length, 1);
   assert.equal(session.events.some(e => e.kind === 'task.completed' && e.task === submitted.task), false);
 });

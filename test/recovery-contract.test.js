@@ -151,7 +151,11 @@ test('logical outcome wait stays pending until completion review decides', {time
   assert.equal((await outcome).kind, 'task.accepted');
 });
 
-test('missing final report gets one real report-only resume and accepts its scoped response', {timeout: 2000}, async t => {
+// A worker's own final answer is the source of truth whenever it has one at all: a non-empty
+// answer synthesizes directly (see final-report.test.js / worker-communication.test.js), so only
+// a literally empty answer still gets a turn back — and that turn asks in plain words, not the
+// bounce_report tool it just failed to use (src/scheduler.js requestPlainAnswer).
+test('an empty final answer gets one plain-words resume and accepts its scoped response', {timeout: 2000}, async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-report-contract-'));
   const session = new Session(root, {root});
   let scheduler, grant, resumes = 0;
@@ -159,14 +163,14 @@ test('missing final report gets one real report-only resume and accepts its scop
     launch: async ({orders}) => { assert.match(orders, /call the bounce_report tool/); assert.doesNotMatch(orders, /bounce report --report/); return {attempt: 1}; },
     async resume({message}) {
       resumes++;
-      assert.match(message, /final report/i);
-      assert.match(message, /call the bounce_report tool/);
+      assert.match(message, /plain words/i);
+      assert.doesNotMatch(message, /call the bounce_report tool/);
       assert.doesNotMatch(message, /bounce report --report/);
       assert.throws(() => scheduler.report({...grant, attempt: 1, report: {op: 'milestone', phase: 'old', text: 'late', next: 'none'}}), /stale report/);
       scheduler.report({...grant, report: {op: 'final', outcome: 'completed', phase: 'done', text: 'Verified', next: 'none', summary: 'Actual result', evidence: ['test/log'], remaining: ''}});
       return {attempt: 2};
     },
-    async *events() { yield {kind: 'native', provider: 'A', sessionId: 'thread'}; yield {kind: 'result', status: 'completed', text: 'preamble'}; },
+    async *events() { yield {kind: 'native', provider: 'A', sessionId: 'thread'}; yield {kind: 'result', status: 'completed', text: ''}; },
     cancel: async () => ({verified: true}),
   };
   scheduler = createScheduler({session, adapters: {codex: adapter}, profiles: {A: {adapter: 'codex', mode: 'plan'}}, requireFinalReport: true, reportGrant: identity => { grant = identity; return {}; }, limits: {attempts: 1}, watchdog: {interval: null}});

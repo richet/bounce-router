@@ -7,7 +7,6 @@ import {createHash} from 'node:crypto';
 import {Session} from '../src/core.js';
 import {createScheduler} from '../src/scheduler.js';
 import {taskView} from '../src/task-view.js';
-import {handoffBlock} from '../src/main-service.js';
 import {fakeAdapter} from './helpers/fake-adapter.js';
 
 const valid = {op: 'final', phase: 'audit', text: 'Inventory finished', next: 'Review findings',
@@ -33,45 +32,49 @@ function setup(t, worker, watchdog = {}) {
 const submit = scheduler => scheduler.submit({task: 'audit', profile: 'analyst',
   from: 'orchestrator', orders: 'Inventory this source; report findings, do not implement them.', requires: ['read']});
 
-test('malformed long answers survive repair failure, restart, and coordinator handoff', {timeout: 4000}, async t => {
-  const first = JSON.stringify({...valid, text: 'Evidence '.repeat(2400)}).replace('],"outcome"', ',"outcome"');
-  const second = JSON.stringify({...valid, summary: 'Still have findings'}).replace('],"outcome"', ',"outcome"');
-  let turns = 0;
-  const worker = fakeAdapter(() => [{kind: 'native', sessionId: 'native-audit'},
-    {kind: 'result', status: 'completed', text: ++turns === 1 ? first : second}]);
-  const {root, session, scheduler, terminal} = setup(t, worker);
-  submit(scheduler);
-  const ended = await terminal;
-  assert.equal(ended.reason, 'incomplete_report');
-  assert.match(ended.text, /malformed_json/);
-  assert.equal(worker.calls.resume, 1);
-  assert.match(worker.resumeCalls[0].message, /malformed_json/);
-  const outputs = session.events.filter(row => row.kind === 'task.output');
-  assert.deepEqual(outputs.map(row => row.text), [first, second]);
-  assert.deepEqual(outputs.map(row => row.attempt), [1, 2]);
-  assert.equal(outputs[0].digest, createHash('sha256').update(first).digest('hex'));
-  assert.equal(outputs[0].chars, first.length);
-  const restored = new Session(root, {root, id: session.id});
-  const view = taskView(restored.events, 'audit', {report: true});
-  assert.equal(view.rawOutput, second);
-  assert.equal(view.candidateReport, null);
-  assert.equal(view.invalidReport.outputSeq, outputs[1].seq);
-  assert.match(handoffBlock(restored, [ended]), /preserved.*task_get.*full/i);
-  assert.equal(session.events.some(row => row.kind === 'task.accepted'), false);
-});
-
-test('a successful repair preserves the first answer and creates only a validated candidate', {timeout: 4000}, async t => {
-  const malformed = JSON.stringify(valid).replace('],"outcome"', ',"outcome"');
-  let turns = 0;
-  const worker = fakeAdapter(() => [{kind: 'native', sessionId: 'native-audit'},
-    {kind: 'result', status: 'completed', text: ++turns === 1 ? malformed : JSON.stringify(valid)}]);
+// The worker's own final answer is the source of truth the moment no valid structured report
+// survives parsing (src/final-report.js synthesizeReport): a long malformed-JSON answer is
+// synthesized directly, never spending a repair turn asking the model to fix its own formatting.
+// Observed live (session 159f4746, 7/19 tasks): a good prose final answer over a missing report
+// was lost to a report repair that timed out or was unavailable.
+test('a long malformed-JSON answer is synthesized directly, with no repair round', {timeout: 3000}, async t => {
+  const malformed = JSON.stringify({...valid, text: 'Evidence '.repeat(2400)}).replace('],"outcome"', ',"outcome"');
+  const worker = fakeAdapter(() => [{kind: 'result', status: 'completed', text: malformed}]);
   const {session, scheduler, terminal} = setup(t, worker);
   submit(scheduler);
   const ended = await terminal;
   assert.equal(ended.kind, 'task.completed');
-  assert.equal(session.events.filter(row => row.kind === 'task.output').length, 2);
-  assert.deepEqual(taskView(session.events, 'audit', {report: true}).candidateReport, valid);
-  assert.equal(session.events.filter(row => row.kind === 'task.reported').length, 1);
+  assert.equal(worker.calls.resume, 0, 'no repair round is ever requested for a non-empty answer');
+  const invalid = session.events.find(row => row.kind === 'task.report.invalid');
+  assert.match(invalid.diagnostic, /^malformed_json/);
+  const synthesized = session.events.find(row => row.kind === 'task.report.synthesized');
+  assert.equal(synthesized.rule, 'default_completed');
+  assert.deepEqual(synthesized.sources, {outcome: 'answer', phase: 'answer', summary: 'answer', remaining: 'answer', next: 'answer', evidence: 'answer'});
+  const outputs = session.events.filter(row => row.kind === 'task.output');
+  assert.equal(outputs.length, 1);
+  assert.equal(outputs[0].digest, createHash('sha256').update(malformed).digest('hex'));
+  assert.equal(session.events.some(row => row.kind === 'task.accepted'), false);
+});
+
+// A malformed `bounce_report`-shaped answer (parsed JSON, rejected only for one missing field)
+// keeps every field it got right; synthesis fills only what was missing, from the same answer.
+test('a malformed report missing only its summary is synthesized by filling that one field', {timeout: 3000}, async t => {
+  const missingSummary = JSON.stringify({...valid, summary: undefined});
+  const worker = fakeAdapter(() => [{kind: 'result', status: 'completed', text: missingSummary}]);
+  const {session, scheduler, terminal} = setup(t, worker);
+  submit(scheduler);
+  const ended = await terminal;
+  assert.equal(ended.kind, 'task.completed');
+  assert.equal(worker.calls.resume, 0);
+  const invalid = session.events.find(row => row.kind === 'task.report.invalid');
+  assert.match(invalid.diagnostic, /^malformed_report: summary/);
+  const synthesized = session.events.find(row => row.kind === 'task.report.synthesized');
+  const reported = session.events.find(row => row.kind === 'task.reported');
+  assert.equal(synthesized.sources.summary, 'answer');
+  for (const field of ['outcome', 'phase', 'next', 'evidence']) assert.equal(synthesized.sources[field], 'worker', `${field} kept its own value`);
+  assert.equal(reported.phase, valid.phase);
+  assert.deepEqual(reported.evidence, valid.evidence);
+  assert.equal(ended.summary, reported.summary);
 });
 
 for (const verified of [true, false]) {
@@ -119,12 +122,33 @@ test('a scoped worker is instructed to use the acknowledged report tool and pres
   assert.equal(session.events.some(row => row.kind === 'task.report_requested'), false);
 });
 
-test('an acknowledged repair report wins over the report-only timeout that fires before the turn ends', {timeout: 3000}, async t => {
-  const malformed = JSON.stringify(valid).replace('],"outcome"', ',"outcome"');
+// Only a literally empty answer still gets a turn back — and only in plain words, never the JSON
+// schema again (src/scheduler.js requestPlainAnswer). Its reply is then synthesized the same way
+// as any other answer.
+test('an empty answer gets one plain-words continuation, whose reply is synthesized', {timeout: 3000}, async t => {
   let turns = 0;
-  // Turn 2 acknowledges its final report through the report tool, then never yields a result.
+  const worker = fakeAdapter(() => [{kind: 'native', sessionId: 'native-audit'},
+    {kind: 'result', status: 'completed', text: ++turns === 1 ? '' : 'Done: inventoried the source tree, nothing to report.'}]);
+  const {session, scheduler, terminal} = setup(t, worker);
+  submit(scheduler);
+  const ended = await terminal;
+  assert.equal(ended.kind, 'task.completed');
+  assert.equal(worker.calls.resume, 1);
+  assert.doesNotMatch(worker.resumeCalls[0].message, /op:final|outcome|summary|schema/i, 'the continuation asks in plain words, not the report schema');
+  assert.match(worker.resumeCalls[0].message, /plain words/i);
+  const requested = session.events.find(row => row.kind === 'task.report_requested');
+  assert.equal(requested.diagnostic, 'no_answer');
+  const synthesized = session.events.find(row => row.kind === 'task.report.synthesized');
+  assert.equal(synthesized.attempt, 2);
+  assert.equal(ended.summary, 'Done: inventoried the source tree, nothing to report.');
+});
+
+test('an acknowledged report wins over the report-only timeout that fires before the plain-answer turn ends', {timeout: 3000}, async t => {
+  let turns = 0;
+  // Turn 2 (asked in plain words after an empty turn 1) acknowledges its final report through
+  // the report tool, then never yields a result.
   const worker = fakeAdapter(({report}) => {
-    if (++turns === 1) return [{kind: 'native', sessionId: 'native-audit'}, {kind: 'result', status: 'completed', text: malformed}];
+    if (++turns === 1) return [{kind: 'native', sessionId: 'native-audit'}, {kind: 'result', status: 'completed', text: ''}];
     report({report: valid});
     return {never: true};
   });
@@ -139,11 +163,10 @@ test('an acknowledged repair report wins over the report-only timeout that fires
   assert.equal(session.events.some(row => row.kind === 'task.failed'), false);
 });
 
-test('a report-only timeout with no acknowledged report still fails with preserved output', {timeout: 3000}, async t => {
-  const malformed = JSON.stringify(valid).replace('],"outcome"', ',"outcome"');
+test('a report-only timeout with no answer at all still fails, never for formatting alone', {timeout: 3000}, async t => {
   let turns = 0;
   const worker = fakeAdapter(() => ++turns === 1
-    ? [{kind: 'native', sessionId: 'native-audit'}, {kind: 'result', status: 'completed', text: malformed}]
+    ? [{kind: 'native', sessionId: 'native-audit'}, {kind: 'result', status: 'completed', text: ''}]
     : {never: true});
   const {session, scheduler, terminal} = setup(t, worker, {reportOnly: 50});
   submit(scheduler);
