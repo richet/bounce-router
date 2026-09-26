@@ -764,6 +764,7 @@ async function main() {
     if (event?.kind === 'progress') progress = clean(event.text);
     terminal?.ingest(event);
     if (event?.kind === 'task.delivered') notice = `Worker ${event.task.slice(0, 8)} · delivery ${event.tier}`;
+    if ((event?.kind === 'btw.answered' || event?.kind === 'btw.failed') && notice === 'btw · answering…') notice = event.kind === 'btw.answered' ? 'btw · answered above' : 'btw · no answer';
     // Vendor streams repeat quota many times per turn; only a changed reading redraws.
     if (event?.kind === 'raw' && !recordQuota(quotas, root, quotaSnapshot(event.provider, event.raw))) return;
     if (renderTimer) return;

@@ -53,7 +53,7 @@ export function resolveBtwAgent({settings, orchestration, session}) {
 export function buildBtwPrompt(question, context) {
   return [
     'This is a side question from the user about this bounce session, asked with /btw. It is not a new instruction and it does not continue or steer any turn in progress.',
-    'Answer it concisely, using only the context below. If the context does not contain the answer, say so plainly instead of guessing.',
+    'Answer it concisely. Start from the context below; when it is not enough, read files in the working folder (the project, its docs and notes) to find the answer. Read only: never edit, run builds or change anything. If you still cannot tell, say so plainly instead of guessing.',
     '', 'Context:', context || '(no context available)', '', `Question: ${question}`,
   ].join('\n');
 }
@@ -62,17 +62,19 @@ export function buildBtwPrompt(question, context) {
 // answer or a failure reason. Never delivers into or queues for the main turn — `ask` is a plain
 // one-shot call injected by the caller (see createBtwAsk below for the default).
 export async function askBtw({session, settings, orchestration, ask, id, question}) {
-  session.append({kind: 'btw.asked', text: question, id});
+  // `btw` pairs the answer with its question; the row's own `id` must stay unique (found live: sharing it,
+  // the view deduped the answer away as a repeat of the question).
+  session.append({kind: 'btw.asked', text: question, btw: id});
   const context = buildBtwContext(session.events, {orchestrating: orchestration?.operation === 'orchestrator'});
   const agent = resolveBtwAgent({settings, orchestration, session});
   try {
     if (!agent.adapter) throw new Error('no_agent');
-    const answer = await ask({prompt: buildBtwPrompt(question, context), agent, settings});
+    const answer = await ask({prompt: buildBtwPrompt(question, context), agent, settings, cwd: session.cwd});
     if (!answer?.text) throw new Error('no_answer');
-    session.append({kind: 'btw.answered', id, text: answer.text, model: answer.model ?? null});
+    session.append({kind: 'btw.answered', btw: id, text: answer.text, model: answer.model ?? null});
   } catch (error) {
     const reason = ['no_agent', 'no_answer', 'cancelled'].includes(error.message) ? error.message : 'failed';
-    session.append({kind: 'btw.failed', id, reason});
+    session.append({kind: 'btw.failed', btw: id, reason});
   }
 }
 
@@ -83,7 +85,7 @@ export async function askBtw({session, settings, orchestration, ask, id, questio
 const exitHook = fn => { process.once('exit', fn); return () => process.off('exit', fn); };
 
 export function createBtwAsk({run = runProcess, executables = {}, onExit = exitHook} = {}) {
-  return async function ask({prompt, agent}) {
+  return async function ask({prompt, agent, cwd}) {
     const dir = os.tmpdir();
     const promptFile = path.join(dir, `bounce-btw-${randomUUID()}.txt`);
     fs.writeFileSync(promptFile, prompt, {mode: 0o600});
@@ -93,7 +95,7 @@ export function createBtwAsk({run = runProcess, executables = {}, onExit = exitH
     const said = [], results = [];
     try {
       const result = await run({provider: agent.adapter, executable: resolveExecutable(agent.adapter, executables[agent.adapter]),
-        args: invocation(agent.adapter, {model: agent.model, mode: 'plan'}, promptFile), prompt, cwd: dir, signal: controller.signal,
+        args: invocation(agent.adapter, {model: agent.model, mode: 'plan'}, promptFile), prompt, cwd: cwd || dir, signal: controller.signal,
         emit: e => { if (e.kind === 'assistant') said.push(e.text); else if (e.kind === 'result' && e.success) results.push(e.text); }});
       if (controller.signal.aborted) throw new Error('cancelled');
       if (result.status !== 'completed') throw new Error('failed');

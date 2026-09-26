@@ -99,8 +99,10 @@ test('askBtw: journals btw.asked then btw.answered via the injected ask, exactly
   const asked = session.events.find(e => e.kind === 'btw.asked');
   const answered = session.events.find(e => e.kind === 'btw.answered');
   assert.equal(asked.text, 'what changed?');
-  assert.equal(asked.id, 'abc123');
-  assert.equal(answered.id, 'abc123');
+  assert.equal(asked.btw, 'abc123');
+  assert.equal(answered.btw, 'abc123');
+  // Found live: sharing the row id, the view deduped the answer away as a repeat of the question.
+  assert.notEqual(asked.id, answered.id);
   assert.equal(answered.text, 'the answer');
   assert.equal(answered.model, 'claude/sonnet');
   assert.equal(session.events.some(e => e.kind === 'aside'), false);
@@ -118,7 +120,7 @@ test('askBtw: orchestrator idle with a worker running — answers via the inject
   const ask = async ({prompt, agent}) => { assert.match(prompt, /docker\/orbstack/); assert.equal(agent.adapter, 'codex'); return {text: 'bounce runs every service in this project\'s own docker compose scope, not the default one', model: 'codex'}; };
   await askBtw({session, settings, orchestration, ask, id: 'seq3354', question: "this is weird.. I don't see anything ace related in docker/orbstack"});
   assert.equal(session.events.some(e => e.kind === 'btw.asked' && e.text.includes('docker/orbstack')), true);
-  assert.equal(session.events.some(e => e.kind === 'btw.answered' && e.id === 'seq3354'), true);
+  assert.equal(session.events.some(e => e.kind === 'btw.answered' && e.btw === 'seq3354'), true);
   assert.equal(session.events.some(e => e.kind === 'aside'), false, 'a /btw must never fall back to saving an aside');
   // No delivery mechanism exists on this path at all: askBtw never references router/deliver.
 });
@@ -128,7 +130,7 @@ test('askBtw: a failing ask journals btw.failed with a reason identifier, never 
   const ask = async () => { throw new Error('boom'); };
   await askBtw({session, settings: {order: ['claude'], models: {}}, orchestration: {operation: 'classic'}, ask, id: 'x1', question: 'q'});
   const failed = session.events.find(e => e.kind === 'btw.failed');
-  assert.equal(failed.id, 'x1');
+  assert.equal(failed.btw, 'x1');
   assert.equal(failed.reason, 'failed');
   assert.equal(session.events.some(e => e.kind === 'btw.answered'), false);
 });
