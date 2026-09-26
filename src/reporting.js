@@ -2,9 +2,26 @@
 // report is data about the caller's already-bound attempt; it cannot address peers, submit work,
 // or invent lifecycle rows.  Scheduler code owns the state transition after validation.
 export const REPORT_OPS = new Set(['milestone', 'blocked', 'input_required', 'final']);
-const TEXT_MAX = 16_000;
-const EVIDENCE_MAX = 32;
-const OUTCOMES = new Set(['completed', 'failed', 'blocked', 'input_required']);
+export const TEXT_MAX = 16_000;
+export const EVIDENCE_MAX = 32;
+export const OUTCOMES = new Set(['completed', 'failed', 'blocked', 'input_required']);
+
+// A worker's outcome word missing the canonical set by a synonym, not a typo, is still a clear
+// verdict — normalize case-insensitively before refusing it. Found live (session 159f4746, 2
+// tasks): a near-miss outcome word was refused by `bounce_report`, and the worker never recovered
+// its final report. Unknown words fall through unchanged, so validateReport still refuses them.
+const OUTCOME_SYNONYMS = {
+  success: 'completed', succeeded: 'completed', done: 'completed', complete: 'completed', finished: 'completed',
+  error: 'failed', failure: 'failed', fail: 'failed',
+  stuck: 'blocked', blocked_on_input: 'blocked',
+  needs_input: 'input_required', waiting: 'input_required',
+};
+export function normalizeOutcome(outcome) {
+  if (typeof outcome !== 'string') return outcome;
+  const key = outcome.trim().toLowerCase();
+  if (OUTCOMES.has(key)) return key;
+  return OUTCOME_SYNONYMS[key] ?? outcome;
+}
 
 // Shared vendor-facing shape; validateReport remains authoritative at the bus boundary.
 export const REPORT_SCHEMA = {
@@ -45,6 +62,10 @@ export function validateReport(report) {
   for (const field of ['phase', 'text', 'next']) if (!text(report[field])) return `${field} (required string)`;
   if (report.evidence !== undefined && (!Array.isArray(report.evidence) || report.evidence.length > EVIDENCE_MAX || report.evidence.some(item => !text(item)))) return 'evidence';
   if (report.op === 'final') {
+    // Canonicalize in place: every caller (the report MCP tool, the bus's own report(), the
+    // final-answer compatibility path) reads report.outcome straight off this same object after
+    // validation, so a synonym must resolve here, once, not at each read site.
+    if (typeof report.outcome === 'string') report.outcome = normalizeOutcome(report.outcome);
     // Observed live: one "final" for both fields, and a worker that had sent everything but `outcome`
     // gave up on the tool.
     if (!OUTCOMES.has(report.outcome)) return 'outcome (a final report needs completed, failed, blocked or input_required)';

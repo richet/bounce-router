@@ -203,6 +203,22 @@ test('a report missing a required field is refused by field name', () => {
   assert.equal(validateReport({...final, outcome: 'completed'}), null);
 });
 
+// Observed live (session 159f4746, 2 tasks): a near-miss outcome word was refused by
+// `bounce_report`, and the worker never recovered its final report. Case-insensitive synonyms
+// canonicalize in place; an unknown word is still refused with the same message as before.
+test('a final report\'s outcome word is normalized case-insensitively before validation', () => {
+  const final = {op: 'final', phase: 'done', text: 'x', next: 'none', summary: 'Reviewed the locking area.'};
+  for (const [given, canonical] of [['Success', 'completed'], ['DONE', 'completed'], ['finished', 'completed'],
+    ['error', 'failed'], ['Failure', 'failed'], ['stuck', 'blocked'], ['Waiting', 'input_required']]) {
+    const report = {...final, outcome: given};
+    assert.equal(validateReport(report), null, `${given} should validate`);
+    assert.equal(report.outcome, canonical, `${given} normalizes to ${canonical}`);
+  }
+  const unknown = {...final, outcome: 'sorta-done'};
+  assert.equal(validateReport(unknown), 'outcome (a final report needs completed, failed, blocked or input_required)');
+  assert.equal(unknown.outcome, 'sorta-done', 'an unrecognized word is left as-is, not silently coerced');
+});
+
 test('S7 malformed submissions throw and publish nothing', async t => {
   const {session} = setup(t);
   const profiles = {A: {adapter: 'fake', model: 'x', mode: 'yolo', fallback: []}};
