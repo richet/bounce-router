@@ -62,6 +62,19 @@ process.stdin.on('end', () => {
     emit('step_finish', {type: 'step-finish', reason: 'stop', tokens: usage});
     return process.exit(0);
   }
+  // FAKE_OC_SCENARIO=capsilent: the real shape of a step cap (observed live, ACE 43387649, opencode with
+  // maxSteps 60): FAKE_OC_STEPS tool steps, the last step's text titled by the model itself, exit 0 —
+  // and NO runtime notice in the stream. Only the step count says the cap was hit.
+  if (scenario === 'capsilent') {
+    const steps = Number(process.env.FAKE_OC_STEPS ?? 5);
+    for (let i = 1; i <= steps; i++) {
+      emit('step_start', {type: 'step-start'});
+      if (i < steps) emit('tool_use', {type: 'tool', tool: 'read', state: {status: 'completed', input: {filePath: `file${i}.txt`}, output: 'ok'}});
+      else emit('text', {type: 'text', text: '## Maximum Steps Reached for This Agent\n\nThe maximum number of steps has been reached. Below is a summary.\n\n### Remaining\n1. Create the blue workspace.'});
+      emit('step_finish', {type: 'step-finish', reason: i < steps ? 'tool-calls' : 'stop', tokens: usage});
+    }
+    return process.exit(0);
+  }
   if (scenario === 'hold' || scenario === 'stubborn') { setInterval(() => {}, 1000); return; }
   if (scenario === 'empty' || scenario === 'empty-notext') {
     // The shape observed from qwen3-coder-30b-a3b: every step ends for `tool-calls`, even the empty ones.

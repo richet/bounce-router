@@ -181,7 +181,10 @@ export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HE
       let announced = false, lastError = null, tail = '', refused = null;
       const answer = createAnswer();
       const repeats = new Map();
-      let stepActed = false, emptySteps = 0, concluded = false, reads = 0, stalled = false, capped = false;
+      let stepActed = false, emptySteps = 0, concluded = false, reads = 0, stalled = false, capped = false, stepsDone = 0;
+      // Found live (ACE 43387649): at maxSteps opencode ends the turn with no notice in the stream, so the
+      // finished-step count against the turn's own budget is what says the cap was hit.
+      const stepBudget = handle.conclude ? null : handle.profile?.agent?.maxSteps ?? DEFAULT_STEPS;
       // `stepActed` is per step and resets at every step boundary; `didWork` never resets — it answers
       // "did this worker do anything at all", which is what decides whether there is an answer worth asking for.
       let didWork = false, reportedFinal = false;
@@ -209,6 +212,7 @@ export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HE
         }
         if (event.kind === 'error') { yield {kind: 'error', code: event.code, text: event.text}; return; }
         if (event.kind === 'exit') {
+          if (stepBudget && stepsDone >= stepBudget) capped = true;
           // Exit IS the turn ending. A clean exit with text is the worker's answer; anything else is
           // a failure of the runtime rather than of the task, so the next AI in the chain may try.
           // Bounce asked for the conclusion (conclude() below: a lease ended), or the loop guard stopped a
@@ -295,6 +299,7 @@ export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HE
           if (status === 'error') yield {kind: 'diagnostic', text: `${part.tool ?? 'tool'}: ${String(part.state?.error ?? part.state?.output ?? 'failed').slice(0, 500)}`};
         } else if (raw.type === 'step_finish') {
           stepOpenedAt = null;
+          stepsDone += 1;
           const usage = mapUsage(part.tokens);
           if (Object.keys(usage).length) yield {kind: 'usage', usage};
           emptySteps = stepActed ? 0 : emptySteps + 1;

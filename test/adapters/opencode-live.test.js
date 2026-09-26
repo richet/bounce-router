@@ -543,3 +543,14 @@ test('a fenced write worker writes its copy and anything else, but not the origi
   await drain(adapter, handle);
   assert.equal(fs.readFileSync(path.join(cwd, 'src/fenced.txt'), 'utf8'), 'ok');
 });
+
+// Found live (ACE 43387649): opencode hit maxSteps 60 with no runtime notice in the stream — the turn just
+// ended after 60 finished steps, the model's own "## Maximum Steps Reached" heading the only text. The cap
+// went unrecorded, so bounce's step renewal (scheduler) never fired. The step count is the signal.
+test('a turn that used its whole step budget is a step cap even when opencode prints no notice', async t => {
+  const {cwd, dir} = setup(t, {FAKE_OC_SCENARIO: 'capsilent', FAKE_OC_STEPS: '4'});
+  const adapter = createOpencodeLive({});
+  const handle = await adapter.launch({peer: 'worker:t16', profile: profileFor({policy: 'read-only', agent: {name: 'builder', prompt: 'You build.', maxSteps: 4}}), orders: 'do it', cwd, dir});
+  const events = await drain(adapter, handle);
+  assert.equal(events.filter(e => e.kind === 'diagnostic' && e.reason === 'step_cap').length, 1);
+});
