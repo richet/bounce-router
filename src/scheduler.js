@@ -41,6 +41,11 @@ export const WATCHDOG_DEFAULTS = {interval: 5000, startupMs: 120_000, silence: 3
 const DEFAULT_DEADLINE_MINUTES = 60; // a worker with no declared deadline; the watchdog ladder still catches silence
 const DEFAULT_CEILING_MINUTES = 60; // no lease is renewed past this, measured from the lineage's first start
 const CALL_MEMORY = 200; // tool calls remembered per running task, to tell new work from repeated work
+// A worker's own step cap (e.g. OpenCode's per-turn maxSteps) ending a turn is not the task ending:
+// while it is still producing new, non-repeated tool calls, bounce resumes the same worker instead
+// of treating a synthesized "steps reached" report as the final answer. Bounded the same way a
+// lease ceiling is, so a genuinely stuck local worker still stops (docs/plans/step-renewal.md).
+const STEP_RENEWAL_LIMIT = 3;
 const TIERS = new Set(['live', 'next-turn', 'queued']);
 // The depends_on hold/fail decision (which dependency states fail a dependent outright vs.
 // merely hold it — A1) now lives in the strategy (src/strategy.js's DEPENDENCY_FAIL_STATES),
@@ -415,11 +420,56 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return event;
   }
 
-  function finalizeReport({task, attempt, from, context}) {
+  // Did THIS attempt's turn end at the worker's own step cap? The adapter already names it
+  // (opencode-live.js's `task.diagnostic` reason 'step_cap', found live for OpenCode's maxSteps) —
+  // this reads that one signal back rather than adding a second way to detect the same thing.
+  function stepCapped(task, attempt) {
+    const started = session.events.findLast(e => e.kind === 'task.started' && e.task === task && e.attempt === attempt);
+    if (!started) return false;
+    return session.events.some(e => e.kind === 'task.diagnostic' && e.task === task && e.reason === 'step_cap' && (e.seq ?? 0) > started.seq);
+  }
+
+  // Progress in that turn: the same repeat check leaseDecision uses for a lease renewal (new tool
+  // calls, not just the same ones already made before this turn started), scoped here to the calls
+  // made since the attempt's own task.started rather than a lease boundary.
+  function stepTurnProgressed(task, attempt) {
+    const started = session.events.findLast(e => e.kind === 'task.started' && e.task === task && e.attempt === attempt);
+    if (!started) return false;
+    const sinceAt = Date.parse(started.time);
+    const calls = toolCalls.get(task) ?? [];
+    const inTurn = calls.filter(c => c.at > sinceAt);
+    const before = calls.filter(c => c.at <= sinceAt);
+    if (!inTurn.length) return false;
+    return before.length === 0 || inTurn.some(c => c.change) || !inTurn.every(c => before.some(b => b.call === c.call));
+  }
+
+  // The step-budget renewal (docs/plans/step-renewal.md): a worker whose turn ended only because it
+  // hit its own step cap, and was still making progress, is resumed on the SAME native session with
+  // a short "keep going" message instead of having its cap-truncated answer treated as final. Bounded
+  // exactly like a lease: at most STEP_RENEWAL_LIMIT times, and never past the task's own deadline —
+  // beyond that, today's block-and-let-the-orchestrator-decide path runs, unchanged.
+  async function attemptStepRenewal({task, attempt, from, context, remaining}) {
+    if (!stepCapped(task, attempt) || !stepTurnProgressed(task, attempt)) return false;
+    const renewals = session.events.filter(e => e.kind === 'task.steps.renewed' && e.task === task).length;
+    if (renewals >= STEP_RENEWAL_LIMIT) return false;
+    const deadline = deadlineAtFor(task);
+    if (deadline !== null && deadline <= clock()) return false;
+    const row = submittedRow(task);
+    if (!row) return false;
+    const remainingText = typeof remaining === 'string' && remaining.trim() ? remaining.trim() : 'none stated.';
+    const text = `You reached the step limit for one turn, not the end of the task. Continue from where you stopped; the remaining work is: ${remainingText}`;
+    append({kind: 'task.steps.renewed', task, attempt, renewal: renewals + 1, text, from, context});
+    append({kind: 'budget.reserved', task, root: budgetRootOf(task, reducers.tasks(session.events)), amount: {starts: 1}, context});
+    await resumeWorker({task, row, round: 0, findings: [], context, renewal: true, continueMessage: text});
+    return true;
+  }
+
+  async function finalizeReport({task, attempt, from, context}) {
     const final = session.events.findLast(e => e.kind === 'task.reported' && e.task === task && e.attempt === attempt);
     if (!final) return false;
     if (final.outcome === 'completed' && remainingWork(final.remaining)) {
       append({kind: 'task.report.invalid', task, attempt, report: final, diagnostic: 'report_incomplete', from, context});
+      if (await attemptStepRenewal({task, attempt, from, context, remaining: final.remaining})) return true;
       append({kind: 'task.blocked', task, reason: 'report_incomplete', text: final.remaining, from, context}); return true;
     }
     if (final.outcome === 'completed') append({kind: 'task.completed', task, summary: final.summary, artifacts: final.evidence, from, context});
@@ -966,7 +1016,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
             if (event.status === 'completed' && requireFinalReport) {
               const state = reducers.tasks(session.events)[task]?.state;
               const attempt = state ? reducers.tasks(session.events)[task]?.attempt : null;
-              if (!finalizeReport({task, attempt, from, context}) && !reducers.TERMINAL.has(state) && state !== 'blocked' && state !== 'input_required') {
+              if (!(await finalizeReport({task, attempt, from, context})) && !reducers.TERMINAL.has(state) && state !== 'blocked' && state !== 'input_required') {
                 // A worker's own final answer is the source of truth the moment no valid structured
                 // report survives parsing: the model does the work and loses it at the hand-off far
                 // more often than it fails the work itself (observed live, session 159f4746: 7/19
@@ -979,10 +1029,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
                 const answer = String(event.text ?? '').trim();
                 if (inspected.diagnostic === 'report_incomplete') {
                   append({kind: 'task.report.invalid', task, attempt, report: inspected.report, diagnostic: inspected.diagnostic, outputSeq: output.seq, from, context});
-                  append({kind: 'task.blocked', task, reason: 'report_incomplete', text: inspected.report.remaining, from, context});
+                  if (!(await attemptStepRenewal({task, attempt, from, context, remaining: inspected.report.remaining})))
+                    append({kind: 'task.blocked', task, reason: 'report_incomplete', text: inspected.report.remaining, from, context});
                 } else if (!inspected.diagnostic) {
                   append(reportEvent({task, attempt, report: inspected.report, from, context}));
-                  finalizeReport({task, attempt, from, context});
+                  await finalizeReport({task, attempt, from, context});
                 } else if (answer) {
                   const synthesis = synthesizeReport(answer, inspected.report);
                   const problem = validateReport(synthesis.report);
@@ -990,7 +1041,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
                   append({kind: 'task.report.invalid', task, attempt, report: inspected.report, diagnostic: inspected.diagnostic, outputSeq: output.seq, from, context});
                   append({kind: 'task.report.synthesized', task, attempt, rule: synthesis.rule, sources: synthesis.sources, outputSeq: output.seq, from, context});
                   append(reportEvent({task, attempt, report: synthesis.report, from, context}));
-                  finalizeReport({task, attempt, from, context});
+                  await finalizeReport({task, attempt, from, context});
                 } else {
                   append({kind: 'task.report.invalid', task, attempt, report: inspected.report, diagnostic: inspected.diagnostic, outputSeq: output.seq, from, context});
                   await requestPlainAnswer({task, attempt, context, adapter});
@@ -1179,10 +1230,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return messages.filter(m => session.events.filter(e => e.kind === 'task.delivered' && e.message === m.id).at(-1)?.tier === 'queued');
   }
 
-  async function resumeWorker({task, row, round, findings, context, reportOnly = false}) {
+  async function resumeWorker({task, row, round, findings, context, reportOnly = false, renewal = false, continueMessage = null}) {
     if (!campaignActive(task) && !await waitForCampaign(task)) return;
-    if (!admitAttempt(task, context, {reportOnly})) {
-      append({kind: 'budget.released', task, root: budgetRootOf(task, reducers.tasks(session.events)), amount: reportOnly ? {starts: 1} : {rounds: 1}, text: 'attempt admission refused', context});
+    if (!admitAttempt(task, context, {reportOnly: reportOnly || renewal})) {
+      append({kind: 'budget.released', task, root: budgetRootOf(task, reducers.tasks(session.events)), amount: (reportOnly || renewal) ? {starts: 1} : {rounds: 1}, text: 'attempt admission refused', context});
       return;
     }
     const baseProfile = resolvedLocalProfiles.get(task) ?? profiles[row.profile];
@@ -1199,7 +1250,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // any non-empty answer, however malformed, is synthesized straight from the log instead.
     let message = reportOnly
       ? 'Your last turn ended with no answer at all. Say in plain words: what you did, whether it is done, and what is left. No JSON, no particular format — a plain answer is enough.'
-      : [`Rework round ${round}:`, ...findings.map(f => `- ${f}`), ...pending.map(m => m.text)].join('\n');
+      : continueMessage !== null
+        ? [continueMessage, ...pending.map(m => m.text)].join('\n')
+        : [`Rework round ${round}:`, ...findings.map(f => `- ${f}`), ...pending.map(m => m.text)].join('\n');
     let adapter = adapters[profile.adapter];
     let admission;
     let handle, owned = null;
@@ -1233,7 +1286,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // The rework round's own reservation (`{rounds: 1}`, made by the caller before this
       // resume) never ran a turn: release it (§4).
       const root = budgetRootOf(task, reducers.tasks(session.events));
-      append({kind: 'budget.released', task, root, amount: reportOnly ? {starts: 1} : {rounds: 1}, text: error.message, context});
+      append({kind: 'budget.released', task, root, amount: (reportOnly || renewal) ? {starts: 1} : {rounds: 1}, text: error.message, context});
       const cancelled = abandonLaunch(task, context, {verified})?.cancelReason;
       if (reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) return;
       if (cancelled) {
@@ -1261,7 +1314,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       return;
     }
     handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : CLOUD_ADAPTERS.has(profile.adapter) ? {cloud: true} : {})});
-    append({kind: 'task.started', task, attempt, resumed: true, ...(reportOnly ? {purpose: 'report'} : {}), requested: profile.model ?? '', from: workerFrom(task), context});
+    append({kind: 'task.started', task, attempt, resumed: true, ...(reportOnly ? {purpose: 'report'} : renewal ? {purpose: 'steps'} : {}), requested: profile.model ?? '', from: workerFrom(task), context});
     for (const staged of launchingAttempts.get(task)?.reports ?? []) report({task, attempt, report: staged.payload, from: staged.from, context: staged.context});
     launchingAttempts.delete(task);
     const attemptEnded = () => session.events.some(e => e.kind === 'task.attempt.ended' && e.task === task && e.attempt === attempt);
@@ -1273,7 +1326,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // A report acknowledged before the timer fired is the answer this turn was asked for; the
       // attempt ends first, so no later report from it can be accepted.
       append({kind: 'task.attempt.ended', task, attempt, verifiedTermination: true, from: workerFrom(task), context});
-      if (finalizeReport({task, attempt, from: workerFrom(task), context})) return;
+      if (await finalizeReport({task, attempt, from: workerFrom(task), context})) return;
       append({kind: 'task.failed', task, reason: 'incomplete_report', text: 'Final report request timed out; original worker output is preserved; use task_get full.', context});
     }, Math.max(1, Math.min(watchdogConfig.reportOnly, (deadlineAtFor(task) ?? (clock() + watchdogConfig.reportOnly)) - clock()))) : null;
     try { await consumeWorkerEvents({adapter, handle, task, context, profile, owned}); }
