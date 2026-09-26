@@ -12,6 +12,7 @@ import {Session} from '../src/core.js';
 import {createScheduler} from '../src/scheduler.js';
 import {createOpencodeLive} from '../src/adapters/opencode-live.js';
 import {ownedBy, treeSnapshot, revertOutside} from '../src/owned-paths.js';
+import {fakeAdapter} from './helpers/fake-adapter.js';
 
 const helper = fileURLToPath(new URL('./helpers/fake-opencode.js', import.meta.url));
 const waitFor = async (check, ms = 8000) => { const start = Date.now(); for (;;) { const value = check(); if (value) return value; if (Date.now() - start > ms) throw new Error('timed out'); await new Promise(r => setTimeout(r, 10)); } };
@@ -43,25 +44,98 @@ test('a snapshot of the tree, and the revert of every change outside the owned p
   fs.rmSync(cwd, {recursive: true, force: true});
 });
 
-test('scheduler: an isolated worker ownership violation preserves the source and blocks with its artifact', async t => {
+// Found live (ACE session 159f4746, task d59ce7f5): a green fix blocked outright because it also
+// needed a two-line change to a file outside `owns`, and a retryOf could not widen `owns` to
+// recover (prepare() forced the original's). A change outside `owns` is only refused when it is
+// actually unsafe — touched in the real checkout since the attempt started, or claimed by another
+// still-running task — never merely for being outside the declared list.
+function sandbox(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'owned-sched-')));
   const cwd = path.join(root, 'ws'); fs.mkdirSync(path.join(cwd, 'src'), {recursive: true});
+  const saved = {...process.env};
+  t.after(() => { for (const key of ['FAKE_OC_WRITE', 'FAKE_OC_SCENARIO', 'FAKE_OC_TURN_MS']) delete process.env[key]; Object.assign(process.env, saved); fs.rmSync(root, {recursive: true, force: true}); });
+  return {root, cwd};
+}
+const builderProfiles = () => ({builder: {adapter: 'opencode', model: '', mode: 'yolo', policy: 'write', fallback: [], role: 'builder', executables: {opencode: helper}}});
+
+test('scheduler: an unowned edit unchanged in the checkout since the attempt baseline extends owns and integrates', async t => {
+  const {root, cwd} = sandbox(t);
   fs.writeFileSync(path.join(cwd, 'src/cart.js'), 'export const x = 1;\n'); fs.writeFileSync(path.join(cwd, 'src/setup.ts'), 'original\n');
-  const saved = {...process.env}; Object.assign(process.env, {FAKE_OC_WRITE: 'src/cart.js:export const x = 2;,src/setup.ts:forbidden edit', FAKE_OC_SCENARIO: 'ok'});
-  t.after(() => { delete process.env.FAKE_OC_WRITE; delete process.env.FAKE_OC_SCENARIO; Object.assign(process.env, saved); fs.rmSync(root, {recursive: true, force: true}); });
+  Object.assign(process.env, {FAKE_OC_WRITE: 'src/cart.js:export const x = 2;,src/setup.ts:the two-line fix', FAKE_OC_SCENARIO: 'ok'});
   const session = new Session(cwd, {root});
-  const profiles = {builder: {adapter: 'opencode', model: '', mode: 'yolo', policy: 'write', fallback: [], role: 'builder', executables: {opencode: helper}}};
-  const scheduler = createScheduler({session, adapters: {opencode: createOpencodeLive({})}, profiles});
+  const scheduler = createScheduler({session, adapters: {opencode: createOpencodeLive({})}, profiles: builderProfiles()});
+  t.after(() => scheduler.close());
+  const row = scheduler.submit({parent: null, profile: 'builder', orders: 'change src/cart.js', owns: ['src/cart.js']});
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'completed');
+  assert.equal(fs.readFileSync(path.join(cwd, 'src/cart.js'), 'utf8'), 'export const x = 2;');
+  assert.equal(fs.readFileSync(path.join(cwd, 'src/setup.ts'), 'utf8'), 'the two-line fix', 'the harmless extra edit is integrated too');
+  const extended = session.events.find(e => e.kind === 'task.owns.extended' && e.task === row.task);
+  assert.deepEqual(extended.paths, ['src/setup.ts']);
+  assert.equal(session.events.some(e => e.kind === 'task.blocked' && e.task === row.task), false);
+});
+
+test('scheduler: an unowned edit changed in the checkout since the attempt baseline still blocks, naming the reason', async t => {
+  const {root, cwd} = sandbox(t);
+  fs.writeFileSync(path.join(cwd, 'src/cart.js'), 'export const x = 1;\n'); fs.writeFileSync(path.join(cwd, 'src/setup.ts'), 'original\n');
+  Object.assign(process.env, {FAKE_OC_WRITE: 'src/cart.js:export const x = 2;,src/setup.ts:forbidden edit', FAKE_OC_SCENARIO: 'ok', FAKE_OC_TURN_MS: '150'});
+  const session = new Session(cwd, {root});
+  const scheduler = createScheduler({session, adapters: {opencode: createOpencodeLive({})}, profiles: builderProfiles()});
   t.after(() => scheduler.close());
   const row = scheduler.submit({parent: null, profile: 'builder', orders: 'change src/cart.js only', owns: ['src/cart.js']});
   assert.deepEqual(row.owns, ['src/cart.js']);
+  await waitFor(() => session.events.some(e => e.kind === 'task.workspace' && e.task === row.task));
+  fs.writeFileSync(path.join(cwd, 'src/setup.ts'), 'someone else edited this meanwhile'); // real checkout moves after the baseline copy
   await waitFor(() => scheduler.tasks()[row.task]?.state === 'blocked');
   assert.equal(fs.readFileSync(path.join(cwd, 'src/cart.js'), 'utf8'), 'export const x = 1;\n', 'the source workspace is unchanged');
-  assert.equal(fs.readFileSync(path.join(cwd, 'src/setup.ts'), 'utf8'), 'original\n', 'the forbidden source edit is absent');
+  assert.equal(fs.readFileSync(path.join(cwd, 'src/setup.ts'), 'utf8'), 'someone else edited this meanwhile', 'the forbidden source edit is absent');
   const blocked = session.events.find(e => e.kind === 'task.blocked' && e.task === row.task);
   assert.equal(blocked.reason, 'ownership_violation');
+  assert.match(blocked.text, /src\/setup\.ts \(changed in the checkout since the attempt baseline\)/);
   assert.ok(session.events.some(e => e.kind === 'task.artifact' && e.task === row.task), 'the isolated artifact is retained for inspection');
+  assert.equal(session.events.some(e => e.kind === 'task.owns.extended' && e.task === row.task), false);
   // a task without owns is untouched, and a read-only worker never snapshots
   assert.throws(() => scheduler.submit({parent: null, profile: 'builder', orders: 'x', owns: ['/abs']}), /owns/);
   assert.throws(() => scheduler.submit({parent: null, profile: 'builder', orders: 'x', owns: 'src'}), /owns/);
+});
+
+test('scheduler: an unowned edit claimed by another still-running task blocks, naming the owner', async t => {
+  const {root, cwd} = sandbox(t);
+  fs.writeFileSync(path.join(cwd, 'src/cart.js'), 'export const x = 1;\n'); fs.writeFileSync(path.join(cwd, 'src/setup.ts'), 'original\n');
+  const session = new Session(cwd, {root});
+  // A fake, non-local adapter here: real opencode workers on this profile share a single local
+  // concurrency slot (admitLocal), which would queue the second task behind the held first one
+  // forever rather than exercising the ownership check this test is actually about.
+  const adapter = fakeAdapter(({orders, cwd: workspace}) => {
+    if (orders.includes('hold')) return {never: true};
+    fs.writeFileSync(path.join(workspace, 'src/cart.js'), 'export const x = 2;');
+    fs.writeFileSync(path.join(workspace, 'src/setup.ts'), 'conflicting edit');
+    return [{kind: 'result', status: 'completed', text: 'done'}];
+  });
+  const scheduler = createScheduler({session, adapters: {fake: adapter}, profiles: {builder: {adapter: 'fake', model: '', mode: 'yolo', policy: 'write', fallback: [], role: 'builder'}}});
+  t.after(() => scheduler.close());
+  const holder = scheduler.submit({parent: null, profile: 'builder', orders: 'hold setup.ts', owns: ['src/setup.ts']});
+  await waitFor(() => scheduler.tasks()[holder.task]?.state === 'running');
+  const row = scheduler.submit({parent: null, profile: 'builder', orders: 'change src/cart.js only', owns: ['src/cart.js']});
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'blocked');
+  const blocked = session.events.find(e => e.kind === 'task.blocked' && e.task === row.task);
+  assert.equal(blocked.reason, 'ownership_violation');
+  assert.match(blocked.text, new RegExp(`src/setup\\.ts \\(owned by active task ${holder.task}\\)`));
+  await scheduler.cancel(holder.task);
+});
+
+test('scheduler: a retryOf submit may carry its own owns, replacing the inherited list', async t => {
+  const {root, cwd} = sandbox(t);
+  fs.writeFileSync(path.join(cwd, 'src/cart.js'), 'export const x = 1;\n');
+  Object.assign(process.env, {FAKE_OC_WRITE: 'src/cart.js:export const x = 2;', FAKE_OC_SCENARIO: 'ok'});
+  const session = new Session(cwd, {root});
+  const scheduler = createScheduler({session, adapters: {opencode: createOpencodeLive({})}, profiles: builderProfiles()});
+  t.after(() => scheduler.close());
+  const first = scheduler.submit({parent: null, profile: 'builder', orders: 'change src/cart.js only', owns: ['src/cart.js']});
+  await waitFor(() => scheduler.tasks()[first.task]?.state === 'completed');
+  // Found live (ACE session 159f4746, task d59ce7f5): a retryOf could not widen `owns` to recover
+  // a blocked attempt because prepare() always forced the original's owns onto it.
+  const retry = scheduler.submit({retryOf: first.task, profile: 'builder', orders: 'change both files', owns: ['src/cart.js', 'src/setup.ts']});
+  assert.deepEqual(retry.owns, ['src/cart.js', 'src/setup.ts'], 'the retry\'s own owns replaces the original, narrower list');
+  const noOwns = scheduler.submit({retryOf: retry.task, profile: 'builder', orders: 'try again'});
+  assert.deepEqual(noOwns.owns, ['src/cart.js', 'src/setup.ts'], 'omitting owns on the next retry still inherits from its predecessor');
 });

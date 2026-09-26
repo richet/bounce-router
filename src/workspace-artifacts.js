@@ -95,11 +95,23 @@ export function createAttemptWorkspace({cwd, dir, owns, attemptId, disposable = 
 export function captureArtifact(workspace) {
   const result = manifest(workspace.cwd);
   const paths = [...new Set([...Object.keys(workspace.baseline), ...Object.keys(result)])].sort();
-  const changes = [], violations = [], unsupported = [];
+  const changes = [], violations = [], unsupported = [], violationChanges = [];
   for (const file of paths) {
     const before = workspace.baseline[file] ?? null, after = result[file] ?? null;
     if (JSON.stringify(before) === JSON.stringify(after)) continue;
-    if (!ownsPath(workspace.owns, file)) { violations.push(file); continue; }
+    if (!ownsPath(workspace.owns, file)) {
+      violations.push(file);
+      // A violation is not automatically unsafe (see extendOwnership): keep the full change
+      // alongside the bare path so a caller who decides it is safe can promote it without a
+      // second capture. Binary/large content has no readable diff either way, so it is left
+      // out here exactly as the owned path below excludes it from `changes` — it stays a plain,
+      // non-promotable violation.
+      if (!(before?.unsupported || after?.unsupported || before?.binary || after?.binary)) {
+        violationChanges.push(!after ? {path: file, kind: 'delete', before}
+          : {path: file, kind: 'write', before, after, data: fs.readFileSync(safeJoin(workspace.cwd, file)).toString('base64'), mode: after.mode});
+      }
+      continue;
+    }
     if (before?.unsupported || after?.unsupported || before?.binary || after?.binary) { unsupported.push({path: file, reason: before?.unsupported ?? after?.unsupported ?? 'binary'}); continue; }
     if (!after) changes.push({path: file, kind: 'delete', before});
     else changes.push({path: file, kind: 'write', before, after, data: fs.readFileSync(safeJoin(workspace.cwd, file)).toString('base64'), mode: after.mode});
@@ -109,12 +121,40 @@ export function captureArtifact(workspace) {
   const digest = hash(json(binding));
   const id = digest.slice(0, 32);
   const show = value => value?.length > 4096 ? `${value.slice(0, 4096)}\n[… truncated …]` : (value ?? '');
-  const artifact = {id, digest, ...binding, files: Object.keys(result).sort(), diff: changes.map(change => change.kind === 'delete' ? `--- a/${change.path}\n+++ /dev/null\n-${show(change.before?.preview)}` : `--- a/${change.path}\n+++ b/${change.path}\n-${show(change.before?.preview)}\n+${show(Buffer.from(change.data, 'base64').toString('utf8'))}`).join('\n')};
+  const artifact = {id, digest, ...binding, files: Object.keys(result).sort(), violationChanges,
+    diff: changes.map(change => change.kind === 'delete' ? `--- a/${change.path}\n+++ /dev/null\n-${show(change.before?.preview)}` : `--- a/${change.path}\n+++ b/${change.path}\n-${show(change.before?.preview)}\n+${show(Buffer.from(change.data, 'base64').toString('utf8'))}`).join('\n')};
   atomicJSON(path.join(workspace.dir, 'artifacts', `${id}.json`), artifact);
   return artifact;
 }
 
-function targetState(root, change) {
+// A change outside `owns` is not automatically unsafe — only the whole-artifact refusal used to
+// treat it that way (found live, ACE session 159f4746 task d59ce7f5: a green fix blocked on a
+// two-line change to an unowned file, and a retryOf could not widen `owns` to recover). The
+// caller (scheduler.js) decides which violation paths are safe to fold in — untouched in the real
+// checkout since this attempt's baseline, and not claimed by any other active task — and promotes
+// only those here. Promoting recomputes the digest/id (owns, changes and violations all changed)
+// and re-persists the artifact under its new id so replay and the integrate action's file lookup
+// see the extended version; the original capture is left on disk, untouched.
+export function extendOwnership({artifact, dir, paths}) {
+  const set = new Set(paths);
+  if (!set.size) return artifact;
+  const promoted = (artifact.violationChanges ?? []).filter(change => set.has(change.path));
+  if (promoted.length !== set.size) throw new Error('unknown or unpromotable violation path');
+  const changes = [...artifact.changes, ...promoted].sort((a, b) => a.path.localeCompare(b.path));
+  const violations = artifact.violations.filter(p => !set.has(p));
+  const violationChanges = (artifact.violationChanges ?? []).filter(change => !set.has(change.path));
+  const owns = [...new Set([...artifact.owns, ...paths])];
+  const binding = {target: artifact.target, attemptId: artifact.attemptId, baselineHash: artifact.baselineHash, resultHash: artifact.resultHash, owns, changes, violations, unsupported: artifact.unsupported};
+  const digest = hash(json(binding));
+  const id = digest.slice(0, 32);
+  const show = value => value?.length > 4096 ? `${value.slice(0, 4096)}\n[… truncated …]` : (value ?? '');
+  const extended = {...artifact, ...binding, id, digest, violationChanges,
+    diff: changes.map(change => change.kind === 'delete' ? `--- a/${change.path}\n+++ /dev/null\n-${show(change.before?.preview)}` : `--- a/${change.path}\n+++ b/${change.path}\n-${show(change.before?.preview)}\n+${show(Buffer.from(change.data, 'base64').toString('utf8'))}`).join('\n')};
+  atomicJSON(path.join(dir, 'artifacts', `${id}.json`), extended);
+  return extended;
+}
+
+export function targetState(root, change) {
   assertNoSymlink(root, change.path);
   const full = safeJoin(root, change.path);
   if (!fs.existsSync(full)) return null;
@@ -123,7 +163,7 @@ function targetState(root, change) {
   const data = fs.readFileSync(full);
   return {hash: hash(data), size: data.length, mode: stat.mode & 0o777};
 }
-function matches(state, expected) { return state === null ? expected === null : expected !== null && state.hash === expected.hash && state.size === expected.size && state.mode === expected.mode; }
+export function matches(state, expected) { return state === null ? expected === null : expected !== null && state.hash === expected.hash && state.size === expected.size && state.mode === expected.mode; }
 function writeAtomic(root, change) {
   const full = safeJoin(root, change.path); assertNoSymlink(root, change.path);
   if (change.kind === 'delete') { fs.rmSync(full, {force: true}); const parent = fs.openSync(path.dirname(full), 'r'); try { fs.fsyncSync(parent); } finally { fs.closeSync(parent); } return; }

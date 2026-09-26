@@ -4,7 +4,7 @@ import {randomUUID, createHash} from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import {createAttemptWorkspace, captureArtifact, integrateArtifact, advanceBaseline} from './workspace-artifacts.js';
+import {createAttemptWorkspace, captureArtifact, integrateArtifact, advanceBaseline, extendOwnership, targetState, matches as checkoutMatches} from './workspace-artifacts.js';
 import * as reducers from './reducers.js';
 import {takeCheckpoint, sameTree} from './checkpoint.js';
 import {POLICY_RANK, effectivePolicy, LOCAL_ADAPTERS, playedBy, READ_ONLY_ROLES as READONLY_ROLES} from './profiles.js';
@@ -21,7 +21,7 @@ import {discoverLocalModels} from './local-models.js';
 import {planTaskAdmission} from './plan-admission.js';
 import {supervisePlan} from './plan-supervision.js';
 import {judgePlan, routingFallback} from './jev.js';
-import {validOwns} from './owned-paths.js';
+import {validOwns, ownedBy} from './owned-paths.js';
 import {execFileSync} from 'node:child_process';
 
 const FALLBACK_REASONS = new Set(['limited', 'missing', 'backend_unavailable', 'watchdog', 'local_unavailable', 'worker_runtime', 'incomplete_report']);
@@ -548,7 +548,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const jobId = original?.jobId ?? spec.jobId ?? (spec.planId && spec.chunkId ? `plan:${spec.planId}:${spec.chunkId}` : `job:${task}`);
     spec = {...spec, task, jobId, ...(campaignId ? {campaignId} : {}),
       ...(original ? {replaces: predecessor, retryOf: predecessor, parent: original.parent ?? null,
-        deadline: original.deadline, requires: original.requires ?? spec.requires, budget: undefined, owns: original.owns, review: original.review ?? undefined,
+        deadline: original.deadline, requires: original.requires ?? spec.requires, budget: undefined, owns: spec.owns ?? original.owns, review: original.review ?? undefined,
         gate: original.gate, planId: original.planId, chunkId: original.chunkId, depends_on: original.depends_on ?? []} : {})};
     const reviewer = jev && profiles[jev.reviewer];
     if (!reviewer || reviewer.adapter !== 'typesafe' || !READONLY_ROLES.has(reviewer.role) || strategy !== defaultStrategy) return spec;
@@ -926,13 +926,40 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
             if (session.events.some(e => e.kind === 'task.attempt.ended' && e.task === task && e.attempt === endedAttempt)) return;
             append({kind: 'task.attempt.ended', task, attempt: endedAttempt, verifiedTermination: true, from, context});
             if (owned && !owned.disposable) {
-              const artifact = captureArtifact(owned);
+              let artifact = captureArtifact(owned);
+              // A change outside `owns` is only refused outright when it is actually unsafe to fold
+              // in: touched in the real checkout since this attempt's baseline (the same before-state
+              // comparison integrateArtifact already does for owned changes), or claimed by another
+              // task that is still running. Anything else — a harmless extra edit nobody else is
+              // touching — extends `owns` instead of blocking the whole artifact (found live, ACE
+              // session 159f4746 task d59ce7f5: a green fix blocked on a two-line unowned change,
+              // and a retryOf could not widen `owns` to recover since prepare() forced the original's).
+              let unsafeReasons = [];
+              if (artifact.violations.length) {
+                const root = fs.realpathSync(session.cwd);
+                const view = reducers.tasks(session.events);
+                const ownsOf = id => submittedRow(id)?.owns?.length ? submittedRow(id).owns : ['**'];
+                const decisions = artifact.violations.map(p => {
+                  if (!checkoutMatches(targetState(root, {path: p}), owned.baseline[p] ?? null)) return {path: p, safe: false, reason: 'changed in the checkout since the attempt baseline'};
+                  const claimedBy = Object.keys(view).find(id => id !== task && !reducers.TERMINAL.has(view[id].state) && ownedBy(p, ownsOf(id)));
+                  if (claimedBy) return {path: p, safe: false, reason: `owned by active task ${claimedBy}`};
+                  return {path: p, safe: true};
+                });
+                const safePaths = decisions.filter(d => d.safe).map(d => d.path);
+                if (safePaths.length) {
+                  artifact = extendOwnership({artifact, dir: owned.dir, paths: safePaths});
+                  append({kind: 'task.owns.extended', task, paths: safePaths, from, context,
+                    text: `Beyond the owned paths, also integrating: ${JSON.stringify(safePaths)}`});
+                }
+                unsafeReasons = decisions.filter(d => !d.safe).map(d => `${d.path} (${d.reason})`);
+              }
               append({kind: 'task.artifact', task, attempt: reducers.tasks(session.events)[task]?.attempt,
                 artifactId: artifact.id, digest: artifact.digest, resultHash: artifact.resultHash,
                 file: path.join(owned.dir, 'artifacts', `${artifact.id}.json`), dir: owned.dir, cwd: owned.cwd, from, context});
               if (artifact.violations.length || artifact.unsupported.length) {
                 append({kind: 'task.blocked', task, reason: artifact.violations.length ? 'ownership_violation' : 'artifact_unsupported',
-                  text: `Isolated artifact cannot be integrated: ${JSON.stringify(artifact.violations.length ? artifact.violations : artifact.unsupported)}`, from, context});
+                  text: `Isolated artifact cannot be integrated: ${JSON.stringify(artifact.violations.length ? artifact.violations : artifact.unsupported)}`
+                    + (unsafeReasons.length ? `; unsafe to extend ownership to: ${unsafeReasons.join(', ')}` : ''), from, context});
                 return;
               }
             }

@@ -126,7 +126,7 @@ test('campaign cannot close remaining scope and only user may remove a required 
   assert.equal(campaigns(session.events).ace.state, 'completed');
 });
 
-test('logical retry preserves ownership and job budget identity across changed instructions', async t => {
+test('logical retry preserves job budget identity across changed instructions, inherits owns by default but a retry may widen it', async t => {
   const {session} = fixture(t);
   const scheduler = createScheduler({session, adapters: {fake: fakeAdapter(() => [{kind: 'result', status: 'failed', text: 'needs repair'}])}, profiles: {reader: {adapter: 'fake', policy: 'read-only'}}, watchdog: {interval: null}});
   t.after(() => scheduler.close());
@@ -134,13 +134,19 @@ test('logical retry preserves ownership and job budget identity across changed i
   const first = scheduler.submit({task: 'first', profile: 'reader', orders: 'Review', owns: ['src/a.js'], budget: {starts: 2}});
   await ended;
   const retryEnded = next(session, e => e.kind === 'orchestration.action.settled' && e.task === 'retry');
+  // Found live (ACE session 159f4746, task d59ce7f5): a green fix stayed blocked on a two-line
+  // change outside `owns`, and a retryOf could not widen `owns` to recover — prepare() always
+  // forced the original's. A retry's own declared `owns` now replaces the inherited list;
+  // omitting it (as most retries do) still inherits, same as before.
   const retried = scheduler.submit({task: 'retry', profile: 'reader', retryOf: 'first', orders: 'Review the remaining work', owns: ['**']});
   assert.equal(retried.jobId, first.jobId);
   assert.equal(retried.replaces, 'first');
   assert.equal(retried.parent, null);
-  assert.deepEqual(retried.owns, ['src/a.js']);
+  assert.deepEqual(retried.owns, ['**'], 'the retry\'s own owns replaces the original, narrower list');
   assert.equal(sameJob(first, retried), true);
   await retryEnded;
+  const implicit = scheduler.submit({task: 'retry2', profile: 'reader', retryOf: 'retry', orders: 'Review once more'});
+  assert.deepEqual(implicit.owns, ['**'], 'no owns declared on the retry: the predecessor\'s still applies');
 });
 
 test('two writing attempts work in isolated copies and integrate both owned outputs', async t => {
