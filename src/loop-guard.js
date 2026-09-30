@@ -11,10 +11,6 @@ const normalize = orders => String(orders ?? '').replace(/\s+/g, ' ').trim();
 
 export const sameJob = (a, b) => {
   if (a.jobId && b.jobId && a.jobId === b.jobId) return true;
-  // Explicit campaign/plan identity distinguishes repeated briefs in different scopes.
-  // Ad hoc roots must still retain the old identical-brief loop guard; auto-generated
-  // per-submission IDs are not permission to reset it.
-  if ((a.campaignId || a.planId || b.campaignId || b.planId) && a.jobId && b.jobId) return false;
   return a.profile === b.profile && normalize(a.orders) === normalize(b.orders);
 };
 

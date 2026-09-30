@@ -80,11 +80,21 @@ test('orchestrator bridge identifies its durable session without leaking process
     BOUNCE_ROLE: 'orchestrator', BOUNCE_ORCHESTRATOR_PROFILE: JSON.stringify({adapter: 'codex', mode: 'plan'})});
 });
 
-test('standing orders describe durable campaigns, plan correlation, and typed bounded recovery', () => {
+// Rewritten 2026-09-29 (plans removed): no campaigns, no plan submission/review, typed recovery
+// and blockers only for what needs the user — never for exhausted retries.
+test('standing orders describe phases/chunks without plan submission, typed recovery and blockers only for the user, and no campaigns or plans', () => {
   const text = fs.readFileSync(new URL('../src/reload.js', import.meta.url), 'utf8');
-  for (const part of ['`campaign_start`', '`campaign_extend`', '`campaign_complete`', '`campaign_block`', '`plan_wait`',
-    '`campaignId`', '`gate`', '`planId`', '`chunkId`', 'retryOf rather than parent', 'Recover by the typed failure',
-    'durable campaign enters needs-input']) assert.equal(text.includes(part), true, part);
+  for (const part of ['retryOf rather than parent', 'Recover by the typed failure',
+    'Break big work down: phases in sequence, each phase made of chunks that run in parallel',
+    'Each chunk gets disjoint owned paths, its own acceptance and how to verify it',
+    'depends_on with its task id, so',
+    'Record a blocker only when something needs the user — a decision, credentials, a push — never because retries ran out',
+    'A review sends a task back at most once'])
+    assert.equal(text.includes(part), true, part);
+  assert.doesNotMatch(text, /campaign/i);
+  for (const gone of ['unconfident review gate', 'it does not authorize dispatch', 'Fix a rejected plan', 'never\',\n    \'do the work yourself',
+    'plan_wait', '`planId`', '`chunkId`', 'plan.submitted', 'plan.accepted', 'plan.drift', 'Plans are advice', 'submit its plan'])
+    assert.equal(text.includes(gone), false, gone);
   assert.equal(text.includes('or task.rejected mean stop and report that reason to the user'), false);
 });
 
@@ -92,7 +102,7 @@ test('standing orders describe durable campaigns, plan correlation, and typed bo
 // orchestrator), and the orchestrator's bus grant was never widened to include it — the grant is extended
 // only for rows it submitted itself. When the reviewer then failed the work and the orchestrator submitted
 // the rework under that replacement, the bus refused it `-32001 unauthorized` on both transports. The
-// orchestrator stopped rather than bypass bounce, and the campaign stalled with the fix already written.
+// orchestrator stopped rather than bypass bounce, and the run stalled with the fix already written.
 test('a replacement bounce made for the orchestrator\'s task is still the orchestrator\'s task', () => {
   const events = [
     {kind: 'task.submitted', task: 'own', from: 'orchestrator', parent: null},

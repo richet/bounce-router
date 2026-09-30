@@ -11,6 +11,9 @@
 //                                  → result {turn:{id:'u-<n>'}}, then after FAKE_DELAY_MS
 //                                    notifications item/completed, thread/tokenUsage/updated,
 //                                    and turn/completed, all with v2-required fields
+//   thread/archive {threadId}      → result {}
+//   thread/unarchive {threadId}    → result {}; FAKE_ARCHIVED (comma-separated thread ids) makes
+//                                    thread/resume refuse those threads until unarchived here
 //   turn/steer {threadId,expectedTurnId,input} → result {turnId}
 //   turn/interrupt {threadId,turnId} → result {} and an immediate interrupted turn/completed
 //   anything else                  → error {code:-32601}
@@ -49,6 +52,7 @@ const complete = ({status = 'completed', error} = {}) => {
     ...(error ? {error: {message: error}} : {})}});
 };
 
+const archived = new Set((process.env.FAKE_ARCHIVED ?? '').split(',').filter(Boolean));
 const handlers = {
   // Mirrors codex-cli 0.154's contract: clientInfo is required.
   initialize: params => {
@@ -62,10 +66,13 @@ const handlers = {
     }
     return {thread: {id: `t-${++threads}`}};
   },
+  'thread/archive': params => { archived.add(params?.threadId); return {}; },
+  'thread/unarchive': params => { archived.delete(params?.threadId); return {}; },
   'thread/resume': params => {
     if (typeof params?.threadId !== 'string' || !['never', 'on-request'].includes(params?.approvalPolicy)) {
       throw Object.assign(new Error('thread/resume requires threadId and permission settings'), {code: -32602});
     }
+    if (archived.has(params.threadId)) throw Object.assign(new Error(`thread ${params.threadId} is archived`), {code: -32600});
     return {thread: {id: params.threadId}};
   },
   'turn/start': params => {

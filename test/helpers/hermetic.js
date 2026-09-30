@@ -28,6 +28,15 @@ if (!String(process.env.NODE_OPTIONS ?? '').includes(self)) {
   process.env.NODE_OPTIONS = `${process.env.NODE_OPTIONS ? `${process.env.NODE_OPTIONS} ` : ''}--import=${self}`;
 }
 
+// The machine-wide slots for local workers (src/machine-slots.js) live in the user's ~/.bounce, shared
+// by every bounce on this machine. A test process gets its own folder, which the children it starts
+// inherit: tests never write there, and never wait on each other or on a real session.
+if (!process.env.BOUNCE_MACHINE_DIR) {
+  const machine = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-test-machine-'));
+  process.env.BOUNCE_MACHINE_DIR = machine;
+  process.on('exit', () => { try { fs.rmSync(machine, {recursive: true, force: true}); } catch {} });
+}
+
 // A test file runs in its own empty project, never this checkout: a daemon or worker started with
 // the default cwd snapshots and copies its whole tree into attempt workspaces (observed: every file
 // of the repo and its agent worktrees read per launch, 1.5 s tests taking 30 s under a full run).

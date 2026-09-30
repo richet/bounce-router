@@ -49,6 +49,10 @@ process.stdin.on('end', () => {
   const agentName = flag('--agent'); const toolsOff = agentName && cfg.agent?.[agentName]?.tools
     && Object.entries(cfg.agent[agentName].tools).filter(([name]) => name !== 'bounce_report').every(([, enabled]) => enabled === false);
   if (flag('-s') && toolsOff) {
+    // FAKE_OC_CONCLUDE=hang: the conclusion turn itself never answers and never exits — a reasoning
+    // model burning wall-clock time on a single step within its own step cap (observed live: 6.5
+    // minutes producing nothing). Responds to SIGTERM like a normal process, unlike `stubborn`.
+    if (process.env.FAKE_OC_CONCLUDE === 'hang') { setInterval(() => {}, 1000); return; }
     if (process.env.FAKE_OC_CONCLUDE === 'answer') emit('text', {type: 'text', text: `FAIL: the boundary is off by one (conclusion for ${prompt.slice(0, 20)})`});
     // Observed live (reviewer 9b02e5ce): the conclusion is posted only as an acknowledged milestone report.
     if (process.env.FAKE_OC_CONCLUDE === 'milestone' || process.env.FAKE_OC_CONCLUDE === 'rejected') {
@@ -60,6 +64,19 @@ process.stdin.on('end', () => {
     // Observed live (reviewer 25126fda): the model titles its real summary after opencode's notice.
     if (process.env.FAKE_OC_CONCLUDE === 'capsummary') emit('text', {type: 'text', text: '\n</think>\n\n## Maximum Steps Reached - Final Summary\n\n### Work Completed\n1. Baseline: 148 passed, 1 failed.\n2. Concurrent stale-lock reclaim: both callers fail with operation_busy.\n\n### Remaining Tasks\n1. Re-run the corrupt-tail probes.'});
     emit('step_finish', {type: 'step-finish', reason: 'stop', tokens: usage});
+    return process.exit(0);
+  }
+  // FAKE_OC_SCENARIO=capsilent: the real shape of a step cap (observed live, ACE 43387649, opencode with
+  // maxSteps 60): FAKE_OC_STEPS tool steps, the last step's text titled by the model itself, exit 0 —
+  // and NO runtime notice in the stream. Only the step count says the cap was hit.
+  if (scenario === 'capsilent') {
+    const steps = Number(process.env.FAKE_OC_STEPS ?? 5);
+    for (let i = 1; i <= steps; i++) {
+      emit('step_start', {type: 'step-start'});
+      if (i < steps) emit('tool_use', {type: 'tool', tool: 'read', state: {status: 'completed', input: {filePath: `file${i}.txt`}, output: 'ok'}});
+      else emit('text', {type: 'text', text: '## Maximum Steps Reached for This Agent\n\nThe maximum number of steps has been reached. Below is a summary.\n\n### Remaining\n1. Create the blue workspace.'});
+      emit('step_finish', {type: 'step-finish', reason: i < steps ? 'tool-calls' : 'stop', tokens: usage});
+    }
     return process.exit(0);
   }
   if (scenario === 'hold' || scenario === 'stubborn') { setInterval(() => {}, 1000); return; }
@@ -114,6 +131,14 @@ process.stdin.on('end', () => {
       emit('tool_use', {type: 'tool', tool: 'read', state: {status: 'error', input: {filePath: '/elsewhere/x'}, error: 'The user rejected permission to use this specific tool call.'}});
       emit('step_finish', {type: 'step-finish', reason: 'stop', tokens: usage});
       return process.exit(0);
+    }
+    // FAKE_OC_SCENARIO=commands: two shell commands as opencode 1.18 reports them (shape read from its
+    // own store, 2026-09-28): the command, its output with terminal colours, and the exit code in metadata.
+    if (scenario === 'commands') {
+      emit('tool_use', {type: 'tool', tool: 'bash', state: {status: 'completed', input: {command: 'deno test -A tests/version_test.ts 2>&1', workdir: dir},
+        output: '\u001b[0m\u001b[32mok\u001b[0m | 1 passed | 0 failed \u001b[0m\u001b[38;5;245m(3ms)\u001b[0m\n\n', metadata: {exit: 0, truncated: false}}});
+      emit('tool_use', {type: 'tool', tool: 'bash', state: {status: 'completed', input: {command: 'deno lint'},
+        output: `${'x'.repeat(5000)}\nerror: Found 2 problems\n`, metadata: {exit: 1, truncated: false}}});
     }
     if (scenario === 'denied') emit('tool_use', {type: 'tool', tool: 'read', state: {status: 'error', input: {filePath: '/etc/hosts'}, error: 'The user rejected permission to use this specific tool call.'}});
     else emit('tool_use', {type: 'tool', tool: 'read', state: {status: 'completed', input: {filePath: 'note.txt'}, output: 'ok'}});

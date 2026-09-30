@@ -35,7 +35,10 @@ export function createMainClient(session, settings, {selection = null} = {}) {
       });
       try {
         const ack = await session.runMain({id, text, files, provider, model, mode: settings.mode, routing: {order: [...settings.order], models: {...settings.models}}, ...(typed ? {typed} : {})});
-        if (ack.accepted === false) throw new Error(ack.reason || 'Main turn refused');
+        // Found live (ACE d1bc0206): the raw reason `termination_unverified` was all the user saw, with no way on.
+        if (ack.accepted === false) throw new Error(ack.reason === 'termination_unverified'
+          ? 'The orchestrator from before the restart could not be confirmed stopped, so no new turn starts. If no process from it is still running, type /unblock.'
+          : ack.reason || 'Main turn refused');
         return await terminal;
       } finally {
         unsubscribe();

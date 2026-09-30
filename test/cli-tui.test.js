@@ -143,7 +143,7 @@ test('CLI commands and live steering work while the daemon main turn is held', {
   child.stdin.write('/sidebar on\r');
   await waitFor(() => output.includes('Sidebar shown'));
   assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'config.json'))).sidebar, true);
-  child.stdin.write('/btw urgent correction\r');
+  child.stdin.write('/steer urgent correction\r');
   await waitFor(() => calls.some(([kind]) => kind === 'deliver'));
   const delivery = calls.find(([kind]) => kind === 'deliver')[1];
   assert.equal(delivery.text, 'urgent correction');
@@ -389,4 +389,14 @@ test('Up on an empty input withdraws this view\'s own queued prompt for editing;
   child.stdin.write('\r');
   await waitFor(() => calls.filter(([kind]) => kind === 'run').length === queuedCallsBefore + 1);
   assert.equal(calls.at(-1)[1].text, 'queued reply text');
+});
+
+// Found live (ACE d1bc0206): the daemon died at 08:14 and the TUI kept showing the orchestrator and
+// its workers as working for four more hours. A lost daemon now says so, with how to restart it.
+test('a daemon that disconnects is shown as stopped, with the command to resume the session', {timeout: 15000}, async t => {
+  const {session, listeners, waitFor, output} = await harness(t);
+  for (const fn of listeners) fn({kind: 'main.disconnected', state: 'unavailable', text: 'Daemon disconnected; session journal is saved'});
+  await waitFor(() => output().includes('bounce stopped at'));
+  const flat = output().replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/[\s│]+/g, ' ');
+  assert.match(flat, new RegExp(`bounce stopped at \\d\\d:\\d\\d, nothing is running · quit, then: bounce --resume ${session.id.slice(0, 8)}`));
 });

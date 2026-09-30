@@ -1,5 +1,6 @@
 import {spawn as spawnProcess} from 'node:child_process';
 import {createInterface} from 'node:readline';
+import {prepareCodexHome} from './codex-home.js';
 
 // One newline-delimited JSON conversation with a vendor CLI. The caller owns the
 // protocol; this owns process lifetime, timeouts and failure text. A failure is
@@ -16,7 +17,7 @@ export function queryLines({executable, args, requests, read, spawn = spawnProce
       resolve({out, error: error ?? null});
     };
     const timer = setTimeout(() => finish(messages.timeout ?? `${executable} did not answer in time`), timeout);
-    try { child = spawn(executable, args, {cwd, stdio: ['pipe', 'pipe', 'pipe']}); }
+    try { prepareCodexHome(executable); child = spawn(executable, args, {cwd, stdio: ['pipe', 'pipe', 'pipe']}); }
     catch (error) { return finish(error.message); }
     child.on('error', error => finish(error.code === 'ENOENT' ? (messages.missing ?? `${executable} is not installed`) : error.message));
     child.stdin.on('error', () => {}); // The CLI may exit before reading the request.

@@ -13,6 +13,7 @@ import {execFile} from 'node:child_process';
 import {createJevClient, decideVerdict, readJevSettings, verdictQuestions} from '../jev.js';
 
 const DIFF_CHARS = 80_000; // ≈ 24k tokens of diff, inside Jev's 32k-token state + question cap
+const DIFF_CHARS_MIN = 5_000; // the least of a diff worth a review
 const ORDERS_CHARS = 12_000;
 const REPORT_CHARS = 12_000;
 const SUMMARY_CHARS = 4_000;
@@ -115,14 +116,28 @@ async function askVerdict({stream, client, state, profile, settings, controller}
   stream.push({kind: 'activity', text: `Jev verdict · asking ${profile?.model || settings.model}`});
   let result;
   try {
-    result = await client.ask({state, questions: verdictQuestions(state), model: profile?.model || settings.model, signal: controller.signal});
+    // The service refuses a state over its token limit, and characters are a poor measure of tokens:
+    // found live (ACE e3bd01d5), 8 of 31 reviews were refused and the work accepted unreviewed, their
+    // diffs long test logs. A refused review is asked again with half the diff, down to DIFF_CHARS_MIN.
+    for (let shown = DIFF_CHARS, asked = state; ; ) {
+      try {
+        result = await client.ask({state: asked, questions: verdictQuestions(asked), model: profile?.model || settings.model, signal: controller.signal});
+        break;
+      } catch (error) {
+        const tooLong = error?.code === 'http_400' && /max_tokens_exceeded/.test(String(error.message));
+        if (!tooLong || shown <= DIFF_CHARS_MIN) throw error;
+        shown = Math.floor(shown / 2);
+        asked = {...state, diff: truncate(state.diff, shown, 'diff')};
+        stream.push({kind: 'activity', text: `Jev verdict · the review was too long for the service; asking again with the first ${shown} characters of the diff`});
+      }
+    }
   } catch (error) {
     const reason = error?.code ?? 'error';
     stream.push({kind: 'jev', name: 'skipped', data: {reason}, text: `Jev verdict unavailable · ${error?.message ?? String(error)}`});
     stream.push({kind: 'result', status: 'completed', text: JSON.stringify({verdict: 'unavailable', jev: 'skipped', reason})});
     return;
   }
-  const decision = decideVerdict(result.answers, {confidence: settings.confidence, state});
+  const decision = decideVerdict(result.answers, {confidence: settings.confidence, sendBackConfidence: settings.sendBackConfidence, state});
   const fired = decision.fired.length ? ` · fired: ${decision.fired.join(', ')}` : '';
   stream.push({kind: 'model', model: result.model});
   if (result.usage && Number.isFinite(result.usage.input_tokens)) stream.push({kind: 'usage', usage: {input: result.usage.input_tokens, output: result.usage.output_tokens ?? 0}});

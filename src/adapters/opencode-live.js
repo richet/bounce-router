@@ -4,6 +4,7 @@ import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {resolveExecutable} from '../executable.js';
 import {spawnLive, vendorEnv, verifiedCancel, appendPending, readPending, takePending, TEXT_MAX, SPEAKER, classifyText, createAnswer, concludeAsk, reportGrant, peerTask} from './live-common.js';
+import {outputTail} from '../command-output.js';
 
 // The OpenCode peer, driven the way claude and codex are: one `opencode run` process per turn, in
 // the user's own tree. The prompt goes in on stdin, JSON event lines come out on stdout, the
@@ -22,6 +23,7 @@ const DEFAULT_STEPS = 30;
 // the same file (or rewrites the same todo list) until the step cap, minutes of inference later.
 // The same call with the same input this many times, with nothing changed in between, is a loop.
 const REPEAT_LIMIT = 4;
+const COMMAND_MAX = 1000;
 // Traced live (qwen3.6-35b-a3b as reviewer): it read the diff and every file a review needs, then
 // repeated one identical glob 26 times and never wrote a verdict. The reading was done; the stopping
 // was not. So a worker the guard stops AFTER it has read something gets one more turn on the same
@@ -45,6 +47,12 @@ const EMPTY_STEP_LIMIT = 2;
 // one step it stops, so a step that never ends still goes silent and the watchdog still catches it.
 const HEARTBEAT_MS = 30_000;
 const STEP_BEAT_CAP_MS = 15 * 60_000;
+// A conclusion turn (tools off, CONCLUDE_STEPS-capped, asked once for the worker's answer) has no
+// step-time bound of its own: a reasoning model can spend minutes generating on a single step,
+// still within its 2-step cap (observed live, ACE session d1bc0206: 6.5 minutes producing nothing).
+// CONCLUDE_TIMEOUT_MS bounds the whole conclusion turn by wall clock; past it the turn is cancelled
+// and treated exactly like a conclusion that said nothing.
+const CONCLUDE_TIMEOUT_MS = 90_000;
 const BEAT = Symbol('beat');
 
 // The policy tier becomes the agent's tools map — the same ladder the vendor CLIs get as flags.
@@ -66,11 +74,6 @@ export function toolsFor(policy) {
 // and refused in the project even when it sits under a temp dir (the last matching rule wins). The
 // network reaches only localhost: the model endpoint and opencode's own in-process server. A Unix
 // socket (Docker's) is not a network address and stays refused.
-// The fence for a write worker in an isolated copy: everything it does is allowed except writing the
-// original checkout the copy was made from, so a path back into it fails instead of bypassing review.
-export function writeFenceSandbox(source) {
-  return `(version 1)(allow default)(deny file-write* (subpath ${JSON.stringify(fs.realpathSync(source))}))`;
-}
 
 export function probeSandbox(cwd, home = os.homedir(), probeSource = null, reportSocket = null) {
   const q = p => JSON.stringify(String(p));
@@ -120,7 +123,7 @@ const CREDENTIAL = /(_API_KEY|_AUTH_TOKEN|_ACCESS_TOKEN|_SECRET|_SECRET_KEY)$|^(
 export const scrubCredentials = (env, keep = []) =>
   Object.fromEntries(Object.entries(env).filter(([key]) => keep.includes(key) || !CREDENTIAL.test(key)));
 
-export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HEARTBEAT_MS, stepBeatCapMs = STEP_BEAT_CAP_MS} = {}) {
+export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HEARTBEAT_MS, stepBeatCapMs = STEP_BEAT_CAP_MS, concludeTimeoutMs = CONCLUDE_TIMEOUT_MS} = {}) {
   const pendingPath = dir => `${dir}/pending.jsonl`;
 
   const start = ({peer, profile = {}, session = null, stdin, cwd, dir, conclude = false}) => {
@@ -157,8 +160,9 @@ export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HE
       // rejected it and ended the turn. A worker's instructions are its agent file and its orders.
       OPENCODE_DISABLE_CLAUDE_CODE: '1', OPENCODE_DISABLE_CLAUDE_CODE_PROMPT: '1', OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: '1',
       OPENCODE_DISABLE_EXTERNAL_SKILLS: '1'};
-    const fence = effectiveTier(profile) === 'probe' ? probeSandbox(cwd, os.homedir(), profile.probeSource ?? null, grant?.BOUNCE_REPORT_BUS)
-      : profile.writeFence && process.platform === 'darwin' ? writeFenceSandbox(profile.writeFence) : null;
+    // Only a probe (read-only checks) runs sandboxed, as Codex's probes do. A write worker has the same
+    // freedom as a Claude or Codex one (user, 2026-09-27: "there's no difference between any").
+    const fence = effectiveTier(profile) === 'probe' ? probeSandbox(cwd, os.homedir(), profile.probeSource ?? null, grant?.BOUNCE_REPORT_BUS) : null;
     const spawned = fence ? {executable: '/usr/bin/sandbox-exec', args: ['-p', fence, executable, ...args]} : {executable, args};
     const live = spawnLive({...spawned, cwd, env, stdin, ...(spawn ? {spawn} : {})});
     return {live, child: live.child, pid: live.child.pid, args: spawned.args, dir, cwd, sessionId: session, tools: config.agent[name].tools, agent: name, peer, profile, conclude};
@@ -181,7 +185,10 @@ export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HE
       let announced = false, lastError = null, tail = '', refused = null;
       const answer = createAnswer();
       const repeats = new Map();
-      let stepActed = false, emptySteps = 0, concluded = false, reads = 0, stalled = false, capped = false;
+      let stepActed = false, emptySteps = 0, concluded = false, reads = 0, stalled = false, capped = false, stepsDone = 0;
+      // Found live (ACE 43387649): at maxSteps opencode ends the turn with no notice in the stream, so the
+      // finished-step count against the turn's own budget is what says the cap was hit.
+      const stepBudget = handle.conclude ? null : handle.profile?.agent?.maxSteps ?? DEFAULT_STEPS;
       // `stepActed` is per step and resets at every step boundary; `didWork` never resets — it answers
       // "did this worker do anything at all", which is what decides whether there is an answer worth asking for.
       let didWork = false, reportedFinal = false;
@@ -209,6 +216,7 @@ export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HE
         }
         if (event.kind === 'error') { yield {kind: 'error', code: event.code, text: event.text}; return; }
         if (event.kind === 'exit') {
+          if (stepBudget && stepsDone >= stepBudget) capped = true;
           // Exit IS the turn ending. A clean exit with text is the worker's answer; anything else is
           // a failure of the runtime rather than of the task, so the next AI in the chain may try.
           // Bounce asked for the conclusion (conclude() below: a lease ended), or the loop guard stopped a
@@ -229,7 +237,10 @@ export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HE
             const again = start({peer: handle.peer, profile: handle.profile, session: handle.sessionId, stdin: ask, cwd: handle.cwd, dir: handle.dir, conclude: true});
             handle.child = again.child; handle.pid = again.pid; // cancel() must reach the turn that is running now
             let concludedAnswer = null;
-            for await (const e of this.events(again)) { if (e.kind === 'result') { concludedAnswer = e.status === 'completed' ? e.text : null; break; } if (e.kind !== 'result') yield e; }
+            const boundTimer = setTimeout(() => { void verifiedCancel(again.child, {kill}); }, concludeTimeoutMs);
+            try {
+              for await (const e of this.events(again)) { if (e.kind === 'result') { concludedAnswer = e.status === 'completed' ? e.text : null; break; } if (e.kind !== 'result') yield e; }
+            } finally { clearTimeout(boundTimer); }
             if (concludedAnswer !== null) { yield {kind: 'diagnostic', text: 'the conclusion turn answered: that answer is the result'}; yield {kind: 'result', status: 'completed', text: concludedAnswer}; return; }
             yield {kind: 'diagnostic', text: 'the conclusion turn gave no answer'};
             if (capped && !lastError) lastError = 'step cap reached without an answer';
@@ -269,6 +280,12 @@ export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HE
             && /\breport accepted \(seq \d+\)/.test(typeof part.state?.output === 'string' ? part.state.output : JSON.stringify(part.state?.output ?? ''))) reportedFinal = true;
           yield {kind: 'activity', text: `${part.tool ?? 'tool'} ${status}`.trim(),
             ...(status === 'completed' || status === 'error' ? {call: `${part.tool ?? 'tool'} ${target}`.slice(0, 300), change: CHANGES.has(part.tool)} : {})};
+          // A finished shell command, as bounce saw it: what ran, how it ended, the end of what it printed.
+          // It is the evidence of a report bounce has to write itself (src/scheduler.js observedEvidence).
+          if (part.tool === 'bash' && (status === 'completed' || status === 'error') && typeof input.command === 'string') {
+            yield {kind: 'command', command: input.command.slice(0, COMMAND_MAX), exit: Number.isInteger(part.state?.metadata?.exit) ? part.state.metadata.exit : null,
+              output: outputTail(part.state?.output ?? part.state?.error ?? '')};
+          }
           // An answer is text said AFTER the worker's last tool call. Observed live: a worker's opening
           // sentence ("I'll execute this systematically…"), six silent minutes of tool work, then the turn
           // ended — and that opener became the task's completion. It was a plan, not an answer.
@@ -295,6 +312,7 @@ export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HE
           if (status === 'error') yield {kind: 'diagnostic', text: `${part.tool ?? 'tool'}: ${String(part.state?.error ?? part.state?.output ?? 'failed').slice(0, 500)}`};
         } else if (raw.type === 'step_finish') {
           stepOpenedAt = null;
+          stepsDone += 1;
           const usage = mapUsage(part.tokens);
           if (Object.keys(usage).length) yield {kind: 'usage', usage};
           emptySteps = stepActed ? 0 : emptySteps + 1;
@@ -337,7 +355,8 @@ export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HE
     },
 
     capabilities() {
-      return {live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'], executionPolicies: ['read-only', 'probe', 'plan', 'write', 'yolo'], quota: 'stream'};
+      // commands: every shell command the worker runs is passed on (a `command` event).
+      return {live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'], executionPolicies: ['read-only', 'probe', 'plan', 'write', 'yolo'], quota: 'stream', commands: true};
     },
 
     pending: dir => readPending(pendingPath(dir)),

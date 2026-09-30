@@ -3,14 +3,13 @@ import {LOCAL_ADAPTERS} from './profiles.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
+const isAlive = pid => { try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } };
 import {handoff} from './core.js';
 import {failedAttempts} from './loop-guard.js';
 import {imagePaths, saveImages, providerInput} from './images.js';
 import {cooldowns, tasks, TERMINAL} from './reducers.js';
 import {
   OUTCOME_KINDS,
-  PLAN_DECISIONS,
-  acceptedPlanSatisfied,
   actionSetKey,
   blockedActionSet,
   pendingMainActions,
@@ -25,6 +24,11 @@ import {
 // journal — each ended only by the user cancelling. The row itself carries the question that was waiting.
 const HANDOFF_KINDS = OUTCOME_KINDS;
 const HANDOFF_TEXT_MAX = 2000; // per task: a final report summary or failure text, never a transcript
+// The worker's answer goes with it whole: found live (ACE e3bd01d5), the orchestrator asked for the full
+// answer after 41 of 43 handoffs. Answers were 1,140 characters at the median and 10,588 at most.
+const HANDOFF_ANSWER_MAX = 12000;
+// How long after a vendor refuses a typed message bounce tries it once more.
+const TYPED_RETRY_MS = 3000;
 const HANDOFF_DELAY_MS = 1000; // several tasks ending together become one wake-up turn
 const WAKE_PROMPT = 'Continue your orders. Resolve the pending outcomes and decisions above: schedule the successor, name the event being awaited, finish the authorized scope, or report a concrete blocker. If a task you still need is listed as running, wait on it with `bounce wait` before reporting. Do not re-run finished work.';
 
@@ -52,6 +56,23 @@ export function handoffBlock(session, ended) {
       : row.summary ?? row.text ?? (Array.isArray(row.questions) && row.questions.length ? row.questions.join('; ') : null) ?? t.summary ?? t.error ?? '';
     lines.push(`- task ${row.task} · profile ${t.profile ?? '?'} · ${row.kind}${row.reason ? ` · reason: ${row.reason}` : ''}${t.replaces ? ` · replaces ${t.replaces}` : ''}`);
     if (outcome) lines.push(`  ${String(outcome).slice(0, HANDOFF_TEXT_MAX).replace(/\n/g, '\n  ')}`);
+    const reported = ['task.completed', 'task.accepted', 'task.blocked', 'task.failed'].includes(row.kind)
+      ? session.events.findLast(event => event.kind === 'task.reported' && event.task === row.task) : null;
+    const answer = String(reported?.text ?? '').trim();
+    if (answer && answer !== String(outcome).trim()) {
+      const shown = answer.length > HANDOFF_ANSWER_MAX
+        ? `${answer.slice(0, HANDOFF_ANSWER_MAX)}\n[… ${answer.length - HANDOFF_ANSWER_MAX} more characters: task_get with full: true]` : answer;
+      lines.push('  answer, in the worker\'s words:', `    ${shown.replace(/\n/g, '\n    ')}`);
+    }
+    // A task.accepted row may carry advice from an unsure Jev review (src/strategy.js jevAdvice):
+    // read it before building on the accepted work, not just its summary.
+    if (row.kind === 'task.accepted' && row.advice) lines.push(`  advice: ${String(row.advice).slice(0, HANDOFF_TEXT_MAX)}`);
+    // The task's check, as bounce ran it on the accepted work (src/task-check.js).
+    const check = row.kind === 'task.accepted' ? session.events.findLast(event => event.kind === 'task.check' && event.task === row.task && typeof event.passed === 'boolean') : null;
+    if (check) lines.push(`  check: ${check.passed ? 'passed' : 'FAILED'} (exit code ${check.exit})${check.passed && check.weak ? ', but it only looks for files or text and did not run the work' : ''} · ${String(check.command).slice(0, 500)}`);
+    // Work the worker reported as still remaining when it completed: the task is done, these are follow-ups.
+    const completed = ['task.completed', 'task.accepted'].includes(row.kind) ? session.events.findLast(event => event.kind === 'task.completed' && event.task === row.task) : null;
+    if (completed?.remaining) lines.push(`  remaining (reported by the worker; follow-up work, not done in this task): ${String(completed.remaining).slice(0, HANDOFF_TEXT_MAX)}`);
     const invalidReport = session.events.findLast(event => event.kind === 'task.report.invalid' && event.task === row.task);
     const output = session.events.findLast(event => event.kind === 'task.output' && event.task === row.task);
     if (invalidReport && (!candidate || invalidReport.seq > candidate.seq)) {
@@ -75,7 +96,7 @@ export function handoffBlock(session, ended) {
 // lands (src/session-title.js); a no-op by default so tests never title a session unless they
 // inject one — see reload.js for the live wiring.
 export function createMainService({session, adapters, profile, settings, profiles = {}, readRouting = () => settings,
-  orchestratorEnv = {}, brief = '', handoffDelayMs = HANDOFF_DELAY_MS, continuationState,
+  orchestratorEnv = {}, brief = '', handoffDelayMs = HANDOFF_DELAY_MS, typedRetryMs = TYPED_RETRY_MS,
   clock = {}, watchdog = {}, onFirstUserPrompt = () => {}}) {
   const now = clock.now ?? Date.now;
   const setTimer = clock.setTimeout ?? setTimeout;
@@ -124,7 +145,15 @@ export function createMainService({session, adapters, profile, settings, profile
   const replayRequest = session.events.findLast(event => event.kind === 'main.requested'
     && !session.events.some(later => later.seq > event.seq && later.requestId === event.requestId
       && ['main.starting', 'main.started', 'main.terminal', 'main.blocked'].includes(later.kind)));
-  if (unfinishedExecution) {
+  // Found live (ACE d1bc0206): a turn orphaned by a crash blocked the orchestrator on every later restart,
+  // for good — nothing cleared it. A turn whose vendor process was recorded and is now gone ended with
+  // it; one with no record (older journals) stays blocked until the user says it is gone (unblock).
+  const startedRow = requestId => session.events.findLast(event => event.kind === 'main.started' && event.requestId === requestId);
+  const processGone = requestId => { const pid = startedRow(requestId)?.pid; return Number.isSafeInteger(pid) && !isAlive(pid); };
+  if (unfinishedExecution && processGone(unfinishedExecution.requestId)) {
+    session.append({kind: 'main.terminal', from: 'main', context: session.id, requestId: unfinishedExecution.requestId, turnId: unfinishedExecution.turnId,
+      status: 'interrupted', text: `The orchestrator turn from before the restart ended with its process (pid ${startedRow(unfinishedExecution.requestId).pid} is gone).`});
+  } else if (unfinishedExecution) {
     current = {id: unfinishedExecution.requestId, turnId: unfinishedExecution.turnId, unverified: true, orphaned: true};
     blockedState = {reason: 'orphaned', requestId: current.id};
     session.append({kind: 'main.blocked', from: 'main', requestId: current.id, turnId: current.turnId, state: 'blocked', reason: 'orphaned', text: 'Termination unverified after daemon restart; inspect the previous orchestrator process before continuing'});
@@ -132,7 +161,8 @@ export function createMainService({session, adapters, profile, settings, profile
   const previousSafetyBlock = session.events.findLast(event => event.kind === 'main.blocked'
     && ['orphaned', 'termination_uncertain'].includes(event.reason));
   if (!current && previousSafetyBlock
-    && !session.events.some(event => event.seq > previousSafetyBlock.seq && event.kind === 'main.requested')) {
+    && !session.events.some(event => event.seq > previousSafetyBlock.seq && ['main.requested', 'main.unblocked'].includes(event.kind))
+    && !processGone(previousSafetyBlock.requestId)) {
     current = {id: previousSafetyBlock.requestId, turnId: previousSafetyBlock.turnId, unverified: true, orphaned: true, finished: true};
     blockedState = {reason: previousSafetyBlock.reason, requestId: previousSafetyBlock.requestId};
   }
@@ -166,10 +196,15 @@ export function createMainService({session, adapters, profile, settings, profile
     if (run.watchdogTimer) clearTimer(run.watchdogTimer);
     run.watchdogTimer = null;
   }
-  function dispositionRows(run, status) {
+  // A turn is not a failed continuation just because it did not durably resolve an outcome: one
+  // that closes by asking the user something (its answer ends with a `Next:` line — reload.js's
+  // own single-prompt convention — or a `state` row names what it is waiting on, per
+  // continuations.js's namedWait) has handed the outcome over, not dropped it. Found live
+  // (session 159f4746): the orchestrator answered "waiting on your go-ahead for P4" without a
+  // durable successor or named wait, so the outcome stayed pending and kept re-waking it.
+  function dispositionRows(run, status, closingText) {
     if (status !== 'completed') return [];
-    const pending = pendingMainActions(session.events, {continuationState});
-    const pendingIds = new Set(pending.map(action => action.actionId));
+    const pending = pendingMainActions(session.events);
     const byOutcome = new Map(pending.filter(action => action.outcomeSeq !== null).map(action => [action.outcomeSeq, action]));
     const ids = new Set(run.actionIds ?? []);
     for (const served of session.events) {
@@ -183,17 +218,14 @@ export function createMainService({session, adapters, profile, settings, profile
       const delivered = run.actions?.find(candidate => candidate.actionId === actionId);
       const action = pending.find(candidate => candidate.actionId === actionId)
         ?? (delivered?.task ? pending.find(candidate => candidate.task === delivered.task) : null)
-        ?? (delivered?.planId ? pending.find(candidate => candidate.planId === delivered.planId) : null)
         ?? delivered;
       if (!action) continue;
-      if (action.kind === 'plan.accepted' && !acceptedPlanSatisfied(session.events, action)) continue;
-      if (action.kind === 'campaign.pending' && pendingIds.has(actionId)) continue;
-      const evidence = action.task ? taskDispositionEvidence(session.events, action, {afterSeq: run.requestedSeq}) : null;
+      const evidence = action.task ? taskDispositionEvidence(session.events, action, {afterSeq: run.requestedSeq, closingText}) : null;
       if (action.task && !evidence) continue;
       rows.push({kind: 'main.disposition', actionId: action.actionId, outcomeSeq: action.outcomeSeq, requestId: run.id,
-        ...(action.task ? {task: action.task} : {}), ...(action.planId ? {planId: action.planId} : {}),
+        ...(action.task ? {task: action.task} : {}),
         ...(evidence?.successor ? {successor: evidence.successor} : {}),
-        disposition: action.kind === 'plan.accepted' ? 'dispatched' : evidence?.disposition ?? 'reported', from: 'main', context: session.id});
+        disposition: evidence?.disposition ?? 'reported', from: 'main', context: session.id});
     }
     return rows;
   }
@@ -207,7 +239,7 @@ export function createMainService({session, adapters, profile, settings, profile
         status: status === 'interrupted' ? 'cancelled' : status},
       {kind: 'main.terminal', from: 'main', context: session.id, requestId: run.id, turnId: run.turnId,
         state: 'idle', status, ...(reason ? {reason, text: reason} : {})},
-      ...dispositionRows(run, status),
+      ...dispositionRows(run, status, reason),
       ...extraRows,
     ];
     const committed = session.commit(rows, {ref: `main-terminal:${run.id}`, version: 2});
@@ -259,9 +291,10 @@ export function createMainService({session, adapters, profile, settings, profile
     run.handle = null;
     const rootRequestId = run.rootRequestId ?? run.id;
     const recoveries = session.events.filter(row => row.kind === 'main.recovery' && row.rootRequestId === rootRequestId).length;
+    // Its process is verifiably gone, so nothing is left to protect: the turn ends failed and the
+    // orchestrator stays ready for the next prompt. Only an unverified live writer blocks it.
     if (!run.resumed || recoveries >= 1) {
-      block(run, 'main_timeout_exhausted', `Main ${stage} timed out after verified termination; automatic recovery is exhausted`,
-        {failure: {code: 'main_timeout', stage, verifiedTermination: true}});
+      finish(run, 'failed', `Main ${stage} timed out after verified termination; automatic recovery is exhausted`);
       return;
     }
     native.delete(run.provider);
@@ -316,9 +349,29 @@ export function createMainService({session, adapters, profile, settings, profile
       const prompt = [brief, roster, previous && run.previousProvider === run.provider ? text0 : handoff(session, text0, settings.contextChars)].filter(Boolean).join('\n');
       const text = providerInput(run.provider, prompt, run.images);
       run.resumed = Boolean(previous && adapter.resume && !run.forceFresh);
-      run.handle = run.resumed
-        ? await adapter.resume({...options, native: previous, message: text})
-        : await adapter.launch({...options, orders: text});
+      try {
+        run.handle = run.resumed
+          ? await adapter.resume({...options, native: previous, message: text})
+          : await adapter.launch({...options, orders: text});
+      } catch (error) {
+        // The thread this session last used cannot be reopened. Found live: the thread was still in the
+        // app's ~/.codex after bounce moved Codex to its own home ("no rollout found", ACE 36ecaacd), and
+        // a reopen that never answered left a session silent (ACE d1bc0206). Whatever the reason, a fresh
+        // thread from the session's handoff carries the conversation forward. A usage limit or a missing
+        // executable is not the thread's fault: those go to the next provider, as before.
+        if (!run.resumed || run.cancelled || closed || run.finished || ['limited', 'missing'].includes(error?.code)) throw error;
+        // Another writer starts only once the failed reopen's process is known to be gone: the vendor
+        // answered that it has no such thread, or the process is stopped here. One that failed without
+        // a process to check keeps the safety block below.
+        const gone = /no rollout found|thread not found|unknown thread/i.test(String(error?.message));
+        if (error.handle ? !(await adapter.cancel(error.handle).catch(() => ({verified: false})))?.verified : !gone) throw error;
+        native.delete(run.provider);
+        run.resumed = false;
+        session.append({kind: 'status', from: 'main', context: session.id,
+          text: `The orchestrator's previous ${run.provider} thread could not be reopened (${error.message}); started a fresh one from this session's handoff.`});
+        const fresh = providerInput(run.provider, [brief, roster, handoff(session, text0, settings.contextChars)].filter(Boolean).join('\n'), run.images);
+        run.handle = await adapter.launch({...options, orders: fresh});
+      }
       if (run.finished) {
         if (run.handle) await adapter.cancel(run.handle).catch(() => ({verified: false}));
         return;
@@ -331,7 +384,7 @@ export function createMainService({session, adapters, profile, settings, profile
       run.turnId = run.handle.turnId ?? run.id;
       run.started = true;
       armWatchdog(run, 'running');
-      emit({kind: 'main.started', requestId: run.id, turnId: run.turnId, state: 'running'});
+      emit({kind: 'main.started', requestId: run.id, turnId: run.turnId, state: 'running', ...(Number.isSafeInteger(run.handle?.pid) ? {pid: run.handle.pid} : {})});
       for await (const event of adapter.events(run.handle)) {
         if (event.kind === 'native') {
           native.set(run.provider, {provider: run.provider, sessionId: event.sessionId});
@@ -340,6 +393,7 @@ export function createMainService({session, adapters, profile, settings, profile
         }
         if (event.kind === 'result') { result = event; break; }
         if (event.kind === 'error' && event.code === 'missing') result = {status: 'missing', text: event.text};
+        if (['assistant', 'tool', 'delta', 'progress', 'activity'].includes(event.kind)) run.spoke = true;
         const row = {...event, provider: run.provider, from: 'main', context: session.id};
         if (['delta', 'progress', 'activity'].includes(event.kind)) session.publish(row);
         else session.append(row);
@@ -353,6 +407,20 @@ export function createMainService({session, adapters, profile, settings, profile
       if (run.finished) return;
       const status = run.cancelled || closed ? 'interrupted' : result?.status;
       if (['limited', 'missing'].includes(status)) return status;
+      // A message the user typed, refused by the vendor before the orchestrator said or did anything,
+      // is tried once more. Found live (ACE e3bd01d5): "model 'gpt-6-sol' is not enabled" on the first
+      // message of a session, which was answered when typed again a minute later. A turn that had
+      // started working is never run twice, and an outcome bounce handed over has its own retries.
+      if (status === 'failed' && !run.wake && !run.retried && !run.spoke) {
+        run.retried = true;
+        session.append({kind: 'status', from: 'main', context: session.id, text: `${run.provider} refused the message (${result?.text ?? 'no reason given'}); trying once more.`});
+        await new Promise(resolve => setTimer(resolve, typedRetryMs));
+        // Closed while it waited: the session is going away, and nothing more is written to it.
+        if (run.finished || closed) return;
+        if (run.cancelled) { finish(run, 'interrupted'); return; }
+        armWatchdog(run, 'startup');
+        return attempt(run, params);
+      }
       finish(run, ['completed', 'failed', 'limited', 'interrupted'].includes(status) ? status : 'failed',
         result ? result.text : 'Provider exited without a terminal result');
     } catch (error) {
@@ -388,25 +456,10 @@ export function createMainService({session, adapters, profile, settings, profile
   // last terminal row. A failure the scheduler has already replaced (policy.fallback) is not
   // an outcome yet: its replacement's end is.
   function pendingActions() {
-    return pendingMainActions(session.events, {continuationState});
+    return pendingMainActions(session.events);
   }
   function actionBlock(actions) {
-    const taskRows = actions.filter(action => action.task).map(action => action.row);
-    const blocks = taskRows.length ? [handoffBlock(session, taskRows)]
-      : ['Pending orchestration decisions delivered by bounce, not typed by the user:'];
-    for (const action of actions) {
-      if (action.task) continue;
-      if (action.kind === 'plan.accepted') {
-        blocks.push(`- plan ${action.planId ?? '?'}${action.phase ? ` · phase ${action.phase}` : ''} · accepted · dispatch ${action.expectedChunks ?? 'its'} approved chunk(s), name the event being awaited, or record a concrete blocker.`);
-      } else if (action.kind === 'plan.rejected') {
-        blocks.push(`- plan ${action.planId ?? '?'}${action.phase ? ` · phase ${action.phase}` : ''} · rejected · submit a corrected plan or record the specific blocker.`);
-      } else if (action.kind === 'plan.unavailable') {
-        blocks.push(`- plan ${action.planId ?? '?'}${action.phase ? ` · phase ${action.phase}` : ''} · review unavailable · repair the gate, name the wait, or record the specific blocker.`);
-      } else {
-        blocks.push(`- campaign ${action.campaignId ?? '?'} · ${action.row.text ?? 'authorized obligations remain'} · schedule the successor, name the wait, or record the specific blocker.`);
-      }
-    }
-    return blocks.join('\n');
+    return handoffBlock(session, actions.map(action => action.row));
   }
   function start(params, {wake, forceFresh = false, fromQueue = false} = {}) {
     if (closed) return {accepted: false, reason: 'daemon_closed'};
@@ -527,55 +580,44 @@ export function createMainService({session, adapters, profile, settings, profile
     wakeTimerKey = key;
     wakeTimer = setTimer(wake, Math.max(0, dueAt - now()));
   }
-  function settleObservedPlans(actions) {
-    const settled = actions.filter(action => action.kind === 'plan.accepted' && action.expectedChunks !== 0
-      && acceptedPlanSatisfied(session.events, action));
-    for (const action of settled) session.commit([{kind: 'main.disposition', from: 'main', context: session.id,
-      actionId: action.actionId, outcomeSeq: action.outcomeSeq, disposition: 'dispatched'}],
-    {ref: `main-plan-disposition:${action.actionId}`, version: 2});
-    return settled.length > 0;
-  }
   function reconcile() {
     if (closed || current || wakeTimer || autoWakeSuppressed) return;
-    let actions = pendingActions();
-    if (settleObservedPlans(actions)) actions = pendingActions();
+    const actions = pendingActions();
     if (!actions.length) return;
     const key = actionSetKey(actions);
-    const priorBlock = session.events.findLast(row => row.kind === 'main.blocked' && row.actionKey === key);
-    if (blockedActionSet(session.events, key)) {
-      blockedState = priorBlock ? {reason: priorBlock.reason, actionKey: key} : blockedState;
-      return;
-    }
-    const attempts = wakeAttempts(session.events, key);
-    if (attempts >= maxWakeAttempts) {
-      const reason = actions.some(action => action.kind === 'plan.accepted') ? 'plan_undispatched'
-        : actions.some(action => action.kind === 'campaign.pending') ? 'campaign_blocked' : 'wake_retry_exhausted';
-      const outcomeSeqs = actions.map(action => action.outcomeSeq).filter(Number.isInteger);
-      const text = reason === 'plan_undispatched'
-        ? `Accepted plan still has undispatched chunks after ${attempts} continuation attempts; inspect plan/task admission and dispatch the missing chunks or change scope explicitly.`
-        : `Pending orchestration outcomes remain unresolved after ${attempts} continuation attempts; inspect provider health and resume explicitly.`;
-      blockedState = {reason, actionKey: key};
-      const blocker = {kind: 'main.blocked', from: 'main', context: session.id, state: 'blocked', reason, actionKey: key,
-        actionIds: actions.map(action => action.actionId), outcomeSeqs, attempts, text};
-      const dispositions = actions.filter(action => action.kind !== 'campaign.pending').map(action => ({kind: 'main.disposition',
-        from: 'main', context: session.id, actionId: action.actionId, outcomeSeq: action.outcomeSeq,
-        ...(action.task ? {task: action.task} : {}), ...(action.planId ? {planId: action.planId} : {}),
-        disposition: 'blocked', blocker: reason}));
-      const committed = session.commit([blocker, ...dispositions], {ref: `main-blocked:${key}`, version: 2});
-      notify(committed);
-      return;
-    }
-    arm(actions, key, attempts + 1);
+    // An older journal's exhausted set (main.blocked wake_retry_exhausted / plan_undispatched) stays settled.
+    if (blockedActionSet(session.events, key)) return;
+    // Bounce never blocks the orchestrator over outcomes it has not resolved: after its continuation
+    // attempts, bounce stops waking it for this same set. The outcomes stay pending — in front of the next
+    // prompt and in the state view — and the orchestrator stays ready. Found live: wake_retry_exhausted
+    // held sessions blocked until the user noticed.
+    if (wakeAttempts(session.events, key) >= maxWakeAttempts) return;
+    arm(actions, key, wakeAttempts(session.events, key) + 1);
   }
   const unsubscribeHandoff = session.subscribe(row => {
-    if (![...HANDOFF_KINDS, ...PLAN_DECISIONS, 'task.submitted', 'main.disposition'].includes(row.kind)
-      && !row.kind.startsWith('campaign.')) return;
+    if (![...HANDOFF_KINDS, 'task.submitted', 'main.disposition'].includes(row.kind)) return;
     reconcile();
   });
   const service = {
     state,
     subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
     run(params) { return start(params, {wake: false}); },
+    // The user's word that the orchestrator process from before a restart is gone (bounce could not
+    // verify it: older journals never recorded its process). Only a safety block is cleared this way.
+    unblock() {
+      const orphanedTasks = Object.values(tasks(session.events)).filter(t => t.state === 'blocked'
+        && session.events.findLast(e => e.task === t.id && e.kind === 'task.blocked')?.reason === 'orphaned');
+      const mainHeld = blockedState && ['orphaned', 'termination_uncertain'].includes(blockedState.reason);
+      if (!mainHeld && !orphanedTasks.length) return {accepted: false, reason: 'not_blocked'};
+      // Workers from before the restart, unverifiable too: cancelled as lost (a cancellation never falls back).
+      for (const t of orphanedTasks) session.append({kind: 'task.cancelled', task: t.id, reason: 'lost_in_restart', from: 'user', context: t.context ?? session.id,
+        text: 'The user confirmed its worker process from before the restart is gone; resubmit what is left'});
+      const row = session.append({kind: 'main.unblocked', from: 'user', context: session.id, ...(mainHeld ? {requestId: blockedState.requestId} : {}),
+        tasks: orphanedTasks.map(t => t.id), text: 'The user confirmed the processes from before the restart are gone; new turns may start.'});
+      for (const listener of listeners) listener(row);
+      if (mainHeld) { current = null; blockedState = null; }
+      return {accepted: true, cancelled: orphanedTasks.map(t => t.id)};
+    },
     async deliver({id = randomUUID(), text, expectedTurnId}) {
       const run = current;
       if (!run?.handle || run.finished || run.cancelled) return {state: 'failed', reason: 'no_active_turn'};

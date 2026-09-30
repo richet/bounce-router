@@ -20,3 +20,29 @@ test('review-blocked handoff carries the candidate reference and gate without ca
   assert.doesNotMatch(text, /Still running:.*audit/);
   assert.doesNotMatch(text, /Still running:.*input/);
 });
+
+test('a task.accepted handoff carries an unsure Jev\'s advice, not just the summary', () => {
+  const session = {events: [
+    {kind: 'task.submitted', seq: 1, task: 'lean', profile: 'build', orders: 'do it', from: 'orchestrator'},
+    {kind: 'task.started', seq: 2, task: 'lean', attempt: 1},
+    {kind: 'task.completed', seq: 3, task: 'lean', summary: 'done'},
+    {kind: 'task.accepted', seq: 4, task: 'lean', stage: 'completion',
+      advice: 'Jev leaned rework (probability 0.86, confidence 0.72 below the 0.8 bar).'},
+  ]};
+  const text = handoffBlock(session, [session.events[3]]);
+  assert.match(text, /Jev leaned rework \(probability 0\.86, confidence 0\.72 below the 0\.8 bar\)\./);
+});
+
+test('a completed task\'s remaining work reaches the orchestrator as a follow-up, and "none" adds no line', () => {
+  const session = {events: [
+    {kind: 'task.submitted', seq: 1, task: 'remove', profile: 'build', orders: 'build remove', from: 'orchestrator'},
+    {kind: 'task.started', seq: 2, task: 'remove', attempt: 1},
+    {kind: 'task.completed', seq: 3, task: 'remove', summary: 'remove built', remaining: 'register runRemove in src/cli/run.ts'},
+    {kind: 'task.accepted', seq: 4, task: 'remove', stage: 'completion'},
+    {kind: 'task.submitted', seq: 5, task: 'doctor', profile: 'build', orders: 'build doctor', from: 'orchestrator'},
+    {kind: 'task.completed', seq: 6, task: 'doctor', summary: 'doctor built'},
+  ]};
+  const text = handoffBlock(session, [session.events[3], session.events[5]]);
+  assert.match(text, /remaining \(reported by the worker; follow-up work, not done in this task\): register runRemove in src\/cli\/run\.ts/);
+  assert.equal(text.match(/remaining \(reported/g).length, 1);
+});

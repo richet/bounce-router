@@ -77,24 +77,24 @@ test('a message answering a worker\'s own blocked outcome resumes it, and a late
   assert.equal(scheduler.budgets().roots[row.task].reserved.rounds, 1);
 });
 
-test('a task blocked at an unconfident review gate does not resume on a message', async t => {
+// Rewritten 2026-09-27: review gates no longer block new work; an older journal's task still held at one is
+// the orchestrator's to decide (task.accepted / task.rework), and a message does not resume its worker.
+test('an older journal\'s task held at a review gate does not resume on a message', async t => {
   const {session} = setup(t);
-  const workerAdapter = fakeAdapter(() => [{kind: 'native', sessionId: 'native-2'}, {kind: 'result', status: 'completed', text: 'done'}]);
-  const lean = JSON.stringify({verdict: 'unavailable', findings: [], confidence: 0.3, threshold: 0.8, choice: 'rework',
-    probabilities: {rework: 0.7, accept: 0.3}, fired: ['unbacked_tests'], leanFindings: ['Paste the test output.'], source: 'jev'});
-  const criticAdapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: lean}]);
-  const scheduler = createScheduler({session, adapters: {worker: workerAdapter, critic: criticAdapter}, profiles: {A: worker(), C: critic()}, watchdog: {interval: null}});
-  const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null, review: {completion: 'C'}});
-  await waitFor(() => scheduler.tasks()[row.task]?.state === 'blocked');
-  const blocked = session.events.findLast(e => e.kind === 'task.blocked' && e.task === row.task);
-  assert.equal(blocked.reason, 'review_not_accepted');
-
-  session.append({kind: 'message', to: `worker:${row.task}`, text: 'go ahead and accept it', from: 'user'});
+  session.append({kind: 'task.submitted', task: 'gated', parent: null, profile: 'A', orders: 'do it', review: {completion: 'C'}, from: 'orchestrator'});
+  session.append({kind: 'task.started', task: 'gated', attempt: 1});
+  session.append({kind: 'peer.native', from: 'worker:gated', provider: 'worker', sessionId: 'native-2'});
+  session.append({kind: 'task.attempt.ended', task: 'gated', attempt: 1, verifiedTermination: true});
+  session.append({kind: 'task.completed', task: 'gated', summary: 'done'});
+  session.append({kind: 'task.blocked', task: 'gated', reason: 'review_unavailable', text: 'Required review unavailable: no confident verdict'});
+  const workerAdapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done'}]);
+  const scheduler = createScheduler({session, adapters: {worker: workerAdapter}, profiles: {A: worker(), C: critic()}, watchdog: {interval: null}});
+  session.append({kind: 'message', to: 'worker:gated', text: 'go ahead and accept it', from: 'user'});
   await waitFor(() => session.events.some(e => e.kind === 'task.delivered'));
   await new Promise(resolve => setTimeout(resolve, 30));
   assert.equal(workerAdapter.calls.resume, 0);
   assert.equal(session.events.findLast(e => e.kind === 'task.delivered').tier, 'queued');
-  assert.equal(scheduler.tasks()[row.task].state, 'blocked');
+  assert.equal(scheduler.tasks().gated.state, 'blocked');
 });
 
 test('a worker blocked with no resumable native session leaves the message queued and escalates why', async t => {

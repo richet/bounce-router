@@ -1,6 +1,7 @@
 import {spawn} from 'node:child_process';
 import {resolveExecutable} from './executable.js';
 import {providers} from './providers.js';
+import {prepareCodexHome} from './codex-home.js';
 
 const installationUrls = {
   claude: 'https://code.claude.com/docs/en/quickstart',
@@ -14,7 +15,9 @@ export function login(provider, settings, cwd) {
   return new Promise((resolve, reject) => {
     if (!Object.hasOwn(providers, provider)) return reject(new Error('Choose claude, codex, or muse'));
     const override = settings.executables[provider];
-    const child = spawn(resolveExecutable(provider, override), providers[provider].login, {cwd, stdio: 'inherit'});
+    const executable = resolveExecutable(provider, override);
+    prepareCodexHome(executable);
+    const child = spawn(executable, providers[provider].login, {cwd, stdio: 'inherit'});
     child.once('error', error => {
       if (error.code !== 'ENOENT') return reject(error);
       reject(new Error([

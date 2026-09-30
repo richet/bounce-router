@@ -135,7 +135,7 @@ async function askCloud(prompt, settings, {run, executables, onExit}) {
   const said = [], results = [];
   try {
     const result = await run({provider: agent.adapter, executable: resolveExecutable(agent.adapter, executables?.[agent.adapter]),
-      args: invocation(agent.adapter, {model, mode: 'plan'}, promptFile), prompt, cwd: dir, signal: controller.signal,
+      args: invocation(agent.adapter, {model, mode: 'plan', ephemeral: true}, promptFile), prompt, cwd: dir, signal: controller.signal,
       emit: e => { if (e.kind === 'assistant') said.push(e.text); else if (e.kind === 'result' && e.success) results.push(e.text); }});
     if (controller.signal.aborted || result.status !== 'completed') return null;
   } finally { clearTimeout(timer); forget(); fs.rmSync(promptFile, {force: true}); }

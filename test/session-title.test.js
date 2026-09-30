@@ -212,11 +212,13 @@ test('createAsk: a local reasoning model gets room to finish thinking, and an em
     bodies.push(JSON.parse(init.body));
     return {ok: true, json: async () => ({choices: [{finish_reason: 'length', message: {content: '', reasoning_content: 'Here is a thinking process'}}]})};
   };
-  let cloud = 0;
-  const run = async ({emit}) => { cloud++; emit({kind: 'result', success: true, text: 'fix the reply queue'}); return {status: 'completed'}; };
+  let cloud = 0, cloudArgs;
+  const run = async ({emit, args}) => { cloud++; cloudArgs = args; emit({kind: 'result', success: true, text: 'fix the reply queue'}); return {status: 'completed'}; };
   const answer = await createAsk({fetchImpl, run})({prompt: 'title me', settings: {local: {enabled: true}, order: ['claude'], profiles: {}}});
   assert.equal(bodies[0].max_tokens, 4096);
   assert.equal(cloud, 1);
+  // Found live: "Name this conversation in 2-5 lowercase words" threads in Daniel's ChatGPT app.
+  assert.equal(cloudArgs.includes('--no-session-persistence'), true);
   assert.equal(answer.text, 'fix the reply queue');
 });
 

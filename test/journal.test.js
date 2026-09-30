@@ -113,3 +113,21 @@ test('subscriber errors are bounded so a broken subscriber cannot grow memory fo
   assert.equal(session.subscriberErrors.length, 100);
   assert.equal(session.subscriberErrors.at(-1).row.text, '149');
 });
+
+// Found live (ACE d1bc0206): 75% of a 21 MB journal was Claude's raw stream (assistant 5.4 MB, user tool
+// results 7.8 MB, thinking-token ticks 1.3 MB), each already stored as its own normalized row, and the
+// whole history then overflowed the view channel on resume. Those raw rows reach listeners live only;
+// raw rows that carry anything not stored elsewhere (rate limits, init, results, heartbeats) stay.
+test('raw rows that only echo normalized ones are delivered live but never journaled', () => {
+  const {root, session} = setup();
+  const seen = [];
+  session.subscribe(row => seen.push(row.raw?.type ?? row.kind));
+  session.append({kind: 'raw', provider: 'claude', raw: {type: 'assistant', message: {content: [{type: 'text', text: 'hi'}]}}});
+  session.append({kind: 'raw', provider: 'claude', raw: {type: 'user', message: {content: [{type: 'tool_result', content: 'x'.repeat(5000)}]}}});
+  session.append({kind: 'raw', provider: 'claude', raw: {type: 'system', subtype: 'thinking_tokens', estimated_tokens: 40}});
+  session.append({kind: 'raw', provider: 'claude', raw: {type: 'rate_limit_event', rate_limit_info: {utilization: 0.19}}});
+  session.append({kind: 'assistant', provider: 'claude', text: 'hi'});
+  assert.deepEqual(seen, ['assistant', 'user', 'system', 'rate_limit_event', 'assistant']);
+  const reopened = new Session(root, {root, id: session.id});
+  assert.deepEqual(reopened.events.filter(e => ['raw', 'assistant'].includes(e.kind)).map(e => e.raw?.type ?? e.kind), ['rate_limit_event', 'assistant']);
+});

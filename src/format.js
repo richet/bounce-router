@@ -133,7 +133,16 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
   function event(e, width) {
     // `model` carries no text: it is what the header's model label reads, not a transcript row.
     if (['raw', 'usage', 'model', 'peer.native', 'peer.joined', 'task.attempt.ended', 'task.report.staged', 'checkpoint', 'wait.served'].includes(e.kind) || e.kind.startsWith('budget.')) return [];
+    // /btw: a side exchange, dimmed so it reads apart from the main conversation it never joins
+    // (src/btw.js never feeds these rows back into the orchestrator's own context).
+    if (e.kind === 'btw.asked') return [clip(style.muted(`btw · ${clean(e.text)}`), width), ''];
+    if (e.kind === 'btw.answered') return [...markdown(e.text, width - 2).map(line => style.muted(line)), ...(e.model ? [style.muted(`  (${clean(e.model)})`)] : []), ''];
+    if (e.kind === 'btw.failed') return [style.muted(`btw · no answer (${clean(e.reason ?? 'failed')})`), ''];
     if (e.kind === 'attempt' && e.status === 'started') return event({...e, kind: 'status', text: 'Starting provider…'}, width);
+    // The request row repeats what the user typed, or is the fixed wake prompt bounce types at the
+    // orchestrator ("Continue your orders…"): bounce talking to the orchestrator, not the
+    // conversation (Daniel, 2026-09-30). The journal keeps it; the transcript shows nothing.
+    if (e.kind === 'main.requested') return [];
     if (e.kind.startsWith('main.')) {
       const label = {'main.starting': 'Starting', 'main.started': 'Running', 'main.terminal': 'Finished', 'main.blocked': 'Blocked', 'main.delivery': 'Message'}[e.kind] ?? 'Orchestrator';
       return event({...e, kind: 'status', text: `${label} · ${e.text || e.status || e.state || ''}`}, width);
@@ -211,6 +220,7 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     }
     if (compact && e.kind === 'user' && e.typed) return [...block(style.user('>'), wrap(clean(e.typed), width - 2)), clip(`  ${style.muted('⎿')}  ${style.muted(`expanded to ${withoutBrief(e.text).length.toLocaleString()} chars · /details shows it`)}`, width), ''];
     if (compact && e.kind === 'user') return [...block(style.user('>'), wrap(clean(withoutBrief(e.text)), width - 2)), ''];
+    if (compact && e.kind === 'assistant' && e.narration) return [...block(style.muted('∴'), wrap(clean(e.text), width - 2).map(line => style.muted(line))), ''];
     if (compact && ['assistant', 'delta', 'result'].includes(e.kind)) return [...block(style.result('●'), markdown(e.text, width - 2).map(line => line ? style.answer(line) : line)), ''];
     const names = {user: 'You', assistant: 'Response', delta: 'Response', result: 'Result',
       status: 'Activity', route: 'Agent selected', tool: 'Tool output', error: 'Error',
@@ -235,6 +245,12 @@ export function displayEvents(events) {
   const result = [];
   for (const event of events) {
     if (['raw', 'usage', 'checkpoint', 'session'].includes(event.kind) || !event.text) continue;
+    // "Orchestrator selected codex" says something the first time and when the AI changes; the copy
+    // journaled at every turn start says nothing new (Daniel, 2026-09-30).
+    if (event.kind === 'route') {
+      const last = result.findLast(row => row.kind === 'route');
+      if (last && last.provider === event.provider && last.model === event.model) continue;
+    }
     const previous = result.at(-1);
     if (event.kind === 'delta' && previous?.kind === 'delta' && previous.provider === event.provider) {
       previous.text += event.text;

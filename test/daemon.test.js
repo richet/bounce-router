@@ -5,9 +5,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {spawn} from 'node:child_process';
+import {spawn, spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
-import {supervise, installControlAuthority, pidAlive} from '../src/reload.js';
+import {supervise, installControlAuthority, installCrashRecord, releaseStuckDaemon, pidAlive} from '../src/reload.js';
 import {createTypesafeLive} from '../src/adapters/typesafe-live.js';
 import {socketPathFor, connectBus} from '../src/bus.js';
 import {quotaFile} from '../src/quota.js';
@@ -76,14 +76,15 @@ async function runHarnessDaemon(root, kind) {
   const trail = {stderr: '', exit: null};
   daemon.stderr.on('data', d => { trail.stderr = (trail.stderr + d).slice(-4000); });
   daemon.stdout.resume();
-  daemon.once('exit', (code, signal) => { trail.exit = {code, signal}; });
+  const exited = new Promise(resolve => daemon.once('exit', (code, signal) => { trail.exit = {code, signal}; resolve(); }));
   const id = await waitFor(() => {
     if (!fs.existsSync(path.join(root, 'sessions'))) return null;
     return fs.readdirSync(path.join(root, 'sessions')).find(candidate => fs.existsSync(path.join(root, 'sessions', candidate, 'daemon.json')));
   });
   const dir = path.join(root, 'sessions', id);
   const info = JSON.parse(fs.readFileSync(path.join(dir, 'daemon.json'), 'utf8'));
-  return {id, dir, info, trail};
+  // The launcher can outlive the daemon under load and still write the session; cleanup waits for it too.
+  return {id, dir, info, trail, exited};
 }
 
 test('D1 legacy run unchanged: exit 0, route+turn rows, journal seq, no daemon/bus left behind', async t => {
@@ -401,6 +402,8 @@ test('D3 --detach returns immediately with an id; attach streams then exits when
   await waitFor(() => fs.existsSync(path.join(dir, 'daemon.json')));
   const info = JSON.parse(fs.readFileSync(path.join(dir, 'daemon.json'), 'utf8'));
   assert.ok(pidAlive(info.pid), 'daemon pid must be alive right after detach');
+  // Found live (ACE d1bc0206): the daemon died with stdio 'ignore' and left no trace of why.
+  assert.equal(fs.existsSync(path.join(dir, 'daemon.log')), true, 'the detached daemon writes its output to daemon.log');
 
   const attachChild = spawn(process.execPath, [cliPath, 'attach', id, '--json'], {env: bounceEnv(root), stdio: ['ignore', 'pipe', 'pipe']});
   let attachOut = '', sawFirstRow = false;
@@ -423,8 +426,9 @@ test('D3 --detach returns immediately with an id; attach streams then exits when
 
 test('D4 stop cancels a hanging task, prints control.stopped, exits 0, daemon dies and daemon.json is gone', async t => {
   const root = tmpRoot('bounce-d4-');
-  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
-  const {id, dir, info, trail} = await runHarnessDaemon(root, 'hang');
+  let launcher = Promise.resolve();
+  t.after(async () => { await launcher; fs.rmSync(root, {recursive: true, force: true}); });
+  const {id, dir, info, trail, exited} = await runHarnessDaemon(root, 'hang'); launcher = exited;
   const stop = await run(['stop', id], bounceEnv(root), {timeout: 20000});
   assert.equal(stop.code, 0);
   assert.match(stop.stdout, /control\.stopped/);
@@ -433,10 +437,29 @@ test('D4 stop cancels a hanging task, prints control.stopped, exits 0, daemon di
   assert.equal(fs.existsSync(path.join(dir, 'daemon.json')), false, `daemon ended ${JSON.stringify(trail.exit)} with daemon.json left; stop: ${stop.stdout}${stop.stderr}; daemon stderr: ${trail.stderr}`);
 });
 
+// Found live (2026-09-27): every `bounce stop` of a resumed session printed "unverified: ccd6d36c, 76ae910e" —
+// tasks long cancelled. The stop waited for the FIRST control.stopped row in the journal, an old stop's.
+test('D4b stop reports this stop, not an earlier stop\'s unverified tasks', async t => {
+  const root = tmpRoot('bounce-d4b-');
+  let launcher = Promise.resolve();
+  t.after(async () => { await launcher; fs.rmSync(root, {recursive: true, force: true}); });
+  const {id, dir, info, exited} = await runHarnessDaemon(root, 'hang'); launcher = exited;
+  const client = await connectBus({path: info.bus, token: fs.readFileSync(info.userToken, 'utf8').trim()});
+  await client.publish({kind: 'control.stopped', cancelled: [], unverified: ['ccd6d36c', '76ae910e']});
+  await client.close();
+  const stop = await run(['stop', id], bounceEnv(root), {timeout: 20000});
+  assert.equal(stop.stdout.includes('ccd6d36c'), false, stop.stdout);
+  assert.equal(stop.code, 0, stop.stdout);
+  assert.match(stop.stdout, /"cancelled":\["/);
+  await waitFor(() => !pidAlive(info.pid));
+  assert.equal(fs.existsSync(path.join(dir, 'daemon.json')), false);
+});
+
 test('D5 stop with unverifiable termination exits 1, lists the unverified id, keeps daemon.json', async t => {
   const root = tmpRoot('bounce-d5-');
-  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
-  const {id, dir, info: started, trail} = await runHarnessDaemon(root, 'stubborn');
+  let launcher = Promise.resolve();
+  t.after(async () => { await launcher; fs.rmSync(root, {recursive: true, force: true}); });
+  const {id, dir, info: started, trail, exited} = await runHarnessDaemon(root, 'stubborn'); launcher = exited;
   const stop = await run(['stop', id], bounceEnv(root), {timeout: 20000});
   assert.equal(stop.code, 1);
   assert.match(stop.stdout, /unverified/);
@@ -498,8 +521,22 @@ test('D11 stop escalates to SIGKILL when the main child ignores SIGTERM, so a st
 
 test('D10 SIGTERM to a daemon with a running task cancels it and removes bus.sock/daemon.json', async t => {
   const root = tmpRoot('bounce-d10-');
-  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
-  const {dir, info} = await runHarnessDaemon(root, 'hang');
+  let launcher = Promise.resolve();
+  // Seen once under a full-suite run (2026-09-29), not reproduced in 28 more: removing the folder failed
+  // with ENOTEMPTY after the daemon had exited, so something was still writing into it. A retry would
+  // hide that; this says what was left and which processes still name the folder, and still fails.
+  t.after(async () => {
+    await launcher;
+    try {
+      fs.rmSync(root, {recursive: true, force: true});
+    } catch (error) {
+      const left = fs.readdirSync(root, {recursive: true}).join(', ');
+      const running = spawnSync('pgrep', ['-fl', root], {encoding: 'utf8'}).stdout.trim();
+      fs.rmSync(root, {recursive: true, force: true, maxRetries: 10, retryDelay: 100});
+      throw new Error(`${error.code} removing the test folder; left in it: ${left || 'nothing'}; processes naming it: ${running || 'none'}`);
+    }
+  });
+  const {dir, info, exited} = await runHarnessDaemon(root, 'hang'); launcher = exited;
   const spath = socketPathFor(dir);
   await waitFor(() => fs.existsSync(spath));
 
@@ -646,6 +683,30 @@ test('O2 orchestrator single-provider: the orchestrator submits over the bridge,
   const skillLine = orders.split('\n').find(line => line.startsWith('Skill: '));
   assert.equal(fs.existsSync(skillLine.slice('Skill: '.length)), true);
   assert.equal(orders.includes('BOUNCE_BUS_TOKEN_FILE='), true);
+  // The orders govern over the user's own global CLAUDE.md/WORKFLOW.md (item 2): first lines say so.
+  assert.match(orders, /^These orders govern this session\. Where the user's CLAUDE\.md or WORKFLOW\.md conflict with them/m);
+  assert.equal(orders.includes('Never push, and never add'), true);
+  assert.equal(orders.includes('AI attribution to commits or PRs.'), true);
+  // Small work stays with the orchestrator (item 1): it may do it itself, not dispatch everything.
+  assert.equal(orders.includes('Do small things yourself: answer questions, read files, run read-only checks, and run a short real-folder'), true);
+  assert.equal(orders.includes('Dispatch a worker for anything that edits source or will take more than about five'), true);
+  assert.equal(orders.includes('Delegate every implementation task to a worker profile below'), false);
+  assert.equal(orders.includes('Do not edit the repository yourself and do not read bounce\'s own source'), false);
+  // A retry may name its own next profile (item 3).
+  assert.equal(orders.includes('After a failed attempt, you may name the next profile for the retry yourself and say why'), true);
+  // Found live (ACE d1bc0206): with names only, the orchestrator took `build_claude` for "the Claude
+  // builder" and ran a routine retry on Opus. Each profile now shows its model, and the retry rule
+  // says to pick the lightest AI that fits.
+  // Decided by Daniel on 2026-09-30: a failed local attempt is retried on the agent's own next AI first (a
+  // second local model, then Sonnet); the chain lines name those profiles so the retry can submit them.
+  assert.equal(orders.includes('Retry first on the agent\'s own next AI: submit the name after the arrow in its chain above (builder~2, then builder~3) with retryOf; it is the lightest AI that has not tried the task. Name a cloud AI yourself only when the cause needs a stronger tier: a mid-tier model (e.g. Sonnet) for routine implementation a local worker could not finish'), true);
+  assert.match(orders, /Worker profiles \(one AI each\): .*build_claude \(opus\[1m\]\)/);
+  // Found across ACE 159f4746 and d1bc0206: most first attempts ended with the worker blocking itself on
+  // a one-line change outside its owned paths, or on live proof its own orders forbade.
+  assert.equal(orders.includes('Owned paths are where a chunk\'s work lands, not a fence'), true);
+  assert.equal(orders.includes('Acceptance must be reachable with the authority you grant'), true);
+  // No jev block: the Jev advice line is absent too, same as every other Jev-conditional line.
+  assert.equal(orders.includes('A task.accepted row may carry advice from an unsure Jev review'), false);
   // Found live: a reviewer's 12 KB FAIL verdict reached the orchestrator cut at
   // 1,200 characters. It tried task_get, four shapes of `bounce wait` and two --help pages, concluded the
   // bridge had no full-report option, and began re-reading the source itself. The option now exists; the
@@ -653,13 +714,24 @@ test('O2 orchestrator single-provider: the orchestrator submits over the bridge,
   assert.equal(orders.includes('`task_get` with `full: true` (or `bounce task <id> --report`)'), true,
     'the orders name the one way to read a finished report in full');
   // The stated capability is the bus's own allowlist (src/bus.js PEER_KINDS), verbatim.
-  assert.equal(orders.includes('You may publish only: task.submitted, task.accepted, task.milestone, task.blocked, task.input_required, task.usage, task.activity, message.'), true);
+  assert.equal(orders.includes('You may publish only: task.submitted, task.accepted, task.rework, task.cancel, task.milestone, task.blocked, task.input_required, task.usage, task.activity, message.'), true);
+  // A replaced or no-longer-needed task must be told to stop waiting (item 43387649/151ed901): the
+  // orders name the exact verb so the orchestrator doesn't leave a superseded task's outcome pending.
+  assert.equal(orders.includes('When you replace a blocked task with a fresh one, or no longer need a task, cancel it with task.cancel and a reason, so its outcome stops waiting.'), true);
   // steps is refused-without when the completion reviewer is a verifier, so the brief has to name it.
   assert.equal(orders.includes('steps (the verification steps, as text) — required when the completion reviewer is a verifier profile'), true);
-  assert.equal(orders.includes('phase, text, next, and evidence'), true, 'workers receive the durable progress checkpoint contract');
-  assert.equal(orders.includes('initial inspection, every phase change, and before completion'), true, 'checkpoint cadence is explicit');
+  // Milestone/report contract is a worker instruction, not an orchestrator order (item 7): the
+  // orchestrator only reads outcomes and does not publish milestones on a worker's behalf.
+  assert.equal(orders.includes('Workers report their own progress and final result through `bounce report`/their report tool'), true);
+  assert.equal(orders.includes('you do not publish milestones for them'), true);
+  assert.equal(orders.includes('Publish task.milestone with task, phase, text, next, and evidence'), false);
+  assert.equal(orders.includes('A Codex worker calls its scoped `bounce_report` tool'), false);
   // The input prefill (Tab, Enter) needs the answer to state its next prompt; nothing else asked for it.
   assert.equal(orders.includes('end the answer with one line `Next: <the prompt, as the user would type it>`'), true, 'the orchestrator is asked for the prefill line');
+  assert.equal(orders.includes('A live container check (starting Docker, inspecting or running one) needs requires including "docker", and only a worker that may write gets it: a read-only or probing analyst never reaches Docker, because a container can write the checkout. Send live container checks to a builder.'), true, 'docker only for workers that may write');
+  // A step-capped local worker is a lease renewal, not an AI switch (item 43387649): the standing
+  // orders name the exact behaviour so the orchestrator does not resubmit or reroute on its own.
+  assert.equal(orders.includes('bounce continues a worker that hits its step limit while progressing (up to 3 times); when a local worker still fails, read the actual cause in its outcome (step limit, blocked, or an error) before switching AI, and prefer retrying the same local worker when the cause was the step limit or a fixable command mistake.'), true);
   // Found live (session 159f4746): the orchestrator offered to commit, then sent the commit to workers seven
   // times — each found a copy with no .git. Docs/plans/in-place-tasks.md: an in-place task is now the way.
   assert.equal(orders.includes('Workers run in copies of the repository: only an in-place task (task.submitted with `inPlace: {authorizedBy: <seq>}`) runs in the real checkout, for a version-control or other real-folder step (commit, push, open a PR) the user\'s own message asked for. Cite that message\'s seq (omit authorizedBy to cite the user\'s latest message) and keep the orders to exactly what it asked — push and PR only when it asked for them. A refusal names what exceeded the request.'), true, 'the orchestrator knows how to use an in-place task');
@@ -815,6 +887,54 @@ test('O9 the orchestrator may publish a milestone for the task it submitted, and
   assert.equal(session.events.some(e => e.kind === 'task.milestone' && e.task === 'foreign-task-id'), false);
 });
 
+// A worker that never finishes on its own, so the task stays a live, non-terminal handle
+// (`handles`, not `launchingAttempts`) until something cancels it — the scheduler's normal
+// cancel() path (src/scheduler.js cancelOne), the same one `bounce cancel`/`stop`/the
+// superseded-task sweep already drive.
+const heldAdapter = () => {
+  const cancelCalls = [];
+  return {
+    cancelCalls,
+    async launch({profile}) { return {profile}; },
+    async *events() { await new Promise(() => {}); }, // never yields until cancelled
+    async cancel(handle) { cancelCalls.push(handle); return {verified: true}; },
+  };
+};
+
+// Gap (session 159f4746): the orchestrator had no way to withdraw a task it replaced or no
+// longer needed — the bus refused a peer-authored lifecycle row outright (PEER_KINDS), so a
+// superseded task's outcome sat pending forever. task.cancel is the orchestrator's own request
+// for the scheduler's cancel(); this drives it through every rule in one live run.
+// Rewritten 2026-09-27: a cancel with no text is corrected (its text defaults) instead of refused.
+test('O10 orchestrator task.cancel: refuses a foreign task, cancels its own running task (a missing reason defaults) through the worker\'s cancel, then refuses it once terminal', async t => {
+  const root = tmpRoot('bounce-o10-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  writeOrchestratorConfig(root, {profiles: {main: {adapter: 'codex'}, build: {adapter: 'codex'}}});
+  const adapter = heldAdapter();
+  const session = await runOrchestratorSession(root, {adapters: {codex: adapter}, env: {FAKE_ORCH_CANCEL: '1'}});
+
+  const submitted = session.events.find(e => e.kind === 'task.submitted');
+  const tried = JSON.parse(session.events.filter(e => e.kind === 'assistant').map(e => e.text).find(text => text.includes('foreign')));
+  // outside the orchestrator's own grant -> refused
+  assert.equal(tried.foreign, 'refused -32001');
+  // its own running task -> accepted, and the resulting row is the normal task.cancelled outcome
+  assert.equal(tried.mine.ok, true);
+  assert.equal(tried.mine.row.kind, 'task.cancelled');
+  assert.equal(tried.mine.row.task, submitted.task);
+  assert.equal(tried.mine.row.reason, 'orchestrator');
+  assert.equal(tried.mine.row.text, 'Cancelled by the orchestrator (no reason given)');
+  // the same task, now terminal -> refused, nothing left to cancel
+  assert.equal(tried.again, 'refused -32602');
+
+  // the running worker was stopped through the normal path, not journaled directly
+  assert.equal(adapter.cancelCalls.length, 1);
+  const cancelled = session.events.find(e => e.kind === 'task.cancelled' && e.task === submitted.task);
+  assert.equal(cancelled.reason, 'orchestrator');
+  assert.equal(cancelled.text, 'Cancelled by the orchestrator (no reason given)');
+  // the outcome no longer sits pending: the orchestrator's own `wait` resolved on it
+  assert.equal(session.events.some(e => e.kind === 'assistant' && e.text === 'child ended: task.cancelled (orchestrator)'), true);
+});
+
 // Jev (src/jev.js) end to end through the daemon: the config's `jev` block, the registered
 // `jev` critic, the bus's prepare hook, the typesafe adapter on a stubbed fetch, and the
 // orchestrator's wait resolving on the accept — plus the ORDERS.md lines that tell it.
@@ -851,11 +971,41 @@ test('O-jev orchestrator with Jev review on: the root task is Jev-reviewed befor
   assert.equal(journal.includes('daemon-test-key-4242'), false);
   assert.equal(fs.readFileSync(path.join(root, 'config.json'), 'utf8').includes('daemon-test-key-4242'), false);
   const orders = fs.readFileSync(path.join(session.dir, 'orchestrator', 'ORDERS.md'), 'utf8');
-  assert.match(orders, /build → codex \(builder\) \[tier mid\] — Steady on routine implementation\./, 'the profile\'s own tier, the note\'s sentence');
+  // The roster prose (tier/capabilities per profile) is gone (item 6): just the one-line roster.
+  assert.match(orders, /^Worker profiles \(one AI each\): [\w, ()[\].-]*\bbuild\b[\w, ()[\].-]* — name one only when the user asks for that AI, or for a retry \(see above\)\.$/m);
   assert.equal(session.events.some(e => e.kind === 'jev.roster' || (e.kind === 'jev.skipped' && e.reason === 'roster')), false);
   assert.equal(orders.includes('jev →'), false, 'the synthetic reviewer is not a roster entry');
   assert.match(orders, /auto → Jev routing is off \(\/jev routing on\): resolves to build/);
   assert.match(orders, /Jev completion verdicts are on/);
   assert.equal(orders.includes('"profile":"analyst"'), true, 'the example names a job, never the synthetic reviewer');
   assert.equal('head' in session.events.find(e => e.kind === 'task.started'), true, 'the Jev-reviewed task records its diff base');
+});
+
+test('a crash that escapes the daemon is journaled as daemon.crashed with its stack before it exits 70', () => {
+  const rows = [], handlers = {}, exits = [];
+  installCrashRecord({append: row => rows.push(row)}, {exit: code => exits.push(code), on: (event, handler) => { handlers[event] = handler; }});
+  handlers.uncaughtException(new Error('bus socket vanished'));
+  handlers.unhandledRejection(new TypeError('cannot read x'));
+  assert.deepEqual(rows.map(row => [row.kind, row.reason, row.text]), [['daemon.crashed', 'uncaught_exception', 'bus socket vanished'], ['daemon.crashed', 'unhandled_rejection', 'cannot read x']]);
+  assert.match(rows[0].stack, /Error: bus socket vanished/);
+  assert.deepEqual(exits, [70, 70]);
+});
+
+// Found live (ACE d1bc0206): a daemon that failed to start held the session lock for half an hour and
+// every resume failed behind it. Only this session's own daemon, alive past the margin with no
+// daemon.json of its own, is stopped; anything else holding the lock is left alone.
+test('a resume stops this session\'s stuck daemon that holds the lock, and leaves any other holder alone', async t => {
+  const dir = tmpRoot('bounce-stuck-');
+  const stuck = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {stdio: 'ignore'});
+  t.after(() => { try { stuck.kill('SIGKILL'); } catch {} fs.rmSync(dir, {recursive: true, force: true}); });
+  await waitFor(() => pidAlive(stuck.pid));
+  fs.writeFileSync(path.join(dir, 'lock'), String(stuck.pid));
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const own = () => `27:20 /usr/bin/node /x/bounce-router/src/cli.js --resume sess-1`;
+  assert.equal(await releaseStuckDaemon(dir, 'sess-1', {inspect: () => '00:05 /usr/bin/node /x/src/cli.js --resume sess-1', sleep}), null, 'still starting: too young to call stuck');
+  assert.equal(await releaseStuckDaemon(dir, 'sess-1', {inspect: () => '27:20 /usr/bin/node /x/src/cli.js --resume other-session', sleep}), null, 'another session\'s daemon');
+  assert.equal(await releaseStuckDaemon(dir, 'sess-1', {inspect: () => '27:20 /usr/bin/vim notes.txt', sleep}), null, 'not a bounce process');
+  assert.equal(pidAlive(stuck.pid), true);
+  assert.equal(await releaseStuckDaemon(dir, 'sess-1', {inspect: own, sleep}), stuck.pid);
+  await waitFor(() => !pidAlive(stuck.pid));
 });

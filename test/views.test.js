@@ -98,13 +98,15 @@ test('U5a: no session subscriber can reach submit()/router.run() — scheduleRen
   assert.equal(/submit\(|router\.run\(/.test(scheduleRenderBody), false);
   const submitCallSites = [...cliSource.matchAll(/(^|[^.\w])submit\(/g)].map(m => m.index);
   assert.equal(submitCallSites.length, 5); // declaration, queued continuation, worker message, command and turn paths
-  // Every session.onEvent assignment in the file is either the bare `scheduleRender` reference
-  // (the TUI) or a one-line logger for `bounce run` — never a function whose body could call
-  // submit(...)/router.run(...).
+  // Every session.onEvent assignment in the file is the bare `scheduleRender` reference, a
+  // one-line logger for `bounce run`, or the TUI's handler that notes a lost daemon and then
+  // calls scheduleRender — never a function whose body could call submit(...)/router.run(...).
   const onEventLines = cliSource.split('\n').filter(l => l.includes('session.onEvent ='));
   assert.equal(onEventLines.length, 3);
   assert.equal(onEventLines.every(l => !/submit\(|router\.run\(/.test(l)), true);
-  assert.equal(onEventLines.some(l => l.trim() === 'session.onEvent = scheduleRender;'), true);
+  const tuiHandler = /session\.onEvent = event => \{[\s\S]*?\n  \};/.exec(cliSource)[0];
+  assert.equal(/submit\(|router\.run\(/.test(tuiHandler), false);
+  assert.equal(tuiHandler.includes('scheduleRender(event);'), true);
 });
 
 test('U5b: /continue is gated by the pure continueMain unit — unknown/read-only profiles refuse, a known write profile enqueues one turn', () => {
@@ -261,20 +263,32 @@ test('U12: a refused task shows its reason in taskTree.outcome and in the fold r
   assert.deepEqual(foldedThread(events, 'c'), [{kind: 'task.fold', task: 'w1', state: 'failed', reason: 'size', text: 'build · failed · size: lines 400 exceeds limit 150'}]);
 });
 
-// U13: /btw — asides fold in front of the next prompt, exactly, and never start a turn: the
-// /btw branch appends only the aside row, and both main-turn prompts pass through withAsides.
-test('U13: withAsides folds /btw notes in front of the next turn; /btw never runs a turn', () => {
+// U13: /steer — asides fold in front of the next prompt, exactly, and never start a turn: the
+// /steer branch appends only the aside row, and both main-turn prompts pass through withAsides.
+// /btw is a separate, side-only command (src/btw.js) and must add no submit(/router.run( site
+// of its own (CONTRACT U5a) — see U13b.
+test('U13: withAsides folds /steer notes in front of the next turn; /steer never runs a turn', () => {
   assert.equal(withAsides('fix the parser', []), 'fix the parser');
   assert.equal(withAsides('fix the parser', ['tests live in test/', 'skip docs']),
     'By the way — notes from the user while you were working:\n- tests live in test/\n- skip docs\n\nfix the parser');
   const runs = [...cliSource.matchAll(/router\.run\([^\n]+/g)].map(m => m[0]);
   assert.equal(runs.length, 3);
   assert.equal(runs.filter(r => r.includes('withAsides(')).length, 2, 'both TUI turns fold idle asides; only the one-shot run does not');
+  const steer = cliSource.indexOf("command === 'steer'");
+  assert.notEqual(steer, -1);
+  const block = cliSource.slice(steer, cliSource.indexOf('} else if', steer + 1));
+  assert.equal(/router\.run\(|pending\.push/.test(block), false);
+  assert.match(cliSource, /session\.append\(\{kind: 'aside', text\}\)/);
+});
+
+// U13b: /btw is a side call, not a turn — it must not introduce a 6th submit(/router.run( site
+// (CONTRACT U5a keeps this count at exactly 5: the definition plus its 4 keyboard call sites).
+test('U13b: /btw adds no submit(/router.run( site of its own', () => {
   const btw = cliSource.indexOf("command === 'btw'");
   assert.notEqual(btw, -1);
   const block = cliSource.slice(btw, cliSource.indexOf('} else if', btw + 1));
-  assert.equal(/router\.run\(|pending\.push/.test(block), false);
-  assert.match(cliSource, /session\.append\(\{kind: 'aside', text\}\)/);
+  assert.equal(/router\.run\(|\bsubmit\(/.test(block), false);
+  assert.equal([...cliSource.matchAll(/\bsubmit\(/g)].length, 5);
 });
 
 // U14: a malformed task row (no task id) never crashes a view — the real crash was

@@ -37,6 +37,9 @@ test('invocation output is unchanged for yolo and plan modes', () => {
   assert.deepEqual(invocation('claude', {mode: 'plan'}), oldInvocation.claude.plan);
   assert.deepEqual(invocation('codex', {mode: 'yolo'}), oldInvocation.codex.yolo);
   assert.deepEqual(invocation('codex', {mode: 'plan'}), oldInvocation.codex.plan);
+  // A one-off call is not saved where the user's own history lists it (~/.codex for the ChatGPT app, `claude --resume`).
+  assert.deepEqual(invocation('codex', {mode: 'plan', ephemeral: true}), ['exec', '--json', '--skip-git-repo-check', '--ephemeral', ...oldInvocation.codex.plan.slice(3)]);
+  assert.deepEqual(invocation('claude', {mode: 'plan', ephemeral: true}), [...oldInvocation.claude.plan.slice(0, 4), '--no-session-persistence', ...oldInvocation.claude.plan.slice(4)]);
   assert.deepEqual(invocation('muse', {mode: 'yolo'}, '/tmp/prompt'), oldInvocation.muse.yolo);
   assert.deepEqual(invocation('muse', {mode: 'plan'}, '/tmp/prompt'), oldInvocation.muse.plan);
 });

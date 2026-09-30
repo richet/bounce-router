@@ -38,15 +38,26 @@ const waitFor = async (condition, {timeout = 1000, interval = 5} = {}) => {
   }
 };
 
-test('campaign commands are admitted only for authorized principals and journal canonical lifecycle rows', async t => {
+// Rewritten 2026-09-27: campaigns were removed; a campaign command is refused with what to send instead,
+// and nothing is journaled for it.
+test('a campaign command is refused with what to send instead, and journals nothing', async t => {
   const {session, bus} = await setup(t);
   const user = await connect(bus, 'user', {canSubmit: true, context: session.id});
-  const started = await user.publish({kind: 'campaign.start', campaignId: 'c1', objective: 'land reliability', required: ['bridge']});
-  assert.deepEqual([started.kind, started.campaignId, started.from], ['campaign.started', 'c1', 'user']);
+  await assert.rejects(user.publish({kind: 'campaign.start', campaignId: 'c1', objective: 'land reliability', required: ['bridge']}),
+    error => error.code === -32602 && /campaigns no longer exist — submit the work as tasks \(task\.submitted\); record a blocker only when the user must decide something$/.test(error.message));
+  assert.equal(session.events.some(row => row.kind.startsWith('campaign.')), false);
   const worker = await connect(bus, 'worker:t1', {tasks: ['t1']});
-  await assert.rejects(worker.publish({kind: 'campaign.block', campaignId: 'c1', reason: 'forged'}), error => error.code === -32001);
-  await assert.rejects(user.publish({kind: 'campaign.started', campaignId: 'c2', objective: 'forged', required: ['x']}), error => error.code === -32602);
   await assert.rejects(worker.publish({kind: 'plan.submitted', plan: 'p1', chunks: [{id: 'x', orders: 'x'}]}), error => error.code === -32001);
+});
+
+// C: plans are no longer reviewed (2026-09-29). An authorized peer's plan.submitted is never refused —
+// a refusal costs the orchestrator a whole turn — it is answered ok, with a note, and nothing is journaled.
+test('a plan.submitted publish is answered ok with a note instead of refused, and journals nothing', async t => {
+  const {session, bus} = await setup(t);
+  const orchestrator = await connect(bus, 'orchestrator', {canSubmit: true, tasks: [], context: session.id});
+  const result = await orchestrator.publish({kind: 'plan.submitted', plan: 'p1', chunks: [{id: 'x', orders: 'x'}]});
+  assert.deepEqual(result, {kind: 'plan.submitted', notes: ['plans are no longer reviewed: dispatch the tasks themselves (task.submitted)']});
+  assert.equal(session.events.some(row => row.kind === 'plan.submitted'), false);
 });
 
 // A raw JSON-RPC-lines client that doesn't go through connectBus's auth handshake,
@@ -86,9 +97,9 @@ const rawConnect = async (bus, t) => {
 };
 
 test('legacy: importing src/bus.js does not change Session exports or defaults()', () => {
-  const before = ['order', 'mode', 'models', 'cooldownMinutes', 'contextChars', 'executables', 'skills', 'sidebar'];
+  const before = ['order', 'mode', 'models', 'cooldownMinutes', 'contextChars', 'executables', 'skills', 'sidebar', 'maxConcurrentCloud'];
   assert.deepEqual(Object.keys(defaults()).sort(), before.sort());
-  assert.deepEqual(Object.keys(core).sort(), ['LIVE_KINDS', 'Router', 'Session', 'config', 'dataRoot', 'defaults', 'gitSnapshot', 'handoff', 'migrateSettings', 'pidAlive', 'readJournal', 'saveJSON'].sort());
+  assert.deepEqual(Object.keys(core).sort(), ['LIVE_KINDS', 'Router', 'Session', 'config', 'echoesNormalizedRow', 'dataRoot', 'defaults', 'gitSnapshot', 'handoff', 'migrateSettings', 'pidAlive', 'readJournal', 'saveJSON'].sort());
 });
 
 test('P1 round trip: publish as the granted peer lands in the journal', async t => {
@@ -593,13 +604,15 @@ test('task.accepted: the owning grant is refused -32602 invalid event: review wh
   t.after(() => a.close());
   await assert.rejects(
     a.publish({kind: 'task.accepted', task: 't1', stage: 'completion', by: 'orchestrator'}),
-    error => error.code === -32602 && /^invalid event: review: only while it is blocked at an unconfident review gate/.test(error.message)
+    error => error.code === -32602 && error.message === 'invalid event: task.accepted: task t1 is queued, with no finished work to accept yet; wait for its outcome'
   );
 });
 
 // Observed live (2026-09-25): three reviewers that passed sat blocked at an unconfident review gate,
 // the block text said "Decide: accept…", and every accept was refused "invalid event: review".
-test('task.accepted: the orchestrator may accept over an unconfident review gate, with text saying why, and nothing else', async t => {
+// Rewritten 2026-09-27: the orchestrator may accept any held work (blocked for any reason, under review, or
+// asking for input); a missing text defaults instead of refusing. Only work not finished yet is refused.
+test('task.accepted: the orchestrator may accept held work whatever held it, and a missing text defaults', async t => {
   const {session, bus} = await setup(t);
   for (const [task, reason] of [['gate', 'review_not_accepted'], ['unsure', 'review_uncertain'], ['nothing', 'review_unavailable'], ['unfinished', 'report_incomplete']]) {
     session.append({kind: 'task.submitted', task, parent: null, profile: 'p', orders: 'x', review: {completion: 'jev'}});
@@ -607,14 +620,12 @@ test('task.accepted: the orchestrator may accept over an unconfident review gate
   }
   const a = await connect(bus, 'orchestrator', {tasks: ['gate', 'unsure', 'nothing', 'unfinished']});
   t.after(() => a.close());
-  await assert.rejects(a.publish({kind: 'task.accepted', task: 'gate', stage: 'completion', by: 'orchestrator'}),
-    error => error.code === -32602 && error.message === 'invalid event: review: accepting over the review gate needs text naming what you checked and why you accept it');
-  const row = await a.publish({kind: 'task.accepted', task: 'gate', stage: 'completion', by: 'orchestrator', text: 'Re-ran the two cited tests myself: both pass; the claims match output.ts:3-78.'});
-  assert.deepEqual([row.kind, row.by, row.overrides, row.text.slice(0, 22)], ['task.accepted', 'orchestrator', 'review_not_accepted', 'Re-ran the two cited t']);
+  const bare = await a.publish({kind: 'task.accepted', task: 'gate', stage: 'completion', by: 'orchestrator'});
+  assert.deepEqual([bare.kind, bare.overrides, bare.text], ['task.accepted', 'review_not_accepted', 'Accepted by the orchestrator']);
   assert.equal((await a.publish({kind: 'task.accepted', task: 'unsure', stage: 'completion', by: 'orchestrator', text: 'checked'})).overrides, 'review_uncertain');
   assert.equal((await a.publish({kind: 'task.accepted', task: 'nothing', stage: 'completion', by: 'orchestrator', text: 'checked'})).overrides, 'review_unavailable');
-  await assert.rejects(a.publish({kind: 'task.accepted', task: 'unfinished', stage: 'completion', by: 'orchestrator', text: 'checked'}),
-    error => error.code === -32602 && /^invalid event: review: only while it is blocked at an unconfident review gate/.test(error.message));
+  assert.equal((await a.publish({kind: 'task.accepted', task: 'unfinished', stage: 'completion', by: 'orchestrator', text: 'checked'})).overrides, 'report_incomplete');
+  assert.deepEqual(['gate', 'unsure', 'nothing', 'unfinished'].map(task => reducers.tasks(session.events)[task].state), ['accepted', 'accepted', 'accepted', 'accepted']);
 });
 
 test('task.accepted: the owning grant is journaled when the submitted row has review.prelaunch only, or no review at all', async t => {
@@ -763,7 +774,7 @@ test('publish applies the scheduler\'s prepare hook to a valid task.submitted an
   assert.deepEqual(explicit.review, {completion: 'C'});
 });
 
-// A /btw delivered live lands in the orchestrator's turn, but the orchestrator only reads it when
+// A /steer delivered live lands in the orchestrator's turn, but the orchestrator only reads it when
 // its current tool call returns. Observed: a message acknowledged at 07:01 and read at 07:08, when
 // a 7-minute `bounce wait` came back. So a live delivery ends every pending orchestrator wait
 // with a row saying why; a worker's wait is not the orchestrator's and keeps waiting.

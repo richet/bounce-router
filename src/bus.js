@@ -6,14 +6,15 @@ import net from 'node:net';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import {actionState, campaignCommand, requestAction} from './orchestration.js';
-import {tasks} from './reducers.js';
+import {actionState, requestAction} from './orchestration.js';
+import {tasks, TERMINAL} from './reducers.js';
 
-const UNCONFIDENT_GATES = new Set(['review_not_accepted', 'review_uncertain', 'review_unavailable']);
+// States in which a task has finished work the orchestrator can accept or send back by hand.
+const DECIDABLE = new Set(['blocked', 'reviewing', 'input_required']);
 
 // Peers publish from a positive allowlist: everything a session, the scheduler or the daemon writes is refused regardless of `from`,
 // because handoff() folds user/note rows into every later prompt and Router reads cooldown rows.
-const PEER_KINDS = new Set(['plan.submitted', 'task.submitted', 'task.milestone', 'task.blocked', 'task.input_required', 'task.usage', 'task.activity', 'message', 'task.accepted', 'agents.defined', 'state']);
+const PEER_KINDS = new Set(['plan.submitted', 'task.submitted', 'task.milestone', 'task.blocked', 'task.input_required', 'task.usage', 'task.activity', 'message', 'task.accepted', 'task.rework', 'task.cancel', 'agents.defined', 'state']);
 const USER_ONLY_PREFIX = 'control.';
 // The scheduler alone owns task lifecycle transitions; a peer may report progress
 // (milestone/blocked/input_required/usage/activity), ask for work (submitted) or
@@ -101,7 +102,11 @@ export async function reapStaleSockets({platform = process.platform, uid = proce
 
 // Resolves once actually listening; rejects (never throws async/uncaught) on any
 // bind/chmod failure — a stale non-socket file at the chosen path, EADDRINUSE, etc.
-export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = AUTH_TIMEOUT, validate = () => null, prepare = null, report: receiveReport = null, accept: acceptOverride = null, commandCampaign = campaignCommand}) {
+// Plans are no longer reviewed: a plan.submitted publish is answered ok with this note instead of
+// being refused, so it never costs the orchestrator a whole turn over an old habit.
+const PLAN_NOT_REVIEWED_NOTE = 'plans are no longer reviewed: dispatch the tasks themselves (task.submitted)';
+
+export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = AUTH_TIMEOUT, validate = () => null, prepare = null, report: receiveReport = null, accept: acceptOverride = null, rework: reworkOverride = null, cancel: cancelOverride = null}) {
   const grants = new Map(); // peer -> {peer, tasks, canSubmit, context, token, file, sockets}
   const tokenToPeer = new Map();
   const tokensDir = path.join(dir, 'tokens');
@@ -171,7 +176,7 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
 
     function refuse(id, code, message) { send({jsonrpc: '2.0', id, error: {code, message}}); }
 
-    function handlePublish(id, event) {
+    async function handlePublish(id, event) {
       const peer = authenticated.peer;
       if (authenticated.report) return refuse(id, -32001, 'unauthorized');
       let e = {...event};
@@ -184,12 +189,8 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
       if (e.from === undefined) e.from = peer;
       else if (e.from !== peer) return refuse(id, -32001, 'unauthorized');
       if (typeof e.kind !== 'string') return refuse(id, -32602, 'invalid event');
-      if (e.kind.startsWith('campaign.')) {
-        if (!authenticated.canSubmit || !['user', 'orchestrator'].includes(peer)) return refuse(id, -32001, 'unauthorized');
-        if (!['campaign.start', 'campaign.extend', 'campaign.complete', 'campaign.block', 'campaign.pause', 'campaign.resume', 'campaign.scope'].includes(e.kind)) return refuse(id, -32602, 'invalid campaign command');
-        try { return send({jsonrpc: '2.0', id, result: commandCampaign(session, e)}); }
-        catch (error) { return refuse(id, -32602, error.message); }
-      }
+      // Campaigns were removed (a plan, or plain tasks, is enough): say what to send instead of a bare refusal.
+      if (e.kind.startsWith('campaign.')) return refuse(id, -32602, `invalid event: ${e.kind}: campaigns no longer exist — submit the work as tasks (task.submitted); record a blocker only when the user must decide something`);
       if (e.kind.startsWith(USER_ONLY_PREFIX) ? peer !== 'user' : !PEER_KINDS.has(e.kind)) return refuse(id, -32001, 'unauthorized');
       if (e.kind === 'task.submitted') {
         // A canSubmit grant may open a root (parent explicitly null); anything with a parent needs that parent in its own tasks.
@@ -199,43 +200,55 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         // task.submitted always carries one — a row without it crashed every task view.
         if (typeof e.task !== 'string' || !e.task) e.task = crypto.randomUUID();
         if (e.task === e.parent) return refuse(id, -32602, 'invalid event');
-        if (session.events.some(row => row.kind === 'task.submitted' && row.task === e.task)) return refuse(id, -32602, 'invalid event');
-        if (typeof e.profile !== 'string' || !e.profile) return refuse(id, -32602, 'invalid event');
+        if (session.events.some(row => row.kind === 'task.submitted' && row.task === e.task)) return refuse(id, -32602, `invalid event: task id ${e.task} is already used; omit task to get a fresh one`);
+        // The scheduler corrects what it can (an unknown or named profile, invalid owns — each said in the
+        // row's `corrections`) and decorates the row (a Jev completion reviewer); only what is still wrong
+        // after that is refused. The prepared row is what everyone reads.
+        if (typeof prepare === 'function') e = prepare(e);
+        if (typeof e.profile !== 'string' || !e.profile) return refuse(id, -32602, 'invalid event: profile: name an agent (or `auto`)');
         const problem = validate(e);
         if (problem) return refuse(id, -32602, `invalid event: ${problem}`);
-        // The scheduler may decorate a valid submission before it is journaled (a Jev completion
-        // reviewer for a root task that names none); the decorated row is what everyone reads.
-        if (typeof prepare === 'function') e = prepare(e);
-        const preparedProblem = validate(e);
-        if (preparedProblem) return refuse(id, -32602, `invalid prepared event: ${preparedProblem}`);
         if (e.retryOf !== undefined && (!authenticated.tasks.includes(e.retryOf) || typeof e.retryOf !== 'string')) return refuse(id, -32001, 'unauthorized retry');
       } else if (e.kind === 'plan.submitted') {
-        // A phase's breakdown, judged by Jev before any of its chunks run (scheduler: plan.accepted/plan.rejected).
-        if (!Array.isArray(e.chunks) || !e.chunks.length || e.chunks.some(c => !c || typeof c !== 'object' || typeof c.id !== 'string' || !c.id || typeof c.orders !== 'string' || !c.orders)) return refuse(id, -32602, 'invalid event: plan.submitted needs chunks, each with an id and orders');
+        // Plans are no longer reviewed (2026-09-29): a refusal here cost the orchestrator a whole turn
+        // for an old habit, so an authorized peer gets an ok with a note instead — nothing is journaled.
         if (!authenticated.canSubmit || !['user', 'orchestrator'].includes(peer)) return refuse(id, -32001, 'unauthorized');
-        if (typeof e.plan !== 'string' || !e.plan) e.plan = crypto.randomUUID();
+        send({jsonrpc: '2.0', id, result: {kind: 'plan.submitted', notes: [PLAN_NOT_REVIEWED_NOTE]}});
+        return;
       } else if (e.kind.startsWith('task.')) {
         // A task.* row without its task is a malformed event, not an authority failure: say so
         // (observed live: an orchestrator publishing a task.milestone with no `task` got a bare
         // `unauthorized` and could not tell what it had done wrong).
         if (typeof e.task !== 'string' || !e.task) return refuse(id, -32602, `invalid event: ${e.kind} requires task`);
         if (!authenticated.tasks.includes(e.task)) return refuse(id, -32001, 'unauthorized');
-        // A peer may close out a task that has no completion reviewer of its own; one with
-        // review.completion set is only ever accepted by the review policy (task.rejected/
-        // task.rework/policy.* stay unpublishable to peers, so this is the one remaining gap).
-        // The one exception (user decision 2026-09-25): a task held at an UNCONFIDENT review gate — the
-        // reviewer leaned without reaching its bar, or gave no verdict — may be accepted by its owner,
-        // with text saying what was checked. The row names the gate it overrides. A confident verdict,
-        // or work the worker itself reported unfinished, is never accepted by hand.
+        // A peer may close out a task that has no completion reviewer of its own. One with review.completion is
+        // decided by its review — unless the orchestrator decides first: while the task holds finished work
+        // (blocked, under review, or asking for input) its owner may accept it (task.accepted) or send it back to
+        // the same worker (task.rework). 2026-09-27: this used to be allowed only at an unconfident review gate,
+        // and the refusals cost orchestrator turns; the review sends work back at most once now anyway.
         if (e.kind === 'task.accepted') {
           const submitted = session.events.find(row => row.kind === 'task.submitted' && row.task === e.task);
           if (submitted?.review?.completion) {
-            const blocked = tasks(session.events)[e.task]?.state === 'blocked'
-              ? session.events.findLast(row => row.kind === 'task.blocked' && row.task === e.task) : null;
-            if (!UNCONFIDENT_GATES.has(blocked?.reason)) return refuse(id, -32602, 'invalid event: review: only while it is blocked at an unconfident review gate (review_not_accepted, review_uncertain or review_unavailable) can a task with a completion reviewer be accepted by hand; otherwise its review decides');
-            if (typeof e.text !== 'string' || !e.text.trim()) return refuse(id, -32602, 'invalid event: review: accepting over the review gate needs text naming what you checked and why you accept it');
-            e = {...e, overrides: blocked.reason};
+            const state = tasks(session.events)[e.task]?.state;
+            if (!DECIDABLE.has(state)) return refuse(id, -32602, `invalid event: task.accepted: task ${e.task} is ${state ?? 'unknown'}, with no finished work to accept yet; wait for its outcome${state === 'accepted' ? ' (it is already accepted)' : ''}`);
+            const blocked = state === 'blocked' ? session.events.findLast(row => row.kind === 'task.blocked' && row.task === e.task) : null;
+            e = {...e, overrides: blocked?.reason ?? state, text: typeof e.text === 'string' && e.text.trim() ? e.text : 'Accepted by the orchestrator'};
           }
+        } else if (e.kind === 'task.rework') {
+          if (peer !== 'orchestrator') return refuse(id, -32001, 'unauthorized');
+          const state = tasks(session.events)[e.task]?.state;
+          if (!DECIDABLE.has(state)) return refuse(id, -32602, `invalid event: task.rework: task ${e.task} is ${state ?? 'unknown'}; only work that is blocked, under review or asking for input goes back to its worker — for finished work submit a follow-up task with retryOf ${e.task}`);
+          if (typeof e.text !== 'string' || !e.text.trim()) return refuse(id, -32602, 'invalid event: task.rework needs text naming what must be fixed, e.g. {"kind":"task.rework","task":"<id>","text":"<what to fix>"}');
+          const blocked = state === 'blocked' ? session.events.findLast(row => row.kind === 'task.blocked' && row.task === e.task) : null;
+          e = {...e, overrides: blocked?.reason ?? state};
+        } else if (e.kind === 'task.cancel') {
+          // The orchestrator's own withdrawal of a task it opened — e.g. after replacing a blocked
+          // task with a fresh one and no longer needing the old id to answer. Only the orchestrator
+          // may ask (a worker or reviewer cancelling itself is not a request this bus models), it
+          // must say why, and a task already terminal has nothing left to cancel.
+          if (peer !== 'orchestrator') return refuse(id, -32001, 'unauthorized');
+          if (typeof e.text !== 'string' || !e.text.trim()) e = {...e, text: 'Cancelled by the orchestrator (no reason given)'};
+          if (TERMINAL.has(tasks(session.events)[e.task]?.state)) return refuse(id, -32602, 'invalid event: task is already terminal, nothing to cancel');
         }
       } else if (e.kind === 'message') {
         if (typeof e.to !== 'string' || !e.to) return refuse(id, -32602, 'invalid event');
@@ -245,13 +258,19 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         if (e.to.startsWith('review:') && !['user', 'orchestrator'].includes(peer)) return refuse(id, -32001, 'unauthorized');
       }
       let row;
-      if (e.kind === 'task.submitted' || e.kind === 'plan.submitted') {
-        requestAction(session, e.kind === 'task.submitted'
-          ? {actionId: `dispatch:${e.task}:0`, type: 'dispatch', task: e.task}
-          : {actionId: `plan:${e.plan}`, type: 'plan', payload: {plan: e.plan}}, [e]);
-        row = session.events.findLast(event => event.kind === e.kind && (e.task ? event.task === e.task : event.plan === e.plan));
-      } else if (e.overrides && typeof acceptOverride === 'function') row = acceptOverride(e);
-      else row = session.publish(e);
+      if (e.kind === 'task.submitted') {
+        requestAction(session, {actionId: `dispatch:${e.task}:0`, type: 'dispatch', task: e.task}, [e]);
+        row = session.events.findLast(event => event.kind === e.kind && event.task === e.task);
+        // What bounce corrected or noticed about this submission, in the reply the orchestrator reads now.
+        const notes = session.events.filter(event => event.kind === 'task.corrected' && event.task === e.task).map(event => event.text);
+        if (row && notes.length) row = {...row, notes};
+      } else if (e.kind === 'task.accepted' && e.overrides && typeof acceptOverride === 'function') row = acceptOverride(e);
+      else if (e.kind === 'task.rework' && e.overrides && typeof reworkOverride === 'function') row = reworkOverride(e);
+      else if (e.kind === 'task.cancel') {
+        if (typeof cancelOverride !== 'function') return refuse(id, -32001, 'unauthorized');
+        try { row = await cancelOverride(e); }
+        catch (error) { return refuse(id, -32602, error.message); }
+      } else row = session.publish(e);
       send({jsonrpc: '2.0', id, result: row});
     }
 
@@ -272,8 +291,6 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
     function handleWait(id, {match = {}, timeout, afterSeq = 0}) {
       if (!Number.isInteger(timeout) || timeout > 600000) return refuse(id, -32602, 'invalid params: timeout must be an integer number of ms, at most 600000 (10 minutes); wait again to keep waiting');
       const outcomeWait = typeof match.task === 'string' && TASK_TERMINAL.has(match.kind);
-      const planWait = match.planDecision === true && typeof match.plan === 'string';
-      const PLAN_DECISIONS = new Set(['plan.accepted', 'plan.rejected', 'plan.unavailable']);
       const latestReplacement = task => {
         let current = task;
         const visited = new Set();
@@ -285,9 +302,7 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         }
         return current;
       };
-      const matches = row => (planWait
-        ? row.plan === match.plan && PLAN_DECISIONS.has(row.kind)
-        : outcomeWait
+      const matches = row => (outcomeWait
         ? row.task === latestReplacement(match.task) && TASK_TERMINAL.has(row.kind)
           && ![...actionState(session.events).values()].some(action => action.task === row.task && action.type === 'terminal' && ['requested', 'started'].includes(action.status))
           && !(row.kind === 'task.completed' && session.events.find(event => event.kind === 'task.submitted' && event.task === row.task)?.review?.completion)

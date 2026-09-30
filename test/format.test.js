@@ -11,6 +11,20 @@ test('main start is not labelled finished and internal transport rows stay hidde
   assert.match(plain.event({kind: 'main.started', state: 'running'}, 80).join('\n'), /Running/);
   assert.match(plain.event({kind: 'policy.fallback.skipped', reason: 'no_profile_configured'}, 80).join('\n'), /no_profile_configured/);
 });
+// /btw renders as its own side exchange — the question labelled "btw · …", the answer under it —
+// and never as a plain "You · By the way" row (that's /steer's aside).
+test('btw.asked/btw.answered/btw.failed render as a side exchange, both compact and classic', () => {
+  for (const formatter of [plain, createFormatter({color: false, compact: true})]) {
+    const asked = formatter.event({kind: 'btw.asked', text: 'why is docker empty?', id: 'a1'}, 80).join('\n');
+    assert.match(asked, /btw · why is docker empty\?/);
+    const answered = formatter.event({kind: 'btw.answered', id: 'a1', text: 'bounce runs its own compose scope', model: 'codex'}, 80).join('\n');
+    assert.match(answered, /bounce runs its own compose scope/);
+    assert.match(answered, /codex/);
+    const failed = formatter.event({kind: 'btw.failed', id: 'a2', reason: 'no_agent'}, 80).join('\n');
+    assert.match(failed, /btw · no answer \(no_agent\)/);
+  }
+});
+
 const color = createFormatter({color: true});
 test('Markdown preserves content while formatting headings, lists, links and emphasis', () => {
   const out = plain.markdown('# Heading\n\n**bold** and `code`\n\n- first\n- second\n\n[Docs](https://example.com)', 60).join('\n');
@@ -239,4 +253,31 @@ test('classic formatter (no compact) still renders a tool row as a full block', 
   const {event} = createFormatter({color: false});
   const tool = event({kind: 'tool', provider: 'claude', text: 'Bash: {"command":"npm test","description":"Run the suite"}'}, 200);
   assert.ok(tool.length > 1, 'classic keeps the multi-line tool block (byte-identical path unchanged)');
+});
+
+// Daniel, 2026-09-30, reading the transcript: the wake prompt bounce types at the orchestrator
+// ("Continue your orders…") and the "Orchestrator selected codex" line repeated every turn are
+// bounce talking to the orchestrator, not the conversation. The journal keeps both rows; the
+// transcript shows a route only when the AI changes, and a request row never.
+test('the transcript hides the orchestrator request row and a route that repeats the last one', () => {
+  const compact = createFormatter({color: false, compact: true});
+  const wake = {kind: 'main.requested', from: 'main', wake: true, text: 'Continue your orders. Resolve the pending outcomes and decisions above.', provider: 'codex'};
+  const typed = {kind: 'main.requested', from: 'main', wake: false, text: 'Do the thing', provider: 'codex'};
+  assert.deepEqual(compact.event(wake, 80), []);
+  assert.deepEqual(compact.event(typed, 80), []);
+  assert.deepEqual(plain.event(wake, 80), []);
+
+  const events = [
+    {kind: 'route', provider: 'codex', model: 'gpt-6-sol', text: 'Orchestrator selected codex'},
+    {kind: 'user', text: 'first'},
+    {kind: 'route', provider: 'codex', model: 'gpt-6-sol', text: 'Orchestrator selected codex'},
+    {kind: 'user', text: 'second'},
+    {kind: 'route', provider: 'claude', model: 'opus', text: 'Orchestrator selected claude'},
+    {kind: 'user', text: 'third'},
+    {kind: 'route', provider: 'claude', model: 'opus', text: 'Orchestrator selected claude'},
+  ];
+  assert.deepEqual(displayEvents(events).map(e => `${e.kind}:${e.provider ?? e.text}`), ['route:codex', 'user:first', 'user:second', 'route:claude', 'user:third']);
+  // a handoff carrying the outcomes stays: it is what the orchestrator was asked to decide
+  const handoff = {kind: 'handoff', from: 'bounce', wake: true, text: 'Worker outcomes not yet handed to you:\n- task 1 · task.blocked · reason: unverified\n\nContinue your orders.'};
+  assert.equal(compact.event(handoff, 120)[0].includes('Worker outcomes not yet handed to you'), true);
 });

@@ -1,28 +1,31 @@
 import {validateRequirements, missingCapabilities} from './task-capabilities.js';
-import {candidateResult, isReviewGate, REVIEW_GATE_REASONS} from './task-result.js';
+import {candidateResult, REVIEW_GATE_REASONS} from './task-result.js';
 import {randomUUID, createHash} from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import {createAttemptWorkspace, captureArtifact, integrateArtifact, advanceBaseline} from './workspace-artifacts.js';
+import {createAttemptWorkspace, captureArtifact, integrateArtifact, advanceBaseline, reviewDiff} from './workspace-artifacts.js';
 import * as reducers from './reducers.js';
 import {takeCheckpoint, sameTree} from './checkpoint.js';
 import {POLICY_RANK, effectivePolicy, LOCAL_ADAPTERS, playedBy, READ_ONLY_ROLES as READONLY_ROLES} from './profiles.js';
 import {defaultStrategy} from './strategy.js';
 import {reportEvent, validateReport, remainingWork} from './reporting.js';
-import {inspectFinalReport, FINAL_REPORT_INSTRUCTION} from './final-report.js';
-import {actionState, campaigns, createActionRunner, requestAction} from './orchestration.js';
+import {inspectFinalReport, synthesizeReport, synthesizeReportFromChanges, FINAL_REPORT_INSTRUCTION} from './final-report.js';
+import {actionState, createActionRunner, requestAction} from './orchestration.js';
 import {normalizeLocalSettings} from './local-models.js';
 import {createLocalResolver} from './local-resolve.js';
 import {createResources, residentModels, sizeOf, fitLocal, gb, pressureName, DEFAULT_RESERVE_BYTES} from './resources.js';
 import {concludeAsk} from './adapters/live-common.js';
 import {failedAttempts, repeatRefusal, REPEAT_LIMIT} from './loop-guard.js';
 import {discoverLocalModels} from './local-models.js';
-import {planTaskAdmission} from './plan-admission.js';
-import {supervisePlan} from './plan-supervision.js';
-import {judgePlan, routingFallback} from './jev.js';
+import {createMachineSlots} from './machine-slots.js';
+import {runCheck, validCheck, weakCheck, CHECK_TIMEOUT_MS} from './task-check.js';
+import {seenRun, checkPassed, weakCheckNotice, NO_RUN, NO_RUN_AFTER_CHANGE} from './command-output.js';
+import {routingFallback} from './jev.js';
 import {validOwns} from './owned-paths.js';
 import {execFileSync} from 'node:child_process';
+import {parseVerdict} from './verdict.js';
+const processAlive = pid => { try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } };
 
 const FALLBACK_REASONS = new Set(['limited', 'missing', 'backend_unavailable', 'watchdog', 'local_unavailable', 'worker_runtime', 'incomplete_report']);
 const RISKS = new Set(['boundary', 'process-model', 'logic', 'extraction']);
@@ -41,6 +44,11 @@ export const WATCHDOG_DEFAULTS = {interval: 5000, startupMs: 120_000, silence: 3
 const DEFAULT_DEADLINE_MINUTES = 60; // a worker with no declared deadline; the watchdog ladder still catches silence
 const DEFAULT_CEILING_MINUTES = 60; // no lease is renewed past this, measured from the lineage's first start
 const CALL_MEMORY = 200; // tool calls remembered per running task, to tell new work from repeated work
+// A worker's own step cap (e.g. OpenCode's per-turn maxSteps) ending a turn is not the task ending:
+// while it is still producing new, non-repeated tool calls, bounce resumes the same worker instead
+// of treating a synthesized "steps reached" report as the final answer. Bounded the same way a
+// lease ceiling is, so a genuinely stuck local worker still stops (docs/plans/step-renewal.md).
+const STEP_RENEWAL_LIMIT = 3;
 const TIERS = new Set(['live', 'next-turn', 'queued']);
 // The depends_on hold/fail decision (which dependency states fail a dependent outright vs.
 // merely hold it — A1) now lives in the strategy (src/strategy.js's DEPENDENCY_FAIL_STATES),
@@ -66,6 +74,23 @@ const reportInstruction = profile => reportsByTool(profile)
 // require …" guesses the progress shape, gets a refusal, and goes looking for the schema in
 // the CLI (observed: `bounce`/`bounce --help` probes costing minutes per task). Every field a
 // report can carry is named here once, so the first report is the right one.
+// How a worker ends when no fixed format is asked of it (config.json `reports`, "plain" by default since
+// 2026-09-29): its own words are its report. Found live (ACE e3bd01d5): of 67 reports in the fixed format
+// 18 were rejected as invalid and 19 rewritten by bounce. To be measured on real sessions against Jev's
+// ranking of wrong work; `reports: "structured"` brings the fixed format back.
+const PLAIN_ENDING = 'End your last turn with a plain answer in your own words: what you did, each check you ran with the last lines it printed, and what is left of this assignment. No JSON and no report call for the end. If you could not finish, begin the answer with "Blocked:" or "Failed:" and say why.';
+const plainContract = profile => [
+  `To report progress, ${reportInstruction(profile)} using your scoped report endpoint (it is the only bounce command you need; \`bounce\` alone starts nothing useful here).`,
+  'A progress report is a JSON object with op ("milestone" | "blocked" | "input_required"), phase ("inspect" | "plan" | "implement" | "test" | "verify" | "review" | "document" | "done"),',
+  'text (what changed), next (what happens next) — all strings, all required — and optional evidence (an array of up to 32 strings naming files, commands or results).',
+  'Report a milestone after initial inspection and at each phase change; report blocked the moment progress stops.',
+  'You run headless, as one turn: ending your turn ends your process, and nothing re-invokes you. Never background a command, set a',
+  'monitor, or stop to "pick up when it finishes" — run long commands (deploys, test suites) in the foreground with a generous timeout,',
+  'then give your answer in this same turn. Work you leave running when you stop is orphaned.',
+  `Example: ${reportsByTool(profile) ? 'bounce_report ' : "bounce report --report '"}{"op":"milestone","phase":"inspect","text":"Read the three files the orders name","next":"Implement the helper","evidence":["src/a.js"]}${reportsByTool(profile) ? '' : "'"}`,
+  PLAIN_ENDING,
+].join('\n');
+
 const reportContract = profile => [
   `To report progress, ${reportInstruction(profile)} using your scoped report endpoint (it is the only bounce command you need; \`bounce\` alone starts nothing useful here).`,
   'Every report is a JSON object with op ("milestone" | "blocked" | "input_required" | "final"), phase ("inspect" | "plan" | "implement" | "test" | "verify" | "review" | "document" | "done"),',
@@ -80,23 +105,6 @@ const reportContract = profile => [
   `Example: ${reportsByTool(profile) ? 'bounce_report ' : "bounce report --report '"}{"op":"milestone","phase":"inspect","text":"Read the three files the orders name","next":"Implement the helper","evidence":["src/a.js"]}${reportsByTool(profile) ? '' : "'"}`,
 ].join('\n');
 
-// The verdict protocol (CONTRACT.md §4): the LAST line of a completed review's text that
-// parses as JSON with a string `verdict` field is the verdict. A missing/failed result, or
-// no such line, is `unreadable` — never thrown, always a value the policy can act on.
-function parseVerdict(status, text) {
-  if (status === 'completed' && typeof text === 'string') {
-    const lines = text.split('\n');
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i].trim();
-      if (!line) continue;
-      try {
-        const parsed = JSON.parse(line);
-        if (parsed && typeof parsed.verdict === 'string') return parsed;
-      } catch { /* not JSON: keep scanning earlier lines */ }
-    }
-  }
-  return {verdict: 'unreadable'};
-}
 
 // Dispatch, fallback, permission ratchet, cancellation, review and reconcile as policies over
 // the log, driven by adapters. Everything the scheduler knows is re-derived from session.events
@@ -105,12 +113,17 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // What the machine can run: one reader, the LM Studio catalog, and the one command that frees memory.
   resources = createResources(), localFleet = ({signal} = {}) => discoverLocalModels(localSettings, {signal, maxAge: 2000}),
   unloadLocal = async name => { execFileSync('lms', ['unload', String(name).split('/').slice(1).join('/')], {timeout: 60000}); },
-  sessionMode = 'yolo', depthCap = 1, checkpointRunner, limits: suppliedLimits = {}, strict = false, requireFinalReport = false, reportGrant = null, clock = () => Date.now(), watchdog: suppliedWatchdog = {}, strategy = defaultStrategy, jev = null, gitHead = defaultGitHead}) {
+  // The machine's own limit on local workers, shared with every other bounce process (src/machine-slots.js).
+  machineSlots = createMachineSlots(),
+  // Runs a task's check (src/task-check.js): the command its orders name as proof the work is done.
+  checkRunner = runCheck, checkTimeoutMs = CHECK_TIMEOUT_MS,
+  sessionMode = 'yolo', depthCap = 1, checkpointRunner, limits: suppliedLimits = {}, strict = false, requireFinalReport = false, reportFormat = 'structured', reportGrant = null, clock = () => Date.now(), watchdog: suppliedWatchdog = {}, strategy = defaultStrategy, jev = null, gitHead = defaultGitHead, maxConcurrentCloud = 3}) {
   // Sizing limits (lines/probes/minutes) gate dispatch ONLY when the caller configures them: a
   // task's declared size is otherwise informational. The old built-in 150/6/15 defaults refused
   // real orchestrations (a 400-line brief) with no way to see why — a shallow rule, removed.
   const limits = {rounds: 2, ...suppliedLimits};
   if (!isPositiveInt(limits.rounds) || (limits.attempts !== undefined && !isPositiveInt(limits.attempts)) || SIZE_FIELDS.some(field => limits[field] !== undefined && !isPositiveInt(limits[field])) || (limits.ceiling !== undefined && !isPositiveInt(limits.ceiling))) throw new Error('malformed: limits');
+  if (!isPositiveInt(maxConcurrentCloud)) throw new Error('malformed: maxConcurrentCloud');
   // The deadline is a lease renewed while the worker makes progress; the ceiling is the hard stop.
   const ceilingMs = (limits.ceiling ?? Math.max(DEFAULT_CEILING_MINUTES, limits.minutes ?? DEFAULT_DEADLINE_MINUTES)) * 60000;
   const watchdogConfig = {...WATCHDOG_DEFAULTS, ...suppliedWatchdog};
@@ -118,14 +131,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   if (!intervalOk || !isPositiveInt(watchdogConfig.startupMs) || !isPositiveInt(watchdogConfig.silence) || !isPositiveInt(watchdogConfig.stall) || !isPositiveInt(watchdogConfig.grace) || !isPositiveInt(watchdogConfig.concludeGrace) || !isPositiveInt(watchdogConfig.concludeCap) || !isPositiveInt(watchdogConfig.reportOnly)) throw new Error('malformed: watchdog');
   const handles = new Map(); // task -> {adapter, handle}
   let closed = false;
-  const planController = new AbortController();
   const cancellationRequests = new Set();
   const reviews = new Map(); // task -> {adapter, handle}, one review in flight per task (A3)
   const heldTasks = new Set(); // tasks queued behind an unaccepted depends_on, re-evaluated on terminal rows
-  const campaignWaiters = new Set();
-  function campaignActive(task, id = submittedRow(task)?.campaignId) {
-    return !id || campaigns(session.events)[id]?.state === 'active';
-  }
   // The in-place task presently holding the lock, if any: `running`, or `blocked`/`orphaned`
   // after a restart whose worker termination is unverified — the lock stays held until a human resolves it.
   const inPlaceRunning = () => Object.values(reducers.tasks(session.events)).find(t => submittedRow(t.id)?.inPlace
@@ -144,25 +152,17 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const others = session.events.filter(e => e.kind === 'user' && (e.seq ?? 0) > since && e.seq !== cited?.seq).map(e => e.text);
     return {citedText: cited?.text ?? '', messages: [cited?.text ?? '', ...others], orders: row.orders};
   }
-  function waitForCampaign(task, campaignId = submittedRow(task)?.campaignId) {
-    if (closed) return Promise.resolve(false);
-    append({kind: task ? 'task.campaign.waiting' : 'campaign.waiting', task, campaignId,
-      text: 'Campaign is paused or needs input; new execution waits for explicit resume'});
-    return new Promise(resolve => {
-      const wake = () => {
-        if (closed || reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) {
-          campaignWaiters.delete(wake); resolve(false);
-        } else if (campaignActive(task, campaignId)) { campaignWaiters.delete(wake); resolve(true); }
-      };
-      campaignWaiters.add(wake);
-      wake();
-    });
-  }
   // Local workers waiting for a slot: `local.endpoints.<name>.maxConcurrent` is how many the endpoint
   // runs at once (LM Studio is loaded with that many parallel slots; more would queue inside it and
   // look stalled, and each running model turn holds memory — observed live as a machine under memory pressure).
   // A task past the limit stays queued, says so once, and dispatches when a local turn ends.
+  if (!['plain', 'structured'].includes(reportFormat)) throw new Error('reportFormat must be "plain" or "structured"');
+  const plainAnswers = reportFormat === 'plain';
+  const contractFor = profile => (plainAnswers ? plainContract(profile) : reportContract(profile));
+  const endingLine = plainAnswers ? PLAIN_ENDING : LOCAL_REPORT_LINE;
   const slotWaiters = new Set();
+  const OBSERVED_RUNS = 8;
+  const observedRuns = new Map(); // task -> what bounce saw its current attempt run
   // In-place tasks (docs/plans/in-place-tasks.md): at most one running, and never alongside a
   // mid-flight integration of any task's — `inPlaceWaiters` holds tasks parked on that lock,
   // exactly like `slotWaiters` parks tasks on a full local endpoint.
@@ -174,6 +174,14 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   const localSlots = endpoint => localEndpoint(endpoint).maxConcurrent ?? 1;
   // Per model: the endpoint's slotsPerModel, else the endpoint ceiling (one model, same number).
   const modelSlots = endpoint => localEndpoint(endpoint).slotsPerModel ?? localSlots(endpoint);
+  // What this process holds of the machine's local slots: a task id (a worker) or a review peer -> token.
+  const machineClaims = new Map();
+  const releaseMachine = key => {
+    const token = machineClaims.get(key);
+    if (!token) return;
+    machineClaims.delete(key);
+    machineSlots.release(token);
+  };
   // Running = a live handle, or a launch still in flight (the handle exists only after launch()
   // resolves, and several dispatches can pass the check before the first one does).
   const localEndpointOf = task => { const p = profiles[reducers.tasks(session.events)[task]?.profile]; return p && LOCAL_ADAPTERS.has(p.adapter) ? p.endpoint ?? 'lmstudio' : null; };
@@ -185,6 +193,18 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       && (model === null || localModelOf(task) === model)),
     ...[...reviews.entries()].filter(([, entry]) => entry.local === endpoint
       && (model === null || entry.model === model)).map(([peer]) => peer),
+  ]).size;
+  // Cloud workers (claude/codex/muse) have no per-endpoint config the way local does — one
+  // machine-wide ceiling (`maxConcurrentCloud`) instead, counted the same way localRunning counts
+  // a local endpoint: a live handle or a launch still in flight. Jev/typesafe decisions are never
+  // workers and are not in this set (typesafe is not a CLOUD_ADAPTERS member); an in-place task
+  // counts here exactly like any other task, by the adapter it actually runs on.
+  const CLOUD_ADAPTERS = new Set(['claude', 'codex', 'muse']);
+  const cloudAdapterOf = task => { const p = profiles[reducers.tasks(session.events)[task]?.profile]; return p && CLOUD_ADAPTERS.has(p.adapter) ? p.adapter : null; };
+  const cloudRunning = () => new Set([
+    ...[...handles.entries()].filter(([, entry]) => entry.cloud).map(([task]) => task),
+    ...[...launchingAttempts.keys()].filter(task => cloudAdapterOf(task)),
+    ...[...reviews.entries()].filter(([, entry]) => entry.cloud).map(([peer]) => peer),
   ]).size;
   const launchingAttempts = new Map(); // task -> {attempt, reports}; grants exist before task.started
   const resolvedLocalProfiles = new Map();
@@ -237,7 +257,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   const append = event => {
     if (closed) return null;
     const submitted = event.task ? session.events.find(e => e.kind === 'task.submitted' && e.task === event.task) : null;
-    const row = {...submitted && {jobId: submitted.jobId, campaignId: submitted.campaignId}, ...event, time: stamp()};
+    const row = {...submitted && {jobId: submitted.jobId}, ...event, time: stamp()};
     if (row.kind === 'task.completed') {
       if (!submitted?.review?.completion && !publishArtifact(row.task, row)) return null;
       const actionId = `completion:${row.task}:${reducers.tasks(session.events)[row.task]?.attempt ?? 0}`;
@@ -284,6 +304,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   function releaseReview(peer, entry, context) {
     if (reviews.get(peer) !== entry) return;
     reviews.delete(peer);
+    releaseMachine(peer);
     if (!entry.local || closed) return;
     const released = append({kind: 'task.slot.released', task: entry.task,
       endpoint: entry.local, stage: 'review', from: peer, context});
@@ -298,9 +319,12 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const launching = launchingAttempts.get(task);
     if (!launching) return null;
     launchingAttempts.delete(task);
+    // A launch whose process might still be running keeps its machine slot, as it announces no release.
+    if (verified && !handles.has(task)) releaseMachine(task);
     const endpoint = localEndpointOf(task);
-    if (!endpoint || !verified || closed || handles.has(task)) return launching;
-    const released = append({kind: 'task.slot.released', task, attempt: launching.attempt, endpoint, stage: 'launch', context});
+    const cloud = !endpoint && Boolean(cloudAdapterOf(task));
+    if ((!endpoint && !cloud) || !verified || closed || handles.has(task)) return launching;
+    const released = append({kind: 'task.slot.released', task, attempt: launching.attempt, stage: 'launch', context, ...(endpoint ? {endpoint} : {cloud: true})});
     if (slotWaiters.size) queueMicrotask(() => wakeSlotWaiters(released.seq));
     return launching;
   }
@@ -319,11 +343,47 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       controller.signal.throwIfAborted();
       await admitMemory({profile: resolved, task, attempt, context, signal: controller.signal, waitOnPressure});
       controller.signal.throwIfAborted();
+      const key = launchState?.peer ?? task;
+      await admitMachine({profile: resolved, key, task, attempt, context, signal: controller.signal});
+      if (controller.signal.aborted) releaseMachine(key);
+      controller.signal.throwIfAborted();
       launching.phase = 'launch';
       launching.requestedAt = clock();
       // Nothing ran before a launch fails, so the failure is always a verified non-start.
       return {profile: resolved, adapter: adapters[profile.adapter], signal: controller.signal, failed: () => true};
     } finally { clearTimeout(timer); }
+  }
+
+  // The machine gate, last before the launch: another bounce process (another home, a benchmark) may
+  // be running a local worker on the same server, which this process cannot see in its own journal.
+  // Found live (ACE d1bc0206): two of them queued inside LM Studio and one read as "stalled for 604 s".
+  // The task waits here, says once who has the model, and is bounded by its own deadline like the
+  // rest of the admission.
+  async function admitMachine({profile, key, task, attempt, context, signal}) {
+    const endpoint = profile.endpoint ?? 'lmstudio';
+    const cfg = localEndpoint(endpoint);
+    const pollMs = Number.isFinite(cfg.pollMs) ? cfg.pollMs : 5000;
+    const running = claimed => handles.has(claimed) || launchingAttempts.has(claimed) || reviews.has(claimed);
+    let said = false;
+    for (;;) {
+      signal?.throwIfAborted();
+      // Work that ended without announcing a release (a stop bounce could not verify) no longer counts
+      // in this process either: its claim is given back rather than waited on forever.
+      for (const claimed of [...machineClaims.keys()]) if (claimed !== key && !running(claimed)) releaseMachine(claimed);
+      if (machineClaims.has(key)) return; // the same task continuing (a rework round, a report repair)
+      const claim = machineSlots.acquire({url: cfg.url ?? endpoint, slots: localSlots(endpoint), holder: {session: session.id, task}});
+      if (claim.ok) {
+        machineClaims.set(key, claim.token);
+        return;
+      }
+      if (!said) {
+        said = true;
+        const holder = claim.holders[0] ?? {};
+        append({kind: 'task.milestone', task, attempt, phase: 'queued', next: 'launch when the local model is free', context,
+          text: `Waiting for the local model on ${endpoint}: another bounce is using it (session ${String(holder.session ?? '?').slice(0, 8)}, task ${String(holder.task ?? '?').slice(0, 8)}, since ${holder.since ?? '?'})`});
+      }
+      await new Promise(resolve => setTimeout(resolve, pollMs));
+    }
   }
 
   // The memory gate, between resolving the model and launching it. Greedy by decision: the budget is
@@ -401,12 +461,60 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return event;
   }
 
-  function finalizeReport({task, attempt, from, context}) {
+  // Did THIS attempt's turn end at the worker's own step cap? The adapter already names it
+  // (opencode-live.js's `task.diagnostic` reason 'step_cap', found live for OpenCode's maxSteps) —
+  // this reads that one signal back rather than adding a second way to detect the same thing.
+  function stepCapped(task, attempt) {
+    const started = session.events.findLast(e => e.kind === 'task.started' && e.task === task && e.attempt === attempt);
+    if (!started) return false;
+    return session.events.some(e => e.kind === 'task.diagnostic' && e.task === task && e.reason === 'step_cap' && (e.seq ?? 0) > started.seq);
+  }
+
+  // Progress in that turn: the same repeat check leaseDecision uses for a lease renewal (new tool
+  // calls, not just the same ones already made before this turn started), scoped here to the calls
+  // made since the attempt's own task.started rather than a lease boundary.
+  function stepTurnProgressed(task, attempt) {
+    const started = session.events.findLast(e => e.kind === 'task.started' && e.task === task && e.attempt === attempt);
+    if (!started) return false;
+    const sinceAt = Date.parse(started.time);
+    const calls = toolCalls.get(task) ?? [];
+    const inTurn = calls.filter(c => c.at > sinceAt);
+    const before = calls.filter(c => c.at <= sinceAt);
+    if (!inTurn.length) return false;
+    return before.length === 0 || inTurn.some(c => c.change) || !inTurn.every(c => before.some(b => b.call === c.call));
+  }
+
+  // The step-budget renewal (docs/plans/step-renewal.md): a worker whose turn ended only because it
+  // hit its own step cap, and was still making progress, is resumed on the SAME native session with
+  // a short "keep going" message instead of having its cap-truncated answer treated as final. Bounded
+  // exactly like a lease: at most STEP_RENEWAL_LIMIT times, and never past the task's own deadline —
+  // beyond that, today's block-and-let-the-orchestrator-decide path runs, unchanged.
+  async function attemptStepRenewal({task, attempt, from, context, remaining}) {
+    if (!stepCapped(task, attempt) || !stepTurnProgressed(task, attempt)) return false;
+    const renewals = session.events.filter(e => e.kind === 'task.steps.renewed' && e.task === task).length;
+    if (renewals >= STEP_RENEWAL_LIMIT) return false;
+    const deadline = deadlineAtFor(task);
+    if (deadline !== null && deadline <= clock()) return false;
+    const row = submittedRow(task);
+    if (!row) return false;
+    const remainingText = typeof remaining === 'string' && remaining.trim() ? remaining.trim() : 'none stated.';
+    const text = `You reached the step limit for one turn, not the end of the task. Continue from where you stopped; the remaining work is: ${remainingText}`;
+    append({kind: 'task.steps.renewed', task, attempt, renewal: renewals + 1, text, from, context});
+    append({kind: 'budget.reserved', task, root: budgetRootOf(task, reducers.tasks(session.events)), amount: {starts: 1}, context});
+    await resumeWorker({task, row, round: 0, findings: [], context, renewal: true, continueMessage: text});
+    return true;
+  }
+
+  async function finalizeReport({task, attempt, from, context}) {
     const final = session.events.findLast(e => e.kind === 'task.reported' && e.task === task && e.attempt === attempt);
     if (!final) return false;
+    // "Done, but X remains" completes: the work is kept and reviewed like any other, and X reaches
+    // the orchestrator as a follow-up. Found live (ACE d1bc0206): blocking it threw away finished work
+    // whose "remaining" was another task's job (router wiring, a live check), and it was redone on Opus.
+    // A worker that only ran out of steps is continued first.
     if (final.outcome === 'completed' && remainingWork(final.remaining)) {
-      append({kind: 'task.report.invalid', task, attempt, report: final, diagnostic: 'report_incomplete', from, context});
-      append({kind: 'task.blocked', task, reason: 'report_incomplete', text: final.remaining, from, context}); return true;
+      if (await attemptStepRenewal({task, attempt, from, context, remaining: final.remaining})) return true;
+      append({kind: 'task.completed', task, summary: final.summary, artifacts: final.evidence, remaining: final.remaining, from, context}); return true;
     }
     if (final.outcome === 'completed') append({kind: 'task.completed', task, summary: final.summary, artifacts: final.evidence, from, context});
     else if (final.outcome === 'failed') append({kind: 'task.failed', task, reason: 'reported_failure', text: final.summary, from, context});
@@ -437,26 +545,64 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return null;
   }
 
+  // The agent a task most plausibly meant, for correcting a submission instead of refusing it: the agent
+  // its profile name points at ('build_claude' → builder, 'Analyst' → analyst), else the named profile's
+  // role, else by what it needs (write → builder; a review role → reviewer; otherwise analyst), else any
+  // agent that can do what it requires. Null when there are no agents.
+  const agentHeads = () => Object.entries(profiles).filter(([name, p]) => p.derived && p.agent?.name === name && !p.ai).map(([name]) => name);
+  function matchingAgent({profile, requires}) {
+    const heads = agentHeads();
+    const fits = name => !missingCapabilities(profiles[name], requires).length;
+    const wanted = String(profile ?? '').toLowerCase();
+    const byName = heads.find(head => wanted && (wanted === head || wanted.includes(head) || (head.length >= 5 && wanted.startsWith(head.slice(0, 5)))));
+    const role = profiles[profile]?.role;
+    const byNeed = Array.isArray(requires) && requires.includes('write') ? 'builder' : ['reviewer', 'critic', 'verifier'].includes(role) ? 'reviewer' : 'analyst';
+    return [byName, heads.includes(role) ? role : null, byNeed].find(name => name && heads.includes(name) && fits(name)) ?? heads.find(fits) ?? null;
+  }
+  // Corrections, not refusals, wherever the intent of a submission is clear (2026-09-27: refusals cost whole
+  // orchestrator turns). Each is said in `corrections` on the journaled row and as a task.corrected row.
+  function correct(spec) {
+    const corrections = [];
+    // Found live (ACE d1bc0206): 11 of 23 first attempts named `build_claude` (Opus) directly, skipping the
+    // builder agent's own order (local, then Sonnet, then Opus). A first attempt from the orchestrator runs
+    // as the matching agent; a profile is for a retry, or for an AI the user asked for (`userAsked: true`).
+    const named = profiles[spec.profile];
+    if (named && spec.from === 'orchestrator' && !spec.retryOf && !spec.replaces && spec.userAsked !== true
+      && !named.derived && named.role !== 'orchestrator' && named.adapter !== 'typesafe') {
+      const agent = matchingAgent(spec);
+      if (agent) {
+        corrections.push(`profile: ${spec.profile} is one AI; a first attempt runs as the ${agent} agent, which tries its own AIs lightest first (name an AI only for a retry, or add userAsked: true when the user asked for it)`);
+        spec = {...spec, profile: agent};
+      }
+    }
+    if (spec.profile !== AUTO_PROFILE && !profiles[spec.profile]) {
+      const agent = matchingAgent(spec);
+      const to = agent ?? (routingFallback(profiles) ? AUTO_PROFILE : null);
+      if (to) {
+        corrections.push(`profile: ${spec.profile === undefined ? 'none given' : `"${spec.profile}" is not a profile here`}; it runs as ${to === AUTO_PROFILE ? '`auto` (routed per task)' : `the ${to} agent`}`);
+        spec = {...spec, profile: to};
+      }
+    }
+    if (spec.owns !== undefined && !validOwns(spec.owns)) {
+      const list = Array.isArray(spec.owns) ? spec.owns : [spec.owns];
+      const kept = list.filter(own => validOwns([own]));
+      const dropped = list.filter(own => !validOwns([own]));
+      corrections.push(dropped.length ? `owns: dropped ${JSON.stringify(dropped)} (owned paths are relative, inside the checkout, without ..)${kept.length ? `; kept ${JSON.stringify(kept)}` : '; none remain, so it owns what it changes'}`
+        : `owns: given as ${JSON.stringify(spec.owns)}, taken as ${JSON.stringify(kept)}`);
+      const {owns: _owns, ...rest} = spec;
+      spec = kept.length ? {...spec, owns: kept} : rest;
+    }
+    // Nothing is changed here: the check runs as given, and the orchestrator is told what passing it is worth.
+    if (validCheck(spec.check) && weakCheck(spec.check)) corrections.push(weakCheckNotice(spec.check));
+    return corrections.length ? {...spec, corrections: [...(spec.corrections ?? []), ...corrections]} : spec;
+  }
   const validate = (spec, view) => {
-    if ((spec.planId !== undefined || spec.chunkId !== undefined) && spec.jobId) {
-      const admission = planTaskAdmission(session.events, spec);
-      if (!admission.ok) return admission.reason;
-    }
     if (spec.retryOf !== undefined && !view[spec.retryOf]) return 'retryOf';
-    const previousTask = spec.retryOf ?? spec.replaces;
-    if (previousTask && view[previousTask]?.state === 'blocked'
-      && isReviewGate(session.events.findLast(e => e.task === previousTask && e.kind === 'task.blocked'))
-      && candidateResult(session.events, previousTask)) return 'review gate unresolved; preserved candidate must be reviewed, not rerun';
-    if (spec.campaignId) {
-      const campaign = campaigns(session.events)[spec.campaignId];
-      if (!campaign || campaign.state !== 'active') return 'campaign is not active';
-      if (!spec.gate || !campaign.required.includes(spec.gate)) return 'campaign gate';
-    }
     if (spec.jobId) {
       const previous = session.events.filter(e => e.kind === 'task.submitted' && e.jobId === spec.jobId);
       if (previous.length && !spec.replaces && !spec.retryOf) return 'job already exists; use retryOf';
     }
-    if (spec.profile === AUTO_PROFILE ? !routingFallback(profiles) : !profiles[spec.profile]) return 'profile';
+    if (spec.profile === AUTO_PROFILE ? !routingFallback(profiles) : !profiles[spec.profile]) return `profile: ${JSON.stringify(spec.profile ?? null)} is not a profile or agent here; send one of ${JSON.stringify(Object.keys(profiles).filter(name => profiles[name].role !== 'orchestrator' && profiles[name].adapter !== 'typesafe'))}`;
     if (spec.inPlace !== undefined) {
       // Structural check (docs/plans/in-place-tasks.md §1, always): the cited row must exist and
       // be a `user` row — only the keyboard path writes those, and bus.js already refuses `user`
@@ -478,6 +624,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (spec.budget !== undefined && spec.parent != null) return 'budget';
     if (spec.budget?.rounds !== undefined && !isNonNegativeInt(spec.budget.rounds)) return 'budget';
     if (spec.checkpoint != null && typeof spec.checkpoint !== 'object') return 'checkpoint';
+    if (spec.check !== undefined && spec.check !== null && !validCheck(spec.check)) return 'check';
     if (spec.risk !== undefined && !RISKS.has(spec.risk)) return 'risk';
     if (spec.owns !== undefined && !validOwns(spec.owns)) return 'owns';
     if (spec.size !== undefined && SIZE_FIELDS.some(field => !isNonNegativeInt(spec.size[field]))) return 'size';
@@ -525,17 +672,20 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   }
 
   function prepare(spec) {
+    spec = correct(spec);
     if (spec.inPlace !== undefined && inPlaceCitation(spec.inPlace) !== null) spec = {...spec, inPlace: {authorizedBy: inPlaceCitation(spec.inPlace)}};
     const predecessor = spec.retryOf ?? spec.replaces;
     const original = predecessor ? rawSubmittedRow(predecessor) : null;
-    const activeCampaign = Object.values(campaigns(session.events)).filter(c => c.state === 'active');
-    const campaignId = spec.campaignId ?? original?.campaignId ?? (activeCampaign.length === 1 ? activeCampaign[0].id : undefined);
+    // Campaigns no longer exist: an older orchestrator habit's campaignId/gate is accepted and ignored.
+    // Plans no longer exist either: an older habit's planId/chunkId is accepted and ignored the same way.
+    const {campaignId: _campaignId, gate: _gate, planId: _planId, chunkId: _chunkId, ...rest} = spec;
+    spec = rest;
     const task = spec.task ?? randomUUID();
-    const jobId = original?.jobId ?? spec.jobId ?? (spec.planId && spec.chunkId ? `plan:${spec.planId}:${spec.chunkId}` : `job:${task}`);
-    spec = {...spec, task, jobId, ...(campaignId ? {campaignId} : {}),
+    const jobId = original?.jobId ?? spec.jobId ?? `job:${task}`;
+    spec = {...spec, task, jobId,
       ...(original ? {replaces: predecessor, retryOf: predecessor, parent: original.parent ?? null,
-        deadline: original.deadline, requires: original.requires ?? spec.requires, budget: undefined, owns: original.owns, review: original.review ?? undefined,
-        gate: original.gate, planId: original.planId, chunkId: original.chunkId, depends_on: original.depends_on ?? []} : {})};
+        deadline: original.deadline, requires: original.requires ?? spec.requires, budget: undefined, owns: spec.owns ?? original.owns, review: original.review ?? undefined,
+        depends_on: original.depends_on ?? []} : {})};
     const reviewer = jev && profiles[jev.reviewer];
     if (!reviewer || reviewer.adapter !== 'typesafe' || !READONLY_ROLES.has(reviewer.role) || strategy !== defaultStrategy) return spec;
     if (spec.review?.completion) return spec;
@@ -573,9 +723,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       depends_on: spec.depends_on ?? [],
       review: spec.review ?? null,
       steps: spec.steps ?? null,
+      ...(spec.check ? {check: spec.check} : {}),
       ...(spec.owns ? {owns: spec.owns} : {}),
       ...(spec.inPlace ? {inPlace: spec.inPlace} : {}),
-      jobId: spec.jobId, retryOf: spec.retryOf, campaignId: spec.campaignId, gate: spec.gate, planId: spec.planId, chunkId: spec.chunkId,
+      jobId: spec.jobId, retryOf: spec.retryOf,
+      ...(spec.corrections?.length ? {corrections: spec.corrections} : {}),
     };
     requestAction(session, {actionId: `dispatch:${task}:0`, type: 'dispatch', task}, [{...row, time: stamp()}]);
     return rawSubmittedRow(task);
@@ -619,18 +771,21 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     : error.code === 'limited' ? {reason: 'limited', text: error.message}
     : {reason: 'error', text: error.message};
 
-  const probeOrders = workspace => `Run commands in your current disposable workspace (${workspace.cwd}). Tests may write caches and output here; none of these changes are integrated into the source. Do not edit source files to make checks pass. Source checkout: ${workspace.source}. For original Git status/history use git --no-optional-locks -C ${JSON.stringify(session.cwd)}; the copy has no Git metadata. Report observed commands and results.`;
+  const probeOrders = workspace => `Run commands in your current disposable workspace (${workspace.cwd}). Tests may write caches and output here; none of these changes are integrated into the source. Do not edit source files to make checks pass. Source checkout: ${workspace.source}. The copy has its own Git: its first commit is the checkout as copied, so git status and git diff there show only changes made in the copy. Report observed commands and results.`;
   // An isolated write worker works in a copy; orders that name the real checkout by absolute path would
   // send it there (observed live: a heredoc appended to the real file, the copy stayed unchanged and
-  // review saw an empty diff). Paths into the checkout are rewritten to the copy, and the adapter fences
-  // the checkout itself (`writeFence`).
-  const inWorkingCopy = (text, workspace) => {
+  // review saw an empty diff). Paths into the checkout are rewritten to the copy.
+  const toWorkingCopy = (text, workspace) => {
     const source = fs.realpathSync(session.cwd);
     // session.cwd is already resolved; macOS also spells /private/{var,tmp,etc} without the prefix.
     const spellings = [source, source.replace(/^\/private(?=\/(?:var|tmp|etc)\/)/, '')];
-    const rewritten = [...new Set(spellings)].sort((a, b) => b.length - a.length)
+    return [...new Set(spellings)].sort((a, b) => b.length - a.length)
       .reduce((value, root) => value.split(root).join(workspace.cwd), text);
-    return `${rewritten}\n\nYour working copy is ${workspace.cwd}: it is a copy of the project, and only changes made there are your work. Writes to the original checkout (${source}) are refused.`;
+  };
+  const inWorkingCopy = (text, workspace) => {
+    const source = fs.realpathSync(session.cwd);
+    const rewritten = toWorkingCopy(text, workspace);
+    return `${rewritten}\n\nYour working copy is ${workspace.cwd}: it is a copy of the project, and only changes made there are your work: bounce integrates them into the original checkout (${source}) after review, so edit the copy, never the original. What your orders ask you to deliver, evidence and reports included, goes inside this copy at the path they name: a file saved anywhere else on disk is not delivered.${fs.existsSync(path.join(workspace.cwd, '.git')) ? ' It has its own git with the project\'s history: log, diff and status work, and a commit there stays in the copy — bounce integrates your file changes, not commits.' : ''}`;
   };
   const workspaces = new Map();
   // Shared by workspaceFor and the integrate handler: the in-memory map first (same process,
@@ -648,15 +803,25 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   function workspaceFor(task, profile, attempt) {
     if (effectivePolicy(profile) !== 'probe' && POLICY_RANK[effectivePolicy(profile)] < POLICY_RANK.write) return null;
     const prior = existingWorkspace(task);
-    if (prior) {
-      if (Boolean(prior.disposable) !== (effectivePolicy(profile) === 'probe')) throw new Error('workspace policy changed; submit a new scoped task');
+    const sameKind = prior && Boolean(prior.disposable) === (effectivePolicy(profile) === 'probe');
+    // A task never turns its own throwaway copy into one that is integrated, or the reverse. A retry
+    // on another AI is another task: when its kind differs from its predecessor's, it gets a copy of
+    // its own. Found on the real path (2026-09-28): a review retried on a cloud profile after the local
+    // reviewer gave no answer was refused here before it started.
+    const own = workspaces.has(task) || session.events.some(e => e.kind === 'task.workspace' && e.task === task);
+    if (prior && !sameKind && own) throw new Error('workspace policy changed; submit a new scoped task');
+    if (prior && sameKind) {
       workspaces.set(task, prior); return {...prior, attemptId: `${task}-${attempt}`};
     }
     const relative = path.relative(fs.realpathSync(session.cwd), fs.realpathSync(session.dir));
     const nested = relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
     const dir = nested ? path.join(os.tmpdir(), 'bounce-workspaces', session.id, task) : path.join(session.dir, 'tasks', task);
     fs.mkdirSync(dir, {recursive: true, mode: 0o700});
-    const workspace = createAttemptWorkspace({cwd: session.cwd, dir, owns: submittedRow(task)?.owns?.length ? submittedRow(task).owns : ['**'], attemptId: `${task}-${attempt}`, disposable: effectivePolicy(profile) === 'probe'});
+    // owns is a hint for the worker and the orchestrator, not a fence any more (2026-09-29): every
+    // working copy owns everything, so any change the worker makes is part of its artifact; what
+    // actually protects the checkout is integrateArtifact's conflict check against the real file.
+    const workspace = createAttemptWorkspace({cwd: session.cwd, dir, owns: ['**'], attemptId: `${task}-${attempt}`, disposable: effectivePolicy(profile) === 'probe',
+      ...(nested ? {} : {copyRoot: path.join(session.root, 'w')})});
     workspaces.set(task, workspace);
     append({kind: 'task.workspace', task, attempt, purpose: workspace.disposable ? 'probe' : 'publish', cwd: workspace.cwd, metadata: path.join(workspace.cwd, '.attempt-workspace.json'), baselineHash: workspace.baselineHash});
     return workspace;
@@ -676,7 +841,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return false;
   }
 
-  // An owner's accept over an unconfident review gate closes the task the way a confident review does:
+  // An owner's accept of finished work (blocked, under review, asking for input) closes the task the way a review does:
   // the isolated work integrates into the checkout first and the accepted row lands after it, or the
   // task blocks on the integration failure. Observed live: the row journaled directly left the task
   // blocked and its fix unintegrated.
@@ -685,6 +850,34 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (!publishArtifact(row.task, row)) return session.events.findLast(e => e.kind === 'task.integration.requested' && e.task === row.task);
     append(row);
     return session.events.findLast(e => e.kind === 'task.accepted' && e.task === row.task);
+  }
+
+  // The symmetric "send back": an owner's rework verdict on finished work. This IS a
+  // rework round in substance — the same effect a CONFIDENT Jev rework has (applyVerdictIntent's
+  // 'rework' branch) — so it reserves the same budget and resumes the same worker through the same
+  // resumeWorker(), just with the orchestrator's own findings instead of a reviewer's.
+  function reworkOverride(event) {
+    const task = event.task;
+    const row = submittedRow(task);
+    if (!row) return null;
+    const context = event.context ?? row.context;
+    const root = budgetRootOf(task, reducers.tasks(session.events));
+    const round = api.roundsUsed(task) + 1;
+    const findings = [event.text];
+    append({kind: 'budget.reserved', task, root, amount: {rounds: 1}, context});
+    append({kind: 'task.rework', task, round, findings, overrides: event.overrides, context});
+    void resumeWorker({task, row, round, findings, context});
+    return session.events.findLast(e => e.kind === 'task.rework' && e.task === task);
+  }
+
+  // The orchestrator's own cancel request for a task it holds: the bus (src/bus.js) has already
+  // checked the peer, the grant and the terminal state before calling this, so this is exactly
+  // `cancel()` tagged with reason 'orchestrator' — the same path a user cancel or the
+  // superseded-task sweep (cancelSuperseded) drives, so the worker (if any) is stopped the normal
+  // way and the task ends task.cancelled through the ordinary lifecycle.
+  async function cancelRequest(event) {
+    await cancel(event.task, {reason: 'orchestrator', text: event.text});
+    return session.events.findLast(e => e.kind === 'task.cancelled' && e.task === event.task) ?? null;
   }
 
   function maybeFallback(row) {
@@ -723,7 +916,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const original = submittedRow(row.task);
     const originalRef = submittedRow(lineageRoot)?.ref;
     submit({
-      jobId: original.jobId, campaignId: original.campaignId, gate: original.gate, planId: original.planId, chunkId: original.chunkId,
+      jobId: original.jobId,
       parent: original.parent, context: original.context, profile: next,
       orders: `${original.orders}\n\nRecovery from ${row.task}: ${row.reason}. ${row.text ?? ''}\nInspect existing work before continuing; do not repeat side effects blindly.\nLast progress: ${JSON.stringify(t.lastMilestone ?? null)}\nPartial report: ${JSON.stringify(session.events.findLast(event => event.kind === 'task.reported' && event.task === row.task) ?? null)}`,
       deadline: original.deadline,
@@ -731,6 +924,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       ...(original.depends_on?.length ? {depends_on: original.depends_on} : {}),
       ...(original.review ? {review: original.review} : {}), ...(original.steps ? {steps: original.steps} : {}),
       ...(original.checkpoint ? {checkpoint: original.checkpoint} : {}), ...(original.risk ? {risk: original.risk} : {}),
+      ...(original.check ? {check: original.check} : {}),
       ...(original.owns ? {owns: original.owns} : {}),
       ...(original.size ? {size: original.size} : {}), replaces: row.task, ref: `${originalRef ?? row.task}:fallback:${next}`,
     });
@@ -753,7 +947,6 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     for (const row of [...session.events]) {
       if (['task.failed', 'task.cancelled', 'task.deadline', 'task.accepted', 'task.rejected'].includes(row.kind)) requestTerminal(row);
       else if (row.kind === 'task.completed') requestAction(session, {actionId: `completion:${row.task}:${row.attempt ?? reducers.tasks(session.events)[row.task]?.attempt ?? 0}`, type: 'completion', task: row.task});
-      else if (row.kind === 'plan.submitted') requestAction(session, {actionId: `plan:${row.plan}`, type: 'plan', payload: {plan: row.plan}, cause: row.seq});
     }
     // An isolated worker's unpublished files stay in its attempt workspace. An interrupted
     // integration resumes through its durable action and manifest. For a lost worker handle,
@@ -785,16 +978,50 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // later one on the same task). `defaultStrategy` reproduces the exact pre-Phase-8 condition
   // (only a row whose review.completion is set ever entered a completion review) via its own
   // onCompleted hook — the CORE here just executes whatever intent comes back.
+  const completedSeqOf = task => session.events.findLast(e => e.kind === 'task.completed' && e.task === task)?.seq ?? null;
+  const checkRowOf = task => session.events.findLast(e => e.kind === 'task.check' && e.task === task && e.completedSeq === completedSeqOf(task)) ?? null;
+  function reportByBounce(task) {
+    const reported = session.events.findLast(e => e.kind === 'task.reported' && e.task === task);
+    return Boolean(reported) && session.events.some(e => e.kind === 'task.report.synthesized' && e.task === task && e.attempt === reported.attempt);
+  }
+
+  // Runs the task's check on the work that just completed, once per completion, in the worker's own
+  // copy (an in-place task has none: its work is already in the checkout). False when the task moved
+  // on while it ran, for the caller to stop.
+  async function ensureCheck(task, row, context) {
+    const completedSeq = completedSeqOf(task);
+    if (completedSeq === null || checkRowOf(task)) return true;
+    const copy = session.events.findLast(e => e.kind === 'task.artifact' && e.task === task)?.cwd ?? (row.inPlace ? session.cwd : null);
+    const attempt = reducers.tasks(session.events)[task]?.attempt ?? null;
+    if (!copy || !fs.existsSync(copy)) {
+      append({kind: 'task.check', task, attempt, completedSeq, command: row.check, passed: null, text: 'The task\'s check was not run: the worker has no working copy to run it in', context});
+      return true;
+    }
+    append({kind: 'task.milestone', task, attempt, phase: 'check', text: `Running the task's check: ${row.check}`, next: 'review and integrate if it passes', context});
+    const outcome = await checkRunner({command: row.check, cwd: copy, timeoutMs: checkTimeoutMs});
+    if (closed || completedSeqOf(task) !== completedSeq || !['completed', 'reviewing'].includes(reducers.tasks(session.events)[task]?.state)) return false;
+    append({kind: 'task.check', task, attempt, completedSeq, ...outcome, cwd: copy, context,
+      text: `The task's check ${outcome.passed ? 'passed' : 'failed'}: ${row.check}`});
+    return true;
+  }
+
   async function handleCompleted(task) {
-    const view = reducers.tasks(session.events);
-    const t = view[task];
+    const t = reducers.tasks(session.events)[task];
     if (!t) return;
     const row = submittedRow(task);
     const context = row?.context;
+    if (row?.check && !(await ensureCheck(task, row, context))) return;
+    const view = reducers.tasks(session.events);
     const hook = invokeHook(() => strategy.onCompleted(task, view, api), task, context);
     if (!hook.ok) return;
     const intent = hook.intent;
     if (intent === 'none') return;
+    // A check that failed: the work goes back once, or is held for the orchestrator.
+    if (intent && typeof intent === 'object' && (intent.action === 'rework' || intent.action === 'escalate')) {
+      if (!['completed', 'reviewing'].includes(view[task]?.state)) return;
+      await applyVerdictIntent(intent, {task, stage: 'completion', row, round: (view[task].rounds || 0) + 1, context, root: budgetRootOf(task, view), reviewIntent: null});
+      return;
+    }
     if (intent && typeof intent === 'object' && intent.action === 'accept') {
       // Only meaningful while the task is still sitting in `completed`/`reviewing` awaiting a
       // completion decision — a task that moved on for an unrelated reason (e.g. already
@@ -841,6 +1068,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   async function consumeWorkerEvents({adapter, handle, task, context, profile, owned = null}) {
     const from = workerFrom(task);
     let observedAt = -Infinity;
+    let lastSaid = ''; // what the worker last said this attempt: its answer when the runtime fails after it
+    // What bounce sees this attempt run, for a report it may have to write: the commands since the
+    // worker's last file change (one that came before a change says nothing about the final state).
+    const seen = {reports: adapter.capabilities?.().commands === true, changed: false, runs: []};
+    observedRuns.set(task, seen);
     try {
       for await (const event of adapter.events(handle)) {
         if (closed) return;
@@ -849,8 +1081,14 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
           append({kind: 'task.observed', task, text: String(event.text ?? '').slice(0, 16000), source: event.kind, from, context});
         }
         switch (event.kind) {
-          case 'activity': publish({kind: 'task.activity', task, text: event.text, source: event.kind, ...(typeof event.call === 'string' ? {call: event.call.slice(0, 300), change: event.change === true} : {}), from, context}); break;
-          case 'assistant': recordFindings(task, event.text, context); publish({kind: 'task.activity', task, text: event.text, source: event.kind, from, context}); break;
+          case 'activity':
+            if (event.change === true) { seen.changed = true; seen.runs = []; }
+            publish({kind: 'task.activity', task, text: event.text, source: event.kind, ...(typeof event.call === 'string' ? {call: event.call.slice(0, 300), change: event.change === true} : {}), from, context}); break;
+          case 'command':
+            seen.reports = true;
+            seen.runs = [...seen.runs, {command: String(event.command), exit: Number.isInteger(event.exit) ? event.exit : null, output: String(event.output ?? '')}].slice(-OBSERVED_RUNS);
+            publish({kind: 'task.activity', task, text: `ran ${String(event.command).slice(0, 200)}`, source: event.kind, from, context}); break;
+          case 'assistant': recordFindings(task, event.text, context); if (String(event.text ?? '').trim()) lastSaid = String(event.text); publish({kind: 'task.activity', task, text: event.text, source: event.kind, from, context}); break;
           case 'tool': case 'progress': publish({kind: 'task.activity', task, text: event.text, source: event.kind, from, context}); break;
           case 'error': publish({kind: 'task.activity', task, text: `error: ${event.text}`, source: event.kind, from, context}); break;
           case 'status': publish({kind: 'task.activity', task, text: event.text, source: event.kind, from, context}); break;
@@ -885,42 +1123,72 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
             const endedAttempt = reducers.tasks(session.events)[task]?.attempt;
             if (session.events.some(e => e.kind === 'task.attempt.ended' && e.task === task && e.attempt === endedAttempt)) return;
             append({kind: 'task.attempt.ended', task, attempt: endedAttempt, verifiedTermination: true, from, context});
+            let artifact = null;
             if (owned && !owned.disposable) {
-              const artifact = captureArtifact(owned);
+              artifact = captureArtifact(owned);
               append({kind: 'task.artifact', task, attempt: reducers.tasks(session.events)[task]?.attempt,
                 artifactId: artifact.id, digest: artifact.digest, resultHash: artifact.resultHash,
                 file: path.join(owned.dir, 'artifacts', `${artifact.id}.json`), dir: owned.dir, cwd: owned.cwd, from, context});
-              if (artifact.violations.length || artifact.unsupported.length) {
-                append({kind: 'task.blocked', task, reason: artifact.violations.length ? 'ownership_violation' : 'artifact_unsupported',
-                  text: `Isolated artifact cannot be integrated: ${JSON.stringify(artifact.violations.length ? artifact.violations : artifact.unsupported)}`, from, context});
+              if (artifact.unsupported.length) {
+                append({kind: 'task.blocked', task, reason: 'artifact_unsupported',
+                  text: `Isolated artifact cannot be integrated: ${JSON.stringify(artifact.unsupported)}`, from, context});
                 return;
               }
             }
             if (event.status === 'completed' && requireFinalReport) {
               const state = reducers.tasks(session.events)[task]?.state;
               const attempt = state ? reducers.tasks(session.events)[task]?.attempt : null;
-              if (!finalizeReport({task, attempt, from, context}) && !reducers.TERMINAL.has(state) && state !== 'blocked' && state !== 'input_required') {
-                // A local worker's answer IS its report: asking a small model to also drive a report
-                // protocol is the step it fails most, and the continuation that chased it never once
-                // succeeded. Only `completed` is inferred, and the row says it was.
+              if (!(await finalizeReport({task, attempt, from, context})) && !reducers.TERMINAL.has(state) && state !== 'blocked' && state !== 'input_required') {
+                // A worker's own final answer is the source of truth the moment no valid structured
+                // report survives parsing: the model does the work and loses it at the hand-off far
+                // more often than it fails the work itself (observed live, session 159f4746: 7/19
+                // tasks ended `task.report.invalid missing_report` over a complete, usable prose
+                // answer). Bounce synthesizes the report from that answer — merging in whatever valid
+                // fields a malformed `bounce_report` call already carried — instead of spending a
+                // repair turn asking the model to do the one thing it just failed to do. Only a
+                // literally empty answer still needs a turn back, and it asks in plain words.
                 const inspected = inspectFinalReport(event.text);
-                const envelope = inspected.diagnostic ? null : inspected.report;
-                if (inspected.diagnostic === 'report_incomplete') {
+                const answer = String(event.text ?? '').trim();
+                if (!answer && artifact?.changes.length) {
+                  // No words, but real changes: the changes are its answer, with no turn spent asking again.
+                  await completeFromWork({task, attempt, from, context, artifact, outputSeq: output.seq, why: 'the worker said nothing after its changes'});
+                } else if (!inspected.diagnostic || inspected.diagnostic === 'report_incomplete') {
+                  append(reportEvent({task, attempt, report: inspected.report, from, context}));
+                  await finalizeReport({task, attempt, from, context});
+                } else if (answer && plainAnswers) {
+                  // The answer is what was asked for: it is the report, with what bounce saw the worker run.
+                  const made = withObserved(task, synthesizeReport(answer, inspected.report, {verdict: answersWithVerdict(task)}));
+                  const report = {...made.report, phase: made.sources.phase === 'worker' ? made.report.phase : 'answer'};
+                  const problem = validateReport(report);
+                  if (problem) throw new Error(`report made from the answer is invalid: ${problem}`);
+                  append(reportEvent({task, attempt, report, from, context}));
+                  await finalizeReport({task, attempt, from, context});
+                } else if (answer) {
+                  const synthesis = withObserved(task, synthesizeReport(answer, inspected.report, {verdict: answersWithVerdict(task)}));
+                  const problem = validateReport(synthesis.report);
+                  if (problem) throw new Error(`synthesized report invalid: ${problem}`);
                   append({kind: 'task.report.invalid', task, attempt, report: inspected.report, diagnostic: inspected.diagnostic, outputSeq: output.seq, from, context});
-                  append({kind: 'task.blocked', task, reason: 'report_incomplete', text: inspected.report.remaining, from, context});
-                } else if (envelope) {
-                  append(reportEvent({task, attempt, report: envelope, from, context}));
-                  finalizeReport({task, attempt, from, context});
+                  append({kind: 'task.report.synthesized', task, attempt, rule: synthesis.rule, sources: synthesis.sources, outputSeq: output.seq, from, context});
+                  append(reportEvent({task, attempt, report: synthesis.report, from, context}));
+                  await finalizeReport({task, attempt, from, context});
                 } else {
                   append({kind: 'task.report.invalid', task, attempt, report: inspected.report, diagnostic: inspected.diagnostic, outputSeq: output.seq, from, context});
-                  await requestFinalReport({task, attempt, context, adapter, diagnostic: inspected.diagnostic});
+                  await requestPlainAnswer({task, attempt, context, adapter});
                 }
               }
             } else if (event.status === 'completed') append({kind: 'task.completed', task, summary: event.text, from, context});
             else {
-              // An adapter marks a failure of its RUNTIME (process died, endpoint down, no answer) as
-              // recoverable: the same job may run on the next AI in the chain. A worker that did the
-              // work and failed it on its merits is not.
+              // An adapter marks a failure of its RUNTIME (process died, endpoint down, step cap, no answer) as
+              // recoverable. Work is never thrown away (2026-09-27): a step-capped worker still progressing is
+              // continued first; then an attempt that changed files or said something ends completed, its
+              // report synthesized from what it produced. Found live (ACE d1bc0206): local builders did real
+              // work, then their turn ended without an answer, and the draft was discarded to a cloud fallback.
+              // Only an attempt that produced nothing — or a vendor/limit error — fails (and falls back).
+              const attempt = reducers.tasks(session.events)[task]?.attempt ?? null;
+              if (event.status !== 'limited' && event.recoverable === true && (stepCapped(task, attempt) || producedWork(lastSaid, artifact))) {
+                if (await attemptStepRenewal({task, attempt, from, context, remaining: ''})) return;
+                if (await completeFromWork({task, attempt, from, context, answer: lastSaid, artifact, outputSeq: output.seq, why: rawText})) return;
+              }
               const reason = event.status === 'limited' ? 'limited' : event.recoverable === true ? 'worker_runtime' : 'error';
               append({kind: 'task.failed', task, reason, text: event.text, from, context});
             }
@@ -953,14 +1221,47 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     }
   }
 
-  // The worker answered but its report cannot be repaired: the answer is the outcome to decide on, so the
-  // task blocks on it (quoted, with where to read it whole) rather than failing as if nothing came back.
-  function repairUnavailable(task, reason, context) {
-    const output = session.events.findLast(e => e.kind === 'task.output' && e.task === task && e.status === 'completed' && e.text?.trim());
-    const flat = output ? output.text.replace(/\s+/g, ' ').trim() : '';
-    const answer = output ? `The worker answered (${output.chars} chars, output seq ${output.seq}): "${flat.length > 240 ? `${flat.slice(0, 240)}…` : flat}". ` : '';
-    append({kind: 'task.blocked', task, reason: 'report_repair_unavailable', from: workerFrom(task), context,
-      text: `${answer}Its report could not be repaired: ${String(reason).replace(/\.$/, '')}. Read it with task_get full; accept it, resubmit it, or continue it on a cloud AI if the user agrees.`});
+  // Work is never thrown away: the report is synthesized from what the attempt produced — its answer
+  // text, else its captured changes — and the task completes (then review, if any, judges it). False
+  // when the attempt produced neither, for the caller to fail it.
+  // Synchronous on purpose: a caller decides before its first await, so no other settle path (a stream
+  // that ends after a cancel) can journal the task's end in between.
+  const producedWork = (answer, artifact) => Boolean(String(answer ?? '').trim() || artifact?.changes?.length);
+  // A report bounce has to write has no evidence of the worker's own: it carries what bounce saw the
+  // worker run instead (Daniel, 2026-09-28: only when the report is missing or wrongly built). Found
+  // live: 45 of 86 local attempts answered in plain text, and the review of such a report could only
+  // object that nothing backed it.
+  function withObserved(task, synthesis) {
+    const seen = observedRuns.get(task);
+    if (!seen?.reports || synthesis.sources?.evidence === 'worker') return synthesis;
+    const evidence = seen.runs.length ? seen.runs.map(seenRun) : [seen.changed ? NO_RUN_AFTER_CHANGE : NO_RUN];
+    return {...synthesis, report: {...synthesis.report, evidence}, sources: {...(synthesis.sources ?? {}), evidence: 'observed'}};
+  }
+  // A reviewer's answer is a verdict: FAIL in it is the result of the review, not the worker's status.
+  const answersWithVerdict = task => ['reviewer', 'critic', 'verifier'].includes(profiles[submittedRow(task)?.profile]?.role);
+  async function completeFromWork({task, attempt, from, context, answer = '', artifact = null, outputSeq = null, why = null}) {
+    if (!producedWork(answer, artifact)) return false;
+    const text = String(answer ?? '').trim();
+    const synthesis = withObserved(task, text ? synthesizeReport(text, null, {verdict: answersWithVerdict(task)}) : synthesizeReportFromChanges(artifact));
+    const problem = validateReport(synthesis.report);
+    if (problem) throw new Error(`synthesized report invalid: ${problem}`);
+    append({kind: 'task.report.synthesized', task, attempt, rule: synthesis.rule, ...(synthesis.sources ? {sources: synthesis.sources} : {}),
+      ...(outputSeq !== null ? {outputSeq} : {}), ...(why ? {why: String(why).slice(0, 500)} : {}), from, context});
+    append(reportEvent({task, attempt, report: synthesis.report, from, context}));
+    await finalizeReport({task, attempt, from, context});
+    return true;
+  }
+
+  // The worker's report could not be repaired. Whatever it produced — an answer, else changes — is its
+  // outcome (completed); an attempt that produced nothing fails as a runtime failure, so its next AI tries.
+  async function repairUnavailable(task, reason, context) {
+    const output = session.events.findLast(e => e.kind === 'task.output' && e.task === task && e.text?.trim());
+    const attempt = reducers.tasks(session.events)[task]?.attempt ?? null;
+    const answer = output?.status === 'completed' ? output.text : '';
+    const artifact = artifactFor(task)?.artifact ?? null;
+    if (producedWork(answer, artifact)) { await completeFromWork({task, attempt, from: workerFrom(task), context, answer, artifact, outputSeq: output?.seq ?? null, why: reason}); return; }
+    append({kind: 'task.failed', task, reason: 'worker_runtime', from: workerFrom(task), context,
+      text: `The worker produced no answer and no changes: ${String(reason).replace(/\.$/, '')}`});
   }
 
   // Capacity release is distinct from task completion: blocked/input-required results also free a
@@ -969,26 +1270,31 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const entry = handles.get(task);
     if (entry?.handle !== handle) return;
     handles.delete(task);
-    if (!entry.local || closed) return;
+    if (!launchingAttempts.has(task)) releaseMachine(task);
+    if ((!entry.local && !entry.cloud) || closed) return;
     const released = append({kind: 'task.slot.released', task,
-      attempt: reducers.tasks(session.events)[task]?.attempt, endpoint: entry.local, context});
+      attempt: reducers.tasks(session.events)[task]?.attempt, context, ...(entry.local ? {endpoint: entry.local} : {cloud: true})});
     if (slotWaiters.size) queueMicrotask(() => wakeSlotWaiters(released.seq));
   }
 
-  async function requestFinalReport({task, attempt, context, adapter, diagnostic}) {
+  // Only reached once (consumeWorkerEvents): the worker's final turn ended with no text at all, so
+  // there is nothing to synthesize a report from. One turn back, asked in plain words — never the
+  // JSON schema again, which is the instruction the worker just failed to follow. A second empty
+  // answer, or no way to ask again, blocks on it rather than failing the task for its formatting.
+  async function requestPlainAnswer({task, attempt, context, adapter}) {
     const jobId = submittedRow(task)?.jobId;
     const previous = session.events.some(event => event.kind === 'task.report_requested' && (jobId ? event.jobId === jobId : event.task === task));
     const root = budgetRootOf(task, reducers.tasks(session.events));
     const remaining = reducers.budgets(session.events).roots[root]?.remaining?.starts;
     const deadline = deadlineAtFor(task);
     const native = session.events.findLast(event => event.kind === 'peer.native' && event.from === workerFrom(task));
-    if (!previous) append({kind: 'task.report_requested', task, attempt, text: `Requesting a valid final report: ${diagnostic}`, diagnostic, context});
+    if (!previous) append({kind: 'task.report_requested', task, attempt, text: 'The worker gave no answer at all; asking once more, in plain words', diagnostic: 'no_answer', context});
     if (previous) {
-      append({kind: 'task.failed', task, reason: 'incomplete_report', text: `Final report validation failed after one repair: ${diagnostic}. Worker output is preserved; use task_get full.`, context});
+      await repairUnavailable(task, 'the worker gave no answer, twice in a row', context);
       return;
     }
     if (!adapter.resume || !native || remaining === 0 || (deadline !== null && deadline <= clock())) {
-      repairUnavailable(task, `${diagnostic}, and no resumable session, start allowance or deadline remains`, context);
+      await repairUnavailable(task, 'the worker gave no answer, and no resumable session, start allowance or deadline remains', context);
       return;
     }
     append({kind: 'budget.reserved', task, root, amount: {starts: 1}, context});
@@ -1000,7 +1306,6 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // already checked by the caller.
   async function launchWorker(row, {reserve = true} = {}) {
     const {task, context} = row;
-    if (!campaignActive(task) && !await waitForCampaign(task)) return;
     if (!admitAttempt(task, context)) return;
     const root = budgetRootOf(task, reducers.tasks(session.events));
     // `reserve: false` means the caller (dispatch) already made this reservation, synchronously,
@@ -1033,15 +1338,16 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // Prefer the acknowledged report endpoint, including OpenCode's dedicated MCP tool.
       // Final-answer parsing remains a compatibility path for workers without a grant.
       const canReport = Boolean(reportEnv);
-      let workerOrders = canReport ? `${roleLead}${row.orders}\n\n${reportContract(profile)}`
-        : LOCAL_ADAPTERS.has(profile.adapter) ? `${roleLead}${row.orders}\n\n${LOCAL_REPORT_LINE}` : `${roleLead}${row.orders}`;
-      if (!campaignActive(task) && !await waitForCampaign(task)) { abandonLaunch(task, context); return; }
-      // An in-place task's worker runs directly in session.cwd: no attempt workspace, no
-      // writeFence (docs/plans/in-place-tasks.md §3) — `owned` stays null, so the ordinary
+      let workerOrders = canReport ? `${roleLead}${row.orders}\n\n${contractFor(profile)}`
+        : LOCAL_ADAPTERS.has(profile.adapter) ? `${roleLead}${row.orders}\n\n${endingLine}` : `${roleLead}${row.orders}`;
+      // An in-place task's worker runs directly in session.cwd: no attempt workspace
+      // (docs/plans/in-place-tasks.md §3) — `owned` stays null, so the ordinary
       // cwd/orders fallbacks below already do the right thing with no further branching.
       owned = row.inPlace ? null : workspaceFor(task, profile, attempt);
       if (owned?.disposable) profile = {...profile, probeSource: fs.realpathSync(session.cwd)};
-      else if (owned) profile = {...profile, writeFence: fs.realpathSync(session.cwd)};
+      // OpenCode takes the agent text as its system prompt, apart from the orders (found live: an agent
+      // file naming the checkout sent a local worker to write there); it points into the copy too.
+      if (owned && profile.agent?.prompt) profile = {...profile, agent: {...profile.agent, prompt: toWorkingCopy(profile.agent.prompt, owned)}};
       append({kind: 'task.launch.requested', task, attempt, executionKey: `${task}:${attempt}`, context});
       handle = await adapter.launch({peer: workerFrom(task), profile, orders: owned?.disposable ? `${workerOrders}\n\n${probeOrders(owned)}` : owned ? inWorkingCopy(workerOrders, owned) : workerOrders, cwd: owned?.cwd ?? session.cwd, dir,
         task, attempt, context, signal: admission?.signal,
@@ -1064,16 +1370,16 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // The task may have been cancelled (or otherwise gone terminal) while launch() was
     // pending: don't adopt it as live, just shut down the now-unwanted process.
     if (launchingAttempts.get(task)?.cancelReason || reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) {
-      handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : {})});
+      handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : CLOUD_ADAPTERS.has(profile.adapter) ? {cloud: true} : {})});
       const reason = launchingAttempts.get(task)?.cancelReason ?? 'user';
       launchingAttempts.delete(task);
       // Nothing consumes this handle's events, so its slot is given back here once it is stopped.
       if (await cancelOne(task, reducers.tasks(session.events), reason)) dropHandle(task, handle, context);
       return;
     }
-    handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : {})});
+    handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : CLOUD_ADAPTERS.has(profile.adapter) ? {cloud: true} : {})});
     append({kind: 'peer.joined', name: workerFrom(task), role: 'worker', adapter: profile.adapter, profile: row.profile, from: workerFrom(task), context});
-      append({kind: 'task.started', task, attempt, requested: profile.model ?? '', ...(attempt === 1 && jevReviewed(row) ? {head: gitHead(session.cwd)} : {}), from: workerFrom(task), context});
+      append({kind: 'task.started', task, attempt, requested: profile.model ?? '', ...(Number.isSafeInteger(handle?.pid) ? {pid: handle.pid} : {}), ...(attempt === 1 && jevReviewed(row) ? {head: gitHead(session.cwd)} : {}), from: workerFrom(task), context});
     for (const staged of launchingAttempts.get(task)?.reports ?? []) report({task, attempt, report: staged.payload, from: staged.from, context: staged.context});
     launchingAttempts.delete(task);
     publish({kind: 'task.activity', task, text: 'Worker started · waiting for first activity', startup: true, from: workerFrom(task), context});
@@ -1092,10 +1398,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return messages.filter(m => session.events.filter(e => e.kind === 'task.delivered' && e.message === m.id).at(-1)?.tier === 'queued');
   }
 
-  async function resumeWorker({task, row, round, findings, context, reportOnly = false}) {
-    if (!campaignActive(task) && !await waitForCampaign(task)) return;
-    if (!admitAttempt(task, context, {reportOnly})) {
-      append({kind: 'budget.released', task, root: budgetRootOf(task, reducers.tasks(session.events)), amount: reportOnly ? {starts: 1} : {rounds: 1}, text: 'attempt admission refused', context});
+  async function resumeWorker({task, row, round, findings, context, reportOnly = false, renewal = false, continueMessage = null}) {
+    if (!admitAttempt(task, context, {reportOnly: reportOnly || renewal})) {
+      append({kind: 'budget.released', task, root: budgetRootOf(task, reducers.tasks(session.events)), amount: (reportOnly || renewal) ? {starts: 1} : {rounds: 1}, text: 'attempt admission refused', context});
       return;
     }
     const baseProfile = resolvedLocalProfiles.get(task) ?? profiles[row.profile];
@@ -1107,10 +1412,21 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const nativeRow = session.events.filter(e => e.kind === 'peer.native' && e.from === workerFrom(task)).at(-1);
     const native = nativeRow ? {provider: nativeRow.provider, sessionId: nativeRow.sessionId, ...(nativeRow.cwd ? {cwd: nativeRow.cwd} : {})} : {};
     const pending = reportOnly ? [] : pendingMessages(task);
-    const invalidReport = session.events.findLast(event => event.kind === 'task.report.invalid' && event.task === task);
+    // reportOnly is only ever requestPlainAnswer's turn back after a literally empty answer
+    // (scheduler.js): ask in plain words, never the JSON schema the worker just failed to use —
+    // any non-empty answer, however malformed, is synthesized straight from the log instead.
     let message = reportOnly
-      ? `Your previous report was rejected: ${invalidReport?.diagnostic ?? 'missing_report'}. Its complete output is retained by Bounce. Correct that exact format error. Return a structurally valid final report of the work actually performed: ${reportInstruction(profile)}. Do not perform additional implementation. Include op:final, outcome, phase, text, next, summary, evidence and remaining. Report blockers honestly. If required work remains, use outcome blocked and retain the remaining work; this formatting-only turn cannot complete it.`
-      : [`Rework round ${round}:`, ...findings.map(f => `- ${f}`), ...pending.map(m => m.text)].join('\n');
+      ? 'Your last turn ended with no answer at all. Say in plain words: what you did, whether it is done, and what is left. No JSON, no particular format — a plain answer is enough.'
+      : continueMessage !== null
+        ? [continueMessage, ...pending.map(m => m.text)].join('\n')
+        // A worker whose report bounce had to write is told that, not that "its report" lacks something:
+        // found live (ACE d1bc0206, 99bd27ea), a worker stopped mid-fix was sent findings about a report
+        // it never wrote.
+        : reportByBounce(task)
+          ? [`Rework round ${round}. Your last turn ended without your final report, so bounce wrote one from what it saw you do.`,
+            'Continue the task from where you stopped, run its checks, and end with your own report: what you did, and the output of the checks you ran.',
+            'What was found in the meantime:', ...findings.map(f => `- ${f}`), ...pending.map(m => m.text)].join('\n')
+          : [`Rework round ${round}:`, ...findings.map(f => `- ${f}`), ...pending.map(m => m.text)].join('\n');
     let adapter = adapters[profile.adapter];
     let admission;
     let handle, owned = null;
@@ -1119,17 +1435,20 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         admission = await admitLocal(profile, task, attempt, context, undefined, {waitOnPressure: reportOnly});
         ({profile, adapter} = admission);
       }
-      if (!campaignActive(task) && !await waitForCampaign(task)) { abandonLaunch(task, context); return; }
-      // An in-place task's worker runs directly in session.cwd: no attempt workspace, no
-      // writeFence (docs/plans/in-place-tasks.md §3) — `owned` stays null, so the ordinary
+      // An in-place task's worker runs directly in session.cwd: no attempt workspace
+      // (docs/plans/in-place-tasks.md §3) — `owned` stays null, so the ordinary
       // cwd/orders fallbacks below already do the right thing with no further branching.
       owned = row.inPlace ? null : workspaceFor(task, profile, attempt);
       if (owned?.disposable) profile = {...profile, probeSource: fs.realpathSync(session.cwd)};
-      else if (owned) profile = {...profile, writeFence: fs.realpathSync(session.cwd)};
+      // OpenCode takes the agent text as its system prompt, apart from the orders (found live: an agent
+      // file naming the checkout sent a local worker to write there); it points into the copy too.
+      if (owned && profile.agent?.prompt) profile = {...profile, agent: {...profile.agent, prompt: toWorkingCopy(profile.agent.prompt, owned)}};
       append({kind: 'task.launch.requested', task, attempt, executionKey: `${task}:${attempt}`, resumed: true, context});
       if (owned?.disposable) message = `${message}\n\n${probeOrders(owned)}`;
       else if (owned) message = inWorkingCopy(message, owned);
-      handle = await adapter.resume({peer: workerFrom(task), profile, native, message: reportEnv ? `${message}\n\n${reportContract(profile)}` : LOCAL_ADAPTERS.has(profile.adapter) ? `${message}\n\n${LOCAL_REPORT_LINE}` : message, cwd: owned?.cwd ?? session.cwd, dir, checkpoint: row.checkpoint,
+      // A reportOnly turn asks in plain words on purpose (requestPlainAnswer): the JSON schema
+      // reminder below is for every OTHER resume, never appended onto that one turn back.
+      handle = await adapter.resume({peer: workerFrom(task), profile, native, message: reportOnly ? message : reportEnv ? `${message}\n\n${contractFor(profile)}` : LOCAL_ADAPTERS.has(profile.adapter) ? `${message}\n\n${endingLine}` : message, cwd: owned?.cwd ?? session.cwd, dir, checkpoint: row.checkpoint,
         task, attempt, context, signal: admission?.signal,
         onActivity: LOCAL_ADAPTERS.has(profile.adapter) ? localActivity(task, attempt, context) : undefined,
         report: requireFinalReport ? ({report: payload}) => report({task, attempt, context, report: payload}) : undefined});
@@ -1139,7 +1458,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // The rework round's own reservation (`{rounds: 1}`, made by the caller before this
       // resume) never ran a turn: release it (§4).
       const root = budgetRootOf(task, reducers.tasks(session.events));
-      append({kind: 'budget.released', task, root, amount: reportOnly ? {starts: 1} : {rounds: 1}, text: error.message, context});
+      append({kind: 'budget.released', task, root, amount: (reportOnly || renewal) ? {starts: 1} : {rounds: 1}, text: error.message, context});
       const cancelled = abandonLaunch(task, context, {verified})?.cancelReason;
       if (reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) return;
       if (cancelled) {
@@ -1149,7 +1468,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // A worker that cannot be RESUMED is classified exactly as one that cannot be launched, so the
       // task's next AI is tried. It used to be a bare `error`, which no fallback follows (found live:
       // a codex thread/resume timed out after a Jev rework and the session stopped).
-      if (reportOnly) { repairUnavailable(task, error.message, context); return; }
+      if (reportOnly) { await repairUnavailable(task, error.message, context); return; }
       append({kind: 'task.failed', task, ...startFailure(error), from: workerFrom(task), context});
       return;
     }
@@ -1159,15 +1478,15 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // A throwing resume (the branch above) journals none of this — nothing was delivered.
     for (const m of pending) append({kind: 'task.delivered', task, tier: 'next-turn', message: m.id, text: `rework round ${round}`, from: 'bounce', context});
     if (launchingAttempts.get(task)?.cancelReason || reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) {
-      handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : {})});
+      handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : CLOUD_ADAPTERS.has(profile.adapter) ? {cloud: true} : {})});
       const reason = launchingAttempts.get(task)?.cancelReason ?? 'user';
       launchingAttempts.delete(task);
       // Nothing consumes this handle's events, so its slot is given back here once it is stopped.
       if (await cancelOne(task, reducers.tasks(session.events), reason)) dropHandle(task, handle, context);
       return;
     }
-    handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : {})});
-    append({kind: 'task.started', task, attempt, resumed: true, ...(reportOnly ? {purpose: 'report'} : {}), requested: profile.model ?? '', from: workerFrom(task), context});
+    handles.set(task, {adapter, handle, ...(LOCAL_ADAPTERS.has(profile.adapter) ? {local: profile.endpoint ?? 'lmstudio'} : CLOUD_ADAPTERS.has(profile.adapter) ? {cloud: true} : {})});
+    append({kind: 'task.started', task, attempt, resumed: true, ...(Number.isSafeInteger(handle?.pid) ? {pid: handle.pid} : {}), ...(reportOnly ? {purpose: 'report'} : renewal ? {purpose: 'steps'} : {}), requested: profile.model ?? '', from: workerFrom(task), context});
     for (const staged of launchingAttempts.get(task)?.reports ?? []) report({task, attempt, report: staged.payload, from: staged.from, context: staged.context});
     launchingAttempts.delete(task);
     const attemptEnded = () => session.events.some(e => e.kind === 'task.attempt.ended' && e.task === task && e.attempt === attempt);
@@ -1179,7 +1498,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // A report acknowledged before the timer fired is the answer this turn was asked for; the
       // attempt ends first, so no later report from it can be accepted.
       append({kind: 'task.attempt.ended', task, attempt, verifiedTermination: true, from: workerFrom(task), context});
-      if (finalizeReport({task, attempt, from: workerFrom(task), context})) return;
+      if (await finalizeReport({task, attempt, from: workerFrom(task), context})) return;
+      // The turn asked only for a report timed out; what the worker produced before is still its work.
+      const output = session.events.findLast(e => e.kind === 'task.output' && e.task === task && e.status === 'completed' && e.text?.trim());
+      const artifact = artifactFor(task)?.artifact ?? null;
+      if (producedWork(output?.text, artifact)) { await completeFromWork({task, attempt, from: workerFrom(task), context, answer: output.text ?? '', artifact, outputSeq: output?.seq ?? null, why: 'final report request timed out'}); return; }
       append({kind: 'task.failed', task, reason: 'incomplete_report', text: 'Final report request timed out; original worker output is preserved; use task_get full.', context});
     }, Math.max(1, Math.min(watchdogConfig.reportOnly, (deadlineAtFor(task) ?? (clock() + watchdogConfig.reportOnly)) - clock()))) : null;
     try { await consumeWorkerEvents({adapter, handle, task, context, profile, owned}); }
@@ -1239,11 +1562,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // launch and the stream ending, so cancel()/stop() can reach it; a throwing stream (A4) ends
   // the same way a broken worker stream does — unreadable, handle cancelled, never left open.
   async function runReview({task, stage, round, profileName, profile, orders, dir, context, peer = reviewFrom(task), review = {stage, round, orders}}) {
-    if (!campaignActive(task) && !await waitForCampaign(task)) return {verdict: 'unreadable', cancelled: true};
     append({kind: 'review.started', task, stage, round, profile: profileName, candidateSeq: review.candidateSeq ?? null, candidateDigest: review.candidateDigest ?? null, from: peer, context});
     let adapter = adapters[profile.adapter];
     let admission;
-    const launchState = {task, pending: true, requestedAt: clock()};
+    const launchState = {task, peer, pending: true, requestedAt: clock()};
     reviews.set(peer, launchState);
     let handle, owned = null;
     try {
@@ -1252,14 +1574,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         admission = await admitLocal(profile, task, round, context, launchState);
         ({profile, adapter} = admission);
       }
-      if (!campaignActive(task) && !await waitForCampaign(task)) {
-        releaseReview(peer, launchState, context);
-        return {verdict: 'unreadable', cancelled: true};
-      }
       const captured = artifactFor(task);
       const workerProfile = profiles[submittedRow(task)?.profile];
       const reportOnly = stage === 'completion' && workerProfile && POLICY_RANK[effectivePolicy(workerProfile)] < POLICY_RANK.write;
-      const reviewState = captured ? {orders: review.orders, report: review.report, diff: captured.artifact.diff, files: captured.artifact.files, baseHead: captured.artifact.baselineHash}
+      const reviewState = captured ? {orders: review.orders, report: review.report, diff: reviewDiff(captured.artifact), files: captured.artifact.files, baseHead: captured.artifact.baselineHash}
         : reportOnly ? {kind: 'report', orders: review.orders, report: review.report, diff: '', files: [], baseHead: null} : null;
       if (effectivePolicy(profile) === 'probe') {
         const source = captured?.row.cwd ?? session.cwd;
@@ -1325,7 +1643,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       return {verdict: 'unreadable', cancelled: true};
     }
     releaseReview(peer, reviewEntry, context);
-    const verdict = streamError ? {verdict: 'unreadable'} : parseVerdict(resultStatus, resultText);
+    // A stream that broke after the reviewer spoke still carries what it said: read that too.
+    const verdict = parseVerdict(resultStatus, resultText ?? '');
     if (streamError) resultText = streamError.message;
     append({kind: 'review.finished', task, stage, round, candidateSeq: review.candidateSeq ?? null, candidateDigest: review.candidateDigest ?? null, verdict: verdict.verdict, text: resultText ?? null, from: peer, context});
     return verdict;
@@ -1360,6 +1679,25 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       return session.events.some(e => e.kind === 'review.reasked' && e.task === id && (!e.candidateSeq || e.candidateSeq === candidate?.seq));
     },
     lastFired: id => session.events.findLast(e => e.kind === 'jev.verdict' && e.task === id)?.fired ?? null,
+    // The task's check as it ran on the work now waiting for a decision; null when the task names none
+    // or it could not be run.
+    checkOf: id => {
+      const row = checkRowOf(id);
+      return row && typeof row.passed === 'boolean' ? row : null;
+    },
+    // Whether the report now waiting for a decision was written by bounce, not by the worker.
+    reportByBounce: id => reportByBounce(id),
+    // Whether the task has file changes waiting to be put in the checkout that no check that runs the work
+    // has verified (a check that only looks for files or text verifies nothing); and where they are.
+    unverifiedChanges: id => {
+      const found = artifactFor(id);
+      if (!found?.artifact.changes.length || session.events.some(e => e.kind === 'task.integrated' && e.task === id && e.artifactId === found.artifact.id)) return false;
+      const check = checkRowOf(id);
+      return !(check?.passed === true && !check.weak);
+    },
+    copyOf: id => artifactFor(id)?.row.cwd ?? null,
+    // What the worker itself reported as left when it completed (task.completed.remaining).
+    remainingOf: id => session.events.findLast(e => e.kind === 'task.completed' && e.task === id)?.remaining ?? '',
     roundsCap: id => {
       const root = budgetRootOf(id, reducers.tasks(session.events));
       return submittedRow(root)?.budget?.rounds ?? limits.rounds;
@@ -1418,6 +1756,12 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // reservation before calling in (dispatch's shared review-or-worker reservation, §4);
   // `reserveFirst: true` means this function reserves it too (the completion path, which has
   // no such shared reservation).
+  // The review reads the check bounce ran as evidence, next to what the report itself carries.
+  const withCheck = (task, evidence) => {
+    const check = api.checkOf(task);
+    return check?.passed ? [...(Array.isArray(evidence) ? evidence : []), checkPassed(check)] : evidence;
+  };
+
   async function runReviewers({task, stage, round, reviewers, row, context, root, reserveFirst, note = null}) {
     const verdicts = [];
     for (let i = 0; i < reviewers.length; i++) {
@@ -1492,7 +1836,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       const reported = session.events.findLast(e => e.kind === 'task.reported' && e.task === task);
       const lineageRoot = lineageRootOf(task, reducers.tasks(session.events));
       const review = {stage, round, candidateSeq: candidate?.seq ?? null, candidateDigest: candidate?.digest ?? null, orders: row.orders, summary: reducers.tasks(session.events)[task]?.summary ?? null,
-        report: reported ? {summary: reported.summary, text: reported.text, next: reported.next, outcome: reported.outcome, evidence: reported.evidence, remaining: reported.remaining, phase: reported.phase} : null,
+        report: reported ? {summary: reported.summary, text: reported.text, next: reported.next, outcome: reported.outcome, evidence: withCheck(task, reported.evidence), remaining: reported.remaining, phase: reported.phase} : null,
         head: session.events.find(e => e.kind === 'task.started' && e.task === lineageRoot)?.head ?? null};
       const verdict = await runReview({task, stage, round, profileName, profile: reviewProfile, orders: note ? `${orders}\n\n${note}` : orders, dir, context, peer, review: note ? {...review, note} : review});
       if (verdict.launchFailed && !exempt) append({kind: 'budget.released', task, root, amount: {starts: 1}, text: 'review launch failed', context});
@@ -1535,8 +1879,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       return;
     }
     // accept
-    if (stage === 'completion' && !publishArtifact(task, {kind: 'task.accepted', task, stage, by: reviewFrom(task), context})) return;
-    append({kind: 'task.accepted', task, stage, by: reviewFrom(task), context});
+    const accepted = {kind: 'task.accepted', task, stage, by: reviewFrom(task), ...(intent.advice ? {advice: intent.advice} : {}), context};
+    if (stage === 'completion' && !publishArtifact(task, accepted)) return;
+    append(accepted);
     if (stage === 'prelaunch') {
       if (availableStarts(root) < 1) return escalateBudget(task, context);
       await launchWorker(row);
@@ -1577,7 +1922,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   }
 
   // One dispatch per task at a time. The handle/launch/review guard below is only set after the
-  // first await (a checkpoint re-check, a campaign wait, a cloud review launch); after a restart the
+  // first await (a checkpoint re-check, a cloud review launch); after a restart the
   // retried action and reconcile's own request both reach that window and would launch twice.
   const dispatching = new Set();
   async function dispatch(row) {
@@ -1589,7 +1934,6 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
 
   async function dispatchOnce(row) {
     if (closed) return;
-    if (row.campaignId && campaigns(session.events)[row.campaignId]?.state !== 'active') { heldTasks.add(row.task); return; }
     const {task, parent, context} = row;
     if (handles.has(task) || launchingAttempts.has(task) || [...reviews.values()].some(review => review.task === task)) return;
     row = submittedRow(task) ?? row; // a re-dispatch (held task, restart) sees an already-routed profile
@@ -1611,8 +1955,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     }
     // The same job, failed the same way this many times, is a loop: bounce stops rather than running it
     // again, and says what to change. Found live: ten identical reviewer tasks, each killed at the ceiling.
-    const jobStarts = session.events.filter(e => e.kind === 'task.started' && e.purpose !== 'report' && e.jobId === row.jobId);
-    if (row.jobId && jobStarts.length >= (suppliedLimits.attempts ?? 3)) {
+    // An attempt of a job is a task, not a start: a rework round, a step renewal or a resume is the same
+    // task continuing, capped by its own limits. Found live (ACE d1bc0206): one rework plus one retry used
+    // up a job, and a completed, evidence-backed result was failed "attempt allowance exhausted".
+    const jobTasks = new Set(session.events.filter(e => e.kind === 'task.started' && e.purpose !== 'report' && e.jobId === row.jobId && e.task !== task).map(e => e.task));
+    if (row.jobId && jobTasks.size >= (suppliedLimits.attempts ?? 3)) {
       append({kind: 'task.failed', task, reason: 'attempts_exhausted', text: 'Logical job attempt allowance exhausted', context}); return;
     }
     const attempts = failedAttempts(session.events.filter(e => e.task !== task), row);
@@ -1712,6 +2059,16 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         : onModel >= perModel ? `Waiting for a local slot on ${endpoint} for ${profile.model}: ${onModel} of ${perModel} in use` : null;
       if (full) {
         if (!slotWaiters.has(task)) append({kind: 'task.milestone', task, phase: 'queued', text: full, next: 'dispatch when a local turn ends', context});
+        slotWaiters.add(task);
+        return;
+      }
+      slotWaiters.delete(task);
+    }
+    if (CLOUD_ADAPTERS.has(profile.adapter)) {
+      const running = cloudRunning();
+      const full = running >= maxConcurrentCloud ? `Waiting for a cloud slot: ${running} of ${maxConcurrentCloud} in use` : null;
+      if (full) {
+        if (!slotWaiters.has(task)) append({kind: 'task.milestone', task, phase: 'queued', text: full, next: 'dispatch when a cloud turn ends', context});
         slotWaiters.add(task);
         return;
       }
@@ -2018,23 +2375,6 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       text: `${expiredHead(reason, row?.profile ?? 'the worker', r)} and gave no final answer within ${seconds(waited)} of being asked.${found.length ? ` Its ${found.length} recorded finding${found.length === 1 ? ' is' : 's are'} in the deadline row.` : ''} Its partial progress is in the journal: resubmit what is left with that progress in the orders, or drop it.`});
   }
 
-  // Nobody answered. The wait is ended the way a lease end is ended — bounce's decision, journaled as a
-  // deadline and a `deadline` cancellation, with the submitter told — never as a user cancellation, which
-  // the orders treat as final and which would stop the whole run.
-  async function expireParked(r) {
-    const view = reducers.tasks(session.events);
-    const t = view[r.task];
-    if (!t) return;
-    const row = submittedRow(r.task);
-    const waited = clock() - (r.parkedAt ?? clock());
-    const asked = t.blocker ?? session.events.findLast(e => e.task === r.task && e.kind === 'task.input_required')?.text ?? 'it asked for input';
-    append({kind: 'task.deadline', task: r.task, reason: 'unanswered', from: 'bounce', context: row?.context,
-      text: `parked ${seconds(waited)} with no answer: ${asked}`});
-    await cancel(r.task, {force: true, reason: 'deadline'});
-    append({kind: 'policy.escalated', task: r.task, reason: 'deadline', to: submitterOf(r.task), context: row?.context,
-      text: `${row?.profile ?? 'the worker'} parked ${seconds(waited)} ago and nothing answered it: ${asked}. Answer it and resubmit what is left, or drop it.`});
-  }
-
   async function handleSignature(r, reason, now) {
     const row = submittedRow(r.task);
     const since = lastProgressResetTime(r.task) ?? -Infinity;
@@ -2080,12 +2420,14 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     }
     const rows = reducers.watchdog(session.events, now, {activity, watchdog: {...watchdogConfig, defaultDeadlineMs: (limits.minutes ?? DEFAULT_DEADLINE_MINUTES) * 60000, ceilingMs}});
     for (const r of rows) {
-      // A parked task that outlived its lease with nobody answering ends here. The escalation still
-      // happens first (handleBlocked, once per blocker), so the owner was told before the clock ran out.
-      if (r.verdicts.includes('blocked')) await handleBlocked(r);
-      if (r.verdicts.includes('unanswered')) { await expireParked(r); continue; }
-      if (r.verdicts.includes('blocked')) continue;
+      // A parked task (blocked) never expires here — it holds no slot and is never killed by its
+      // lease/ceiling; this escalation (once per blocker) is only ever informational.
+      if (r.verdicts.includes('blocked')) { await handleBlocked(r); continue; }
       if (r.verdicts.includes('deadline')) { await handleLeaseEnd(r, now); continue; }
+      // A task waiting for its turn (the local model, memory) has no worker to be silent: found live
+      // (ACE e3bd01d5), two tasks sent back by their check were cancelled as silent while they waited
+      // for the local model, and redone on a cloud fallback.
+      if (launchingAttempts.get(r.task)?.phase === 'admission') continue;
       for (const reason of ['silent', 'stalled']) if (r.verdicts.includes(reason)) await handleSignature(r, reason, now);
     }
   }
@@ -2137,29 +2479,6 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       else if (row.kind === 'task.deadline') append({kind: 'policy.fallback.skipped', task: row.task, reason: 'deadline_exhausted', text: 'logical deadline exhausted', context: row.context, ref: `deadline-skip:${row.task}`});
       handleTerminal(row);
     },
-    plan: async action => {
-      const row = session.events.find(e => e.kind === 'plan.submitted' && e.plan === action.payload.plan);
-      if (!row || session.events.some(e => ['plan.accepted', 'plan.rejected', 'plan.unavailable'].includes(e.kind) && e.plan === row.plan)) return;
-      if (!campaignActive(null, row.campaignId) && !await waitForCampaign(null, row.campaignId)) return;
-      const capabilityFindings = (row.chunks ?? []).flatMap(chunk => {
-        const required = requireFinalReport && row.from === 'orchestrator' && chunk.requires === undefined
-          ? 'declare requires for this chunk' : validateRequirements(chunk.requires);
-        const missing = !required && profiles[chunk.profile] ? missingCapabilities(profiles[chunk.profile], chunk.requires) : [];
-        return required || missing.length ? [{chunk: chunk.id, check: 'capabilities', confidence: 1,
-          fix: required ?? `Profile ${chunk.profile} lacks ${missing.join(', ')}; split source analysis from command verification`}] : [];
-      });
-      const result = await supervisePlan({events: session.events, plan: row.plan, now: clock,
-        startupMs: watchdogConfig.startupMs, signal: planController.signal,
-        append: event => append({...event, planId: row.plan, phase: row.phase, campaignId: row.campaignId, context: row.context}),
-        run: ({signal}) => capabilityFindings.length ? {verdict: 'reject', findings: capabilityFindings} : jev?.plan ? jev.plan({plan: row, ceilingMinutes: ceilingMs / 60000, signal})
-          : judgePlan({plan: row, settings: {enabled: false}, ceilingMinutes: ceilingMs / 60000, signal})});
-      if (result.status !== 'decision' || closed) return;
-      const decision = result.decision ?? {verdict: 'unavailable', reason: 'empty_decision'};
-      const kind = decision.verdict === 'accept' ? 'plan.accepted' : decision.verdict === 'rework' || decision.verdict === 'reject' ? 'plan.rejected' : 'plan.unavailable';
-      append({kind, plan: row.plan, planId: row.plan, phase: row.phase, campaignId: row.campaignId, chunks: row.chunks?.length ?? 0,
-        findings: decision.findings ?? [], noted: decision.noted ?? [], model: decision.model ?? null,
-        reason: decision.reason ?? null, context: row.context, text: `${row.phase ?? 'Plan'}: ${kind}${decision.reason ? ` (${decision.reason})` : ''}`});
-    },
     completion: async action => {
       try { await handleCompleted(action.task); }
       catch (error) { append({kind: 'task.failed', task: action.task, reason: 'error', text: error.message}); }
@@ -2174,7 +2493,6 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   }, reconcile: action => {
     if (action.type === 'integrate') return session.events.filter(e => e.kind === 'orchestration.action.started' && e.actionId === action.actionId).length < 3 ? 'retry' : 'blocked';
     if (action.type === 'terminal') return 'retry';
-    if (action.type === 'plan') return session.events.some(e => ['plan.accepted', 'plan.rejected', 'plan.unavailable'].includes(e.kind) && e.plan === action.payload.plan) ? 'settled' : 'retry';
     const state = reducers.tasks(session.events)[action.task]?.state;
     if (reducers.TERMINAL.has(state)) return 'settled';
     if (action.type === 'completion' && !session.events.some(e => e.task === action.task && e.kind === 'review.started' && e.seq > (action.cause ?? action.seq))) return 'retry';
@@ -2204,23 +2522,34 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       if (row) requestDispatch(row, cause);
     }
   }
-  const unsubscribe = session.subscribe(row => {
-    if (row.kind === 'campaign.resumed' || row.kind === 'task.cancelled') for (const wake of [...campaignWaiters]) wake();
-    if (row.kind === 'campaign.resumed') {
-      for (const task of Object.values(reducers.tasks(session.events))) if (task.campaignId === row.campaignId && ['queued', 'waiting'].includes(task.state) && !handles.has(task.id)) {
-        const submitted = submittedRow(task.id);
-        if (submitted) requestDispatch(submitted, row.seq);
-      }
+  // A vendor that saves every thread where the user sees it (Codex: ~/.codex, listed by the ChatGPT
+  // app) gets the task's worker and review threads archived once the task has a final outcome. A
+  // completed task may still be sent back for rework, so completion alone does not archive.
+  function archiveThreads(task, context) {
+    const peers = row => row.from === workerFrom(task) || String(row.from ?? '').startsWith(`review:${task}`);
+    const natives = session.events.filter(e => e.kind === 'peer.native' && peers(e) && typeof e.sessionId === 'string');
+    const done = new Set(session.events.filter(e => e.kind === 'task.thread.archived' && e.task === task).map(e => e.sessionId));
+    const profile = profiles[submittedRow(task)?.profile] ?? {};
+    for (const native of natives) {
+      const adapter = adapters[native.provider];
+      if (typeof adapter?.archive !== 'function' || done.has(native.sessionId)) continue;
+      done.add(native.sessionId);
+      Promise.resolve(adapter.archive({profile, native: {sessionId: native.sessionId}, cwd: session.cwd}))
+        .then(archived => { if (archived) append({kind: 'task.thread.archived', task, provider: native.provider, sessionId: native.sessionId, context}); },
+          error => append({kind: 'task.diagnostic', task, text: `could not archive ${native.provider} thread ${native.sessionId}: ${error.message}`, context}));
     }
+  }
+  const unsubscribe = session.subscribe(row => {
     if (row.task && TERMINAL_ROW_KINDS.has(row.kind) && reducers.TERMINAL.has(reducers.tasks(session.events)[row.task]?.state)) {
       activity.delete(row.task); toolCalls.delete(row.task);
+      if (row.kind !== 'task.completed') archiveThreads(row.task, row.context);
     }
     // §5/§6: any task-scoped row is a candidate to have moved an in-place task off `running`,
     // or an integrate action to have settled — wakeInPlace() itself checks whether the lock
     // has actually cleared before doing anything, so this is cheap to call liberally.
     if (row.task && (inPlaceWaiters.size || integrationWaiting.size)) queueMicrotask(() => wakeInPlace(row.seq));
-    if (row.kind === 'plan.submitted') requestAction(session, {actionId: `plan:${row.plan}`, type: 'plan', payload: {plan: row.plan}, cause: row.seq});
     if (row.kind === 'task.submitted') {
+      for (const text of Array.isArray(row.corrections) ? row.corrections : []) append({kind: 'task.corrected', task: row.task, text: String(text).slice(0, 500), context: row.context});
       // Any throw here (including one from before the first `await`, which an async
       // function turns into a rejection rather than a synchronous throw) must land on the
       // task as its own failure — never disappear, leaving the task queued forever.
@@ -2233,6 +2562,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       requestAction(session, {actionId: `completion:${row.task}:${reducers.tasks(session.events)[row.task]?.attempt ?? 0}`, type: 'completion', task: row.task});
     }
     else if (['task.failed', 'task.cancelled', 'task.deadline', 'task.accepted', 'task.rejected'].includes(row.kind)) requestTerminal(row);
+    if (row.kind === 'task.accepted' || (row.kind === 'task.completed' && reducers.tasks(session.events)[row.task]?.state === 'completed'))
+      queueMicrotask(() => { void cancelSuperseded(row.task); });
     // Messages to `user`/`orchestrator`/anyone else — and a malformed empty worker
     // address — are not this subscriber's business.
     else if (row.kind === 'message' && typeof row.to === 'string' && /^(worker|review):.+/.test(row.to)) {
@@ -2290,8 +2621,15 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       reason: 'outcome_recovery_required', context: t.context,
       text: 'Worker exit was verified, but no durable outcome was recorded; inspect preserved work and submit an explicit retry'});
   }
-  for (const t of Object.values(initialView)) if (!executionEnded(t.id) && (MID_FLIGHT.has(t.state) || t.state === 'queued') && (t.attempt != null || session.events.some(row => row.task === t.id && ['task.local_selected', 'task.launch.requested', 'review.started'].includes(row.kind))) && !handles.has(t.id))
+  // A worker whose process was recorded (task.started pid) and is gone ended with the daemon that
+  // ran it: cancelled as lost, never a fallback, so it does not hold the orchestrator. Found live (ACE
+  // d1bc0206): two such workers, dead for hours, kept every orchestrator turn refused.
+  const workerGone = task => { const pid = session.events.findLast(e => e.task === task && e.kind === 'task.started')?.pid; return Number.isSafeInteger(pid) && !processAlive(pid) ? pid : null; };
+  for (const t of Object.values(initialView)) if (!executionEnded(t.id) && (MID_FLIGHT.has(t.state) || t.state === 'queued') && (t.attempt != null || session.events.some(row => row.task === t.id && ['task.local_selected', 'task.launch.requested', 'review.started'].includes(row.kind))) && !handles.has(t.id)) {
+    const gone = workerGone(t.id);
+    if (gone) { append({kind: 'task.cancelled', task: t.id, reason: 'lost_in_restart', text: `its worker process (pid ${gone}) ended with the previous daemon; resubmit what is left`, context: t.context}); continue; }
     if (session.events.findLast(e => e.task === t.id && e.kind === 'task.blocked')?.reason !== 'orphaned') append({kind: 'task.blocked', task: t.id, reason: 'orphaned', text: 'termination unverified after daemon restart; inspect the previous worker process before resubmitting', context: t.context});
+  }
 
   // Cycle-guarded for the same reason as the root-walkers above.
   const postOrder = (view, id, seen = new Set()) => {
@@ -2300,7 +2638,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return [...(view[id]?.children ?? []).flatMap(child => postOrder(view, child, seen)), id];
   };
 
-  async function cancelOne(id, view, reason = 'user') {
+  async function cancelOne(id, view, reason = 'user', text = null) {
     if (session.events.findLast(e => e.task === id && e.kind === 'task.blocked')?.reason === 'orphaned') return false;
     if (!cancellationRequests.has(id)) {
       cancellationRequests.add(id);
@@ -2311,7 +2649,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       launching.cancelReason = reason;
       launching.localController?.abort();
       if (launching.phase === 'admission') {
-        append({kind: 'task.cancelled', task: id, reason, from: workerFrom(id), context: view[id].context});
+        append({kind: 'task.cancelled', task: id, reason, ...(text ? {text} : {}), from: workerFrom(id), context: view[id].context});
         return true;
       }
       append({kind: 'task.blocked', task: id, text: 'termination pending: worker launch has not resolved', context: view[id].context});
@@ -2343,7 +2681,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       append({kind: 'task.blocked', task: id, text: 'termination unverified', from: workerFrom(id), context: view[id].context});
       return false;
     }
-    append({kind: 'task.cancelled', task: id, reason, from: workerFrom(id), context: view[id].context});
+    append({kind: 'task.cancelled', task: id, reason, ...(text ? {text} : {}), from: workerFrom(id), context: view[id].context});
     return true;
   }
 
@@ -2355,12 +2693,19 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const submitted = submittedRow(task);
     const jobId = submitted?.jobId;
     const starts = session.events.filter(e => e.kind === 'task.started' && e.purpose !== 'report' && (jobId ? submittedRow(e.task)?.jobId === jobId : e.task === task));
-    if (!reportOnly && starts.length >= (limits.attempts ?? 3)) {
+    // Only a new task is another attempt of its job (see the dispatch check): this task's own rework
+    // rounds and resumes are bounded by rounds, renewals and the ceiling below.
+    const jobTasks = new Set(starts.map(e => e.task));
+    if (!reportOnly && !jobTasks.has(task) && jobTasks.size >= (limits.attempts ?? 3)) {
       append({kind: 'task.failed', task, reason: 'attempts_exhausted', text: 'Logical job attempt allowance exhausted; retain progress and request a scope decision', context});
       return false;
     }
-    if (starts.length && clock() >= Date.parse(starts[0].time) + ceilingMs) {
-      append({kind: 'task.failed', task, reason: 'deadline', text: 'Logical job ceiling exhausted', context});
+    // A job's time is not shared between its attempts (Daniel, 2026-09-30): the ceiling counts from this
+    // task's own first start. Found live (ACE e3bd01d5): a retry on a slow local model ran to the ceiling,
+    // and the retry on Sonnet submitted right after it was refused in the same second.
+    const own = starts.find(e => e.task === task);
+    if (own && clock() >= Date.parse(own.time) + ceilingMs) {
+      append({kind: 'task.failed', task, reason: 'deadline', text: 'Task ceiling exhausted', context});
       return false;
     }
     return true;
@@ -2370,15 +2715,42 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // handler journals `task.deadline` (state -> `timed_out`, terminal) THEN cancels — the process
   // is still live and must actually be torn down, so this one caller needs to reach a task the
   // ordinary terminal-skip below would otherwise treat as already handled.
-  async function cancel(taskId, {force = false, reason = 'user'} = {}) {
+  async function cancel(taskId, {force = false, reason = 'user', text = null} = {}) {
     const view = reducers.tasks(session.events);
     if (!view[taskId]) return {verified: true}; // nothing was ever submitted under this id: nothing to cancel
     let verified = true;
     for (const id of postOrder(view, taskId)) {
       if (reducers.TERMINAL.has(view[id]?.state) && !(force && id === taskId)) continue;
-      if (!(await cancelOne(id, view, reason))) verified = false;
+      if (!(await cancelOne(id, view, reason, text))) verified = false;
     }
     return {verified};
+  }
+
+  // A successor reaching `task.accepted`, or completing outright with no review gate, settles
+  // whatever OTHER task it was standing in for. A parked (blocked/input_required) task left
+  // behind by that supersession is news nobody will ever answer — its worker already exited, no
+  // watchdog covers it (reducers.watchdog skips both states), and no later row will touch it — so
+  // it is cancelled here the same way a user cancellation would be, not left to wake the
+  // orchestrator forever. Found live (session 159f4746): tasks 43387649 and 151ed901 stayed
+  // blocked after 01416607/56ae277e replaced them, because neither fresh task carried retryOf.
+  function supersedes(view, successorId, candidateId) {
+    if (successorId === candidateId) return false;
+    const successor = view[successorId], candidate = view[candidateId];
+    if (!successor || !candidate) return false;
+    if (successor.jobId && successor.jobId === candidate.jobId) return true;
+    const seen = new Set();
+    let id = successorId;
+    while (view[id]?.replaces && !seen.has(id)) {
+      if (view[id].replaces === candidateId) return true;
+      seen.add(id);
+      id = view[id].replaces;
+    }
+    return false;
+  }
+  async function cancelSuperseded(successorId) {
+    const view = reducers.tasks(session.events);
+    const parked = Object.values(view).filter(t => ['blocked', 'input_required'].includes(t.state) && supersedes(view, successorId, t.id));
+    for (const task of parked) await cancel(task.id, {reason: 'superseded', text: `Superseded by task ${successorId}`});
   }
 
   async function stop() {
@@ -2415,12 +2787,12 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     validate: spec => validate(spec, reducers.tasks(session.events)),
     // The submit decoration the bus applies before journaling a peer's task.submitted (Jev review).
     prepare,
-    submit, report, acceptOverride, cancel, stop, tick, reconcile,
+    submit, report, acceptOverride, reworkOverride, cancel, cancelRequest, stop, tick, reconcile,
     tasks: () => reducers.tasks(session.events),
     budgets: () => reducers.budgets(session.events),
     spend: () => reducers.spend(session.events),
     // Test-only observable for the live activity map's size (F2/A5) — never used by production code.
     _activitySize: () => activity.size,
-    close: () => { closed = true; planController.abort(); for (const entry of [...launchingAttempts.values(), ...reviews.values()]) entry.localController?.abort(); for (const wake of [...campaignWaiters]) wake(); effects.close(); unsubscribe(); if (watchdogInterval) clearInterval(watchdogInterval); },
+    close: () => { closed = true; for (const entry of [...launchingAttempts.values(), ...reviews.values()]) entry.localController?.abort(); machineSlots.releaseAll(); effects.close(); unsubscribe(); if (watchdogInterval) clearInterval(watchdogInterval); },
   };
 }

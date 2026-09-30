@@ -1,8 +1,9 @@
 // The orchestrator's working memory (docs/plans/orchestrator-memory.md). Found live: five sessions in one
-// workspace were a single campaign, each starting from an empty journal, and inside a session the
+// workspace were a single piece of work, each starting from an empty journal, and inside a session the
 // orchestrator re-derived the situation every wake — which is how ten identical reviewer tasks happened
-// without anyone noticing. Its own state note is judgement it rewrites each turn; the campaign view beside
-// it is fact bounce derives. Bounce never edits the note: over budget, it asks.
+// without anyone noticing. Its own state note is judgement it rewrites each turn; the view of the work beside
+// it is fact bounce derives. (Plans were removed 2026-09-29: the view is jobs only, no phase line.) Bounce
+// never edits the note: over budget, it asks.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {sessionView, STATE_MAX, VIEW_MAX} from '../src/session-view.js';
@@ -10,8 +11,9 @@ import {handoff} from '../src/core.js';
 
 const at = (m, rest) => ({time: `2026-09-22T20:${String(m).padStart(2, '0')}:00.000Z`, ...rest});
 const ORDERS = 'Review locking and journaling in src/workspaces.';
-const campaign = [
+const journal = [
   at(16, {kind: 'user', text: 'review the locking work'}),
+  // An old journal's plan rows: no phase is derived from them any more, and they change nothing else.
   at(19, {kind: 'plan.submitted', phase: 'p2-verdicts', chunks: [{id: 'lock'}, {id: 'docker'}, {id: 'cli'}]}),
   at(19, {kind: 'plan.accepted', plan: 'p2-verdicts', chunks: 3}),
   at(37, {kind: 'task.submitted', task: 'r1', profile: 'reviewer', orders: ORDERS}),
@@ -28,9 +30,9 @@ const campaign = [
   at(59, {kind: 'task.started', task: 'r3'}),
 ];
 
-test('S1 the campaign view: the phase, what each job has done, and a repeat nobody could see turn by turn', () => {
-  const view = sessionView(campaign, {now: Date.parse('2026-09-22T21:00:00.000Z')});
-  assert.deepEqual(view.phase, {name: 'p2-verdicts', chunks: 3, accepted: true});
+test('S1 the view of the work: what each job has done, and a repeat nobody could see turn by turn', () => {
+  const view = sessionView(journal, {now: Date.parse('2026-09-22T21:00:00.000Z')});
+  assert.equal('phase' in view, false, 'plans are gone: the view carries no phase');
   const reviewJob = view.jobs.find(job => job.profile === 'reviewer');
   assert.deepEqual([reviewJob.attempts, reviewJob.failed, reviewJob.endings], [3, 2, ['ceiling', 'ceiling']]);
   assert.equal(reviewJob.live, 1, 'r3 is still running');
@@ -42,11 +44,11 @@ test('S1 the campaign view: the phase, what each job has done, and a repeat nobo
 
 test('S2 the packet leads with the orchestrator\'s own state, then the facts, then the transcript', () => {
   const state = 'Phase p2-verdicts. Locking review failed twice at the ceiling on the 27B — not retrying it there; next is the same scope on codex. Docker and CLI areas untouched.';
-  const session = {cwd: '/w', file: '/w/journal.jsonl', events: [...campaign, at(59, {kind: 'state', text: state, from: 'orchestrator'})]};
+  const session = {cwd: '/w', file: '/w/journal.jsonl', events: [...journal, at(59, {kind: 'state', text: state, from: 'orchestrator'})]};
   const packet = handoff(session, 'carry on');
   assert.match(packet, /Where you are \(your own note, rewritten each turn\):\n/);
-  assert.equal(packet.indexOf(state) < packet.indexOf('Campaign:'), true, 'its own words come first');
-  assert.equal(packet.indexOf('Campaign:') < packet.indexOf('Recent history'), true, 'then the facts, then raw history');
+  assert.equal(packet.indexOf(state) < packet.indexOf('reviewer · 3 attempts'), true, 'its own words come first');
+  assert.equal(packet.indexOf('reviewer · 3 attempts') < packet.indexOf('Recent history'), true, 'then the facts, then raw history');
   assert.match(packet, /reviewer · 3 attempts · 2 failed \(ceiling, ceiling\)/);
   assert.equal(packet.includes('your state note is'), false, 'a note inside its budget is carried without comment');
 });
@@ -54,7 +56,7 @@ test('S2 the packet leads with the orchestrator\'s own state, then the facts, th
 test('S3 only the latest state is carried, and an over-budget one is carried in full with a request to shorten it', () => {
   const older = 'Phase one: reading.';
   const newest = `Phase two: ${'x'.repeat(STATE_MAX)}`;
-  const session = {cwd: '/w', file: '/w/journal.jsonl', events: [...campaign,
+  const session = {cwd: '/w', file: '/w/journal.jsonl', events: [...journal,
     at(58, {kind: 'state', text: older, from: 'orchestrator'}),
     at(59, {kind: 'state', text: newest, from: 'orchestrator'})]};
   const packet = handoff(session, 'carry on');
@@ -65,8 +67,8 @@ test('S3 only the latest state is carried, and an over-budget one is carried in 
 });
 
 test('S4 a session with no state note yet is asked for one, once', () => {
-  const session = {cwd: '/w', file: '/w/journal.jsonl', events: campaign};
+  const session = {cwd: '/w', file: '/w/journal.jsonl', events: journal};
   const packet = handoff(session, 'carry on');
   assert.match(packet, /You wrote no state note last turn: end this turn with one/);
-  assert.match(packet, /Campaign:/, 'the facts are there either way');
+  assert.match(packet, /reviewer · 3 attempts/, 'the facts are there either way');
 });

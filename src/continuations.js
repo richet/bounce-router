@@ -1,7 +1,5 @@
 import {createHash} from 'node:crypto';
 import {tasks, TERMINAL} from './reducers.js';
-import {admittedPlanDispatches} from './plan-admission.js';
-import {campaigns} from './orchestration.js';
 
 export const OUTCOME_KINDS = new Set([
   'task.completed',
@@ -13,12 +11,10 @@ export const OUTCOME_KINDS = new Set([
   'task.blocked',
   'task.input_required',
 ]);
-export const PLAN_DECISIONS = new Set(['plan.accepted', 'plan.rejected', 'plan.unavailable']);
 const PARKED = new Set(['blocked', 'input_required']);
 const SUCCESSFUL_TASK_OUTCOMES = new Set(['task.completed', 'task.accepted']);
 
 const taskActionId = row => `outcome:${row.seq}`;
-const planActionId = row => `plan:${row.seq}`;
 
 function orchestratorsTask(events, view, taskId) {
   let id = taskId;
@@ -64,7 +60,6 @@ export function disposedActionIds(events) {
 
 function taskActions(events) {
   const view = tasks(events);
-  const campaignView = campaigns(events);
   const byTask = new Map();
   for (const row of events) {
     if (!OUTCOME_KINDS.has(row.kind)) continue;
@@ -73,9 +68,7 @@ function taskActions(events) {
     // same task every turn. (A user's action still is news to the orchestrator.)
     if (row.from === 'orchestrator') { byTask.delete(row.task); continue; }
     const task = view[row.task];
-    const campaign = task?.campaignId ? campaignView[task.campaignId] : null;
     if (!task || carriedByAncestor(view, row.task) || !(TERMINAL.has(task.state) || PARKED.has(task.state))
-      || ['needs-input', 'user-paused'].includes(campaign?.state)
       || replaced(events, row.task) || !orchestratorsTask(events, view, row.task)) continue;
     byTask.set(row.task, row);
   }
@@ -96,70 +89,34 @@ function namedWait(row) {
   return typeof row.text === 'string' && /\bwait(?:ing)?\s+(?:for|on)\s+\S+/i.test(row.text);
 }
 
+// reload.js's own documented convention: an answer that ends the turn by asking the user for
+// one prompt closes with a `Next: <prompt>` line. That is a question, not a dropped outcome.
+const NEXT_LINE = /(^|\n)\s*Next:\s*\S/;
+const closesWithNext = text => typeof text === 'string' && NEXT_LINE.test(text);
+
 // A completed provider turn is transport success, not proof that an outcome was acted on.
-// The narrow compatibility exception is a successful task outside a campaign: reporting that
-// result to the user was the historical one-task flow. Failures and campaign work require a
-// durable successor, named wait, scope closure, or blocker written by this consuming turn.
-export function taskDispositionEvidence(events, action, {afterSeq = 0} = {}) {
+// A successful task is settled by reporting it. A failure or a parked task needs a durable
+// successor, a named wait, a `Next:` question, or a blocker written by this consuming turn.
+export function taskDispositionEvidence(events, action, {afterSeq = 0, closingText = null} = {}) {
   if (!action?.task) return null;
   const submitted = events.find(row => row.kind === 'task.submitted' && row.task === action.task);
   if (!submitted) return null;
-  if (SUCCESSFUL_TASK_OUTCOMES.has(action.kind) && !submitted.campaignId) return {disposition: 'reported'};
+  if (SUCCESSFUL_TASK_OUTCOMES.has(action.kind)) return {disposition: 'reported'};
   const durableLater = events.filter(row => (row.seq ?? 0) > (action.outcomeSeq ?? 0));
   const turnLater = durableLater.filter(row => (row.seq ?? 0) > afterSeq);
   const successor = durableLater.find(row => row.kind === 'task.submitted' && row.task !== action.task && (
     row.retryOf === action.task || row.replaces === action.task
-    || (submitted.jobId && row.jobId === submitted.jobId)
-    || (submitted.campaignId && row.campaignId === submitted.campaignId)));
+    || (submitted.jobId && row.jobId === submitted.jobId)));
   if (successor) return {disposition: 'scheduled', successor: successor.task};
-  if (turnLater.some(namedWait)) return {disposition: 'waiting'};
-  if (submitted.campaignId) {
-    const transition = durableLater.find(row => row.campaignId === submitted.campaignId
-      && ['campaign.completed', 'campaign.blocked'].includes(row.kind));
-    if (transition) return {disposition: transition.kind === 'campaign.completed' ? 'closed' : 'blocked'};
-    const scope = durableLater.findLast(row => row.campaignId === submitted.campaignId && row.kind === 'campaign.scope_changed');
-    const campaign = campaigns(events)[submitted.campaignId];
-    if (scope && campaign && campaign.remaining.length === 0) return {disposition: 'closed'};
-  }
+  if (turnLater.some(namedWait) || closesWithNext(closingText)) return {disposition: 'waiting'};
   const blocker = turnLater.find(row => row.kind === 'main.blocked'
     || (row.kind === 'task.blocked' && row.task === action.task));
   return blocker ? {disposition: 'blocked'} : null;
 }
 
-function planActions(events) {
-  const campaignView = campaigns(events);
-  const latest = new Map();
-  for (const row of events) {
-    if (!PLAN_DECISIONS.has(row.kind)) continue;
-    latest.set(row.planId ?? row.plan ?? `seq:${row.seq}`, row);
-  }
-  return [...latest.values()].filter(row => !['needs-input', 'user-paused'].includes(campaignView[row.campaignId]?.state)).map(row => ({
-    actionId: planActionId(row),
-    outcomeSeq: row.seq,
-    kind: row.kind,
-    planId: row.planId ?? row.plan,
-    phase: row.phase,
-    expectedChunks: Number.isInteger(row.chunks) ? row.chunks : Array.isArray(row.chunks) ? row.chunks.length : null,
-    row,
-  }));
-}
-
-function campaignActions(continuationState) {
-  const projected = continuationState?.() ?? [];
-  const pending = Array.isArray(projected) ? projected : projected.pending ?? [];
-  return pending.map((row, index) => ({
-    actionId: row.actionId ?? `campaign:${row.campaignId}:${row.seq ?? row.revision ?? index}`,
-    outcomeSeq: row.seq ?? null,
-    kind: row.kind ?? 'campaign.pending',
-    campaignId: row.campaignId,
-    row,
-  }));
-}
-
-export function pendingMainActions(events, {continuationState} = {}) {
+export function pendingMainActions(events) {
   const disposed = disposedActionIds(events);
-  return [...taskActions(events), ...planActions(events), ...campaignActions(continuationState)]
-    .filter(action => !disposed.has(action.actionId));
+  return taskActions(events).filter(action => !disposed.has(action.actionId));
 }
 
 export function actionSetKey(actions) {
@@ -174,24 +131,4 @@ export function wakeAttempts(events, key) {
 export function blockedActionSet(events, key) {
   return events.some(row => row.kind === 'main.blocked' && row.actionKey === key
     && ['wake_retry_exhausted', 'plan_undispatched', 'campaign_blocked'].includes(row.reason));
-}
-
-export function planDispatches(events, action) {
-  if (action.kind !== 'plan.accepted') return [];
-  const decision = action.row;
-  const linked = admittedPlanDispatches(events, action.planId).filter(row => row.seq > decision.seq);
-  if (linked.length) return linked;
-  // Old journals did not persist plan correlation. Retain their one-plan/one-dispatch behavior only
-  // when the decision itself also lacks the new planId field.
-  if (!decision.planId) return events.filter(row => row.kind === 'task.submitted' && row.seq > decision.seq && row.from === 'orchestrator');
-  return [];
-}
-
-export function acceptedPlanSatisfied(events, action) {
-  if (action.kind !== 'plan.accepted') return false;
-  if (action.expectedChunks === 0) return true;
-  const dispatches = planDispatches(events, action);
-  if (action.expectedChunks === null) return dispatches.length > 0;
-  const chunks = new Set(dispatches.map(row => row.chunkId ?? row.task));
-  return chunks.size >= action.expectedChunks;
 }

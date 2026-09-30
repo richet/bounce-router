@@ -1,12 +1,13 @@
 import {spawn} from 'node:child_process';
 import {createInterface} from 'node:readline';
 import {adapters} from './adapters/index.js';
+import {prepareCodexHome} from './codex-home.js';
 
 export const providers = Object.fromEntries(Object.entries(adapters).map(([name, a]) => [name, {login: a.login}]));
 export const limitPattern = /rate[_ -]?limit|usage[_ -]?limit|quota[_ -]?(?:exceeded|exhausted)|insufficient_quota|too many requests|(?:hit|reached|exceeded) your (?:usage )?limit|out of (?:credits|tokens)|\b429\b/i;
-export function invocation(provider, {model, mode, images = []}, promptFile) {
+export function invocation(provider, {model, mode, images = [], ephemeral = false}, promptFile) {
   if (!adapters[provider]) throw new Error(`Unknown provider: ${provider}`);
-  return adapters[provider].invocation({model, mode, images}, promptFile);
+  return adapters[provider].invocation({model, mode, images, ephemeral}, promptFile);
 }
 export function normalize(provider, raw) {
   if (!adapters[provider]) throw new Error(`Unknown provider: ${provider}`);
@@ -26,6 +27,7 @@ export function runProcess({provider, executable = provider, args, prompt, cwd, 
     const {BOUNCE_BUS, BOUNCE_BUS_TOKEN_FILE, BOUNCE_REMOTE_SESSION, BOUNCE_ROLE, BOUNCE_ORCHESTRATOR_PROFILE,
       BOUNCE_SUPERVISED, BOUNCE_DETACHED, BOUNCE_VIEW_DAEMON, BOUNCE_PERSISTENT_VIEW, BOUNCE_RESTART, ...env} = process.env;
     if (keepBus && BOUNCE_BUS !== undefined) { env.BOUNCE_BUS = BOUNCE_BUS; env.BOUNCE_BUS_TOKEN_FILE = BOUNCE_BUS_TOKEN_FILE; }
+    prepareCodexHome(executable, env);
     const child = spawn(executable, args, {cwd, env, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe']});
     const finish = result => { if (!closed) { closed = true; clearTimeout(killTimer); signal?.removeEventListener('abort', cancel); resolve(result); } };
     let killTimer;

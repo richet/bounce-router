@@ -12,7 +12,8 @@ import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {createHash} from 'node:crypto';
 import {installUpdate} from './update.js';
-import {spawn} from 'node:child_process';
+import {ensureCodexHome} from './codex-home.js';
+import {spawn, execFileSync} from 'node:child_process';
 import {parseArgs} from 'node:util';
 import {Session, config, dataRoot, pidAlive} from './core.js';
 import {loadQuota, recordQuota, quotaSnapshot} from './quota.js';
@@ -30,8 +31,6 @@ import {providers} from './providers.js';
 import {createScheduler} from './scheduler.js';
 import {hostSession} from './remote.js';
 import {createMainService} from './main-service.js';
-import {campaignCommand, campaigns} from './orchestration.js';
-import {tasks, TERMINAL as TASK_TERMINAL} from './reducers.js';
 import {createViewServer, connectView, requestViewControl} from './view-transport.js';
 
 const CHILD_KILL_GRACE_MS = 1500; // same grace as runProcess's cancel and live-common's verifiedCancel
@@ -73,6 +72,58 @@ export async function validate(root = projectRoot, emit = () => {}) {
 
 
 function daemonJsonPath(dir) { return path.join(dir, 'daemon.json'); }
+
+// A detached daemon used to run with stdio 'ignore', so whatever killed it was lost. Found live
+// (ACE d1bc0206): the daemon died at 08:14 with nothing on record, and the TUI showed its tasks as
+// working for four more hours. Its stdout and stderr now go to <session>/daemon.log (V8's own
+// out-of-memory message included), rotated once past 10 MB.
+const DAEMON_LOG_MAX = 10 * 1024 * 1024;
+export function daemonLogStdio(dir) {
+  const file = path.join(dir, 'daemon.log');
+  try { if (fs.statSync(file).size > DAEMON_LOG_MAX) fs.renameSync(file, `${file}.1`); } catch {}
+  const fd = fs.openSync(file, 'a', 0o600);
+  return ['ignore', fd, fd];
+}
+
+const daemonLogTail = dir => { try { return fs.readFileSync(path.join(dir, 'daemon.log'), 'utf8').trim().split('\n').slice(-3).join(' | ').slice(0, 600); } catch { return ''; } };
+
+// A bounce daemon for this session that holds its lock but never became ready (no daemon.json of
+// its own) is stuck, and every resume fails behind it with "already open in another bounce process".
+// Found live (ACE d1bc0206): a daemon that failed to start kept the lock for half an hour. Such a
+// process — this session's own daemon command line, alive past `minAgeMs` — is stopped (SIGTERM,
+// then SIGKILL) so the resume can start a fresh one. Anything else holding the lock is left alone.
+const elapsedMs = etime => {
+  const [days, clock] = etime.includes('-') ? etime.split('-') : ['0', etime];
+  return (clock.split(':').map(Number).reduce((total, part) => total * 60 + part, 0) + Number(days) * 86400) * 1000;
+};
+export async function releaseStuckDaemon(dir, id, {minAgeMs = 30000, inspect = pid => execFileSync('ps', ['-o', 'etime=,command=', '-p', String(pid)], {encoding: 'utf8'}).trim(), kill = (pid, signal) => process.kill(pid, signal), sleep = ms => new Promise(resolve => setTimeout(resolve, ms))} = {}) {
+  let pid;
+  try { pid = Number(fs.readFileSync(path.join(dir, 'lock'), 'utf8')); } catch { return null; }
+  if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid || !pidAlive(pid)) return null;
+  if (readDaemonJson(dir)?.pid === pid) return null;
+  let line;
+  try { line = inspect(pid); } catch { return null; }
+  const [etime, ...command] = line.split(/\s+/);
+  const commandLine = command.join(' ');
+  if (!/cli\.js/.test(commandLine) || !commandLine.includes(`--resume ${id}`) || elapsedMs(etime) < minAgeMs) return null;
+  try { kill(pid, 'SIGTERM'); } catch { return null; }
+  for (let waited = 0; waited < 10000 && pidAlive(pid); waited += 250) await sleep(250);
+  if (pidAlive(pid)) { try { kill(pid, 'SIGKILL'); } catch {} for (let waited = 0; waited < 2000 && pidAlive(pid); waited += 250) await sleep(250); }
+  return pid;
+}
+
+// An error that escapes everything in the daemon is recorded in its own journal before it exits,
+// so the session says why it stopped. It still exits: nothing downstream expects a daemon that
+// carries on after an unknown failure.
+export function installCrashRecord(session, {exit = code => process.exit(code), on = (event, handler) => process.on(event, handler)} = {}) {
+  const record = reason => error => {
+    try { session.append({kind: 'daemon.crashed', reason, text: String(error?.message ?? error), stack: String(error?.stack ?? '').slice(0, 4000)}); } catch {}
+    try { process.stderr.write(`bounce daemon ${reason}: ${error?.stack ?? error}\n`); } catch {}
+    exit(70);
+  };
+  on('uncaughtException', record('uncaught_exception'));
+  on('unhandledRejection', record('unhandled_rejection'));
+}
 
 function readDaemonJson(dir) {
   try { return JSON.parse(fs.readFileSync(daemonJsonPath(dir), 'utf8')); }
@@ -134,10 +185,12 @@ export function choosingOrders({agents = false, routingOn = false, localOn = fal
   return ['Who to submit to — the job, not the AI:',
     ...(agents ? ['    1. An agent, by the job the task is: analyst to inspect and run checks, builder to implement (and, when its orders say so, to own shared files and run the full gate), reviewer to review, debugger to root-cause a failure that resisted a first attempt. Analysts and verifiers run commands in disposable workspaces by default. Explicit read-only profiles are for source-only inspection.'] : []),
     ...(routingOn ? [`    ${agents ? '2' : '1'}. \`auto\` when no agent is clearly the job: Jev routes it.`] : []),
-    `    ${[agents, routingOn].filter(Boolean).length + 1}. A worker profile by name ONLY when the user asks for that specific AI, or an agent's own list has been exhausted.`,
+    `    ${[agents, routingOn].filter(Boolean).length + 1}. A worker profile by name ONLY when the user asks for that specific AI (add \`userAsked: true\` to the task), or for a retry (\`retryOf\`); bounce refuses a first attempt that names a profile otherwise.`,
+    'After a failed attempt, you may name the next profile for the retry yourself and say why; first attempts still follow the ordering above. Retry first on the agent\'s own next AI: submit the name after the arrow in its chain above (builder~2, then builder~3) with retryOf; it is the lightest AI that has not tried the task. Name a cloud AI yourself only when the cause needs a stronger tier: a mid-tier model (e.g. Sonnet) for routine implementation a local worker could not finish; the top tier (e.g. Opus) only for hard design, cross-module debugging, or work a mid-tier attempt already failed.',
     routingOn ? 'Do not pick a tier or a model yourself: for an agent or `auto`, Jev weighs the orders and picks the AI per task.'
       : 'An agent runs on the AIs in the order its file lists them; naming a profile skips that list.',
-    'Every task.submitted and plan chunk must declare requires: ["read"], ["read", "exec"], or ["read", "exec", "write"] to match the actual deliverables. Command execution requires exec even when no source edits are allowed. Use command-capable analysts for audits; independent verification may be a separate probe task and required campaign gate. Probe tasks run in disposable copies so checks can write caches without changing source. Never ask a read-only analyst to run git, checks, lint or tests. A blocked completion review preserves the candidate: read task_get full and its reviewGate before deciding what work is missing. Never resubmit completed analysis just because its acceptance review is unavailable.',
+    'Every task.submitted declares requires: ["read"], ["read", "exec"], or ["read", "exec", "write"] to match its deliverables; running a command needs exec even with no edits. Probe tasks run in disposable copies. Never ask a read-only analyst to run git, checks, lint or tests.',
+    'A live container check (starting Docker, inspecting or running one) needs requires including "docker", and only a worker that may write gets it: a read-only or probing analyst never reaches Docker, because a container can write the checkout. Send live container checks to a builder.',
     'Once you have dispatched a task, end your turn: say in a line what you dispatched and what comes next, then stop. bounce wakes you with each outcome as your next turn (a `handoff` row), so nothing is lost. Do not hold your turn open in `bounce wait` while workers run — a turn held open keeps its whole context live and idle (observed: 74% of a 35-minute turn spent waiting), and do not investigate the same question yourself in parallel — that spends the worker\'s whole slot for nothing. If you must take the work back, cancel the task first.',
     ...(localOn ? ['Local models are part of the normal path, not a special request: an agent runs on a local model when one fits the task, at no cost — do not wait for the user to ask for them, and do not route around them by naming a cloud profile.',
       'They are bounded by this machine\'s memory: bounce loads what fits, unloads an idle model to make room, and waits when nothing fits (it tells you if a task waits too long). While macOS reports memory pressure (warning or critical) it will not start a local worker: that task goes to the agent\'s next AI. You never manage memory yourself.'] : []),
@@ -148,7 +201,7 @@ export function choosingOrders({agents = false, routingOn = false, localOn = fal
 // Whose task is this, for the bus grant? A task the orchestrator submitted, or a replacement bounce made
 // for one — a fallback is submitted `from: bounce`, but the work is still the orchestrator's and it must be
 // able to submit under it. Found live: a rework under a fallback replacement was refused `-32001
-// unauthorized` on both transports, and the campaign stopped with the fix already written. Cycle-guarded.
+// unauthorized` on both transports, and the run stopped with the fix already written. Cycle-guarded.
 // Every task the orchestrator owns, for seeding its bus grant at startup. The grant is otherwise built
 // empty and widened only by rows arriving live, so a restart disowned everything from before it — and a
 // submit parented under earlier work was refused. Finished tasks are included: they can still be parents.
@@ -171,21 +224,18 @@ export function orchestratorOwns(events, task) {
   return false;
 }
 
-export const breakdownOrders = (minutes, {jevOn = false, ceiling = Math.max(TASK_CEILING_MINUTES, minutes)} = {}) => [
+export const breakdownOrders = (minutes, {ceiling = Math.max(TASK_CEILING_MINUTES, minutes)} = {}) => [
   'Break big work down: phases in sequence, each phase made of chunks that run in parallel.',
   `A task runs under a ${minutes}-minute lease that bounce renews while the worker makes progress, up to a ${ceiling}-minute ceiling; a deadline over the ceiling is refused (task.failed, reason size) before anything runs. Size a chunk by scope (one owner, one acceptance), not by minutes: long work is normal.`,
-  'However large the request, never hand one worker the whole job. Plan the phases first; within a phase submit every chunk whose',
+  'For work big enough to need phases, do not hand one worker the whole job. Plan the phases first; within a phase submit every chunk whose',
   'owned paths are disjoint at once, so they run in parallel; give a task that needs another\'s result depends_on with its task id, so',
   'phases run in sequence without you polling. Each chunk gets disjoint owned paths, its own acceptance and how to verify it.',
-  'Before dispatching a phase, submit its plan with a stable plan id and wait for that exact decision:',
-  `    bounce publish --event '{"kind":"plan.submitted","plan":"<plan id>","phase":"<phase name>","chunks":[{"id":"<short id>","profile":"<agent>","orders":"<goal, acceptance, how to verify>","requires":["read","exec"],"owns":["<path or glob>"],"depends_on":["<chunk id>"],"deadline":${minutes * 60000}}]}'`,
-  'Use the `plan_wait` tool with that plan id. A timeout means the decision is still pending; it does not authorize dispatch.',
-  `${jevOn ? 'Jev judges each chunk — phase-sized, no acceptance, overlapping paths, hidden dependency — and bounce' : 'bounce checks each chunk for overlapping owned paths and a deadline over the ceiling, and'} answers with plan.accepted`,
-  'or plan.rejected (findings per chunk, with the fix). Fix a rejected plan and submit it again; submit the chunks of an accepted one',
-  'with the same `requires`, `owns`, deadline, review constraints and `depends_on`, and copy the plan id and chunk id into each task as `planId` and `chunkId`.',
+  'Owned paths are where a chunk\'s work lands, not a fence: they tell the worker where its work belongs and help you plan chunks that can run side by side. Bounce integrates whatever the worker actually changed, and refuses only a file that changed in the checkout in the meantime (a conflict) — never tell a worker to stop over a change outside its owned paths.',
+  'Acceptance must be reachable with the authority you grant: never require live proof (Docker, a real run) from a worker whose orders forbid it — grant it (`requires` docker) or plan the live check as its own task.',
   'A review of a whole phase, or of more than one risk area, is heavy: split it into one reviewer per area (for example locking and journaling, ownership, the CLI), each with the verification commands for its area. Reviewers probe: they run commands but cannot change the tree.',
   'Review each phase before the next one starts: read what the chunks produced, integrate, run the gate, then submit the next',
-  'phase. A chunk that stops making progress or reaches the ceiling is asked for its conclusion and reported as is: resubmit what is left with that progress in its orders, or record the concrete campaign blocker after bounded recovery.', ''];
+  'phase. A chunk that stops making progress or reaches the ceiling is asked for its conclusion and reported as is: resubmit what is left with that progress in its orders, or do the small remaining step yourself.',
+  'bounce continues a worker that hits its step limit while progressing (up to 3 times); when a local worker still fails, read the actual cause in its outcome (step limit, blocked, or an error) before switching AI, and prefer retrying the same local worker when the cause was the step limit or a fixable command mistake.', ''];
 
 export function buildProfiles(settings) {
   return {main: {adapter: settings.order[0], mode: settings.mode, fallback: settings.order.slice(1)}};
@@ -203,64 +253,28 @@ export function orchestratorBridgeEnv({session, bus, grant, profile}) {
     BOUNCE_ROLE: 'orchestrator', BOUNCE_ORCHESTRATOR_PROFILE: JSON.stringify(profile)};
 }
 
-const ACTIVE_CAMPAIGN_TASKS = new Set(['queued', 'running', 'waiting', 'reviewing']);
-
-// A campaign action changes identity when its scope revision or latest scoped task evidence changes.
-// Main narration is deliberately absent from the key: describing an obligation cannot satisfy it.
-export function campaignContinuationState(events) {
-  const campaignView = campaigns(events);
-  const taskProjection = tasks(events);
-  const result = [];
-  for (const campaign of Object.values(campaignView)) {
-    if (campaign.state !== 'active' || !campaign.remaining.length) continue;
-    const scopedTasks = Object.values(taskProjection).filter(task => task.campaignId === campaign.id);
-    if (scopedTasks.some(task => ACTIVE_CAMPAIGN_TASKS.has(task.state) && !TASK_TERMINAL.has(task.state))) continue;
-    const taskIds = new Set(scopedTasks.map(task => task.id));
-    const latest = events.findLast(row => row.campaignId === campaign.id
-      || (row.kind?.startsWith('task.') && taskIds.has(row.task)));
-    const seq = latest?.seq ?? 0;
-    const remainingKey = createHash('sha256').update(campaign.remaining.join('\n')).digest('hex').slice(0, 12);
-    result.push({kind: 'campaign.pending', campaignId: campaign.id, revision: campaign.revision, seq,
-      remaining: [...campaign.remaining], actionId: `campaign:${campaign.id}:r${campaign.revision}:s${seq}:${remainingKey}`,
-      text: `Campaign ${campaign.id} still requires gates: ${campaign.remaining.join(', ')}`});
-  }
-  return result;
-}
-
-// Exhausting the main continuation allowance is itself a campaign transition. Persist needs-input
-// so restart and UI projections cannot mistake an exhausted active campaign for silent progress.
-export function installCampaignContinuation({session}) {
-  const persistBlocker = row => {
-    if (row.kind !== 'main.blocked' || row.reason !== 'campaign_blocked') return;
-    const blocked = new Set(row.actionIds ?? []);
-    for (const pending of campaignContinuationState(session.events)) {
-      if (!blocked.has(pending.actionId)) continue;
-      campaignCommand(session, {kind: 'campaign.block', from: 'orchestrator', campaignId: pending.campaignId,
-        reason: `Campaign continuation attempts exhausted with unmet gates: ${pending.remaining.join(', ')}`});
-    }
-  };
-  const unsubscribe = session.subscribe(persistBlocker);
-  for (const row of session.events) persistBlocker(row);
-  return unsubscribe;
-}
-
 // The orchestrator profile's standing brief, written once per daemon start: where its skill
 // lives and how to reach the bridge. The prompt line cli.js prepends points at this file.
 function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, jev = null, notes = {}, roles = null, settings = {}, adapterNames = []}) {
   const dir = path.join(session.dir, 'orchestrator');
   const autoFallback = routingFallback(profiles, jev?.routing?.default);
   const routingOn = Boolean(jev?.enabled && jev?.routing?.enabled);
-  // What each profile's model is for, from the profile itself or the roster notes bounce wrote.
-  const about = name => notes[name] ?? {};
   fs.mkdirSync(dir, {recursive: true, mode: 0o700});
   const file = path.join(dir, 'ORDERS.md');
   fs.writeFileSync(file, [
     `# Orchestrator orders — session ${session.id}`, '',
-    'You coordinate; workers implement. Delegate every implementation task to a worker profile below.',
-    'Do not edit the repository yourself and do not read bounce\'s own source to learn the bridge — everything you need is here.',
-    'Workers run ONLY through this bridge: never your own subagent/Agent/Task tools (they are switched off for you), and never',
-    'do the work yourself when a dispatch fails — a task.failed row names the reason and the bounded recovery allowed for it.', '',
-    'Brief from the request and what you already know; do not read the repository first to write a "precise" brief. The worker',
+    'These orders govern this session. Where the user\'s CLAUDE.md or WORKFLOW.md conflict with them — asking before assuming,',
+    'waiting at gates, opening every answer with a TLDR — follow these orders. You may still read those files for the user\'s',
+    'conventions (commit style, testing rules, repository conventions) and pass them on to workers. Never push, and never add',
+    'AI attribution to commits or PRs.', '',
+    'You coordinate. Do small things yourself: answer questions, read files, run read-only checks, and run a short real-folder',
+    'step the user asked for (e.g. a commit). Dispatch a worker for anything that edits source or will take more than about five',
+    'minutes; big work is still planned in phases (below) rather than handed to one worker whole.',
+    'Do not read bounce\'s own source to learn the bridge — everything you need is here.',
+    'Workers run ONLY through this bridge: never your own subagent/Agent/Task tools (they are switched off for you). When a dispatch',
+    'fails, its task.failed row names the reason: re-dispatch it (the next AI, or a smaller scope), or do the small remaining step yourself.', '',
+    'For anything you dispatch to a worker, brief from the request and what you already know; do not read the repository first',
+    'to write a "precise" brief. The worker',
     'inspects the code itself at full speed and would only reread what you read (measured: 1–2 minutes of orchestrator reading per',
     'turn, then the same files again in the worker). State the goal, the acceptance, the paths you happen to know and how to verify,',
     'and submit — usually within a few seconds of the user\'s message. When a decision genuinely depends on a fact you lack, ask one',
@@ -273,16 +287,18 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     `    BOUNCE_SESSION=${session.id}`, '',
     // Two layers, both submit targets. AGENTS are jobs: one line each, the hidden backend chain folded in;
     // a model ref names its provider, and a local provider runs through opencode (said, not shown as the ref).
-    'Agents you can submit to (a job: name → the AIs that may play it, in fallback order):',
+    'Agents you can submit to (a job: name → the AIs that may play it, in fallback order; the name before each later AI is the profile a retry submits to run on it):',
     ...(() => {
       const ref = p => `${LOCAL_ADAPTERS.has(p.adapter) ? `${p.endpoint ?? 'lmstudio'}/${p.model || 'auto'} (via opencode)` : [p.adapter, p.model].filter(Boolean).join('/')}`;
       const seen = new Set(); const lines = [];
       for (const [name, p] of Object.entries(profiles)) {
         if (name === orchestrator || name === JEV_REVIEWER || seen.has(name) || !p.derived) continue;
         const chain = []; let current = name;
-        while (current && !seen.has(current)) { seen.add(current); chain.push(profiles[current]); current = profiles[current].derived ? profiles[current].fallback[0] : null; }
+        const names = [];
+        while (current && !seen.has(current)) { seen.add(current); names.push(current); chain.push(profiles[current]); current = profiles[current].derived ? profiles[current].fallback[0] : null; }
         const head = chain[0];
-        lines.push(`    ${name} → ${head.auto && routingOn ? 'Jev picks the AI per task, else ' : ''}${chain.map(ref).join(', ')}${head.agent ? ` · ${head.agent.policy} · ${head.agent.description}` : head.role ? ` (${head.role})` : ''}`);
+        const named = chain.map((p, index) => index === 0 ? ref(p) : `then ${names[index]}: ${ref(p)}`);
+        lines.push(`    ${name} → ${head.auto && routingOn ? 'Jev picks the AI per task, else ' : ''}${named.join(', ')}${head.agent ? ` · ${head.agent.policy} · ${head.agent.description}` : head.role ? ` (${head.role})` : ''}`);
       }
       return lines;
     })(),
@@ -306,8 +322,7 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
         '`bounce agents` lists the team in force; `bounce agents show NAME` prints one.', '',
       ];
     })(),
-    'Worker profiles (one AI each: name → adapter/model) — the exception: name one only when the user asks for that AI:',
-    ...Object.entries(profiles).filter(([name, p]) => name !== orchestrator && name !== JEV_REVIEWER && !p.derived).map(([name, p]) => `    ${name} → ${[p.adapter, p.model].filter(Boolean).join('/')}${p.role ? ` (${p.role})` : ''}${about(name).tier ?? p.tier ? ` [tier ${about(name).tier ?? p.tier}]` : ''}${about(name).capabilities ?? p.capabilities ? ` — ${about(name).capabilities ?? p.capabilities}` : ''}`),
+    `Worker profiles (one AI each): ${Object.entries(profiles).filter(([name, p]) => name !== orchestrator && name !== JEV_REVIEWER && !p.derived).map(([name, p]) => p.model ? `${name} (${p.model})` : name).join(', ') || 'none configured'} — name one only when the user asks for that AI, or for a retry (see above).`,
     ...(jev && autoFallback ? [`    auto → ${routingOn ? 'Jev (TypeSafe) routes each task: to the agent above whose job the orders clearly describe (that agent\'s own models then decide the AI), otherwise by the tier the orders need — the first fitting worker profile of that tier in the provider order; unconfident picks go to' : 'Jev routing is off (/jev routing on): resolves to'} ${autoFallback}`] : []),
     'Local discovery checks eligibility at dispatch. A downloaded model is not necessarily loaded or tool-capable.',
     'If the user asks for a LOCAL worker specifically and no agent can run on one, report that and point to /local on and /local setup; do not quietly substitute a cloud worker for that request.',
@@ -323,51 +338,45 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     ...choosingOrders({agents: Object.entries(profiles).some(isAgentHead), routingOn, localOn: (() => { try { return normalizeLocalSettings(settings.local).enabled && adapterNames.includes('opencode'); } catch { return false; } })()}),
     'Submit work with `bounce publish --event <json>`; its outcome reaches you as a handoff when you end your turn.',
     'When bounce\'s MCP tools are available to you (submit, wait, report, task_get, tasks_list), use them instead of these commands: the answers come back structured and bounded. The commands stay as the fallback.',
-    'For work with several required outcomes, call `campaign_start` first with the objective and every required gate. Put its `campaignId` and one `gate` on every task. The campaign stays active until every gate is satisfied; a status narration does not satisfy a gate.',
-    'Use `campaign_extend` when authorized work adds a required gate, `campaign_complete` only after every gate is satisfied, and `campaign_block` with the exact blocker when bounded recovery is exhausted or progress needs user input. Only the user can reduce scope or pause/resume a campaign.',
-    'After submitting a plan, call `plan_wait` with its exact plan id. Dispatch only accepted chunks, carrying `planId` and `chunkId` onto each task; a late decision is durable and wakes the main conversation after restart.',
-    'End every turn by writing where the campaign is — the `state` tool, or `bounce publish --event \'{"kind":"state","text":"…"}\'`. It is one living note you rewrite each turn, not a log: the phase, what is done, what is next, and why you changed course. It is the first thing you are given when you wake, so write it for a reader who has nothing else. Keep it under 2000 characters; bounce tells you when it is too long and never cuts it for you.',
+    'End every turn by writing where the work is — the `state` tool, or `bounce publish --event \'{"kind":"state","text":"…"}\'`. It is one living note you rewrite each turn, not a log: the phase, what is done, what is next, and why you changed course. It is the first thing you are given when you wake, so write it for a reader who has nothing else. Keep it under 2000 characters; bounce tells you when it is too long and never cuts it for you.',
     'A task killed at its ceiling or for silence is not to be resubmitted unchanged: change the scope or the AI first. Bounce refuses a third identical attempt (task.failed, reason repeat), and each handoff tells you when a job has failed the same way before.',
     'To see what a task is doing or what it produced, ask `task_get` (or `bounce task <id>`), and `tasks_list` (or `bounce tasks`) for everything live. Never read a session journal with tail, cat, jq or grep: it is the raw log, it is what bounce already summarised for you, and one read of it has put 143 KB into a turn.',
     // Found live: the summary is cut at 1,200 characters, and with the journal forbidden the
     // orchestrator had no way to the rest of a 12 KB verdict — it hunted, gave up, and started redoing the
     // reviewer's work. The way exists now, so the orders are where it is named.
-    'That view is bounded on purpose, so its summary is cut. When a task has finished and you need its verdict whole — every finding, its repro and its observed output — ask `task_get` with `full: true` (or `bounce task <id> --report`). That is the one way to the full text, and the reason you never need the journal.',
+    'A handoff carries the worker\'s answer in full, up to 12,000 characters, so a finished task handed to you needs no second look-up. '
+      + 'That view is bounded on purpose, so its summary is cut. When a task has finished and you need its verdict whole — every finding, its repro and its observed output — ask `task_get` with `full: true` (or `bounce task <id> --report`). That is the one way to the full text, and the reason you never need the journal.',
     'Example — submit one task, then end your turn:',
-    `    bounce publish --event '{"kind":"task.submitted","parent":null,"campaignId":"<campaign id>","gate":"<required gate>","planId":"<plan id>","chunkId":"<chunk id>","profile":"${defaultTarget(profiles, orchestrator, {routingOn})}","orders":"<goal, owned paths, acceptance, how to verify>","deadline":${taskLimits(settings).minutes * 60000}}'`,
+    `    bounce publish --event '{"kind":"task.submitted","parent":null,"profile":"${defaultTarget(profiles, orchestrator, {routingOn})}","orders":"<goal, owned paths, acceptance, how to verify>","deadline":${taskLimits(settings).minutes * 60000}}'`,
     '`bounce wait` is for a short wait only, at most 120 seconds, when the very next step depends on an outcome you expect within it:',
     `    bounce wait --match '{"kind":"task.completed","task":"<task id from the publish reply>"}' --timeout 120`,
     '`--timeout` is seconds. A `null` reply means it expired, not that the task ended — end your turn: every outcome of a task you',
     'submitted that no `wait` of yours returned is handed to you by bounce, as your next turn when you are idle (a `handoff` row in',
     'the journal) or in front of the next prompt, so you never need to poll. A `[bounce:wait.interrupted]` reply means the user sent',
     'you a message during the wait: it is in your turn now — read it and act on it before anything else.',
-    'Fields: parent (null for a root task), profile (a name above), orders (the brief, required), deadline (ms, optional), campaignId and gate (the durable obligation), planId and chunkId (the accepted-plan correlation),',
+    'Fields: parent (null for a root task), profile (a name above), orders (the brief, required), deadline (ms, optional),',
     'jobId (stable logical job) and retryOf (the previous task attempt). A retry continues the same job; use retryOf rather than parent, which creates dependent work instead of retrying the job.',
     'depends_on (task ids, optional), review ({"prelaunch": <profile>, "completion": <profile>}, optional, review-role profiles only),',
     'steps (the verification steps, as text) — required when the completion reviewer is a verifier profile, refused with reason `steps` without it.',
+    'check (one shell command that proves the work is done, optional but give one to every task that changes files; it must run the work — its tests, its script — and fail when the result is wrong, because a check that only looks for a file or a phrase passes on a false report; bounce tells you when you submit one, and passing it does not count as verification): bounce runs it in the worker\'s copy when the worker finishes, in a plain shell with its own environment (give a tool that is not on the path its full path), and only work that passes (exit 0) reaches the checkout by itself. A failure goes back to the worker once with what the check printed. Work that changed files and that no such check has verified (the check still fails, could not run, only looks, or was not given) is kept in the worker\'s copy and comes to you as task.blocked (reason `check_failed`, `check_unrunnable` or `unverified`) with the folder it is in and what the review said: that is not a failure, it is work waiting for you. Read or run it there, then accept it (task.accepted with what you checked, which puts it in the checkout), send it back, or retry it on another AI.',
     'A verifier is handed steps alone as its orders, so they must stand on their own. A strict session requires both review stages as well.',
     'The publish reply shows the task id as `task=<id>` (add --json for the whole row). Always match on kind AND task: a match on the task alone returns the task.submitted row at once.',
     'The publish reply carries the task id. `wait` on a task outcome follows replacements and waits for completion review when configured. Read the',
     'returned row\'s `kind`: task.completed or task.accepted is done. task.deadline (and the task.cancelled with reason `deadline` that',
     'follows it) means the worker ran out of time with the work unfinished: use its partial progress to submit a smaller continuation with retryOf; it is not a reason to stop the run.',
-    'Recover by the typed failure and keep it bounded: repair validation/refusal input once; retry transient provider or infrastructure failure within the recorded allowance; rework a rejected result against its findings. Never resubmit an unchanged timed-out or repeated attempt.',
-    'A user cancellation stops that work. When retries are exhausted, termination is unverified, or a decision truly requires the user, call campaign_block with the concrete blocker so the durable campaign enters needs-input instead of silently stopping.',
-    'Terminal rows: task.completed, task.failed, task.cancelled, task.rejected. Steer a running worker with',
+    'Recover by the typed failure: retry a transient provider failure on the next AI, send a result back once against its findings, resubmit a timed-out task smaller. Never resubmit an unchanged timed-out or repeated attempt. A user cancellation stops that work.',
+    'Record a blocker only when something needs the user — a decision, credentials, a push — never because retries ran out: re-dispatch a lost or blocked worker, or do the small thing yourself. A refusal or a correction note on your submission says exactly what to change.',
+    'Terminal rows: task.completed, task.accepted, task.failed, task.cancelled, task.rejected. Steer a running worker with',
     `    bounce publish --event '{"kind":"message","to":"worker:<task id>","text":"..."}'`, '',
-    ...breakdownOrders(taskLimits(settings).minutes, {jevOn: Boolean(jev?.enabled), ceiling: taskLimits(settings).ceiling}),
-    'Progress is a durable contract, not a heartbeat. Publish task.milestone with task, phase, text, next, and evidence',
-    'after initial inspection, every phase change, and before completion. Phases: inspect, plan, implement, test,',
-    'verify, review, document, done. `text` says what changed, `next` says what happens next, and `evidence` names',
-    'the concrete file, command, test result, or artifact. Publish task.blocked immediately when progress stops.',
-    'Every task.* row you publish needs `task` (an id from your own publish replies): without it the bus refuses',
-    `    bounce publish --event '{"kind":"task.milestone","task":"<task id>","phase":"inspect","text":"…","next":"…","evidence":["…"]}'`, '',
-    'You may publish only: task.submitted, task.accepted, task.milestone, task.blocked, task.input_required, task.usage, task.activity, message.',
-    'A task blocked at an unconfident review gate (reason review_not_accepted, review_uncertain or review_unavailable) waits for your decision: check the work yourself, then publish task.accepted with `text` naming what you checked and why, or send it back or resubmit. A confident review verdict, and work its worker reported unfinished, cannot be accepted by hand.',
+    ...breakdownOrders(taskLimits(settings).minutes, {ceiling: taskLimits(settings).ceiling}),
+    'Workers report their own progress and final result through `bounce report`/their report tool, on the contract bounce hands',
+    'them; you read their outcomes (task_get, tasks_list, a handoff) — you do not publish milestones for them.',
+    'Every task.* row you publish needs `task` (an id from your own publish replies): without it the bus refuses.',
+    'You may publish only: task.submitted, task.accepted, task.rework, task.cancel, task.milestone, task.blocked, task.input_required, task.usage, task.activity, message.',
+    'A review sends a task back at most once; after that it is accepted, and what the review still found arrives as `advice` on task.accepted — read it before building on the work. Any task holding finished work (blocked, under review, or asking for input) you may accept yourself (task.accepted with `text`) or send back to the same worker (task.rework with `text` naming what to fix).',
+    'When you replace a blocked task with a fresh one, or no longer need a task, cancel it with task.cancel and a reason, so its outcome stops waiting.',
     'When a worker is blocked or asks for input because it needs a decision, answer it by publishing a message to worker:<task id>: the same worker resumes with your answer. Do not re-dispatch the job as new work for that.',
     '`bounce agents set` journals agents.defined for you.',
-    'A Codex worker calls its scoped `bounce_report` tool; other workers use `bounce report --report <json>`. Reports require op (milestone, blocked,',
-    'input_required or final), phase, text and next;',
-    'a final report additionally requires outcome (completed|failed|blocked|input_required) and summary. Do not use publish for a final report.',
     'Everything else is refused — `user`, `control.*`, and every other task lifecycle row the scheduler owns.',
   ].join('\n') + '\n', {mode: 0o600});
   return file;
@@ -448,6 +457,15 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   const cwd = fs.realpathSync(values.cwd || process.cwd());
   const session = new Session(cwd, {root, id: values.resume ? resolveSessionRef(root, values.resume) : undefined});
   session.lock();
+  if (detachedDaemon) installCrashRecord(session);
+  // Bounce's own Codex home (src/codex-home.js): its MCP entry kept current, and a missing sign-in said
+  // plainly, since a Codex worker there would otherwise fail at launch with the vendor's own message.
+  if (orchestrating && Object.values(orchestration.profiles).some(p => p.adapter === 'codex')) {
+    try {
+      const home = ensureCodexHome({command: 'bounce'});
+      if (!home.signedIn) session.append({kind: 'status', text: `Codex is not signed in for bounce (bounce keeps its own Codex home, apart from the Codex app): run bounce login codex`});
+    } catch (error) { session.append({kind: 'status', text: `Could not prepare bounce's Codex home: ${error.message}`}); }
+  }
 
   const profiles = profileOverride ?? (orchestrating ? orchestration.profiles : buildProfiles(settings));
   // Jev (src/jev.js): the read-only `jev` critic every root task may be reviewed by, registered
@@ -481,15 +499,16 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // `strategy:` setting resolved by validateOrchestration (default: defaultStrategy) applies.
   let bus;
   const reportTokens = new Map();
-  const scheduler = createScheduler({session, adapters, profiles, localSettings: settings.local, sessionMode: settings.mode, strict: orchestration.strict, limits: taskLimits(settings),
-    requireFinalReport: orchestrating, reportGrant: ({task, attempt, context}) => {
+  const scheduler = createScheduler({session, adapters, profiles, localSettings: settings.local, sessionMode: settings.mode, strict: orchestration.strict, limits: taskLimits(settings), maxConcurrentCloud: settings.maxConcurrentCloud,
+    // How a worker ends: a plain answer (the default) or a report in the fixed format (config.json `reports`).
+    requireFinalReport: orchestrating, reportFormat: settings.reports ?? 'plain', reportGrant: ({task, attempt, context}) => {
       if (!orchestrating || !bus) return null;
       const peer = `report:${task}:${attempt}`;
       const grant = bus.grant({peer, tasks: [task], context, report: {task, attempt}});
       reportTokens.set(peer, true);
       return {BOUNCE_REPORT_BUS: bus.path, BOUNCE_REPORT_TOKEN_FILE: grant.file};
     }, strategy: strategyOverride ?? orchestration.strategy, jev});
-  bus = await createBus({session, dir: session.dir, validate: scheduler.validate, prepare: scheduler.prepare, report: scheduler.report, accept: scheduler.acceptOverride});
+  bus = await createBus({session, dir: session.dir, validate: scheduler.validate, prepare: scheduler.prepare, report: scheduler.report, accept: scheduler.acceptOverride, rework: scheduler.reworkOverride, cancel: scheduler.cancelRequest});
   const userGrant = bus.grant({peer: 'user', canSubmit: true, tasks: [], context: session.id});
   // daemon.json is written AFTER the SIGTERM/SIGINT handlers are installed (below), never here:
   // it is the daemon's discovery record, so the moment it exists a `stop`/SIGTERM can arrive, and
@@ -526,11 +545,10 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   if (orchestrating) session.append({kind: 'operation', operation: 'orchestrator', orchestrator: orchestration.orchestrator, shape: orchestration.shape, text: `Operation: orchestrator on ${orchestration.orchestrator} (${orchestration.shape})`});
   const bridgeEnv = orchestrating ? orchestratorBridgeEnv({session, bus, grant: orchestratorGrant, profile: orchestratorProfile}) : null;
   const main = orchestrating && positionals[0] !== 'run' ? createMainService({session, adapters, profile: orchestratorProfile, settings, profiles: orchestration.profiles, readRouting: () => config(root),
-    orchestratorEnv: bridgeEnv, continuationState: () => campaignContinuationState(session.events),
+    orchestratorEnv: bridgeEnv,
     brief: `Read and follow ${path.join(session.dir, 'orchestrator', 'ORDERS.md')}.`,
     // Fire-and-forget: a new session's first prompt gets a model-given title once (src/session-title.js).
     onFirstUserPrompt: (s, cfg) => { titleSession({session: s, settings: cfg, ask: createAsk({executables: cfg.executables})}).catch(() => {}); }}) : null;
-  const closeCampaignContinuation = main ? installCampaignContinuation({session}) : () => {};
   const closeLocalActivation = createLocalActivation({session, scheduler, profiles, settings, roles, readRoles,
     readSettings: () => config(root),
     refresh: orders});
@@ -607,7 +625,6 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
       quotaUnsubscribe();
       closeLocalActivation();
       closeJevActivation();
-      closeCampaignContinuation();
       scheduler.close();
       const mainStopped = await main?.close().catch(() => ({verified: false}));
       if (mainStopped?.verified === false) unverifiedOnStop = [...unverifiedOnStop, 'orchestrator'];
@@ -786,9 +803,11 @@ async function detachRun(args, {spawnChild}) {
   const childArgs = args.filter(a => a !== '--detach').filter(a => a !== '--resume' && a !== id);
   if (!childArgs.includes('--json')) childArgs.push('--json');
   childArgs.push('--resume', id);
+  const stdio = daemonLogStdio(session.dir);
   const child = spawnChild(process.execPath, [cliPath, ...childArgs], {
-    detached: true, stdio: 'ignore', env: {...process.env, BOUNCE_DETACHED: '1'},
+    detached: true, stdio, env: {...process.env, BOUNCE_DETACHED: '1'},
   });
+  fs.closeSync(stdio[1]);
   child.unref();
   console.log(values.json ? JSON.stringify({id}) : id);
   process.exitCode = 0;
@@ -808,15 +827,19 @@ async function interactiveView(args, {existing, restart} = {}) {
     : new Session(fs.realpathSync(values.cwd || process.cwd()), {root, id: values.resume ? resolveSessionRef(root, values.resume) : undefined});
   let info = existing?.info ?? readDaemonJson(session.dir);
   if (!info || !pidAlive(info.pid)) {
-    // The daemon is spawned with stdio:'ignore', so anything it throws is invisible and surfaces
-    // only as "did not become ready". Configuration errors are deterministic and detectable here,
+    // The daemon's output goes to daemon.log, not this terminal, so anything it throws surfaces
+    // here only as "did not become ready". Configuration errors are deterministic and detectable here,
     // in the foreground, where the user can actually read them — a bad profile must name itself
     // rather than masquerade as a daemon that failed to start.
     validateOrchestration(config(root), undefined, {roles: rolesFor(root, {cwd: session.cwd ?? process.cwd()})});
+    const released = await releaseStuckDaemon(session.dir, session.id);
+    if (released) console.error(`bounce: stopped a daemon for this session (pid ${released}) that never finished starting and was holding it`);
     const daemonArgs = args.filter((value, index) => value !== '--resume' && args[index - 1] !== '--resume' && !value.startsWith('--resume='));
+    const stdio = daemonLogStdio(session.dir);
     const daemon = spawn(process.execPath, [cliPath, ...daemonArgs, '--resume', session.id], {
-      detached: true, stdio: 'ignore', env: {...process.env, BOUNCE_VIEW_DAEMON: '1', BOUNCE_DETACHED: '1', BOUNCE_SUPERVISED: '', BOUNCE_REMOTE_SESSION: ''},
+      detached: true, stdio, env: {...process.env, BOUNCE_VIEW_DAEMON: '1', BOUNCE_DETACHED: '1', BOUNCE_SUPERVISED: '', BOUNCE_REMOTE_SESSION: ''},
     });
+    fs.closeSync(stdio[1]);
     daemon.unref();
     let spawnError;
     daemon.once('error', error => { spawnError = error; });
@@ -826,7 +849,7 @@ async function interactiveView(args, {existing, restart} = {}) {
       if (info?.view && pidAlive(info.pid)) break;
       await new Promise(resolve => setTimeout(resolve, 25));
     }
-    if (spawnError || !info?.view || !pidAlive(info.pid)) throw spawnError ?? new Error(`Daemon did not become ready for ${session.id}; inspect its session journal`);
+    if (spawnError || !info?.view || !pidAlive(info.pid)) throw spawnError ?? new Error(`Daemon did not become ready for ${session.id}: ${daemonLogTail(session.dir) || 'no output; inspect its session journal'}`);
   }
   if (!info.view || info.protocol !== 1) throw new Error('Running daemon uses an older view protocol; use bounce attach ID --json or stop it explicitly before restarting');
   const channel = await connectView({path: info.view, token: fs.readFileSync(info.userToken, 'utf8').trim()});
@@ -925,9 +948,11 @@ async function stopCommand(args) {
   let client;
   try { client = await connectBus({path: info.bus, token: fs.readFileSync(info.userToken, 'utf8').trim()}); }
   catch (error) { console.log(`session ${id} is not running`); process.exitCode = 1; return; }
-  await client.publish({kind: 'control.stop'}).catch(() => {});
+  // Wait for THIS stop's answer: a resumed session's journal already holds earlier control.stopped rows,
+  // and the first of them used to be printed as this stop's (old, long-cancelled tasks shown "unverified").
+  const request = await client.publish({kind: 'control.stop'}).catch(() => null);
   let row = null;
-  try { row = await client.wait({match: {kind: 'control.stopped'}, timeout: 30000}); }
+  try { row = await client.wait({match: {kind: 'control.stopped'}, timeout: 30000, afterSeq: request?.seq ?? 0}); }
   catch { row = null; } // the daemon may tear down its socket before this reply is flushed; fall back to daemon.json below
   try { await client.close(); } catch {}
   if (row) {

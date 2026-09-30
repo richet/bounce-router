@@ -11,6 +11,7 @@ import {connectBus} from './bus.js';
 import {listSessions} from './sessions.js';
 
 export const DEFAULT_WAIT_MS = 30_000;
+const realpath = dir => { try { return fs.realpathSync(dir); } catch { return dir; } };
 // One bus wait is capped in src/bus.js (handleWait); a longer wait — a task deadline is the natural one —
 // is re-armed in chunks, each re-scanning the log, so a row landing between chunks is still returned.
 export const WAIT_CHUNK_MS = 600_000;
@@ -19,12 +20,22 @@ export const WAIT_CHUNK_MS = 600_000;
 // the general publish/wait capability, whatever transport it speaks through.
 // The session a client-launched server should act on: the live one, found the way `bounce task` finds it.
 // It refuses rather than guesses — no live session, or more than one, is answered with a reason the caller
-// can act on. Writing into the wrong campaign is worse than not writing.
-export function liveSessionCredentials(root, {list = null, readdir = fs.readdirSync} = {}) {
+// can act on. Writing into the wrong session is worse than not writing.
+// Several live sessions are told apart by the caller's own directory: exactly one whose workspace is the
+// caller's cwd (or contains it) is the one it means. Found live: an orchestrator's MCP server refused
+// every call with "2 live bounce sessions" while the other session ran in another repository.
+export function liveSessionCredentials(root, {list = null, readdir = fs.readdirSync, cwd = process.cwd()} = {}) {
   const sessions = (list ?? listSessions)(root);
-  const live = sessions.filter(row => row.live);
+  let live = sessions.filter(row => row.live);
   if (!live.length) return {ok: false, reason: 'no live bounce session on this machine: start one with `bounce`, or set BOUNCE_BUS and BOUNCE_BUS_TOKEN_FILE'};
-  if (live.length > 1) return {ok: false, reason: `${live.length} live bounce sessions (${live.map(row => row.id.slice(0, 8)).join(', ')}): set BOUNCE_BUS and BOUNCE_BUS_TOKEN_FILE to name the one you mean`};
+  if (live.length > 1) {
+    const inside = (dir, base) => typeof base === 'string' && (dir === base || dir.startsWith(base.endsWith(nodePath.sep) ? base : `${base}${nodePath.sep}`));
+    const here = live.filter(row => inside(realpath(cwd), realpath(row.cwd)));
+    const exact = here.filter(row => realpath(row.cwd) === realpath(cwd));
+    const chosen = exact.length === 1 ? exact : here.length === 1 ? here : null;
+    if (!chosen) return {ok: false, reason: `${live.length} live bounce sessions (${live.map(row => `${row.id.slice(0, 8)} in ${row.cwd ?? '?'}`).join(', ')}) and ${here.length ? 'more than one' : 'none'} in ${cwd}: set BOUNCE_SESSION (or BOUNCE_BUS and BOUNCE_BUS_TOKEN_FILE) to the one you mean`};
+    live = chosen;
+  }
   const home = nodePath.join(root, 'sessions', live[0].id);
   // `createBus` may need a short fallback outside the session directory. daemon.json
   // is the daemon's published endpoint; deriving bus.sock here silently binds reads

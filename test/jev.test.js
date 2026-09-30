@@ -26,13 +26,13 @@ const okResponse = (body, {status = 200, headers = {}} = {}) => ({
 });
 
 test('settings: Jev is off by default, everything it does is on once enabled, the model is pinned, and the persisted shape round-trips', () => {
-  assert.deepEqual(normalizeJevSettings(undefined), {enabled: false, model: JEV_DEFAULT_MODEL, review: true, routing: {enabled: true, default: null}, confidence: 0.8});
-  assert.deepEqual(normalizeJevSettings({enabled: true}), {enabled: true, model: JEV_DEFAULT_MODEL, review: true, routing: {enabled: true, default: null}, confidence: 0.8});
+  assert.deepEqual(normalizeJevSettings(undefined), {enabled: false, model: JEV_DEFAULT_MODEL, review: true, routing: {enabled: true, default: null}, confidence: 0.8, sendBackConfidence: 0.9});
+  assert.deepEqual(normalizeJevSettings({enabled: true}), {enabled: true, model: JEV_DEFAULT_MODEL, review: true, routing: {enabled: true, default: null}, confidence: 0.8, sendBackConfidence: 0.9});
   assert.equal(normalizeJevSettings({enabled: true, routing: false}).routing.enabled, false);
   assert.equal(normalizeJevSettings({enabled: true, routing: {enabled: false, default: 'build'}}).routing.enabled, false);
   assert.equal(JEV_DEFAULT_MODEL, 'jev-1.13.0');
   const custom = normalizeJevSettings({enabled: true, model: ' jev-1.12.0 ', review: false, routing: {enabled: true, default: 'build'}, confidence: 0.6});
-  assert.deepEqual(custom, {enabled: true, model: 'jev-1.12.0', review: false, routing: {enabled: true, default: 'build'}, confidence: 0.6});
+  assert.deepEqual(custom, {enabled: true, model: 'jev-1.12.0', review: false, routing: {enabled: true, default: 'build'}, confidence: 0.6, sendBackConfidence: 0.9});
   assert.deepEqual(persistedJevSettings(custom), {enabled: true, model: 'jev-1.12.0', review: false, routing: {enabled: true, default: 'build'}, confidence: 0.6});
   assert.deepEqual(persistedJevSettings({enabled: true, routing: true}).routing, true);
   // junk never widens what Jev does
@@ -135,13 +135,14 @@ test('client: a hung request times out via the abort signal with code timeout', 
   await assert.rejects(client.ask({state: 's', questions: {}}), error => error.code === 'timeout');
 });
 
-test('verdict questions: one accept/rework choice plus 4–8 narrow nouls', () => {
+test('verdict questions: one accept/rework choice plus 4–8 narrow nouls, none of them a finding', () => {
   const questions = verdictQuestions();
   assert.equal(questions.decision.type, 'choice');
   assert.deepEqual(Object.keys(questions.decision.criteria), ['accept', 'rework']);
   const nouls = Object.entries(questions).filter(([, q]) => q.type === 'noul');
   assert.ok(nouls.length >= 4 && nouls.length <= 8, `${nouls.length} nouls`);
-  assert.deepEqual(nouls.map(([name]) => name), Object.keys(VERDICT_CHECKS));
+  assert.deepEqual(nouls.map(([name]) => name), Object.keys(VERDICT_QUESTIONS));
+  assert.deepEqual(Object.keys(VERDICT_CHECKS), ['outside_scope', 'forbidden_files', 'unbacked_tests', 'remaining_work', 'unmet_acceptance', 'unverified_claims', 'empty_diff']);
 });
 
 test('report verdict questions evaluate the assignment and report evidence without diff-only checks', () => {
@@ -156,7 +157,7 @@ test('report verdict questions evaluate the assignment and report evidence witho
 test('decideVerdict: confident rework reworks with the fired checks as findings; low confidence is unavailable and accept accepts', () => {
   const answers = {
     decision: {type: 'choice', choice: 'rework', probabilities: {accept: 0.1, rework: 0.9}, confidence: 0.9},
-    unbacked_tests: {type: 'noul', noul: 0.93}, remaining_work: {type: 'noul', noul: 0.71}, outside_scope: {type: 'noul', noul: 0.05},
+    claims_tests_passed: {type: 'noul', noul: 0.93}, names_remaining_work: {type: 'noul', noul: 0.71}, changes_outside_scope: {type: 'noul', noul: 0.05},
   };
   const rework = decideVerdict(answers, {confidence: 0.8});
   assert.equal(rework.verdict, 'rework');
@@ -164,7 +165,8 @@ test('decideVerdict: confident rework reworks with the fired checks as findings;
   assert.deepEqual(rework.findings, [VERDICT_CHECKS.unbacked_tests.fix, VERDICT_CHECKS.remaining_work.fix]);
   assert.deepEqual(rework.probabilities, {accept: 0.1, rework: 0.9});
   assert.equal(rework.checks.outside_scope, 0.05);
-  assert.equal(rework.checks.empty_diff, null);
+  assert.equal(rework.checks.empty_diff, 0); // no state, so no empty diff to speak of
+  assert.equal(rework.checks.unmet_acceptance, null); // not answered
 
   const unsure = decideVerdict({...answers, decision: {...answers.decision, confidence: 0.55}}, {confidence: 0.8});
   assert.equal(unsure.verdict, 'unavailable');
@@ -270,15 +272,62 @@ test('the daemon answers a user control.jev row with a status row (last 4 key ch
 // A check the worker cannot act on is not a finding. `empty_diff` says "the orders require changes and
 // the diff shows none" — when the diff Jev was shown is NOT empty, that check is contradicted by the
 // state itself and is dropped; if dropping it leaves a rework with nothing actionable, it is an accept.
-test('decideVerdict drops an empty_diff finding when the state shows a diff, and a rework with no actionable finding left becomes an accept', () => {
-  const nouls = Object.fromEntries(Object.keys(VERDICT_CHECKS).map(n => [n, {type: 'noul', noul: 0.05}]));
-  const rework = choice => ({decision: {type: 'choice', choice: 'rework', probabilities: {rework: 0.95, accept: 0.05}, confidence: 0.95}, ...nouls, ...choice});
-  const withDiff = {diff: 'diff --git a/x b/x\n+changed'};
-  const onlyEmpty = decideVerdict(rework({empty_diff: {type: 'noul', noul: 0.9}}), {confidence: 0.8, state: withDiff});
-  assert.deepEqual([onlyEmpty.verdict, onlyEmpty.fired, onlyEmpty.dropped], ['accept', [], ['empty_diff']]);
-  const mixed = decideVerdict(rework({empty_diff: {type: 'noul', noul: 0.9}, unbacked_tests: {type: 'noul', noul: 0.9}}), {confidence: 0.8, state: withDiff});
-  assert.deepEqual([mixed.verdict, mixed.fired, mixed.dropped], ['rework', ['unbacked_tests'], ['empty_diff']]);
-  const trulyEmpty = decideVerdict(rework({empty_diff: {type: 'noul', noul: 0.9}}), {confidence: 0.8, state: {diff: ''}});
-  assert.deepEqual([trulyEmpty.verdict, trulyEmpty.fired], ['rework', ['empty_diff']], 'an empty diff is a real finding when the diff really is empty');
-  assert.equal(decideVerdict(rework({}), {confidence: 0.8}).verdict, 'rework', 'no state: nothing is dropped, today\'s behaviour');
+// TypeSafe's own guidance (docs.typesafe.ai, read 2026-09-29), against what bounce did: one bar for both
+// directions, where they ask for one bar per action, chosen on one's own cases by what a wrong call costs
+// (measured on 27 real tasks, a send-back at 0.9 returns 4 of 6 wrong results and 2 of 21 good ones; at 0.6,
+// 5 and 8); and seven checks that each packed two conditions and a negation into one question ("claims
+// tests passed, but shows no output"), where they ask for one condition per question, said directly.
+import {VERDICT_QUESTIONS, JEV_SEND_BACK_CONFIDENCE} from '../src/jev.js';
+
+test('a send-back is decided at 0.9; an accept still needs the configured bar', () => {
+  const leaning = (choice, confidence) => decideVerdict({decision: {choice, confidence}}, {confidence: 0.8});
+  assert.equal(JEV_SEND_BACK_CONFIDENCE, 0.9);
+  assert.deepEqual([leaning('rework', 0.9).verdict, leaning('rework', 0.9).threshold], ['rework', 0.9]);
+  assert.deepEqual([leaning('rework', 0.89).verdict, leaning('rework', 0.89).threshold], ['unavailable', 0.9]);
+  assert.deepEqual([leaning('accept', 0.79).verdict, leaning('accept', 0.79).threshold], ['unavailable', 0.8]);
+  assert.deepEqual([leaning('accept', 0.8).verdict, leaning('accept', 0.8).threshold], ['accept', 0.8]);
+  assert.equal(decideVerdict({decision: {choice: 'rework', confidence: 0.6}}, {confidence: 0.8, sendBackConfidence: 0.6}).verdict, 'rework');
+  assert.equal(normalizeJevSettings({enabled: true}).sendBackConfidence, 0.9);
+  assert.equal(normalizeJevSettings({enabled: true, sendBackConfidence: 0.7}).sendBackConfidence, 0.7);
+});
+
+test('each question Jev is asked has one condition, said directly, with what counts as yes and as no and examples of both', () => {
+  assert.deepEqual(Object.keys(VERDICT_QUESTIONS), ['changes_outside_scope', 'changes_forbidden_file', 'claims_tests_passed',
+    'names_remaining_work', 'meets_acceptance', 'claims_outcome', 'shows_backing', 'orders_need_changes']);
+  for (const [name, question] of Object.entries(VERDICT_QUESTIONS)) {
+    assert.match(question.instructions, /^(Does|Do) [^.?]+\?$/, name);
+    assert.equal(/\b(not|no|never|without|but|yet|unless)\b/i.test(question.instructions), false, `${name}: ${question.instructions}`);
+    for (const side of ['true', 'false']) {
+      assert.equal(typeof question.criteria[side].what, 'string', name);
+      assert.equal(question.criteria[side].examples.length >= 2, true, name);
+    }
+  }
+  const asked = verdictQuestions({diff: 'x'});
+  assert.deepEqual(Object.keys(asked), ['decision', ...Object.keys(VERDICT_QUESTIONS)]);
+  assert.deepEqual(asked.meets_acceptance, {type: 'noul', ...VERDICT_QUESTIONS.meets_acceptance});
+  assert.deepEqual(Object.keys(asked.decision.criteria.rework), ['what', 'not_for', 'examples']);
+});
+
+test('the seven findings are worked out in code from those answers and from what bounce knows itself', () => {
+  const yes = values => Object.fromEntries(Object.entries(values).map(([name, noul]) => [name, {type: 'noul', noul}]));
+  const quiet = {changes_outside_scope: 0.1, changes_forbidden_file: 0.1, claims_tests_passed: 0.1, names_remaining_work: 0.1, meets_acceptance: 0.9, claims_outcome: 0.1, shows_backing: 0.9, orders_need_changes: 0.9};
+  const decide = (values, state) => decideVerdict({decision: {choice: 'rework', confidence: 0.9}, ...yes({...quiet, ...values})}, {confidence: 0.8, state});
+  const withDiff = {diff: 'diff --git a/x b/x\n+x', test_output: []};
+
+  assert.deepEqual(decide({}, withDiff).fired, []);
+  // a claim of passing tests is unbacked only when the report holds no test result line, which bounce reads itself
+  assert.deepEqual(decide({claims_tests_passed: 0.9}, withDiff).fired, ['unbacked_tests']);
+  assert.deepEqual(decide({claims_tests_passed: 0.9}, {...withDiff, test_output: ['# pass 12']}).fired, []);
+  assert.deepEqual(decide({names_remaining_work: 0.7}, withDiff).fired, ['remaining_work']);
+  // asked as "does it meet", read as "does it not"
+  assert.deepEqual([decide({meets_acceptance: 0.2}, withDiff).fired, decide({meets_acceptance: 0.2}, withDiff).checks.unmet_acceptance], [['unmet_acceptance'], 0.8]);
+  // an outcome claimed and nothing shown for it: both have to hold
+  assert.deepEqual(decide({claims_outcome: 0.9, shows_backing: 0.2}, withDiff).fired, ['unverified_claims']);
+  assert.deepEqual(decide({claims_outcome: 0.9, shows_backing: 0.8}, withDiff).fired, []);
+  assert.deepEqual(decide({claims_outcome: 0.3, shows_backing: 0.2}, withDiff).fired, []);
+  // an empty diff is a fact bounce has; Jev is asked only whether the orders wanted changes
+  assert.deepEqual(decide({}, {diff: '', test_output: []}).fired, ['empty_diff']);
+  assert.deepEqual(decide({orders_need_changes: 0.2}, {diff: '', test_output: []}).fired, []);
+  assert.deepEqual(decide({changes_outside_scope: 0.6, changes_forbidden_file: 0.6}, withDiff).fired, ['outside_scope', 'forbidden_files']);
+  assert.deepEqual(decide({changes_outside_scope: 0.6}, withDiff).findings, [VERDICT_CHECKS.outside_scope.fix]);
 });

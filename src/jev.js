@@ -23,6 +23,13 @@ export const PROFILE_TIERS = ['cheapest', 'mid', 'strongest'];
 // A tier is a three-way question Jev answers well (measured live: right 5/5 at 0.60–1.00), so it
 // decides at a lower bar than a choice between named profiles, which never reached 0.8.
 export const JEV_TIER_CONFIDENCE = 0.6;
+// The bar for sending finished work back once: its own bar, as TypeSafe asks (one per action, chosen
+// on one's own cases by what a wrong call costs). A Choice between two options reports a confidence of
+// 2 × probability − 1 (checked against 95 recorded verdicts), so 0.9 is a probability of 0.95. Measured
+// on the real Jev over the 27 accepted build tasks of ACE e3bd01d5, 6 of them later found wrong: 0.9
+// sends back 4 wrong and 2 good, 0.8 sends back 4 and 5, 0.6 sends back 5 and 8. A needless send-back
+// costs a worker round, and a wrong result missed here is still read by the orchestrator.
+export const JEV_SEND_BACK_CONFIDENCE = 0.9;
 
 const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const bool = (value, fallback) => typeof value === 'boolean' ? value : fallback;
@@ -36,20 +43,23 @@ export function normalizeJevSettings(input) {
   const routing = isObject(raw.routing)
     ? {enabled: bool(raw.routing.enabled, true), default: typeof raw.routing.default === 'string' && raw.routing.default ? raw.routing.default : null}
     : {enabled: bool(raw.routing, true), default: null};
-  const confidence = typeof raw.confidence === 'number' && raw.confidence >= 0 && raw.confidence <= 1 ? raw.confidence : 0.8;
+  const bar = (value, fallback) => (typeof value === 'number' && value >= 0 && value <= 1 ? value : fallback);
+  const confidence = bar(raw.confidence, 0.8);
   return {
     enabled: bool(raw.enabled, false),
     model: typeof raw.model === 'string' && raw.model.trim() ? raw.model.trim() : JEV_DEFAULT_MODEL,
     review: bool(raw.review, true),
     routing,
     confidence,
+    sendBackConfidence: bar(raw.sendBackConfidence, JEV_SEND_BACK_CONFIDENCE),
   };
 }
 
 // The shape written back to config.json: `routing` stays a plain boolean until a default is set.
 export function persistedJevSettings(settings) {
   const n = normalizeJevSettings(settings);
-  return {enabled: n.enabled, model: n.model, review: n.review, routing: n.routing.default ? {enabled: n.routing.enabled, default: n.routing.default} : n.routing.enabled, confidence: n.confidence};
+  return {enabled: n.enabled, model: n.model, review: n.review, routing: n.routing.default ? {enabled: n.routing.enabled, default: n.routing.default} : n.routing.enabled, confidence: n.confidence,
+    ...(n.sendBackConfidence === JEV_SEND_BACK_CONFIDENCE ? {} : {sendBackConfidence: n.sendBackConfidence})};
 }
 
 // Read at use time (the daemon never caches it), so `/jev on` in the TUI applies to the next
@@ -169,33 +179,127 @@ export function createJevClient({fetchImpl = (...args) => globalThis.fetch(...ar
 // Each check is one narrow yes/no over the same state; a check that fires (≥ 0.5) becomes a
 // must-fix line in the rework round. Instructions are literal on purpose: Jev answers the
 // question written, and one judgement per question keeps the answers independent.
+// What Jev is asked about finished work. TypeSafe (docs.typesafe.ai: primitives, known limitations of
+// jev-1.13): one condition per question, said directly, without negation; what counts as yes and as no,
+// with examples; and what code can know, code decides. The seven findings below are worked out from
+// these answers. They used to be the questions themselves, each two conditions and a negation ("claims
+// tests passed, but shows no output"). The examples are from real tasks.
+const example = (what, ...examples) => ({what, examples});
+export const VERDICT_QUESTIONS = {
+  changes_outside_scope: {
+    instructions: 'Does the diff change a file that lies outside the paths the orders name for this task?',
+    criteria: {
+      true: example('A changed file is in a folder or has a name that the orders leave out of the task.',
+        'Orders: own src/cli/doctor.ts and its test. Diff: also changes deno.json.',
+        'Orders: fix the recover operation. Diff: reformats tests/p4_tasks_test.ts.'),
+      false: example('Every changed file is one the orders name, or sits inside a folder or pattern they name.',
+        'Orders: own scripts/ and evidence/p6/. Diff: adds scripts/p6-git-acceptance.sh.',
+        'Orders: own src/x.js; bounce extended the owned paths to tests/x_test.js. Diff: changes both.'),
+    },
+  },
+  changes_forbidden_file: {
+    instructions: 'Does the diff change a file that the orders say must stay unchanged?',
+    criteria: {
+      true: example('The orders name a file or area as off limits, and the diff changes it.',
+        'Orders: do not edit source. Diff: changes src/workspaces/operations/recover.ts.',
+        'Orders: leave deno.json alone. Diff: prefixes every task in deno.json with a PATH export.'),
+      false: example('The orders forbid nothing, or the diff stays away from what they forbid.',
+        'Orders: do not commit or push. Diff: changes two source files.',
+        'Orders: do not edit source. Diff: adds only a report.'),
+    },
+  },
+  claims_tests_passed: {
+    instructions: 'Does the report say that tests were run or that tests passed?',
+    criteria: {
+      true: example('The report states a test run or a test result, in words or in numbers.',
+        'All tests pass.', 'Ran deno task test: 367 passed, 0 failed.'),
+      false: example('The report speaks of other things than running tests.',
+        'Added the flag and its help text.', 'Read the three files and listed two risks.'),
+    },
+  },
+  names_remaining_work: {
+    instructions: 'Does the report name work of this task that is still to be done?',
+    criteria: {
+      true: example('The report lists something the orders asked for as left undone or still pending.',
+        'Remaining: wire the command into the CLI.', 'The two-database check was left for a later run.'),
+      false: example('The report names nothing left of this task; work for a later task is outside it.',
+        'No work remains.', 'Found two product bugs while testing; each needs its own fix task.'),
+    },
+  },
+  meets_acceptance: {
+    instructions: 'Do the diff and the report together meet the acceptance criteria that the orders state?',
+    criteria: {
+      true: example('Each thing the orders require is matched by a change in the diff or a result in the report.',
+        'Orders: add --version with a test. Diff: adds the flag and tests/version_test.ts. Report: 1 passed, 0 failed.',
+        'Orders: run the gate twice and save the logs. Report: both runs 367 passed, 0 failed; six log files saved.'),
+      false: example('Something the orders require is absent from both, or the report gives a failing result for it.',
+        'Orders: run the acceptance script and record its verdict. Report: VERDICT: PASS, 0 assertions, script was not executed.',
+        'Orders: keep the suite green. Report: 360 passed, 7 failed.'),
+    },
+  },
+  claims_outcome: {
+    instructions: 'Does the report state that something works, passes, is fixed or is verified?',
+    criteria: {
+      true: example('The report asserts a result as achieved.',
+        'The rollback bug is fixed.', 'Verified: the workspace is removed and its volume kept.'),
+      false: example('The report describes what was done or found and asserts no result.',
+        'Changed the guard in remove.ts at line 664.', 'The run stopped at register with exit code 127.'),
+    },
+  },
+  shows_backing: {
+    instructions: 'Does the report or the diff contain command output, a file or an artifact that shows the outcome the report states?',
+    criteria: {
+      true: example('A pasted result line, a saved log, or a test in the diff shows the stated outcome.',
+        'ok | 24 passed | 0 failed (3s)', 'The diff adds tests/p5_recover_test.ts with a case for the stated fix.'),
+      false: example('The outcome is only asserted: the report and the diff hold nothing that shows it.',
+        'Everything works as expected.', 'A summary written by hand in place of the raw output of the run.'),
+    },
+  },
+  orders_need_changes: {
+    instructions: 'Do the orders ask for changes to files in the repository?',
+    criteria: {
+      true: example('The orders ask to add, edit or remove files.',
+        'Add a --version flag to the CLI, with a test.', 'Write scripts/install-smoke.sh.'),
+      false: example('The orders ask only to read, run or report.',
+        'Review remove.ts and report findings only; do not change code.', 'Where does Ace validate workspace names?'),
+    },
+  },
+};
+
+// Fuzzy "and" and "not" over probabilities of yes; null when Jev gave no answer.
+const all = (...values) => (values.some(value => value === null) ? null : Math.min(...values));
+const none = value => (value === null ? null : Math.round((1 - value) * 100) / 100);
+
+// The findings a worker is sent, each worked out from the answers (`yes`) and from the state bounce built.
 export const VERDICT_CHECKS = {
   outside_scope: {
-    instructions: 'The diff changes files outside the paths the orders name as owned, allowed or in scope for this task.',
+    from: yes => yes('changes_outside_scope'),
     fix: 'The diff touches files outside the owned paths the orders name; revert those changes or keep them inside scope.',
   },
   forbidden_files: {
-    instructions: 'The diff changes a file or area the orders explicitly say must not be changed.',
+    from: yes => yes('changes_forbidden_file'),
     fix: 'The diff changes something the orders forbid changing; revert it.',
   },
   unbacked_tests: {
-    instructions: 'The report claims tests were run or passed, but the report shows no test output or result lines for them.',
+    // Whether the report holds a test result line is read by bounce (test_output), never asked.
+    from: (yes, state) => (state?.test_output?.length ? 0 : yes('claims_tests_passed')),
     fix: 'The report claims tests it shows no output for; run them and include the actual result lines.',
   },
   remaining_work: {
-    instructions: 'The report says the task is done, yet its summary or text names work that is still remaining or left out.',
+    from: yes => yes('names_remaining_work'),
     fix: 'The report says done but names remaining work; finish it or report the task as blocked/failed with what is left.',
   },
   unmet_acceptance: {
-    instructions: 'An acceptance criterion or required deliverable stated in the orders is not met by the diff and the report together.',
+    from: yes => none(yes('meets_acceptance')),
     fix: 'An acceptance criterion in the orders is not met; address it and show how it is met.',
   },
   unverified_claims: {
-    instructions: 'The report asserts an outcome (works, verified, fixed, passes) without any command output, file or artifact in the report or diff backing it.',
+    from: yes => all(yes('claims_outcome'), none(yes('shows_backing'))),
     fix: 'The report asserts outcomes without evidence; back each claim with command output, a file or an artifact.',
   },
   empty_diff: {
-    instructions: 'The orders require repository changes, but the diff is empty or unrelated to what the orders ask for.',
+    // Whether the diff is empty is a fact; a state with no diff in it (a bare call) decides nothing.
+    from: (yes, state) => (typeof state?.diff === 'string' && !state.diff.trim() ? yes('orders_need_changes') : 0),
     fix: 'The orders require repository changes but the diff shows none that address them.',
   },
 };
@@ -226,36 +330,44 @@ export function verdictQuestions(state = null) {
       instructions: reportReview
         ? 'Given the assignment and the analyst\'s report, should this assignment be accepted as complete or sent back for a better report or further analysis?'
         : 'Given the orders, the worker\'s final report and the diff of its changes, should this task be accepted as done or sent back to the same worker for rework?',
-      criteria: {
-        accept: reportReview
-          ? 'The report addresses the assignment, backs its claims with evidence, and completes the assigned analysis. An audit may correctly identify defects and future project work without implementing it.'
-          : 'The diff and the report satisfy the orders: scope respected, claims backed by output or files, no material work left undone.',
-        rework: reportReview
-          ? 'The report misses the assigned analysis or lacks evidence for material claims. Do not require an analyst to implement the project work identified by the audit.'
-          : 'Something material is wrong or missing: scope violated, a claim unbacked, an acceptance criterion unmet, or named work remaining.',
+      criteria: reportReview ? {
+        accept: 'The report addresses the assignment, backs its claims with evidence, and completes the assigned analysis. An audit may correctly identify defects and future project work without implementing it.',
+        rework: 'The report misses the assigned analysis or lacks evidence for material claims. Do not require an analyst to implement the project work identified by the audit.',
+      } : {
+        accept: {
+          what: 'The diff and the report satisfy the orders: the required work is in the diff, and its results are shown.',
+          not_for: 'Work whose report gives a failing result, or states a result that nothing in the report or the diff shows.',
+          examples: ['Orders: add --version with a test. Diff: the flag and a test. Report: 1 passed, 0 failed.',
+            'Orders: run the gate and save the logs. Report: the six commands, each with its exit code and summary line.'],
+        },
+        rework: {
+          what: 'Something the orders require is missing, failed, or only asserted.',
+          not_for: 'Follow-up work for a later task, or evidence files that are named as saved and left out of the diff for length.',
+          examples: ['Report: VERDICT: PASS, 0 assertions, script was not executed.',
+            'Orders: keep the suite green. Report: 360 passed, 7 failed.'],
+        },
       },
     },
-    ...Object.fromEntries(Object.entries(checks).map(([name, check]) => [name, {type: 'noul', instructions: check.instructions}])),
+    ...(reportReview
+      ? Object.fromEntries(Object.entries(checks).map(([name, check]) => [name, {type: 'noul', instructions: check.instructions}]))
+      : Object.fromEntries(Object.entries(VERDICT_QUESTIONS).map(([name, question]) => [name, {type: 'noul', ...question}]))),
   };
 }
 
 // A decision that cannot meet the configured confidence bar is unresolved. It must never be
 // converted into acceptance merely because transport succeeded.
-export function decideVerdict(answers, {confidence = 0.8, state = null} = {}) {
+export function decideVerdict(answers, {confidence = 0.8, sendBackConfidence = JEV_SEND_BACK_CONFIDENCE, state = null} = {}) {
   const activeChecks = checksFor(state);
   const decision = isObject(answers?.decision) ? answers.decision : {};
   const choice = typeof decision.choice === 'string' ? decision.choice : null;
   const conf = Number.isFinite(Number(decision.confidence)) ? Number(decision.confidence) : 0;
-  const checks = Object.fromEntries(Object.keys(activeChecks).map(name => [name, Number.isFinite(Number(answers?.[name]?.noul)) ? Number(answers[name].noul) : null]));
-  const firedRaw = Object.keys(activeChecks).filter(name => checks[name] !== null && checks[name] >= 0.5);
-  // A check the state itself contradicts is not a finding the worker can act on: `empty_diff` says
-  // the diff shows nothing, so when the diff Jev was shown is not empty the check is dropped. A rework
-  // that keeps no actionable finding is an accept. (Observed live: a correct change sent back three
-  // times on checks it could not satisfy.)
-  const dropped = state?.review_kind !== 'report' && state && typeof state.diff === 'string' && state.diff.trim() ? firedRaw.filter(name => name === 'empty_diff') : [];
-  const fired = firedRaw.filter(name => !dropped.includes(name));
-  const resolved = (choice === 'accept' || choice === 'rework') && conf >= confidence;
-  const rework = resolved && choice === 'rework' && !(dropped.length && !fired.length);
+  const yes = name => (Number.isFinite(Number(answers?.[name]?.noul)) ? Number(answers[name].noul) : null);
+  const checks = Object.fromEntries(Object.entries(activeChecks).map(([name, check]) => [name, check.from ? check.from(yes, state) : yes(name)]));
+  const fired = Object.keys(activeChecks).filter(name => checks[name] !== null && checks[name] >= 0.5);
+  // One bar per action, by what a wrong call costs: a send-back costs a round, an accept puts work in the checkout.
+  const threshold = choice === 'rework' ? sendBackConfidence : confidence;
+  const resolved = (choice === 'accept' || choice === 'rework') && conf >= threshold;
+  const rework = resolved && choice === 'rework';
   const verdict = !resolved ? 'unavailable' : rework ? 'rework' : 'accept';
   const findings = rework ? (fired.length ? fired.map(name => activeChecks[name].fix) : [state?.review_kind === 'report'
     ? 'Jev judged the report not ready against the assignment; re-read the assignment and support the report with evidence before resubmitting.'
@@ -263,7 +375,7 @@ export function decideVerdict(answers, {confidence = 0.8, state = null} = {}) {
   // An unconfident rework is not sent back, but it is still Jev's answer: its fired checks go with it
   // so whoever decides sees what Jev objected to instead of "no verdict".
   const leanFindings = !resolved && choice === 'rework' ? fired.map(name => activeChecks[name].fix) : [];
-  return {verdict, choice, confidence: conf, threshold: confidence, probabilities: isObject(decision.probabilities) ? decision.probabilities : {}, checks, fired, ...(dropped.length ? {dropped} : {}), findings, leanFindings};
+  return {verdict, choice, confidence: conf, threshold, probabilities: isObject(decision.probabilities) ? decision.probabilities : {}, checks, fired, findings, leanFindings};
 }
 
 // ---- model routing: a Choice over the roster plus Nouls for the access the orders need ----
@@ -502,70 +614,6 @@ export async function routeTask({orders, profiles, settings, ask, notes = {}, or
   }
 }
 
-// ---- the plan gate: judge a phase's breakdown before any worker runs ----------------------------
-
-// Per chunk. Overlap and a deadline over the ceiling are structural and decided by bounce itself; the
-// other two are what Jev is for. Found live: a 40-minute "finish P2" task; two builders on git.ts at
-// once; chunks with no acceptance criterion; a chunk run against a tree another was still changing.
-export const PLAN_CHECKS = {
-  phase_sized: {instructions: chunk => `Chunk "${chunk}" describes a whole phase or several independent pieces of work, not one bounded piece with a single owner and a single acceptance.`,
-    fix: 'this is a phase, not a chunk: split it into pieces with one owner and one acceptance each'},
-  no_acceptance: {instructions: chunk => `Chunk "${chunk}" names no concrete acceptance criterion, or no way for the worker to verify it (a command, a test, an observable result).`,
-    fix: 'say what done looks like and how the worker proves it (a command to run and the output that means pass)'},
-  overlapping_paths: {instructions: chunk => `Chunk "${chunk}" would edit files that another chunk in this plan also edits, so two workers would write the same paths at once.`,
-    fix: 'give each chunk disjoint owned paths, or make one depend on the other'},
-  hidden_dependency: {instructions: chunk => `Chunk "${chunk}" needs the result of another chunk in this plan (a file it creates, a change it makes) but does not declare that dependency.`,
-    fix: 'declare depends_on so it runs after the chunk it needs'},
-};
-
-const globRe = glob => new RegExp(`^${glob.split('**').map(part => part.split('*').map(seg => seg.replace(/[.+^${}()|[\]\\]/g, '\\$&')).join('[^/]*')).join('.*')}$`);
-const pathsOverlap = (a, b) => a === b || globRe(a).test(b) || globRe(b).test(a);
-
-export function planQuestions(plan) {
-  const chunks = (plan?.chunks ?? []).map(c => ({id: c.id, profile: c.profile, ...(c.requires !== undefined ? {requires: c.requires} : {}), orders: String(c.orders ?? '').slice(0, 6000), owns: c.owns ?? [], depends_on: c.depends_on ?? [],
-    ...(Number.isFinite(c.deadline) ? {deadline_minutes: Math.round(c.deadline / 60000)} : {})}));
-  const questions = {};
-  for (const c of chunks) for (const [name, check] of Object.entries(PLAN_CHECKS)) questions[`${c.id}.${name}`] = {type: 'noul', instructions: check.instructions(c.id)};
-  return {state: {phase: String(plan?.phase ?? ''), chunks}, questions};
-}
-
-// Pure. Structural findings first (no model needed), then Jev's confident ones; the rest are noted.
-export function decidePlan(answers, {plan, confidence = 0.8, ceilingMinutes = null} = {}) {
-  const chunks = plan?.chunks ?? [];
-  const findings = [], noted = [];
-  for (const c of chunks) {
-    const others = chunks.filter(o => o !== c && !(c.depends_on ?? []).includes(o.id) && !(o.depends_on ?? []).includes(c.id));
-    if ((c.owns ?? []).some(p => others.some(o => (o.owns ?? []).some(q => pathsOverlap(p, q))))) findings.push({chunk: c.id, check: 'overlapping_paths', confidence: 1, fix: PLAN_CHECKS.overlapping_paths.fix});
-    if (ceilingMinutes && Number.isFinite(c.deadline) && c.deadline > ceilingMinutes * 60000) findings.push({chunk: c.id, check: 'phase_sized', confidence: 1, fix: `${PLAN_CHECKS.phase_sized.fix} (deadline ${Math.round(c.deadline / 60000)} min over the ${ceilingMinutes} min ceiling)`});
-  }
-  for (const c of chunks) for (const name of Object.keys(PLAN_CHECKS)) {
-    if (findings.some(f => f.chunk === c.id && f.check === name)) continue;
-    const v = Number(answers?.[`${c.id}.${name}`]?.noul);
-    if (!Number.isFinite(v) || v < 0.5) continue;
-    if (v >= confidence) findings.push({chunk: c.id, check: name, confidence: v, fix: PLAN_CHECKS[name].fix});
-    else noted.push({chunk: c.id, check: name, confidence: v});
-  }
-  return {verdict: findings.length ? 'reject' : 'accept', findings, noted};
-}
-
-// Disabled model review uses explicit structural validation. An enabled but unavailable
-// reviewer cannot manufacture acceptance; preserve structural rejection when already known.
-export async function judgePlan({plan, settings, ask, ceilingMinutes = null, signal} = {}) {
-  const s = normalizeJevSettings(settings);
-  const structural = decidePlan({}, {plan, confidence: s.confidence, ceilingMinutes});
-  const off = reason => ({...structural, reason, model: null});
-  const unavailable = reason => ({...structural, verdict: structural.verdict === 'reject' ? 'reject' : 'unavailable', reason, model: null});
-  if (!s.enabled) return off('jev disabled');
-  if (typeof ask !== 'function') return unavailable('plan reviewer unavailable');
-  const {state, questions} = planQuestions(plan);
-  if (!Object.keys(questions).length) return off('no chunks');
-  try {
-    const result = await ask({state, questions, model: s.model, signal});
-    if (Object.keys(questions).some(name => !Number.isFinite(result.answers?.[name]?.noul))) return unavailable('incomplete plan review');
-    return {...decidePlan(result.answers, {plan, confidence: s.confidence, ceilingMinutes}), reason: null, model: result.model, latencyMs: result.latencyMs};
-  } catch (error) { return unavailable(error?.code ?? error?.message ?? 'error'); }
-}
-
 // ---- the lease judge: is a running task still getting somewhere, at the end of its lease? --------
 
 // One Choice over the worker's recent text and tool calls against its orders (docs/plans/task-leases.md).
@@ -641,7 +689,7 @@ export function decideInPlace(answers, {confidence = 0.8} = {}) {
 }
 
 // Never throws: off, without a client, or failing, the verdict is 'unresolved' with the reason —
-// the same fallback shape judgeLease/judgePlan use, so the caller's structural check always decides.
+// the same fallback shape judgeLease uses, so the caller's structural check always decides.
 export async function judgeInPlace({citedText, messages, orders, settings, ask, signal} = {}) {
   const s = normalizeJevSettings(settings);
   const none = reason => ({verdict: 'unresolved', choice: null, confidence: 0, probabilities: {}, reason, model: null});
@@ -668,7 +716,6 @@ export function createJevDecisions({root = dataRoot(), adapter, readSettings = (
   return {
     reviewer: JEV_REVIEWER,
     settings: readSettings,
-    plan: ({plan, ceilingMinutes, signal}) => judgePlan({plan, settings: readSettings(), ask: adapter?.ask, ceilingMinutes, signal}),
     lease: request => judgeLease({...request, settings: readSettings(), ask: adapter?.ask}),
     routeAI: ({orders, profiles, head, signal}) => routeAgentAI({orders, profiles, head, order: order(), ...(locals ? {locals} : {}), settings: readSettings(), ask: adapter?.ask, ...(notes ? {notes} : {}), signal}),
     route: ({orders, profiles, signal}) => routeTask({orders, profiles, order: order(), ...(locals ? {locals} : {}), settings: readSettings(), ask: adapter?.ask, ...(notes ? {notes} : {}), signal}),

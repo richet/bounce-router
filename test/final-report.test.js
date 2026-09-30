@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {inspectFinalReport, parseFinalReport, FINAL_REPORT_INSTRUCTION} from '../src/final-report.js';
+import {inspectFinalReport, parseFinalReport, synthesizeReport, synthesizeReportFromChanges, FINAL_REPORT_INSTRUCTION} from '../src/final-report.js';
 
 const completed = {
   op: 'final', phase: 'complete', text: 'Implemented the report parser.', next: 'none',
@@ -69,4 +69,151 @@ test('the local-worker instruction states the report boundary types and bounds',
   assert.match(FINAL_REPORT_INSTRUCTION, /next must be one string, not an array/);
   assert.match(FINAL_REPORT_INSTRUCTION, /at most 32 strings/);
   assert.match(FINAL_REPORT_INSTRUCTION, /outcome reflects only the assigned task/);
+});
+
+// Observed live (session 159f4746, 7/19 tasks): a good prose final answer, with no structured
+// report at all, was lost to a report repair that timed out or was unavailable. synthesizeReport
+// is the worker's own answer turned into the report bounce needs, with no candidate to merge.
+test('a short plain-prose answer synthesizes into a completed report, by default', () => {
+  const synthesis = synthesizeReport('Done: renamed the variable, tests pass.');
+  assert.deepEqual(synthesis.report, {
+    op: 'final', phase: 'synthesized', text: 'Done: renamed the variable, tests pass.', next: '',
+    evidence: [], outcome: 'completed', summary: 'Done: renamed the variable, tests pass.', remaining: '', synthesized: true,
+  });
+  assert.equal(synthesis.rule, 'default_completed');
+  assert.deepEqual(synthesis.sources, {outcome: 'answer', phase: 'answer', summary: 'answer', remaining: 'answer', next: 'answer', evidence: 'answer'});
+});
+
+test('the outcome rule reads only an explicit status; a finished-sounding or prose answer goes to review as completed', () => {
+  assert.equal(synthesizeReport('Blocked: cannot proceed without the API key.').report.outcome, 'blocked');
+  assert.equal(synthesizeReport('❌ Blocked\n\nCould not reach the database.').report.outcome, 'blocked');
+  // Prose, not a status: counted completed and judged by the completion review, rather than thrown away.
+  assert.equal(synthesizeReport('The build failed with three compile errors.').report.outcome, 'completed');
+  assert.equal(synthesizeReport('Implemented the fix.\n\nA prior attempt here had failed.').report.outcome, 'completed',
+    'a later paragraph mentioning "failed" does not override a clean first paragraph');
+});
+
+// Found on the real path (2026-09-29): a local worker's plain answer opened with the label "**What I
+// did:**", and that label became the summary handed to the orchestrator.
+test('an answer that opens with a label is summarised by what follows the label', () => {
+  const answer = '**What I did:**\n\nChanged `src/greet.js` so that it greets with a capital H.\n\n**Check results:**\n\n- ok 1 passed';
+  assert.equal(synthesizeReport(answer).report.summary, 'Changed `src/greet.js` so that it greets with a capital H.');
+  assert.equal(synthesizeReport('Summary:\nAll three files read.').report.summary, 'All three files read.');
+  assert.equal(synthesizeReport('**What I did:**').report.summary, '**What I did:**');
+});
+
+test('a heading that only names what is left is not the summary', () => {
+  const answer = 'State is now "new" in src/x.js.\n\nI ran the tests: 3 passed.\n\n## Remaining\nNothing.';
+  assert.equal(synthesizeReport(answer).report.summary, 'State is now "new" in src/x.js.');
+  assert.equal(synthesizeReport(`## Next\nShip it.\n\n## Result\nAll green.`).report.summary, 'Result');
+});
+
+test('summary reads the first heading when there is one, else the first paragraph', () => {
+  const withHeading = synthesizeReport('## Final Report\n\nInventoried the source tree and found no issues.');
+  assert.equal(withHeading.report.summary, 'Final Report');
+  const withoutHeading = synthesizeReport('Inventoried the source tree.\n\nFound no issues.');
+  assert.equal(withoutHeading.report.summary, 'Inventoried the source tree.');
+});
+
+test('remaining reads the body of a Remaining/Next/Not done heading when present, else empty', () => {
+  const withRemaining = synthesizeReport('## Final Report\n\nDid the work.\n\n### Not Done\n\nThe lint step still fails.\n\n### Evidence\n\nsrc/a.js');
+  assert.equal(withRemaining.report.remaining, 'The lint step still fails.');
+  assert.equal(synthesizeReport('## Final Report\n\nDid the work, all of it.').report.remaining, '');
+});
+
+// A malformed `bounce_report` call (parsed JSON, rejected by validateReport) is not discarded: its
+// own valid fields win over synthesis, and only what it was missing is filled from the answer.
+test('a malformed report candidate contributes its own valid fields; synthesis fills only the rest', () => {
+  const answer = '## Final Report\n\nRenamed the variable and reran the suite.';
+  const candidate = {op: 'final', phase: 'cleanup', text: 'Renamed x to total.', next: 'Run the full suite.',
+    evidence: ['src/a.js:12'], outcome: 'completed'}; // missing summary: rejected by validateReport
+  const synthesis = synthesizeReport(answer, candidate);
+  assert.equal(synthesis.report.phase, 'cleanup');
+  assert.equal(synthesis.report.next, 'Run the full suite.');
+  assert.deepEqual(synthesis.report.evidence, ['src/a.js:12']);
+  assert.equal(synthesis.report.outcome, 'completed');
+  assert.equal(synthesis.report.summary, 'Final Report', 'the one missing field is filled from the answer');
+  assert.deepEqual(synthesis.sources, {outcome: 'worker', phase: 'worker', summary: 'answer', remaining: 'answer', next: 'worker', evidence: 'worker'});
+});
+
+test('a candidate outcome synonym still wins over the answer-derived fallback', () => {
+  const synthesis = synthesizeReport('All good here.', {outcome: 'Success'});
+  assert.equal(synthesis.report.outcome, 'completed');
+  assert.equal(synthesis.sources.outcome, 'worker');
+});
+
+// Only an explicit status decides; ordinary prose that mentions a failing test or an obstacle it got past
+// must not turn finished work into `failed`/`blocked` (the synthesized outcome drives the next step).
+test('a synthesized outcome follows an explicit status, not a word that happens to appear in the prose', () => {
+  const outcome = text => synthesizeReport(text).report.outcome;
+  assert.equal(outcome('Red confirmed — the new tests fail as expected, then pass after the fix.'), 'completed');
+  assert.equal(outcome('Unable to reproduce the flake; all 12 runs pass. Renamed the helper.'), 'completed');
+  assert.equal(outcome('The fence blocked my first write, so I wrote to the working copy instead. Done.'), 'completed');
+  assert.equal(outcome('**BLOCKED: Docker socket unreachable from the sandbox.**\n\nDetails…'), 'blocked');
+  assert.equal(outcome('Blocked: cannot proceed without the API key.'), 'blocked');
+  assert.equal(outcome('| Implementation | ❌ Blocked — cannot write to filesystem |'), 'blocked');
+  assert.equal(outcome('**Verdict: FAIL**\n\n1. The lock is not released.'), 'failed');
+  assert.equal(outcome('Status: failed — 3 tests still fail.'), 'failed');
+});
+
+// The worker's changes are its answer when its turn ends with no text at all: the scheduler
+// synthesizes a completed report straight from the captured artifact instead of failing the task.
+test('a report synthesized from an artifact names the changed files and a per-file diff stat', () => {
+  const artifact = {changes: [
+    {path: 'src/a.js', kind: 'write', before: {preview: 'old\nline\n'}, data: Buffer.from('new\nline\nmore\n').toString('base64')},
+    {path: 'src/b.js', kind: 'write', before: null, data: Buffer.from('fresh\n').toString('base64')},
+    {path: 'src/c.js', kind: 'delete', before: {preview: 'gone\nline\n'}},
+  ]};
+  const synthesis = synthesizeReportFromChanges(artifact);
+  assert.equal(synthesis.rule, 'from_changes');
+  assert.equal(synthesis.report.op, 'final');
+  assert.equal(synthesis.report.outcome, 'completed');
+  assert.equal(synthesis.report.remaining, '');
+  assert.equal(synthesis.report.synthesized, true);
+  assert.equal(synthesis.report.summary, 'No summary from the worker; it changed 3 file(s): src/a.js, src/b.js, src/c.js');
+  assert.equal(synthesis.report.text, 'src/a.js: +3 -2\nsrc/b.js: +1 -0\nsrc/c.js: -2');
+});
+
+// Found live (ACE d1bc0206, task 99bd27ea): a 17-line change to a 1124-line file was reported as
+// `+1141 -127` (the whole new file, and the lines of the old file's 4096-character preview).
+test('a report synthesized from an artifact counts the lines that changed when the artifact has them', () => {
+  const artifact = {
+    changes: [
+      {path: 'src/a.js', kind: 'write', before: {preview: 'old\nline\n'}, data: Buffer.from('new\nline\nmore\n').toString('base64')},
+      {path: 'src/c.js', kind: 'delete', before: {preview: 'gone\nline\n'}},
+      {path: 'src/d.js', kind: 'write', before: null, data: Buffer.from('uncounted\n').toString('base64')},
+    ],
+    stats: {'src/a.js': {added: 2, removed: 1}, 'src/c.js': {added: 0, removed: 2}},
+  };
+  assert.equal(synthesizeReportFromChanges(artifact).report.text, 'src/a.js: +2 -1\nsrc/c.js: -2\nsrc/d.js: +1 -0');
+});
+
+test('a report synthesized from an artifact bounds the file list in its summary', () => {
+  const artifact = {changes: Array.from({length: 8}, (_, i) => ({path: `src/f${i}.js`, kind: 'write', before: null, data: Buffer.from('x\n').toString('base64')}))};
+  const synthesis = synthesizeReportFromChanges(artifact);
+  assert.equal(synthesis.report.summary, 'No summary from the worker; it changed 8 file(s): src/f0.js, src/f1.js, src/f2.js, src/f3.js, src/f4.js, and 3 more');
+});
+
+test('a report a local model wrote as tool-call markup is read from its parameters (ACE d1bc0206 seq 1685)', () => {
+  const answer = '</parameter>\n<parameter=next>\n\n</parameter>\n<parameter=summary>\nP4 task execution fully implemented: src/tasks/operations/run.ts, contract tests (287 total, 0 failures).\n</parameter>\n<parameter=remaining>\n\n</parameter>\n<parameter=evidence>\n[]\n</parameter>\n</function>\n</tool_call>';
+  const inspected = inspectFinalReport(answer);
+  assert.equal(inspected.diagnostic, 'malformed_report: phase (required string)');
+  assert.equal(inspected.report.summary, 'P4 task execution fully implemented: src/tasks/operations/run.ts, contract tests (287 total, 0 failures).');
+  const {report, sources} = synthesizeReport(answer, inspected.report);
+  assert.equal(report.summary, 'P4 task execution fully implemented: src/tasks/operations/run.ts, contract tests (287 total, 0 failures).');
+  assert.equal(sources.summary, 'worker');
+  assert.equal(report.outcome, 'completed');
+  assert.equal(report.remaining, '');
+  assert.deepEqual(report.evidence, []);
+  assert.equal(report.text.includes('</parameter>'), false);
+  assert.equal(report.text.includes('<parameter='), false);
+});
+
+test('a complete report written as tool-call markup is accepted as the worker\'s own report', () => {
+  const answer = '<tool_call>\n<function=bounce_report>\n<parameter=op>\nfinal\n</parameter>\n<parameter=phase>\ndone\n</parameter>\n<parameter=text>\nAdded the parser.\n</parameter>\n<parameter=next>\n\n</parameter>\n<parameter=outcome>\ncompleted\n</parameter>\n<parameter=summary>\nParser added\n</parameter>\n<parameter=remaining>\n\n</parameter>\n<parameter=evidence>\n["npm test: 12 pass"]\n</parameter>\n</function>\n</tool_call>';
+  const inspected = inspectFinalReport(answer);
+  assert.equal(inspected.diagnostic, null);
+  assert.equal(inspected.report.outcome, 'completed');
+  assert.equal(inspected.report.summary, 'Parser added');
+  assert.deepEqual(inspected.report.evidence, ['npm test: 12 pass']);
 });

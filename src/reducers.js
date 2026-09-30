@@ -58,7 +58,7 @@ export function tasks(events) {
     if (e.kind === 'task.submitted') {
       const t = ensure(e.task);
       if (TERMINAL.has(t.state)) continue;
-      t.jobId = e.jobId ?? e.task; t.campaignId = e.campaignId ?? null; t.gate = e.gate ?? null; t.planId = e.planId ?? null; t.chunkId = e.chunkId ?? null;
+      t.jobId = e.jobId ?? e.task;
       t.context = e.context; t.profile = e.profile; t.deadline = e.deadline; t.budget = e.budget && {...e.budget}; t.replaces = e.replaces ?? null;
       t.review = e.review ?? null; t.depends_on = e.depends_on ? [...e.depends_on] : []; t.steps = e.steps ?? null;
       if (t.state === 'waiting') priorState[e.task] = 'queued'; else t.state = 'queued';
@@ -113,7 +113,10 @@ export function tasks(events) {
         if (t.state === 'queued') { t.state = 'rejected'; settleParent(t.parent); }
         break;
       case 'task.rework':
-        if (t.state === 'reviewing') { t.state = 'running'; t.rounds = (t.rounds || 0) + 1; }
+        // An owner's own rework verdict on finished work (bus.js marks it `overrides`, the same shape
+        // task.accepted's override uses) is the other exit from `blocked`/`input_required`, symmetric to
+        // the accept override; a plain rework row never moves a parked task.
+        if (t.state === 'reviewing' || (['blocked', 'input_required'].includes(t.state) && e.overrides)) { t.state = 'running'; t.rounds = (t.rounds || 0) + 1; }
         break;
       case 'task.accepted':
         if (e.stage === 'prelaunch') { if (t.state === 'queued') t.prelaunch = 'accepted'; break; }
@@ -123,9 +126,9 @@ export function tasks(events) {
         // first went terminal at `completed`, so settleParent does not re-fire here.
         if (t.state === 'reviewing') { t.state = 'accepted'; t.accepted = true; settleParent(t.parent); }
         else if (t.state === 'completed') { t.state = 'accepted'; t.accepted = true; }
-        // An owner's accept over an unconfident review gate (bus.js admits it only then, and marks it
-        // `overrides`) is the exit from that gate's `blocked`; a plain accept never moves a blocked task.
-        else if (t.state === 'blocked' && e.overrides) { t.state = 'accepted'; t.accepted = true; settleParent(t.parent); }
+        // An owner's accept of finished work (bus.js marks it `overrides`) is the exit from
+        // `blocked`/`input_required`; a plain accept never moves a parked task.
+        else if (['blocked', 'input_required'].includes(t.state) && e.overrides) { t.state = 'accepted'; t.accepted = true; settleParent(t.parent); }
         break;
     }
   }
@@ -235,16 +238,17 @@ export function watchdog(events, now, {activity = new Map(), watchdog: cfg} = {}
   };
   const result = [];
   for (const t of Object.values(taskView)) {
-    // A parked task — blocked, or asking its owner a question — has no worker left to watch: its process
-    // has exited, so no later row will change it on its own. It gets a lease all the same, measured from
-    // the moment it parked, so a wait nobody answers ends as a deadline instead of sitting forever.
+    // A parked task — blocked, or asking its owner a question — is a decision waiting on a person,
+    // not a worker to watch: its process has already exited, and it holds no slot. It is never killed
+    // by a lease or ceiling while parked; it stays parked until answered (a message that resumes it, a
+    // task.rework, an accept) or explicitly cancelled. It used to get a lease measured from the moment
+    // it parked, ending an unanswered wait as a deadline — found live (session 159f4746, 4 tasks) that
+    // this silently discarded a blocked worker's resumable context after 60 minutes nobody was
+    // watching, even though the block itself was the very reason no slot was being spent. `blocked`
+    // still yields its existing escalation verdict, once, so the owner is told; `input_required` yields
+    // none, and neither can ever expire here.
     if (t.state === 'blocked' || t.state === 'input_required') {
-      const parked = [...events].reverse().find(e => e.task === t.id && (e.kind === 'task.blocked' || e.kind === 'task.input_required'));
-      const parkedAt = parked ? Date.parse(parked.time) : null;
-      const verdicts = t.state === 'blocked' ? ['blocked'] : [];
-      const parkMs = cfg.ceilingMs ?? cfg.defaultDeadlineMs;
-      if (parkedAt !== null && parkMs && now - parkedAt > parkMs) verdicts.push('unanswered');
-      if (verdicts.length) result.push({task: t.id, stage: 'parked', parkedAt, verdicts});
+      if (t.state === 'blocked') result.push({task: t.id, stage: 'parked', verdicts: ['blocked']});
       continue;
     }
     // A completion review is a worker turn too, with its own lease from `review.started` — the worker's
@@ -304,7 +308,8 @@ export function attemptLease(events, task, {defaultDeadlineMs = 3600000, ceiling
   const ownStart = events.findLast(e => e.kind === 'task.started' && e.task === task);
   const start = reviewing ? review : ownStart ?? rootStart;
   if (!start) return null;
-  const startedAt = Date.parse((rootStart ?? start).time);
+  // The ceiling counts from this task's own first start, not the task it replaces (Daniel, 2026-09-30).
+  const startedAt = Date.parse((ownStart ?? rootStart ?? start).time);
   const leaseFrom = Date.parse(start.time);
   const submitted = events.find(e => e.kind === 'task.submitted' && e.task === root);
   const leaseMs = submitted?.deadline ?? defaultDeadlineMs;

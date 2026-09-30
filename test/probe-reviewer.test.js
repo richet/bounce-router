@@ -99,8 +99,11 @@ test('P5 the orders split a heavy review by risk area', () => {
 
 // Found live: the reviewer hit its step cap, its notice did not parse as a verdict, and the
 // task sat `blocked` — waiting for a person. An unusable review ends the task with its reason instead, so
-// the orchestrator is woken by an outcome and decides what to do.
-test('P6 a review with no readable verdict fails the task, it does not block it', async t => {
+// the orchestrator is woken by an outcome and decides what to do. Rewritten 2026-09-27: failing it threw the
+// finished work away (review_unreadable is no fallback reason); it is accepted with advice instead.
+test('P6 a review with no verdict in it goes to the orchestrator with what the reviewer said; the work is neither accepted nor failed', async t => {
+  // Rewritten 2026-09-27 (user: "unreadable reviews should not exist … let the orchestrator define a
+  // strategy"): bounce no longer accepts or re-asks on its own. The finished work stays the candidate.
   const dir = root(t);
   const session = new Session(dir, {root: dir});
   const worker = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'built it'}]);
@@ -109,33 +112,32 @@ test('P6 a review with no readable verdict fails the task, it does not block it'
     profiles: {b: {adapter: 'W', model: 'w', mode: 'yolo', fallback: []}, rev: {adapter: 'R', model: 'r', mode: 'yolo', fallback: [], policy: 'probe', role: 'reviewer'}}});
   t.after(() => scheduler.close());
   const row = scheduler.submit({parent: null, profile: 'b', orders: 'build', deadline: null, review: {completion: 'rev'}});
-  const failed = await waitFor(() => session.events.find(e => e.kind === 'task.failed' && e.task === row.task));
-  assert.deepEqual([failed.reason, failed.text], ['review_unreadable', 'the reviewer returned no readable verdict']);
-  assert.equal(session.events.some(e => e.kind === 'task.blocked' && e.task === row.task), false, 'never a dead end that waits for a person');
+  const escalated = await waitFor(() => session.events.find(e => e.kind === 'policy.escalated' && e.task === row.task));
+  assert.equal(escalated.reason, 'review_unreadable');
+  assert.match(escalated.text, /^The review ended without a verdict bounce could read\. Decide: .* The reviewer said: CRITICAL - MAXIMUM STEPS REACHED\nTools are disabled until next user input\.$/s);
+  assert.equal(session.events.findLast(e => e.kind === 'task.blocked' && e.task === row.task)?.reason, 'review_unreadable', 'held for the orchestrator, which may accept it (src/bus.js)');
+  assert.equal(session.events.some(e => ['task.accepted', 'task.failed', 'review.reasked'].includes(e.kind) && e.task === row.task), false);
 });
 
-// The seam the answer-contract plan left open: a reviewer that answers in prose instead of the verdict
-// line is asked once more, with the note on record, before the review is failed. Never twice.
-test('P7 an unreadable verdict is re-asked exactly once, with the note in the reviewer\'s orders', async t => {
+// Rewritten 2026-09-27: a verdict written as plain text used to be "unreadable" and cost a re-ask; it is read.
+test('P7 a plain "Verdict: PASS" is read on the first answer, with no re-ask', async t => {
   const dir = root(t);
   const session = new Session(dir, {root: dir});
-  const seen = [];
+  let runs = 0;
   const worker = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'built it'}]);
-  let answers = ['it looks fine to me, no JSON here', '{"verdict": "accept"}'];
-  const reviewer = fakeAdapter(({orders}) => { seen.push(orders); return [{kind: 'result', status: 'completed', text: answers.shift() ?? 'still prose'}]; });
+  const reviewer = fakeAdapter(() => { runs++; return [{kind: 'result', status: 'completed', text: 'Checked the diff and ran the tests.\nVerdict: PASS'}]; });
   const scheduler = createScheduler({session, adapters: {W: worker, R: reviewer}, watchdog: {interval: null},
     profiles: {b: {adapter: 'W', model: 'w', mode: 'yolo', fallback: []}, rev: {adapter: 'R', model: 'r', mode: 'yolo', fallback: [], policy: 'probe', role: 'reviewer'}}});
   t.after(() => scheduler.close());
   const row = scheduler.submit({parent: null, profile: 'b', orders: 'build', deadline: null, review: {completion: 'rev'}});
   await waitFor(() => scheduler.tasks()[row.task]?.state === 'accepted');
-  const asked = session.events.filter(e => e.kind === 'review.reasked' && e.task === row.task);
-  assert.deepEqual(asked.map(e => e.text), ['Your last answer carried no readable verdict. Answer again with the verdict line only, as JSON.']);
-  assert.equal(seen.length, 2, 'the reviewer ran twice: the first answer, then the re-ask');
-  assert.match(seen[1], /Answer again with the verdict line only, as JSON\./);
-  assert.equal(session.events.some(e => e.kind === 'task.failed' && e.task === row.task), false, 'the second answer was readable: accepted');
+  assert.equal(runs, 1);
+  assert.equal(session.events.find(e => e.kind === 'review.finished' && e.task === row.task).verdict, 'accept');
+  assert.equal(session.events.some(e => e.kind === 'review.reasked'), false);
 });
 
-test('P8 a reviewer that is unreadable twice fails the task, never a third ask', async t => {
+// Rewritten 2026-09-27: a reviewer that only writes prose is not re-asked; the orchestrator decides after one run.
+test('P8 a reviewer that answers only in prose runs once, then the orchestrator decides', async t => {
   const dir = root(t);
   const session = new Session(dir, {root: dir});
   let runs = 0;
@@ -145,8 +147,7 @@ test('P8 a reviewer that is unreadable twice fails the task, never a third ask',
     profiles: {b: {adapter: 'W', model: 'w', mode: 'yolo', fallback: []}, rev: {adapter: 'R', model: 'r', mode: 'yolo', fallback: [], policy: 'probe', role: 'reviewer'}}});
   t.after(() => scheduler.close());
   const row = scheduler.submit({parent: null, profile: 'b', orders: 'build', deadline: null, review: {completion: 'rev'}});
-  const failed = await waitFor(() => session.events.find(e => e.kind === 'task.failed' && e.task === row.task));
-  assert.equal(failed.reason, 'review_unreadable');
-  assert.equal(runs, 2, 'asked once more, then done');
-  assert.equal(session.events.filter(e => e.kind === 'review.reasked' && e.task === row.task).length, 1);
+  const escalated = await waitFor(() => session.events.find(e => e.kind === 'policy.escalated' && e.task === row.task));
+  assert.match(escalated.text, /The reviewer said: prose, always prose$/);
+  assert.equal(runs, 1);
 });

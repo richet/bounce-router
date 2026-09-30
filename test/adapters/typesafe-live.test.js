@@ -5,6 +5,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createTypesafeLive, buildReviewState, testOutputLines} from '../../src/adapters/typesafe-live.js';
 import {JEV_ENDPOINT} from '../../src/jev.js';
+import {findingAnswers} from '../helpers/jev-answers.js';
 
 const okResponse = (body, {status = 200, headers = {}} = {}) => ({ok: status < 300, status, headers: {get: name => headers[name.toLowerCase()] ?? null}, json: async () => body, text: async () => JSON.stringify(body)});
 const drain = async (adapter, handle) => { const events = []; for await (const event of adapter.events(handle)) events.push(event); return events; };
@@ -13,7 +14,7 @@ const lastVerdict = events => JSON.parse(events.at(-1).text);
 const gitStub = (diff = 'diff --git a/src/x.js b/src/x.js\n+added', untracked = 'notes.md\n') => async args => args[0] === 'diff' ? diff : args[0] === 'ls-files' ? untracked : args[0] === 'rev-parse' ? 'true\n' : '';
 const review = {stage: 'completion', round: 1, orders: 'Own src/x.js. Add the feature and run npm test.', summary: 'Added it', report: {summary: 'Added it', text: 'Implemented x.\nnpm test\n# tests 12\n# pass 12\n# fail 0', evidence: ['src/x.js'], remaining: ''}, head: 'abc123'};
 const settings = {enabled: true, model: 'jev-1.13.0', review: true, routing: {enabled: false, default: null}, confidence: 0.8};
-const answers = (choice, confidence, nouls = {}) => ({decision: {type: 'choice', choice, probabilities: {accept: choice === 'accept' ? confidence : 1 - confidence, rework: choice === 'rework' ? confidence : 1 - confidence}, confidence}, ...Object.fromEntries(Object.entries(nouls).map(([name, noul]) => [name, {type: 'noul', noul}]))});
+const answers = (choice, confidence, nouls = {}) => ({decision: {type: 'choice', choice, probabilities: {accept: choice === 'accept' ? confidence : 1 - confidence, rework: choice === 'rework' ? confidence : 1 - confidence}, confidence}, ...findingAnswers(nouls)});
 
 test('state: orders, the final report, the diff against the start ref, untracked files and test lines', async () => {
   const calls = [];
@@ -73,7 +74,7 @@ test('testOutputLines picks result-looking lines from the report text and eviden
 
 test('happy path: the request carries state and questions with the Bearer key; a confident rework yields the verdict line with findings', async () => {
   const calls = [];
-  const fetchImpl = async (url, options) => { calls.push({url, options}); return okResponse({model: 'jev-1.13.0', answers: answers('rework', 0.92, {unbacked_tests: 0.88, remaining_work: 0.2}), usage: {input_tokens: 900, output_tokens: 20}}); };
+  const fetchImpl = async (url, options) => { calls.push({url, options}); return okResponse({model: 'jev-1.13.0', answers: answers('rework', 0.92, {remaining_work: 0.88, unverified_claims: 0.2}), usage: {input_tokens: 900, output_tokens: 20}}); };
   const adapter = createTypesafeLive({fetchImpl, readKey: () => ({key: 'k-secret', source: 'env'}), readSettings: () => settings, git: gitStub()});
   const handle = await adapter.launch({peer: 'review:t1', profile: {adapter: 'typesafe', model: ''}, orders: 'ignored', cwd: '/repo', dir: '/tmp/x', task: 't1', attempt: 1, review});
   const events = await drain(adapter, handle);
@@ -91,21 +92,21 @@ test('happy path: the request carries state and questions with the Bearer key; a
   const verdictRow = events.find(e => e.kind === 'jev' && e.name === 'verdict');
   assert.equal(verdictRow.data.verdict, 'rework');
   assert.equal(verdictRow.data.confidence, 0.92);
-  assert.deepEqual(verdictRow.data.fired, ['unbacked_tests']);
+  assert.deepEqual(verdictRow.data.fired, ['remaining_work']);
   assert.deepEqual(verdictRow.data.probabilities, {accept: 0.07999999999999996, rework: 0.92});
-  assert.match(verdictRow.text, /Jev verdict · rework · confidence 0.92 of 0.8 · fired: unbacked_tests/);
+  assert.match(verdictRow.text, /Jev verdict · rework · confidence 0.92 of 0.9 · fired: remaining_work/);
   assert.deepEqual(events.find(e => e.kind === 'usage').usage, {input: 900, output: 20});
   assert.equal(events.at(-1).kind, 'result');
   assert.equal(events.at(-1).status, 'completed');
   const verdict = lastVerdict(events);
   assert.equal(verdict.verdict, 'rework');
   assert.equal(verdict.findings.length, 1);
-  assert.match(verdict.findings[0], /claims tests it shows no output for/);
+  assert.equal(verdict.findings[0], 'The report says done but names remaining work; finish it or report the task as blocked/failed with what is left.');
   assert.deepEqual(await adapter.cancel(handle), {verified: true});
 });
 
 test('a low-confidence verdict is unavailable; a confident accept remains accept', async () => {
-  for (const [choice, confidence, verdict] of [['rework', 0.6, 'unavailable'], ['accept', 0.97, 'accept']]) {
+  for (const [choice, confidence, verdict] of [['rework', 0.5, 'unavailable'], ['accept', 0.97, 'accept']]) {
     const adapter = createTypesafeLive({fetchImpl: async () => okResponse({answers: answers(choice, confidence)}), readKey: () => ({key: 'k', source: 'env'}), readSettings: () => settings, git: gitStub()});
     const events = await drain(adapter, await adapter.launch({profile: {}, cwd: '/repo', review}));
     assert.equal(lastVerdict(events).verdict, verdict);
@@ -160,4 +161,40 @@ test('cancel aborts an in-flight request; the stream ends with a skipped unavail
   assert.equal(abortSeen, true);
   assert.equal(events.find(e => e.kind === 'jev').data.reason, 'aborted');
   assert.equal(lastVerdict(events).verdict, 'unavailable');
+});
+
+// Found live (ACE e3bd01d5, 2026-09-29): 8 of 31 completion reviews were refused by the service,
+// `TypeSafe HTTP 400: {"detail":{"error_type":"max_tokens_exceeded"}}`, and the work was accepted
+// unreviewed. The changes held long test logs; 80,000 characters of those are more tokens than the
+// same length of source.
+test('a review the service refuses as too long is asked again with less of the diff, and says how much it was shown', async () => {
+  const sent = [];
+  const tooLong = {ok: false, status: 400, headers: {get: () => null}, json: async () => ({}), text: async () => '{"detail":{"error_type":"max_tokens_exceeded"}}'};
+  const adapter = createTypesafeLive({
+    fetchImpl: async (url, options) => {
+      const body = JSON.parse(options.body);
+      sent.push(body.state.diff.length);
+      return body.state.diff.length > 25_000 ? tooLong : okResponse({answers: answers('accept', 0.95)});
+    },
+    readKey: () => ({key: 'k', source: 'env'}), readSettings: () => settings, git: async () => { throw new Error('must not read git'); },
+  });
+  const diff = Array.from({length: 4000}, (_, index) => `+log line ${index} of a long test run`).join('\n');
+  const events = await drain(adapter, await adapter.launch({profile: {}, cwd: '/repo', review, reviewState: {orders: review.orders, report: review.report, diff, files: ['evidence/test.log'], baseHead: null}}));
+
+  assert.equal(lastVerdict(events).verdict, 'accept');
+  assert.deepEqual(sent.map(length => length > 25_000), [true, true, false]);
+  assert.deepEqual(sent.map(length => Math.round(length / 1000)), [80, 40, 20]);
+  assert.deepEqual(events.filter(event => event.kind === 'activity' && /too long/.test(event.text)).map(event => event.text), [
+    'Jev verdict · the review was too long for the service; asking again with the first 40000 characters of the diff',
+    'Jev verdict · the review was too long for the service; asking again with the first 20000 characters of the diff',
+  ]);
+});
+
+test('a review still too long with the smallest diff is unavailable, as before', async () => {
+  const tooLong = {ok: false, status: 400, headers: {get: () => null}, json: async () => ({}), text: async () => '{"detail":{"error_type":"max_tokens_exceeded"}}'};
+  let asked = 0;
+  const adapter = createTypesafeLive({fetchImpl: async () => { asked += 1; return tooLong; }, readKey: () => ({key: 'k', source: 'env'}), readSettings: () => settings, git: async () => ''});
+  const events = await drain(adapter, await adapter.launch({profile: {}, cwd: '/repo', review, reviewState: {orders: review.orders, report: review.report, diff: 'x'.repeat(200_000), files: [], baseHead: null}}));
+
+  assert.deepEqual([lastVerdict(events).verdict, lastVerdict(events).reason, asked], ['unavailable', 'http_400', 5]);
 });

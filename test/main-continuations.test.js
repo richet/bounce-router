@@ -48,6 +48,7 @@ function service(t, session, mainAdapter, options = {}) {
     profile: {adapter: 'codex', mode: 'plan'},
     settings: {executables: {}},
     handoffDelayMs: 5,
+    typedRetryMs: 5,
     watchdog: {startupMs: 100, runningMs: 100, retryDelayMs: 5, maxWakeAttempts: 2},
     ...options,
   });
@@ -64,62 +65,78 @@ test('startup reconciliation wakes an outcome persisted before main service crea
   assert.equal(session.events.some(row => row.kind === 'main.disposition' && row.outcomeSeq), true);
 });
 
-test('an idle main wakes for accepted, rejected, and unavailable plan decisions', async t => {
+// Plans were removed 2026-09-29: an old journal's plan.submitted/plan.accepted/plan.rejected/
+// plan.unavailable rows still replay, but no longer wake an idle main — there is no decision left
+// to hand over.
+test('an idle main does not wake for old journal plan rows: they replay and change nothing', async t => {
   const session = fixture(t);
   const mainAdapter = adapter(() => ({events: [{kind: 'result', status: 'completed', text: 'handled'}]}));
   service(t, session, mainAdapter);
-  for (const [index, kind] of ['plan.accepted', 'plan.rejected', 'plan.unavailable'].entries()) {
-    session.append({kind: 'plan.submitted', plan: `p${index}`, phase: 'build', from: 'orchestrator', chunks: []});
-    session.append({kind, plan: `p${index}`, phase: 'build', chunks: 0});
-    await until(() => mainAdapter.calls.launch + mainAdapter.calls.resume === index + 1);
-  }
+  session.append({kind: 'plan.submitted', plan: 'p0', phase: 'build', from: 'orchestrator', chunks: []});
+  session.append({kind: 'plan.accepted', plan: 'p0', phase: 'build', chunks: 0});
+  session.append({kind: 'plan.rejected', plan: 'p0', phase: 'build', chunks: 0});
+  session.append({kind: 'plan.unavailable', plan: 'p0', phase: 'build', chunks: 0});
+  session.append({kind: 'plan.drift', task: 'x', planId: 'p0', chunkId: 'a', reason: 'unknown plan chunk'});
+  await delay(50);
+  assert.equal(mainAdapter.calls.launch + mainAdapter.calls.resume, 0, 'plan rows carry no outcome to wake for');
 });
 
-test('failed wake consumers retry at most twice and persist an actionable blocker', async t => {
+// Rewritten 2026-09-27: bounce never blocks the orchestrator. After its continuation attempts it stops
+// waking it for the same outcomes, which stay pending, and the next user prompt is accepted and carries them.
+test('failed wake consumers retry at most twice, then stop waking without blocking the orchestrator', async t => {
   const session = fixture(t);
   const mainAdapter = adapter(() => ({events: [{kind: 'result', status: 'failed', text: 'transport failed'}]}));
-  service(t, session, mainAdapter);
+  const main = service(t, session, mainAdapter);
   const outcome = submittedOutcome(session);
-  await until(() => session.events.some(row => row.kind === 'main.blocked' && row.reason === 'wake_retry_exhausted'));
-  assert.equal(mainAdapter.calls.launch + mainAdapter.calls.resume, 2);
-  const blocked = session.events.findLast(row => row.kind === 'main.blocked');
-  assert.deepEqual(blocked.outcomeSeqs, [outcome.seq]);
+  await until(() => mainAdapter.calls.launch + mainAdapter.calls.resume === 2 && session.events.filter(row => row.kind === 'main.terminal').length === 2);
+  await delay(50);
+  assert.equal(mainAdapter.calls.launch + mainAdapter.calls.resume, 2, 'no third automatic wake');
+  assert.equal(session.events.some(row => row.kind === 'main.blocked'), false);
+  assert.equal(main.state().state, 'idle');
+  const started = main.run({text: 'what happened?'});
+  assert.equal(started.accepted, true);
+  const handoff = session.events.findLast(row => row.kind === 'handoff');
+  assert.deepEqual(handoff.outcomeSeqs, [outcome.seq], 'the unresolved outcome rides in front of the user\'s prompt');
+  // the typed prompt is refused as well, tried once more, and ends before the session goes away
+  await until(() => session.events.filter(row => row.kind === 'main.terminal').length === 3);
+  assert.equal(mainAdapter.calls.launch + mainAdapter.calls.resume, 4);
 });
 
-test('successful no-op turns cannot erase a failed outcome and exhaustion atomically records its blocker', async t => {
+// Rewritten 2026-09-27: exhaustion no longer records a blocker; the failed outcome simply stays pending.
+test('successful no-op turns cannot erase a failed outcome, and exhaustion leaves it pending without a blocker', async t => {
   const session = fixture(t);
   const mainAdapter = adapter(() => ({events: [{kind: 'result', status: 'completed', text: 'acknowledged'}]}));
-  service(t, session, mainAdapter, {watchdog: {startupMs: 100, runningMs: 100, retryDelayMs: 50, maxWakeAttempts: 2}});
+  const main = service(t, session, mainAdapter, {watchdog: {startupMs: 100, runningMs: 100, retryDelayMs: 50, maxWakeAttempts: 2}});
   session.append({kind: 'task.submitted', task: 'failed-work', from: 'orchestrator', profile: 'builder', orders: 'repair'});
   const outcome = session.append({kind: 'task.failed', task: 'failed-work', reason: 'error', text: 'repair failed'});
   await until(() => session.events.filter(row => row.kind === 'main.terminal').length === 1);
   assert.equal(session.events.some(row => row.kind === 'main.disposition' && row.outcomeSeq === outcome.seq), false,
     'provider success without an orchestration decision is not disposition evidence');
-  await until(() => session.events.some(row => row.kind === 'main.blocked' && row.reason === 'wake_retry_exhausted'));
+  await until(() => session.events.filter(row => row.kind === 'main.terminal').length === 2);
+  await delay(150);
   assert.equal(mainAdapter.calls.launch + mainAdapter.calls.resume, 2);
-  const disposition = session.events.find(row => row.kind === 'main.disposition' && row.outcomeSeq === outcome.seq);
-  assert.equal(disposition.disposition, 'blocked');
-  const envelope = fs.readFileSync(session.file, 'utf8').trim().split('\n').map(line => JSON.parse(line))
-    .find(row => row.kind === 'journal.commit' && row.events?.some(event => event.kind === 'main.blocked' && event.reason === 'wake_retry_exhausted'));
-  assert.deepEqual(envelope.events.map(row => row.kind), ['main.blocked', 'main.disposition']);
+  assert.equal(session.events.some(row => row.kind === 'main.blocked'), false);
+  assert.equal(session.events.some(row => row.kind === 'main.disposition' && row.outcomeSeq === outcome.seq), false, 'still pending, still visible');
+  assert.equal(main.state().state, 'idle');
 });
 
-test('campaign task outcome dispositions only after the consuming turn schedules durable successor work', async t => {
+// Rewritten 2026-09-27: campaigns were removed. A failed outcome is still dispositioned only once the
+// consuming turn schedules durable successor work for the same job.
+test('a failed outcome dispositions only after the consuming turn schedules durable successor work', async t => {
   const session = fixture(t);
-  session.append({kind: 'campaign.started', campaignId: 'release', objective: 'ship', required: ['phase-1', 'phase-2'], from: 'orchestrator'});
-  session.append({kind: 'task.submitted', task: 'phase-1', jobId: 'job-1', campaignId: 'release', gate: 'phase-1',
+  session.append({kind: 'task.submitted', task: 'phase-1', jobId: 'job-1',
     from: 'orchestrator', profile: 'builder', orders: 'phase one'});
-  const outcome = session.append({kind: 'task.completed', task: 'phase-1', summary: 'phase one done'});
+  const outcome = session.append({kind: 'task.failed', task: 'phase-1', reason: 'error', text: 'phase one broke'});
   const mainAdapter = adapter(() => {
-    session.append({kind: 'task.submitted', task: 'phase-2', jobId: 'job-2', campaignId: 'release', gate: 'phase-2',
-      from: 'orchestrator', profile: 'builder', orders: 'phase two'});
-    return {events: [{kind: 'result', status: 'completed', text: 'phase two scheduled'}]};
+    session.append({kind: 'task.submitted', task: 'phase-1b', jobId: 'job-1', retryOf: 'phase-1',
+      from: 'orchestrator', profile: 'builder', orders: 'phase one, again'});
+    return {events: [{kind: 'result', status: 'completed', text: 'phase one resubmitted'}]};
   });
   service(t, session, mainAdapter);
   await until(() => session.events.some(row => row.kind === 'main.disposition' && row.outcomeSeq === outcome.seq));
   const disposition = session.events.find(row => row.kind === 'main.disposition' && row.outcomeSeq === outcome.seq);
   assert.equal(disposition.disposition, 'scheduled');
-  assert.equal(disposition.successor, 'phase-2');
+  assert.equal(disposition.successor, 'phase-1b');
   assert.equal(mainAdapter.calls.launch + mainAdapter.calls.resume, 1);
 });
 
@@ -137,18 +154,6 @@ test('wait delivery is dispositioned only when its consuming main turn completes
   assert.equal(session.events.some(row => row.kind === 'main.disposition' && row.outcomeSeq === outcome.seq), false);
   handles[1].release({kind: 'result', status: 'completed', text: 'reported'});
   await until(() => session.events.some(row => row.kind === 'main.disposition' && row.outcomeSeq === outcome.seq));
-});
-
-test('partly dispatched accepted plan retries finitely then records a concrete blocker', async t => {
-  const session = fixture(t);
-  const mainAdapter = adapter(() => ({events: [{kind: 'result', status: 'completed', text: 'will dispatch'}]}));
-  service(t, session, mainAdapter);
-  session.append({kind: 'plan.submitted', plan: 'partial', phase: 'build', from: 'orchestrator', chunks: [{id: 'a', profile: 'builder', orders: 'a'}, {id: 'b', profile: 'builder', orders: 'b'}]});
-  const decision = session.append({kind: 'plan.accepted', planId: 'partial', plan: 'partial', phase: 'build', chunks: 2});
-  session.append({kind: 'task.submitted', task: 'task-a', jobId: 'plan:partial:a', planId: 'partial', chunkId: 'a', from: 'orchestrator', profile: 'builder', orders: 'a'});
-  await until(() => session.events.some(row => row.kind === 'main.blocked' && row.reason === 'plan_undispatched'));
-  assert.equal(mainAdapter.calls.launch + mainAdapter.calls.resume, 2);
-  assert.deepEqual(session.events.findLast(row => row.kind === 'main.blocked').outcomeSeqs, [decision.seq]);
 });
 
 test('a durably requested turn with no starting row is replayed after restart', async t => {
@@ -196,15 +201,6 @@ test('an orchestrator-authored terminal row after a consumed wait never re-wakes
   await delay(50);
   assert.equal(session.events.some(row => row.kind === 'main.wake.scheduled' && row.outcomeSeqs?.includes(accepted.seq)), false);
   assert.equal(mainAdapter.calls.launch + mainAdapter.calls.resume, 1);
-});
-
-test('campaign callback obligations remain pending after narration and exhaust the same finite wake policy', async t => {
-  const session = fixture(t);
-  const mainAdapter = adapter(() => ({events: [{kind: 'result', status: 'completed', text: 'still waiting'}]}));
-  service(t, session, mainAdapter, {continuationState: () => ({pending: [{kind: 'campaign.pending', campaignId: 'campaign-1', seq: 9,
-    text: 'release gate is still unmet'}]})});
-  await until(() => session.events.some(row => row.kind === 'main.blocked' && row.reason === 'campaign_blocked'));
-  assert.equal(mainAdapter.calls.launch + mainAdapter.calls.resume, 2);
 });
 
 test('running resume timeout retries once only after verified termination', async t => {

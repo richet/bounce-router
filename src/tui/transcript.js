@@ -149,6 +149,12 @@ export function conversationEvents(events, {details = false} = {}) {
     }
     // A run of tool rows — calls and their pasted output — is one line: how many calls, and the last.
     if (event.kind === 'tool') {
+      // Text a model writes just before a tool call is narration of what it is about to do ("Trivial
+      // request; answer directly and write the state note."), not its answer: it reads as a thought.
+      const said = rows.findLast(row => row && row.kind !== 'progress');
+      if (said?.kind === 'assistant' && said.provider === event.provider && !said.narration) {
+        rows[rows.lastIndexOf(said)] = {...said, narration: true, id: `${said.id}:narration`};
+      }
       const isCall = TOOL_CALL.test(String(event.text ?? '').trim());
       const previous = rows.at(-1);
       if (previous?.kind === 'tool.fold' && previous.provider === event.provider) {

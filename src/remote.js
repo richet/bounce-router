@@ -3,7 +3,10 @@
 // proxy that looks like Session. hostSession runs in the parent; createRemoteSession
 // runs in the child. See docs/local-orchestration.md "Process model".
 import {randomUUID} from 'node:crypto';
-import {LIVE_KINDS} from './core.js';
+import {LIVE_KINDS, echoesNormalizedRow} from './core.js';
+
+// A history chunk stays well under the view channel's 16 MB message limit (src/view-transport.js).
+const REPLAY_CHUNK_BYTES = 4 * 1024 * 1024;
 
 const MAIN_RPC_TIMEOUT = 5000;
 
@@ -27,7 +30,7 @@ export function hostSession({session, child, main = null}) {
       session.active = msg.provider;
     } else if (msg.type?.startsWith('main.')) {
       const method = msg.type.slice('main.'.length);
-      const fn = ['run', 'deliver', 'cancel', 'withdraw'].includes(method) ? main?.[method] : null;
+      const fn = ['run', 'deliver', 'cancel', 'withdraw', 'unblock'].includes(method) ? main?.[method] : null;
       if (typeof fn !== 'function') {
         child.send({type: 'main.error', seq: msg.seq, message: 'main provider is unavailable'});
         return;
@@ -38,7 +41,20 @@ export function hostSession({session, child, main = null}) {
     }
   };
   child.on('message', onMessage);
-  child.send({type: 'session.replay', id: session.id, dir: session.dir, file: session.file, cwd: session.cwd, context: session.context, events: session.events, active: session.active,
+  // The history goes in chunks, the last one inside session.replay itself. Found live (ACE d1bc0206): as
+  // one message a 20.1 MB history exceeded the view channel's 16 MB message limit, the connection was
+  // dropped, and the TUI hung waiting for it. Sent in one tick, so no live row can land in between.
+  const chunks = [];
+  let current = [], size = 0;
+  for (const event of session.events) {
+    // Journals written before echo raw rows stopped being persisted still hold them; a view never shows them.
+    if (echoesNormalizedRow(event)) continue;
+    const bytes = JSON.stringify(event).length;
+    if (current.length && size + bytes > REPLAY_CHUNK_BYTES) { chunks.push(current); current = []; size = 0; }
+    current.push(event); size += bytes;
+  }
+  for (const events of chunks) child.send({type: 'session.replay.chunk', events});
+  child.send({type: 'session.replay', id: session.id, dir: session.dir, file: session.file, cwd: session.cwd, context: session.context, events: current, active: session.active,
     mainState: main?.state ? main.state() : {state: 'unavailable', currentTurnId: null}});
   const unsubscribeMain = main?.subscribe ? main.subscribe(event => {
     try { child.send({type: 'main.event', event}); } catch {}
@@ -51,8 +67,13 @@ export function hostSession({session, child, main = null}) {
 // daemon-owned; this proxy intentionally does not expose Session.commit. append/publish
 // build a provisional row immediately (no seq), then the parent's reply (or its broadcast
 // of the same row, whichever arrives first) replaces it in place.
+// Found live (ACE d1bc0206): a daemon started before history replays were chunked closed every view
+// before the history arrived, and the TUI waited forever. A view whose daemon goes away before the
+// history arrives fails with what to do instead.
+const lostBeforeReplay = () => new Error(`the session's daemon closed the connection before sending its history; it may be running older bounce code — stop it with: bounce stop ${process.env.BOUNCE_SESSION?.slice(0, 8) || '<session>'}, then resume`);
+
 export function createRemoteSession(channel) {
-  return new Promise(resolve => {
+  return new Promise((resolve, reject) => {
     const listeners = new Set();
     let clientSeq = 0;
     const pendingBySeq = new Map(); // client seq -> provisional row id
@@ -99,6 +120,7 @@ export function createRemoteSession(channel) {
       deliverMain: params => callMain('deliver', params),
       cancelMain: params => callMain('cancel', params),
       withdrawMain: params => callMain('withdraw', params),
+      unblockMain: params => callMain('unblock', params),
       main: {state: 'unknown', currentTurnId: null},
       flush,
       lock() {}, unlock() {},
@@ -196,10 +218,14 @@ export function createRemoteSession(channel) {
       pendingBySeq.clear(); pendingById.clear(); pendingLiveIds.clear();
     }
 
+    let replayPrefix = [];
     channel.on('message', msg => {
       if (!msg || typeof msg.type !== 'string') return;
+      if (!resolved && msg.type === 'main.event' && msg.event?.kind === 'main.disconnected') { resolved = true; reject(lostBeforeReplay()); return; }
+      if (msg.type === 'session.replay.chunk') { for (const event of msg.events ?? []) replayPrefix.push(event); return; }
       if (msg.type === 'session.replay') {
-        applyReplay(msg);
+        applyReplay(replayPrefix.length ? {...msg, events: replayPrefix.concat(msg.events ?? [])} : msg);
+        replayPrefix = [];
         if (!resolved) { resolved = true; resolve(remote); }
         return;
       }
@@ -247,6 +273,7 @@ export function createRemoteSession(channel) {
     // A disconnected channel will never deliver the acks flush() is waiting on;
     // reject rather than let a caller (cli.js, before process.exit()) hang forever.
     channel.on('disconnect', () => {
+      if (!resolved) { resolved = true; reject(lostBeforeReplay()); }
       const error = Object.assign(new Error('remote session channel disconnected'), {code: 'closed'});
       for (const waiter of flushWaiters) waiter.reject(error);
       flushWaiters.clear();

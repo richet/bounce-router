@@ -56,7 +56,7 @@ test('the orders tell the orchestrator to hand off what it dispatched instead of
 
 // Found live (ACE session): the orchestrator spent 1560 s of a 2115 s turn inside seven `bounce wait`
 // calls — a 35-minute turn held open, its whole context live, doing nothing bounce would not have
-// done for it with a handoff. And a /btw delivered into that turn was read only when the wait returned.
+// done for it with a handoff. And a /steer delivered into that turn was read only when the wait returned.
 test('the orders make ending the turn the rule after dispatch, and a wait short and for a dependent step only', () => {
   const choosing = choosingOrders({agents: true, routingOn: true, localOn: true}).join('\n');
   assert.equal(choosing.includes('Do not hold your turn open in `bounce wait` while workers run'), true);
@@ -67,11 +67,17 @@ test('the orders make ending the turn the rule after dispatch, and a wait short 
   assert.equal(text.includes('[bounce:wait.interrupted]'), true);
 });
 
-// Found live: an analyst ran out of its ten-minute deadline; the orders said a deadline means stop
-// and report, and the orchestrator ended the whole run over it, with the builder's work done.
-test('the orders tell the orchestrator to submit a plan before a phase and how bounce answers', () => {
+// Rewritten 2026-09-29: plans (submitting a phase's breakdown for review) were removed — the
+// orchestrator breaks work into phases and chunks itself and dispatches each chunk as a task, with
+// no submission or review step in between.
+test('the orders describe phases and chunks with no plan submission or review', () => {
   const text = fs.readFileSync(new URL('../src/reload.js', import.meta.url), 'utf8');
-  for (const part of ['Before dispatching a phase, submit its plan', '"kind":"plan.submitted"', 'plan.accepted', 'plan.rejected', 'Fix a rejected plan and submit it again']) assert.equal(text.includes(part), true, part);
+  for (const part of ['Break big work down: phases in sequence, each phase made of chunks that run in parallel',
+    'Each chunk gets disjoint owned paths, its own acceptance and how to verify it'])
+    assert.equal(text.includes(part), true, part);
+  for (const gone of ['Before dispatching a phase, submit its plan', '"kind":"plan.submitted"',
+    'answers with plan.accepted', 'Fix a rejected plan', 'plan_wait', '`planId`', '`chunkId`'])
+    assert.equal(text.includes(gone), false, gone);
 });
 
 test('the orders say a deadline is a task to resubmit smaller, not a reason to stop the run', () => {
