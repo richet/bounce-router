@@ -317,7 +317,7 @@ test('an interrupted or cancelled turn/completed never drains the queue', async 
   assert.equal(h.methods('turn/start').length, 1);
 });
 
-test('X6 the reader ignores malformed, null, oversized and unmatched lines', async t => {
+test('X6 the reader ignores malformed, null and unmatched lines, and says when it drops an oversized one', async t => {
   const {adapter, handle, server} = await scriptedLaunch();
   const stream = adapter.events(handle);
 
@@ -335,11 +335,12 @@ test('X6 the reader ignores malformed, null, oversized and unmatched lines', asy
   }}});
   server.send({method: 'turn/completed', params: {threadId: 't-9', turn: {id: 'u-1', items: [], status: 'completed'}}});
 
-  const rows = await take(stream, 4);
+  const rows = await take(stream, 5);
   assert.deepEqual(rows[0], {kind: 'native', provider: 'codex', sessionId: 't-9'});
-  assert.deepEqual(rows[1], {kind: 'assistant', text: 'survivor'});
-  assert.equal(rows[2].kind, 'usage');
-  assert.deepEqual(rows[3], {kind: 'result', status: 'completed', text: 'survivor'});
+  assert.deepEqual(rows[1], {kind: 'diagnostic', text: 'codex sent a 1048835-character item/completed line, over the 1048576 limit; ignored'});
+  assert.deepEqual(rows[2], {kind: 'assistant', text: 'survivor'});
+  assert.equal(rows[3].kind, 'usage');
+  assert.deepEqual(rows[4], {kind: 'result', status: 'completed', text: 'survivor'});
   assert.equal(handle.threadId, 't-9'); // the forged id resolved nothing
   assert.deepEqual(adapter.capabilities(),
     {live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'], executionPolicies: ['read-only', 'probe', 'plan', 'yolo'], quota: 'query'});
@@ -552,6 +553,28 @@ test('a request deadline rejects an unanswered App Server request and cancels it
   assert.deepEqual([error.code, error.message], ['backend_unavailable', 'codex app-server request timed out: initialize']);
 });
 
+// Found live (d1bc0206, 2026-09-28): codex answers thread/resume with the thread's turns, one
+// 1,116,595-character line for a two-day orchestrator thread. The reader dropped every line over
+// 1 MiB, so the answer never arrived, the request "timed out", and the session could not wake.
+test('a thread/resume answer over 1 MiB still resumes the thread', async () => {
+  const server = scriptedServer();
+  const adapter = createCodexLive({spawn: server.spawn, kill: goneKill, requestTimeoutMs: 300});
+  const resuming = adapter.resume({peer: 'main', profile: {executables: {codex: 'codex'}},
+    native: {sessionId: 't-long'}, message: 'continue', cwd: '/tmp', dir: '/tmp'});
+  const outcome = resuming.then(handle => handle.threadId, error => error.message);
+  await server.expect(1);
+  server.send({id: 1, result: {}});
+  await server.expect(3);
+  const answer = JSON.stringify({id: 2, result: {thread: {id: 't-long'}, initialTurnsPage: {turns: ['x'.repeat(1_116_595)]}}});
+  assert.equal(answer.length > 1024 * 1024, true);
+  server.send(answer);
+  await Promise.race([server.expect(4), outcome]);
+  server.send({id: 3, result: {turn: {id: 'u-long'}}});
+
+  assert.equal(await outcome, 't-long');
+  assert.deepEqual(server.lines().map(line => line.method), ['initialize', 'initialized', 'thread/resume', 'turn/start']);
+});
+
 test('a thread response without an id rejects at the adapter boundary and leaves no process behind', async () => {
   const server = scriptedServer();
   let killed = 0;
@@ -642,4 +665,18 @@ test('X9 codex tracing on stderr is summarised, not repeated; real stderr still 
   assert.equal(vendorTracing('2026-09-22T17:40:53Z  WARN codex_core::config: two servers need OAuth'), true);
   assert.equal(vendorTracing('error: could not find codex home'), false, 'a plain message is not tracing');
   assert.equal(vendorTracing(''), false);
+});
+
+// Found live: every bounce worker and reviewer thread stayed in ~/.codex and in the ChatGPT app's
+// history. A finished task's thread is archived; a task that resumes later unarchives it first.
+test('archive sends thread/archive for the thread and leaves no process; resume unarchives an archived thread', async t => {
+  const h = harness(t, {env: {FAKE_ARCHIVED: 't-7'}});
+  assert.equal(await h.adapter.archive({profile: {executables: {codex: fakeExecutable}}, native: {sessionId: 't-9'}, cwd: h.root}), true);
+  assert.deepEqual(h.methods('thread/archive').map(message => message.params), [{threadId: 't-9'}]);
+  await waitFor(() => h.spawned.every(({child}) => child.exitCode !== null || child.signalCode !== null), 'the archive process to exit');
+  assert.equal(await h.adapter.archive({profile: {}, native: {}, cwd: h.root}), false, 'nothing to archive without a thread id');
+  const handle = await h.resume({native: {sessionId: 't-7'}, message: 'continue'});
+  const rows = await take(h.adapter.events(handle), 4);
+  assert.deepEqual(h.received().slice(-4).map(message => message.method), ['thread/resume', 'thread/unarchive', 'thread/resume', 'turn/start']);
+  assert.deepEqual(rows[3], {kind: 'result', status: 'completed', text: 'echo: continue'});
 });

@@ -3,6 +3,7 @@ import {createInterface} from 'node:readline';
 import fs from 'node:fs';
 import path from 'node:path';
 import {limitPattern} from '../providers.js';
+import {prepareCodexHome} from '../codex-home.js';
 export {toolText, TOOL_OUTPUT_MAX} from './transcript.js';
 
 // Shared by every live adapter: a vendor process must never block on an undrained pipe, never
@@ -25,6 +26,7 @@ export const vendorEnv = (env = process.env, capabilities = {}) => ({
 // stderr line, then exactly one terminal event: {kind:'exit', code, signal, limited} or {kind:'error', code, text}.
 // keepStdin: a persistent peer (an app-server) is fed requests for its whole life; one-shot CLIs get their prompt and EOF.
 export function spawnLive({executable, args, cwd, env = vendorEnv(), stdin, keepStdin = false, spawn = spawnProcess}) {
+  prepareCodexHome(executable, env);
   const child = spawn(executable, args, {cwd, env, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe']});
   const queue = []; let wake = null, done = false, tail = '';
   const push = e => { queue.push(e); const w = wake; wake = null; w?.(); };

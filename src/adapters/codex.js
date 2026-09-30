@@ -5,10 +5,12 @@ const describe = value => typeof value === 'string' ? value : JSON.stringify(val
 export default {
   name: 'codex',
   login: ['login'],
-  invocation({model, mode, images = []}) {
+  // `ephemeral`: a one-off call (a session title, a /btw answer, a roster note) never lands in
+  // ~/.codex, where the ChatGPT app would list it.
+  invocation({model, mode, images = [], ephemeral = false}) {
     const imageArgs = images.flatMap(image => ['--image', image.path]);
     const modelArgs = model ? ['--model', model] : [];
-    return ['exec', '--json', '--skip-git-repo-check', ...modelArgs, ...imageArgs,
+    return ['exec', '--json', '--skip-git-repo-check', ...(ephemeral ? ['--ephemeral'] : []), ...modelArgs, ...imageArgs,
       ...(mode === 'yolo' ? ['--dangerously-bypass-approvals-and-sandbox'] : ['--sandbox', 'read-only']), '-'];
   },
   stdin: prompt => prompt,

@@ -6,7 +6,7 @@ import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {spawn, spawnSync} from 'node:child_process';
 import net from 'node:net';
-import {createOpencodeLive, toolsFor, mapUsage, scrubCredentials, probeSandbox, writeFenceSandbox} from '../../src/adapters/opencode-live.js';
+import {createOpencodeLive, toolsFor, mapUsage, scrubCredentials, probeSandbox} from '../../src/adapters/opencode-live.js';
 
 // The OpenCode adapter is the claude adapter's twin: one `opencode run` per turn, prompt on stdin,
 // JSON lines out, exit = turn end. The fake prints the event shapes observed from the real binary
@@ -414,7 +414,7 @@ test('empty steps after an answer end the turn AS that answer; empty steps with 
 
 test('capabilities: the same ladder as before, live and resumable', () => {
   assert.deepEqual(createOpencodeLive().capabilities(), {live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'],
-    executionPolicies: ['read-only', 'probe', 'plan', 'write', 'yolo'], quota: 'stream'});
+    executionPolicies: ['read-only', 'probe', 'plan', 'write', 'yolo'], quota: 'stream', commands: true});
 });
 
 test('the answer is the last text that says something: a stray closing fence after the report is not the result', async t => {
@@ -522,24 +522,59 @@ test('a step cap with no answer at all is a clean failure, not a fake result', a
   assert.deepEqual([events.at(-1).kind, events.at(-1).status, events.at(-1).text], ['result', 'failed', 'step cap reached without an answer']);
 });
 
+// A conclusion turn (tools off, asked once for its answer) has no step-time bound of its own — a
+// reasoning model can spend minutes generating on a single step within its 2-step cap (observed
+// live, ACE session d1bc0206: a reasoning model ran 6.5 minutes on the conclusion turn and produced
+// nothing). A wall-clock bound cuts that turn off and treats it exactly like a conclusion that said
+// nothing, instead of leaving the task hanging on it.
+test('a conclusion turn that never answers is cut off at its wall-clock bound, promptly', async t => {
+  const {cwd, dir} = setup(t, {FAKE_OC_SCENARIO: 'loop', FAKE_OC_CONCLUDE: 'hang'});
+  const adapter = createOpencodeLive({concludeTimeoutMs: 100});
+  const handle = await adapter.launch({peer: 'worker:t16', profile: profileFor({policy: 'read-only'}), orders: 'review it', cwd, dir});
+  const started = Date.now();
+  const events = await drain(adapter, handle);
+  assert.equal(Date.now() - started < 5000, true);
+  assert.equal(events.some(e => e.kind === 'diagnostic' && e.text === 'the conclusion turn gave no answer'), true);
+  assert.equal(events.at(-1).kind, 'result');
+  assert.equal(events.at(-1).status, 'failed');
+  assert.equal(events.at(-1).recoverable, true);
+  assert.throws(() => process.kill(handle.pid, 0), {code: 'ESRCH'});
+});
+
 // A write worker edits its isolated copy; the real checkout it was copied from is fenced by the OS, so an
 // absolute path back into it fails loudly instead of silently bypassing integration and review.
-test('a fenced write worker writes its copy and anything else, but not the original checkout', async t => {
-  if (process.platform !== 'darwin') return t.skip('macOS sandbox-exec only');
-  const copy = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-fence-copy-'));
-  const source = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-fence-source-'));
-  t.after(() => { fs.rmSync(copy, {recursive: true, force: true}); fs.rmSync(source, {recursive: true, force: true}); });
-  const policy = writeFenceSandbox(source);
-  const code = `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(path.join(copy, 'edit.txt'))}, 'work'); try { fs.writeFileSync(${JSON.stringify(path.join(source, 'leak.txt'))}, 'bad'); process.exit(2); } catch (error) { if (!['EPERM','EACCES'].includes(error.code)) throw error; }`;
-  const result = spawnSync('/usr/bin/sandbox-exec', ['-p', policy, process.execPath, '--input-type=module', '-e', code], {encoding: 'utf8'});
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(fs.readFileSync(path.join(copy, 'edit.txt'), 'utf8'), 'work');
-  assert.equal(fs.existsSync(path.join(source, 'leak.txt')), false);
-  // the adapter launches a write worker with a fence through sandbox-exec, and it still edits its copy
-  const {cwd, dir} = setup(t, {FAKE_OC_WRITE: 'src/fenced.txt:ok'});
+// User, 2026-09-27: "codex and claude code already work like this; local workers should also be allowed
+// the same". A local write worker runs its tools directly, never under sandbox-exec; only a probe is fenced.
+test('a local write worker launches unsandboxed, like a Claude or Codex worker, and edits its copy', async t => {
+  const {cwd, dir} = setup(t, {FAKE_OC_WRITE: 'src/free.txt:ok'});
   const adapter = createOpencodeLive({});
-  const handle = await adapter.launch({peer: 'worker:t17', profile: profileFor({policy: 'write', writeFence: source}), orders: 'write it', cwd, dir});
-  assert.equal(handle.args[0], '-p');
+  const handle = await adapter.launch({peer: 'worker:t17', profile: profileFor({policy: 'write', writeFence: '/some/checkout'}), orders: 'write it', cwd, dir});
+  assert.notEqual(handle.args[0], '-p', 'no sandbox-exec policy in front of opencode');
   await drain(adapter, handle);
-  assert.equal(fs.readFileSync(path.join(cwd, 'src/fenced.txt'), 'utf8'), 'ok');
+  assert.equal(fs.readFileSync(path.join(cwd, 'src/free.txt'), 'utf8'), 'ok');
+});
+
+// Found live (ACE 43387649): opencode hit maxSteps 60 with no runtime notice in the stream — the turn just
+// ended after 60 finished steps, the model's own "## Maximum Steps Reached" heading the only text. The cap
+// went unrecorded, so bounce's step renewal (scheduler) never fired. The step count is the signal.
+test('a turn that used its whole step budget is a step cap even when opencode prints no notice', async t => {
+  const {cwd, dir} = setup(t, {FAKE_OC_SCENARIO: 'capsilent', FAKE_OC_STEPS: '4'});
+  const adapter = createOpencodeLive({});
+  const handle = await adapter.launch({peer: 'worker:t16', profile: profileFor({policy: 'read-only', agent: {name: 'builder', prompt: 'You build.', maxSteps: 4}}), orders: 'do it', cwd, dir});
+  const events = await drain(adapter, handle);
+  assert.equal(events.filter(e => e.kind === 'diagnostic' && e.reason === 'step_cap').length, 1);
+});
+
+// What bounce saw the worker run is the evidence of a report bounce has to write itself (Daniel,
+// 2026-09-28). Found live: 45 of 86 local attempts answered in plain text and wrote no report.
+test('a finished shell command is passed on with its exit code and the end of its output, colours removed', async t => {
+  const {cwd, dir} = setup(t, {FAKE_OC_SCENARIO: 'commands'});
+  const adapter = createOpencodeLive();
+  const handle = await adapter.launch({peer: 'worker:cmd', profile: profileFor(), orders: 'run the checks', cwd, dir});
+  const commands = (await drain(adapter, handle)).filter(event => event.kind === 'command');
+
+  assert.deepEqual(commands, [
+    {kind: 'command', command: 'deno test -A tests/version_test.ts 2>&1', exit: 0, output: 'ok | 1 passed | 0 failed (3ms)'},
+    {kind: 'command', command: 'deno lint', exit: 1, output: `[… the first 3024 characters are left out …]\n${'x'.repeat(1976)}\nerror: Found 2 problems`},
+  ]);
 });

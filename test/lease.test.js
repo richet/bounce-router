@@ -45,7 +45,8 @@ const MIN = 60000;
 const watchdog = {interval: null, silence: 120000, stall: 600000, grace: 120000, concludeGrace: 30000};
 const profiles = {A: {adapter: 'A', model: 'w', mode: 'yolo', fallback: []}};
 
-test('a replacement review keeps its renewable lease but cannot outlive the logical job ceiling', () => {
+// 2026-09-30: the ceiling counts from the replacement's own start, not the original's.
+test('a replacement review keeps its renewable lease and its ceiling counts from its own start', () => {
   const at = minutes => new Date(minutes * MIN).toISOString();
   const events = [
     {kind: 'task.submitted', task: 'original', jobId: 'job:1', deadline: MIN, time: at(0), seq: 1},
@@ -57,8 +58,8 @@ test('a replacement review keeps its renewable lease but cannot outlive the logi
   ];
   const lease = attemptLease(events, 'retry', {defaultDeadlineMs: MIN, ceilingMs: 3 * MIN, stage: 'review'});
   assert.deepEqual(lease, {
-    stage: 'review', startedAt: 0, leaseFrom: 2 * MIN, leaseMs: MIN, renewals: 1,
-    ceilingAt: 3 * MIN, leaseStartAt: 3 * MIN, deadlineAt: 3 * MIN,
+    stage: 'review', startedAt: MIN, leaseFrom: 2 * MIN, leaseMs: MIN, renewals: 1,
+    ceilingAt: 4 * MIN, leaseStartAt: 3 * MIN, deadlineAt: 4 * MIN,
   });
 });
 
@@ -240,10 +241,11 @@ test('L9 a review is leased like a turn: renewed while it works, asked to conclu
   assert.equal(prompts.length, 1, 'the reviewer itself was asked, not the worker');
 });
 
-// L10: the backstop for a task nobody answers. A parked task (blocked, or asking its owner a question)
-// has no worker left — its process exited — so nothing will change it on its own. Waking the orchestrator
-// lets it act; this ends the wait when nobody does, as a deadline rather than a silent forever.
-test('L10 a parked task nobody answers ends at its lease, as a deadline and not a user cancellation', async t => {
+// L10: a blocked task holds no slot, so it is never killed by its lease/ceiling — it stays blocked
+// until answered or cancelled. Found live (session 159f4746, 4 tasks): the previous lease measured
+// from the moment a task parked discarded a blocked worker's resumable context after 60 minutes
+// nobody was watching, even though the block itself was the reason no slot was being spent.
+test('L10 a blocked task is never killed by the watchdog, however long nobody answers it', async t => {
   const session = setup(t);
   let now = 0;
   const adapter = fakeAdapter(() => [{kind: 'blocked', text: 'needs owner authorisation'}, {kind: 'result', status: 'completed', text: 'parked'}]);
@@ -258,12 +260,12 @@ test('L10 a parked task nobody answers ends at its lease, as a deadline and not 
   assert.equal(scheduler.tasks()[row.task].state, 'blocked', 'inside its lease it is simply waiting');
   assert.equal(session.events.some(e => e.kind === 'task.deadline' && e.task === row.task), false);
 
-  now = parkedAt + 3 * MIN + 1000; await scheduler.tick();
-  const deadline = await waitFor(() => session.events.find(e => e.kind === 'task.deadline' && e.task === row.task));
-  assert.equal(deadline.reason, 'unanswered');
-  assert.match(deadline.text, /needs owner authorisation/, 'the deadline says what went unanswered');
-  const cancelled = session.events.find(e => e.kind === 'task.cancelled' && e.task === row.task);
-  assert.equal(cancelled?.reason, 'deadline', 'bounce\'s decision, never recorded as the user\'s');
-  assert.equal(session.events.some(e => e.kind === 'policy.escalated' && e.task === row.task && e.reason === 'deadline'), true,
-    'and whoever submitted it is told');
+  // Well past where the old lease (measured from the moment it parked) would have expired it.
+  now = parkedAt + 10 * MIN; await scheduler.tick();
+  assert.equal(scheduler.tasks()[row.task].state, 'blocked', 'still simply waiting, no lease to outlive');
+  assert.equal(session.events.some(e => e.kind === 'task.deadline' && e.task === row.task), false,
+    'a blocked task is never given a task.deadline row by the watchdog');
+  assert.equal(session.events.some(e => e.kind === 'task.cancelled' && e.task === row.task), false);
+  assert.equal(session.events.filter(e => e.kind === 'policy.escalated' && e.task === row.task && e.reason === 'blocked').length, 1,
+    'the owner was told once, but the task was never killed for it');
 });

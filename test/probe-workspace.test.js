@@ -77,7 +77,7 @@ for (const wasDisposable of [true, false]) test(`restart rejects an incompatible
 // Observed live (2026-09-25, e9353126 task 87a72495): orders named the real checkout's absolute path, the
 // isolated write worker appended there with a heredoc, its own copy stayed unchanged, and review saw an
 // empty diff. A write worker's orders point into its working copy, and it is fenced off the checkout.
-test('an isolated write worker is sent into its working copy and fenced off the real checkout', {timeout: 4000}, async t => {
+test('an isolated write worker is sent into its working copy, unfenced like any Claude or Codex worker', {timeout: 4000}, async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-write-fence-'));
   const cwd = path.join(root, 'project'); fs.mkdirSync(path.join(cwd, 'docs'), {recursive: true}); fs.writeFileSync(path.join(cwd, 'docs', 'PROGRESS.md'), 'original');
   const session = new Session(cwd, {root}); const real = fs.realpathSync(cwd); const seen = [];
@@ -89,8 +89,57 @@ test('an isolated write worker is sent into its working copy and fenced off the 
   await waitFor(() => seen.length === 1);
   const [{work, profile, orders}] = seen;
   assert.notEqual(work, cwd);
-  assert.equal(profile.writeFence, real);
+  // User, 2026-09-27: local write workers get the same freedom as Claude and Codex ones — no OS fence.
+  assert.equal(profile.writeFence, undefined);
   assert.match(orders, new RegExp(`^Append a section to ${work.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/docs/PROGRESS\\.md and show the tail of ${work.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/docs/PROGRESS\\.md\\.`));
   assert.equal(orders.includes(`${real}/docs`), false);
-  assert.match(orders, /Your working copy is .+: it is a copy of the project, and only changes made there are your work\. Writes to the original checkout .+ are refused\./);
+  assert.match(orders, /Your working copy is .+: it is a copy of the project, and only changes made there are your work: bounce integrates them into the original checkout .+ after review, so edit the copy, never the original\./);
+});
+
+// Observed live (2026-09-25, 159f4746 task 921f9fe0): ACE's builder agent file says "Project: Ace … at
+// /Users/…/code/ace". OpenCode gets the agent text as its system prompt, apart from the orders, so the
+// path was never rewritten: the local worker wrote to the real checkout, the fence refused, and it spent
+// its turn on workarounds. The agent text points into the working copy too.
+test('an isolated OpenCode worker\'s agent prompt points into its working copy, not the real checkout', {timeout: 4000}, async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-agent-prompt-'));
+  const cwd = path.join(root, 'project'); fs.mkdirSync(path.join(cwd, 'src'), {recursive: true}); fs.writeFileSync(path.join(cwd, 'src', 'a.ts'), 'x');
+  const session = new Session(cwd, {root}); const real = fs.realpathSync(cwd); const seen = [];
+  const adapter = fakeAdapter(({cwd: work, profile}) => { seen.push({work, profile}); return [{kind: 'result', status: 'completed', text: 'done'}]; });
+  const agent = {name: 'builder', prompt: `You are a builder. Project: Ace at ${real}. Tests write under ${real}/tests.`};
+  const scheduler = createScheduler({session, adapters: {opencode: adapter}, profiles: {builder: {adapter: 'opencode', policy: 'write', agent}}, watchdog: {interval: null}});
+  t.after(() => { scheduler.close(); fs.rmSync(root, {recursive: true, force: true}); });
+  scheduler.submit({task: 'edit', profile: 'builder', owns: ['src/a.ts'], requires: ['read', 'exec', 'write'], orders: 'Edit src/a.ts.'});
+  await waitFor(() => seen.length === 1);
+  const [{work, profile}] = seen;
+  assert.equal(profile.agent.prompt, `You are a builder. Project: Ace at ${work}. Tests write under ${work}/tests.`);
+  assert.equal(agent.prompt.includes(real), true, 'the shared agent definition itself is not mutated');
+});
+
+// Found on the real path (benchmark, 2026-09-28): a local reviewer ended without an answer, the
+// orchestrator retried the review on a cloud profile with retryOf, and the retry was refused before it
+// started: "workspace policy changed; submit a new scoped task". The reviewer's copy was a throwaway
+// one and the new profile writes; a retry on another AI gets a copy of its own instead of a refusal.
+test('a retry on a profile of another kind gets a working copy of its own, instead of being refused for its predecessor\'s', {timeout: 5000}, async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-probe-retry-')));
+  const cwd = path.join(root, 'project');
+  fs.mkdirSync(cwd);
+  fs.writeFileSync(path.join(cwd, 'file'), 'original');
+  const session = new Session(cwd, {root: path.join(root, 'home')});
+  const local = fakeAdapter(() => [{kind: 'result', status: 'failed', recoverable: true, text: 'opencode finished without an answer'}]);
+  const cloud = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'reviewed: no finding'}]);
+  const scheduler = createScheduler({session, adapters: {local, cloud}, watchdog: {interval: null},
+    profiles: {reviewer: {adapter: 'local', role: 'reviewer', policy: 'probe', fallback: []}, cloud: {adapter: 'cloud', role: 'builder', policy: 'write', fallback: []}}});
+  t.after(() => { scheduler.close(); fs.rmSync(root, {recursive: true, force: true}); });
+
+  const first = scheduler.submit({parent: null, profile: 'reviewer', orders: 'Review file', requires: ['read'], deadline: null});
+  await waitFor(() => scheduler.tasks()[first.task]?.state === 'failed');
+  const retry = scheduler.submit({parent: null, profile: 'cloud', orders: 'Review file', requires: ['read'], deadline: null, retryOf: first.task});
+  await waitFor(() => ['completed', 'accepted', 'failed'].includes(scheduler.tasks()[retry.task]?.state));
+
+  assert.equal(scheduler.tasks()[retry.task].state, 'completed', session.events.findLast(e => e.task === retry.task && e.kind === 'task.failed')?.text);
+  assert.equal(cloud.calls.launch, 1);
+  const copies = session.events.filter(e => e.kind === 'task.workspace');
+  assert.deepEqual(copies.map(row => [row.task, row.purpose]), [[first.task, 'probe'], [retry.task, 'publish']]);
+  assert.notEqual(copies[0].cwd, copies[1].cwd);
+  assert.equal(fs.readFileSync(path.join(cwd, 'file'), 'utf8'), 'original');
 });

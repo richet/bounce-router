@@ -1,12 +1,12 @@
 import { effectivePolicy } from './profiles.js';
 
-const CAPABILITIES = ['read', 'exec', 'write'];
+const CAPABILITIES = ['read', 'exec', 'write', 'docker'];
 
 export function validateRequirements(requires) {
   if (requires === undefined) return null;
   if (!Array.isArray(requires)) return 'task.requires must be an array';
   if (requires.some((capability) => !CAPABILITIES.includes(capability))) {
-    return 'task.requires must contain only read, exec, write';
+    return 'task.requires must contain only read, exec, write, docker';
   }
   return null;
 }
@@ -17,8 +17,11 @@ export function taskCapabilities(profile) {
   switch (effectivePolicy(profile)) {
     case 'plan':
     case 'read-only': return ['read'];
+    // A probe worker never gets Docker: a container can bind-mount the checkout and write it, which no
+    // sandbox around the worker can stop (decided 2026-09-25: Docker only for tasks that may write).
     case 'probe': return ['read', 'exec'];
-    default: return ['read', 'exec', 'write'];
+    // A full write/yolo worker runs unsandboxed, local or cloud alike: the Docker socket is already reachable.
+    default: return ['read', 'exec', 'write', 'docker'];
   }
 }
 

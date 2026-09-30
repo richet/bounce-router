@@ -73,17 +73,38 @@ test('final report is staged until the provider terminal outcome', async t => {
   assert.equal(session.events.some(e => e.kind === 'task.completed'), false);
 });
 
-// A report that cannot be repaired (here: no resumable session) blocks on the answer the worker gave,
-// quoted, so the orchestrator decides on it instead of reading "failed" as "nothing came back".
-test('a clean worker exit without final report requests it once, then blocks on the answer it gave', async t => {
+// A clean exit with no structured report but a real answer is synthesized straight into a
+// completed report: the worker's own answer is the source of truth (src/final-report.js
+// synthesizeReport), never a reason to spend a repair turn or fail the task.
+test('a clean worker exit with prose but no final report is synthesized into a completed report', async t => {
   const {session} = setup(t);
   const adapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'opening intention'}]);
   const scheduler = createScheduler({session, adapters: {A: adapter}, profiles: {A: {adapter: 'A', mode: 'yolo', fallback: []}}, requireFinalReport: true});
   const submitted = scheduler.submit({parent: null, profile: 'A', orders: 'inspect'});
-  await waitFor(() => scheduler.tasks()[submitted.task]?.state === 'blocked');
-  const blocked = session.events.findLast(e => e.kind === 'task.blocked' && e.task === submitted.task);
-  assert.equal(blocked.reason, 'report_repair_unavailable');
-  assert.match(blocked.text, /^The worker answered \(17 chars, output seq \d+\): "opening intention"\. Its report could not be repaired: missing_report, and no resumable session/);
+  await waitFor(() => scheduler.tasks()[submitted.task]?.state === 'completed');
+  const completed = session.events.findLast(e => e.kind === 'task.completed' && e.task === submitted.task);
+  assert.equal(completed.summary, 'opening intention');
+  const synthesized = session.events.findLast(e => e.kind === 'task.report.synthesized' && e.task === submitted.task);
+  assert.equal(synthesized.rule, 'default_completed');
+  assert.equal(session.events.some(e => e.kind === 'task.report_requested' && e.task === submitted.task), false);
+  assert.equal(session.events.some(e => e.kind === 'task.blocked' && e.task === submitted.task), false);
+});
+
+// Only a literally empty answer still needs a turn back, and when nothing can ask for it (here: no
+// resumable session), it blocks on that — quoted, when there is anything to quote — rather than
+// failing the task for its formatting.
+// Rewritten 2026-09-27: an attempt that produced nothing at all (no answer, no changes) fails as a runtime
+// failure — so the next AI in the chain may try — instead of blocking on report_repair_unavailable.
+test('a clean worker exit with no answer at all, no changes and no resumable session fails as worker_runtime', async t => {
+  const {session} = setup(t);
+  const adapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: ''}]);
+  const scheduler = createScheduler({session, adapters: {A: adapter}, profiles: {A: {adapter: 'A', mode: 'yolo', fallback: []}}, requireFinalReport: true});
+  const submitted = scheduler.submit({parent: null, profile: 'A', orders: 'inspect'});
+  await waitFor(() => scheduler.tasks()[submitted.task]?.state === 'failed');
+  const failed = session.events.findLast(e => e.kind === 'task.failed' && e.task === submitted.task);
+  assert.equal(failed.reason, 'worker_runtime');
+  assert.equal(failed.text, 'The worker produced no answer and no changes: the worker gave no answer, and no resumable session, start allowance or deadline remains');
+  assert.equal(session.events.some(e => e.kind === 'task.blocked' && e.task === submitted.task), false);
   assert.equal(session.events.filter(e => e.kind === 'task.report_requested' && e.task === submitted.task).length, 1);
   assert.equal(session.events.some(e => e.kind === 'task.completed' && e.task === submitted.task), false);
 });
@@ -141,6 +162,94 @@ test('S3b a recoverable failure falls back to the next profile in the chain; any
   const retry = await waitFor(() => session.events.find(e => e.kind === 'task.submitted' && e.profile === 'A~2'));
   await waitFor(() => scheduler.tasks()[retry.task]?.state === 'completed');
   assert.equal(scheduler.tasks()[row.task].reason, 'worker_runtime');
+});
+
+// The worker's changes are its answer. When a write worker's turn ends with no answer text at all
+// but its isolated workspace captured real changes, those changes are the outcome: the scheduler
+// synthesizes a completed report from the artifact instead of failing the task and falling back to
+// the next AI in the chain, which would otherwise discard a working draft (found live, ACE session
+// d1bc0206: two local qwen builders did real work, then answered nothing on their last turn).
+test('a recoverable failure with no answer text but captured file changes completes via synthesis, not fallback', async t => {
+  const {session} = setup(t);
+  const adapter = fakeAdapter(({cwd}) => {
+    fs.writeFileSync(path.join(cwd, 'fix.js'), 'export const x = 1;\n');
+    return [{kind: 'result', status: 'failed', recoverable: true, text: ''}];
+  });
+  const cloud = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done via cloud'}]);
+  const profiles = {A: {adapter: 'opencode', model: 'q', mode: 'yolo', fallback: ['A~2']}, 'A~2': {adapter: 'claude', model: 'sonnet', mode: 'yolo', fallback: []}};
+  const scheduler = createScheduler({session, adapters: {opencode: adapter, claude: cloud}, profiles});
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'fix it', deadline: null});
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'completed');
+
+  const synthesized = session.events.findLast(e => e.kind === 'task.report.synthesized' && e.task === row.task);
+  assert.equal(synthesized.rule, 'from_changes');
+  const reported = session.events.findLast(e => e.kind === 'task.reported' && e.task === row.task);
+  assert.equal(reported.outcome, 'completed');
+  assert.match(reported.summary, /changed 1 file\(s\): fix\.js/);
+  assert.equal(reported.remaining, '');
+  assert.equal(session.events.some(e => e.kind === 'policy.fallback'), false);
+  assert.equal(session.events.some(e => e.kind === 'task.failed' && e.task === row.task), false);
+});
+
+// Work is never thrown away (2026-09-27). A runtime failure (step cap, no final answer) after the worker
+// had said something ends completed with a report synthesized from what it said — not a fallback that
+// discards the attempt. The runtime's own error text is never taken as the answer.
+test('a recoverable failure after the worker said something completes from what it said, not fallback', async t => {
+  const {session} = setup(t);
+  const adapter = fakeAdapter(() => [
+    {kind: 'assistant', text: '## Fixed the parser\nThe off-by-one in src/parse.js is fixed; 12 passed, 0 failed.'},
+    {kind: 'result', status: 'failed', recoverable: true, text: 'step cap reached without an answer'},
+  ]);
+  const cloud = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done via cloud'}]);
+  const profiles = {A: {adapter: 'opencode', model: 'q', mode: 'yolo', fallback: ['A~2']}, 'A~2': {adapter: 'claude', model: 'sonnet', mode: 'yolo', fallback: []}};
+  const scheduler = createScheduler({session, adapters: {opencode: adapter, claude: cloud}, profiles, requireFinalReport: true});
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'fix it', deadline: null});
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'completed');
+  const synthesized = session.events.findLast(e => e.kind === 'task.report.synthesized' && e.task === row.task);
+  assert.deepEqual([synthesized.rule, synthesized.why], ['default_completed', 'step cap reached without an answer']);
+  const reported = session.events.findLast(e => e.kind === 'task.reported' && e.task === row.task);
+  assert.deepEqual([reported.outcome, reported.summary], ['completed', 'Fixed the parser']);
+  assert.equal(session.events.some(e => e.kind === 'policy.fallback' || (e.kind === 'task.failed' && e.task === row.task)), false);
+  assert.equal(cloud.calls.launch, 0);
+});
+
+// A step-capped worker that was still making progress is continued on its own session first
+// (docs/plans/step-renewal.md) — before its partial answer is taken as the result.
+test('a step-capped runtime failure while progressing renews the worker\'s steps before anything is synthesized', async t => {
+  const {session} = setup(t);
+  let turn = 0;
+  const adapter = fakeAdapter(() => ++turn === 1 ? [
+    {kind: 'native', sessionId: 'oc-1'},
+    {kind: 'activity', text: 'read', call: 'read src/a.js'},
+    {kind: 'assistant', text: 'Halfway: the reader is done, the writer is next.'},
+    {kind: 'diagnostic', text: 'opencode stopped at its step cap', reason: 'step_cap'},
+    {kind: 'result', status: 'failed', recoverable: true, text: 'step cap reached without an answer'},
+  ] : [{kind: 'result', status: 'completed', text: JSON.stringify({op: 'final', phase: 'done', text: 'both done', next: '', outcome: 'completed', summary: 'reader and writer done', evidence: []})}]);
+  const profiles = {A: {adapter: 'opencode', model: 'q', mode: 'yolo', fallback: []}};
+  const scheduler = createScheduler({session, adapters: {opencode: adapter}, profiles, requireFinalReport: true});
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'fix it', deadline: null});
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'completed');
+  assert.equal(session.events.filter(e => e.kind === 'task.steps.renewed' && e.task === row.task).length, 1);
+  assert.equal(adapter.calls.resume, 1);
+  assert.equal(session.events.some(e => e.kind === 'task.report.synthesized' && e.task === row.task), false);
+  assert.equal(session.events.findLast(e => e.kind === 'task.reported' && e.task === row.task).summary, 'reader and writer done');
+});
+
+// A completed turn with an empty answer but real changes completes from the changes at once — no turn
+// is spent asking the worker again for words.
+test('a completed turn with no answer but captured changes completes from the changes without asking again', async t => {
+  const {session} = setup(t);
+  const adapter = fakeAdapter(({cwd}) => {
+    fs.writeFileSync(path.join(cwd, 'fix.js'), 'export const x = 1;\n');
+    return [{kind: 'native', sessionId: 'oc-2'}, {kind: 'result', status: 'completed', text: ''}];
+  });
+  const profiles = {A: {adapter: 'opencode', model: 'q', mode: 'yolo', fallback: []}};
+  const scheduler = createScheduler({session, adapters: {opencode: adapter}, profiles, requireFinalReport: true});
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'fix it', deadline: null});
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'completed');
+  assert.equal(session.events.findLast(e => e.kind === 'task.report.synthesized' && e.task === row.task).rule, 'from_changes');
+  assert.equal(session.events.some(e => e.kind === 'task.report_requested'), false);
+  assert.equal(adapter.calls.resume, 0);
 });
 
 test('S4 ratchet: worker mode yolo under session mode plan fails before launch', async t => {
@@ -203,13 +312,30 @@ test('a report missing a required field is refused by field name', () => {
   assert.equal(validateReport({...final, outcome: 'completed'}), null);
 });
 
+// Observed live (session 159f4746, 2 tasks): a near-miss outcome word was refused by
+// `bounce_report`, and the worker never recovered its final report. Case-insensitive synonyms
+// canonicalize in place; an unknown word is still refused with the same message as before.
+test('a final report\'s outcome word is normalized case-insensitively before validation', () => {
+  const final = {op: 'final', phase: 'done', text: 'x', next: 'none', summary: 'Reviewed the locking area.'};
+  for (const [given, canonical] of [['Success', 'completed'], ['DONE', 'completed'], ['finished', 'completed'],
+    ['error', 'failed'], ['Failure', 'failed'], ['stuck', 'blocked'], ['Waiting', 'input_required']]) {
+    const report = {...final, outcome: given};
+    assert.equal(validateReport(report), null, `${given} should validate`);
+    assert.equal(report.outcome, canonical, `${given} normalizes to ${canonical}`);
+  }
+  const unknown = {...final, outcome: 'sorta-done'};
+  assert.equal(validateReport(unknown), 'outcome (a final report needs completed, failed, blocked or input_required)');
+  assert.equal(unknown.outcome, 'sorta-done', 'an unrecognized word is left as-is, not silently coerced');
+});
+
 test('S7 malformed submissions throw and publish nothing', async t => {
   const {session} = setup(t);
   const profiles = {A: {adapter: 'fake', model: 'x', mode: 'yolo', fallback: []}};
   const scheduler = createScheduler({session, adapters: {fake: fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done'}])}, profiles});
   const before = session.events.length;
 
-  assert.throws(() => scheduler.submit({parent: null, profile: 'nope', orders: 'x', deadline: null}), {message: 'malformed: profile'});
+  // The refusal now says exactly what to send (2026-09-27); with no agent and no auto route there is no correction to make.
+  assert.throws(() => scheduler.submit({parent: null, profile: 'nope', orders: 'x', deadline: null}), {message: 'malformed: profile: "nope" is not a profile or agent here; send one of ["A"]'});
   assert.equal(session.events.length, before);
   assert.throws(() => scheduler.submit({parent: null, profile: 'A', orders: '', deadline: null}), {message: 'malformed: orders'});
   assert.equal(session.events.length, before);
@@ -974,7 +1100,7 @@ test('S-role: a non-opencode worker receives its role prompt ahead of the orders
   await waitFor(() => seen.fake !== undefined && seen.opencode !== undefined, {timeout: 4000});
   // Both are yolo (write-rank) workers in an isolated copy, so their orders now carry the appended
   // working-copy paragraph (src/scheduler.js inWorkingCopy) after the role-prompt/orders text.
-  const workingCopyParagraph = /\n\nYour working copy is .+: it is a copy of the project, and only changes made there are your work\. Writes to the original checkout .+ are refused\.$/;
+  const workingCopyParagraph = /\n\nYour working copy is .+: it is a copy of the project, and only changes made there are your work: bounce integrates them into the original checkout .+ after review, so edit the copy, never the original\. What your orders ask you to deliver, evidence and reports included, goes inside this copy at the path they name: a file saved anywhere else on disk is not delivered\.$/;
   assert.equal(seen.fake.startsWith('You are the reviewer.\n\n---\n\nreview the tree'), true, seen.fake);
   assert.match(seen.fake, workingCopyParagraph);
   // opencode gets the agent natively, so no role prompt; a local worker is told its answer is its report.
@@ -1006,3 +1132,4 @@ test('excess delegation names its parent and recommends a logical retry', async 
   assert.match(failed.text, /retryOf/i, 'it tells the orchestrator how to continue existing work');
   assert.match(failed.text, new RegExp(child.task.slice(0, 8)), 'and under which task');
 });
+

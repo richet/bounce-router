@@ -4,7 +4,9 @@
 export const MARKER = '# written by bounce (bounce mcp install)';
 const HEADER = '[mcp_servers.bounce]';
 
-export const codexEntry = command => `${MARKER}\n${HEADER}\ncommand = "${command}"\nargs = ["mcp-serve"]\n`;
+// env_vars: Codex starts an MCP server with a stripped environment, so without them the server cannot tell
+// which live session its orchestrator belongs to (found live, ACE 36ecaacd: "2 live bounce sessions").
+export const codexEntry = command => `${MARKER}\n${HEADER}\ncommand = "${command}"\nargs = ["mcp-serve"]\nenv_vars = ["BOUNCE_BUS", "BOUNCE_BUS_TOKEN_FILE"]\n`;
 
 // The span of an existing `[mcp_servers.bounce]` block: from its header (or the marker above it) to the next
 // top-level `[`. Returns null when there is none.

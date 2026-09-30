@@ -12,9 +12,10 @@ function fixture(t, provider = 'codex') {
   t.after(() => fs.rmSync(root, {recursive: true, force: true}));
   const session = new Session(root, {root});
   const pending = [], calls = [];
+  let resumeError = null;
   const adapter = {
     async launch(args) { calls.push(['launch', args]); return {turnId: 'vendor-turn'}; },
-    async resume(args) { calls.push(['resume', args]); return {turnId: 'next-turn'}; },
+    async resume(args) { calls.push(['resume', args]); if (resumeError) throw Object.assign(new Error(resumeError.message), resumeError.extra); return {turnId: 'next-turn'}; },
     async *events() {
       yield {kind: 'native', provider, sessionId: 'native-thread'};
       yield {kind: 'assistant', text: 'Working'};
@@ -25,7 +26,7 @@ function fixture(t, provider = 'codex') {
   };
   const main = createMainService({session, adapters: {[provider]: adapter}, profile: {adapter: provider, mode: 'plan'}, settings: {executables: {}}, brief: 'Orders'});
   t.after(() => main.close());
-  return {main, session, calls, pending};
+  return {main, session, calls, pending, failResume: (message, extra = {}) => { resumeError = {message, extra}; }};
 }
 
 function nextEvent(main, kind) {
@@ -726,33 +727,20 @@ test('an outcome is handed over only by a wake turn that completed, not one that
   assert.match(f.promptOf(f.calls.at(-1)), /P2 majors fixed/, 'an interrupted wake does not consume the outcome');
 });
 
-// Found live: the orchestrator ended a turn having dispatched nothing — its submit had been refused — and
-// said "bounce is evaluating it and will resume the campaign with the verdict". Nothing was running, so no
-// outcome could ever arrive and no wake could ever fire. A turn that ends with no work and no pending
-// outcome is a dead end: the user is told, and the orchestrator is woken ONCE to notice it itself.
-test('an accepted plan with no dispatch gets two continuations and then a concrete blocker', async t => {
+// Plans were removed 2026-09-29: an old journal's plan.submitted/plan.accepted rows replay without
+// waking the orchestrator — there is no decision left to hand over.
+test('old journal plan rows replay without waking the orchestrator', async t => {
   const f = wakeFixture(t);
-  // The shape that failed live: bounce accepted the plan, then the turn ended without dispatching a chunk
-  // because the submit was refused. An ordinary turn that dispatches nothing is NOT this and is not nudged.
   const started = nextEvent(f.main, 'main.started');
-  f.main.run({id: 'first', text: 'plan it'});
+  f.main.run({id: 'first', text: 'go'});
   await started;
   f.session.append({kind: 'plan.submitted', phase: 'rework', chunks: [{id: 'repair'}], from: 'orchestrator'});
   f.session.append({kind: 'plan.accepted', plan: 'rework', chunks: 1, from: 'bounce'});
-  const woken = nextTurn(f.main);
-  await f.finishTurn('I submitted the plan; bounce will resume the campaign with the verdict.');
-  assert.equal((await woken.starting).handoff, true);
-  await woken.started;
-  assert.match(f.promptOf(f.calls.at(-1)), /dispatch 1 approved chunk/i);
-
-  const secondWake = nextTurn(f.main);
-  await f.finishTurn('Still nothing to do.');
-  await secondWake.starting;
-  await secondWake.started;
-  const blocked = nextEvent(f.main, 'main.blocked');
-  await f.finishTurn('Still nothing to do.');
-  assert.equal((await blocked).reason, 'plan_undispatched');
-  assert.equal(f.session.events.filter(e => e.kind === 'main.starting').length, 3, 'initial turn plus two bounded continuations');
+  await f.finishTurn('Done for now.');
+  await new Promise(resolve => setTimeout(resolve, 60));
+  assert.equal(f.session.events.filter(e => e.kind === 'main.starting').length, 1, 'no handoff turn for plan rows');
+  assert.equal(f.session.events.some(e => e.kind === 'main.blocked'), false);
+  assert.equal(f.main.state().state, 'idle');
 });
 
 // Reproduces the bug from session 159f4746: the daemon wakes the orchestrator on worker outcomes
@@ -1017,4 +1005,157 @@ test('a withdrawn prompt is skipped by the restart rebuild, not re-queued', {tim
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(sessionB.events.some(e => e.kind === 'main.requested' && e.requestId === 'q1'), false,
     'the withdrawn prompt is never dispatched on restart');
+});
+
+// Found live (ACE 36ecaacd): after bounce moved Codex to its own home, the orchestrator's thread was
+// still in the app's ~/.codex, and every turn failed with "no rollout found for thread id …".
+test('a resume whose vendor thread is gone starts a fresh thread from the session handoff, and says so', async t => {
+  const f = fixture(t, 'codex');
+  const first = nextEvent(f.main, 'main.started');
+  f.main.run({id: 'one', text: 'work'});
+  await first;
+  while (!f.pending.length) await new Promise(resolve => setImmediate(resolve));
+  const ended = nextEvent(f.main, 'main.terminal');
+  f.pending.shift()({kind: 'result', status: 'completed', text: 'done'});
+  await ended;
+  const adapter = f.calls;
+  const original = f.session;
+  const second = nextEvent(f.main, 'main.started');
+  f.failResume('no rollout found for thread id native-thread');
+  f.main.run({id: 'two', text: 'continue phase 5'});
+  await second;
+  const kinds = adapter.map(([kind]) => kind);
+  assert.deepEqual(kinds.slice(-2), ['resume', 'launch']);
+  assert.match(adapter.at(-1)[1].orders, /continue phase 5/);
+  assert.equal(original.events.findLast(e => e.kind === 'status').text, 'The orchestrator\'s previous codex thread could not be reopened (no rollout found for thread id native-thread); started a fresh one from this session\'s handoff.');
+});
+
+// Found live (ACE d1bc0206, 2026-09-28): the thread was there, but reopening it failed ("codex
+// app-server request timed out: thread/resume"), twice, and the session went silent. Daniel: a thread
+// that cannot be reopened for any reason is replaced by a fresh one from the handoff.
+async function secondTurnAfterFailedResume(t, message, extra) {
+  const f = fixture(t, 'codex');
+  const first = nextEvent(f.main, 'main.started');
+  f.main.run({id: 'one', text: 'work'});
+  await first;
+  while (!f.pending.length) await new Promise(resolve => setImmediate(resolve));
+  const ended = nextEvent(f.main, 'main.terminal');
+  f.pending.shift()({kind: 'result', status: 'completed', text: 'done'});
+  await ended;
+  f.failResume(message, extra);
+  return f;
+}
+
+test('a resume that fails for any other reason starts a fresh thread from the session handoff', async t => {
+  const f = await secondTurnAfterFailedResume(t, 'codex app-server request timed out: thread/resume', {code: 'backend_unavailable', handle: {pid: 4242}});
+  const second = nextEvent(f.main, 'main.started');
+  f.main.run({id: 'two', text: 'continue phase 5'});
+  await second;
+
+  // the failed reopen's process is stopped before the fresh thread starts
+  assert.deepEqual(f.calls.map(([kind]) => kind).slice(-3), ['resume', 'cancel', 'launch']);
+  assert.match(f.calls.at(-1)[1].orders, /continue phase 5/);
+  assert.equal(f.session.events.findLast(e => e.kind === 'status').text, 'The orchestrator\'s previous codex thread could not be reopened (codex app-server request timed out: thread/resume); started a fresh one from this session\'s handoff.');
+});
+
+test('a resume that fails with no process to check keeps the safety block and starts nothing', async t => {
+  const f = await secondTurnAfterFailedResume(t, 'codex launch transport lost');
+  const blocked = nextEvent(f.main, 'main.blocked');
+  f.main.run({id: 'two', text: 'continue phase 5'});
+
+  assert.equal((await blocked).reason, 'termination_uncertain');
+  assert.equal(f.calls.map(([kind]) => kind).at(-1), 'resume');
+});
+
+test('a resume refused for a usage limit starts no fresh thread: the provider is cooling down', async t => {
+  const f = await secondTurnAfterFailedResume(t, 'You have hit your usage limit', {code: 'limited', handle: {pid: 4242}});
+  const ended = nextEvent(f.main, 'main.terminal');
+  f.main.run({id: 'two', text: 'continue phase 5'});
+  const terminal = await ended;
+
+  assert.equal(f.calls.filter(([kind]) => kind === 'launch').length, 1); // the first turn's, nothing since
+  assert.equal(terminal.status, 'unavailable');
+  assert.equal(f.session.events.some(e => e.kind === 'status' && /could not be reopened/.test(e.text)), false);
+});
+
+// Found live (ACE d1bc0206): a turn orphaned by a crash blocked the orchestrator on every later restart,
+// and nothing cleared it. A turn whose recorded process is gone ended with it; one with no record waits for
+// the user's /unblock, and only a safety block can be cleared that way.
+test('a restart ends an orphaned turn whose recorded process is gone, and /unblock clears one with no record', async t => {
+  const f = fixture(t);
+  f.session.append({kind: 'main.started', requestId: 'dead', turnId: 'dead-turn', pid: 2 ** 30, from: 'main'});
+  const main = createMainService({session: f.session, adapters: {codex: {launch: async () => ({}), async *events() {}, cancel: async () => ({verified: true})}}, profile: {adapter: 'codex'}, settings: {}});
+  t.after(() => main.close());
+  assert.notEqual(main.state().state, 'blocked');
+  assert.match(f.session.events.findLast(e => e.kind === 'main.terminal').text, /^The orchestrator turn from before the restart ended with its process \(pid 1073741824 is gone\)\.$/);
+  assert.equal(f.session.events.some(e => e.kind === 'main.blocked'), false);
+
+  const g = fixture(t);
+  g.session.append({kind: 'main.started', requestId: 'legacy', turnId: 'legacy-turn', from: 'main'});
+  const legacy = createMainService({session: g.session, adapters: {codex: {launch: async () => ({}), async *events() {}, cancel: async () => ({verified: true})}}, profile: {adapter: 'codex'}, settings: {}});
+  t.after(() => legacy.close());
+  g.session.append({kind: 'task.submitted', task: 'w1', profile: 'build', orders: 'x', from: 'orchestrator'});
+  g.session.append({kind: 'task.started', task: 'w1', attempt: 1});
+  g.session.append({kind: 'task.blocked', task: 'w1', reason: 'orphaned', text: 'termination unverified after daemon restart'});
+  assert.equal(legacy.run({text: 'more'}).reason, 'termination_unverified');
+  assert.deepEqual(legacy.unblock(), {accepted: true, cancelled: ['w1']});
+  assert.deepEqual([g.session.events.findLast(e => e.task === 'w1').kind, g.session.events.findLast(e => e.task === 'w1').reason], ['task.cancelled', 'lost_in_restart']);
+  assert.equal(g.session.events.at(-1).kind, 'main.unblocked');
+  assert.deepEqual(legacy.unblock(), {accepted: false, reason: 'not_blocked'});
+  const restarted = createMainService({session: g.session, adapters: {codex: {launch: async () => ({}), async *events() {}, cancel: async () => ({verified: true})}}, profile: {adapter: 'codex'}, settings: {}});
+  t.after(() => restarted.close());
+  assert.notEqual(restarted.state().state, 'blocked', 'an unblock survives the next restart');
+});
+
+// Found live (ACE e3bd01d5, 2026-09-28 22:58): the first message typed into the session was refused by
+// the vendor ("model 'gpt-6-sol' is not enabled …", status 400). bounce showed the error and stopped;
+// the same message typed again a minute later was answered.
+function refusingFixture(t, turns) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-main-refused-'));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const session = new Session(root, {root});
+  const calls = [];
+  const start = kind => async args => { calls.push(kind); return {turnId: `turn-${calls.length}`, script: turns[calls.length - 1] ?? turns.at(-1)}; };
+  const adapter = {
+    launch: start('launch'),
+    resume: start('resume'),
+    async *events(handle) { for (const event of handle.script) yield event; },
+    async cancel() { return {verified: true}; },
+  };
+  const main = createMainService({session, adapters: {codex: adapter}, profile: {adapter: 'codex', mode: 'plan'}, settings: {executables: {}}, brief: 'Orders', typedRetryMs: 5});
+  t.after(() => main.close());
+  return {main, session, calls};
+}
+const refused = [{kind: 'error', text: 'model is not enabled'}, {kind: 'result', status: 'failed', text: 'model is not enabled'}];
+const answered = [{kind: 'native', provider: 'codex', sessionId: 'thread'}, {kind: 'assistant', text: 'pong'}, {kind: 'result', status: 'completed', text: 'pong'}];
+
+test('a typed message the vendor refuses before saying anything is tried once more, and says so', async t => {
+  const f = refusingFixture(t, [refused, answered]);
+  const ended = nextEvent(f.main, 'main.terminal');
+  f.main.run({id: 'one', text: 'where are we at?'});
+  const terminal = await ended;
+
+  assert.deepEqual([terminal.status, terminal.reason], ['completed', 'pong']);
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.session.events.filter(e => e.kind === 'main.terminal').length, 1, 'the refusal is not shown as the turn\'s end');
+  assert.equal(f.session.events.findLast(e => e.kind === 'status').text, 'codex refused the message (model is not enabled); trying once more.');
+});
+
+test('a message refused twice ends failed with the vendor\'s words, and is not tried a third time', async t => {
+  const f = refusingFixture(t, [refused, refused, answered]);
+  const ended = nextEvent(f.main, 'main.terminal');
+  f.main.run({id: 'one', text: 'where are we at?'});
+  const terminal = await ended;
+
+  assert.deepEqual([terminal.status, terminal.reason], ['failed', 'model is not enabled']);
+  assert.equal(f.calls.length, 2);
+});
+
+test('a turn that had already said something when it failed is not run again', async t => {
+  const f = refusingFixture(t, [[{kind: 'native', provider: 'codex', sessionId: 'thread'}, {kind: 'assistant', text: 'I have dispatched the task.'}, {kind: 'result', status: 'failed', text: 'stream closed'}], answered]);
+  const ended = nextEvent(f.main, 'main.terminal');
+  f.main.run({id: 'one', text: 'dispatch it'});
+  const terminal = await ended;
+
+  assert.deepEqual([terminal.status, f.calls.length], ['failed', 1]);
 });

@@ -29,5 +29,5 @@ export function candidateResult(events, task) {
 
 // Why a completed candidate is held at its review gate: the reviewer leaned rework, leaned accept,
 // or gave no answer at all. Older journals only say it in the text.
-export const REVIEW_GATE_REASONS = new Set(['review_not_accepted', 'review_uncertain', 'review_unavailable']);
+export const REVIEW_GATE_REASONS = new Set(['review_not_accepted', 'review_uncertain', 'review_unavailable', 'review_unreadable']);
 export const isReviewGate = row => REVIEW_GATE_REASONS.has(row?.reason) || /^Required review unavailable/i.test(row?.text ?? '');

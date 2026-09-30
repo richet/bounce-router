@@ -50,7 +50,10 @@ test('a cancellation wins a simultaneous successful result', {timeout: 3000}, as
   assert.deepEqual(session.events.filter(e => e.task === 'work' && ['task.completed', 'task.accepted', 'task.cancelled'].includes(e.kind)).map(e => e.kind), ['task.cancelled']);
 });
 
-test('a rework cannot launch a second attempt after its logical job cap', {timeout: 3000}, async t => {
+// Reversed 2026-09-27 (ACE d1bc0206): a rework round counted as an attempt of its job, so one rework plus
+// one retry exhausted the job and a completed, evidence-backed result was failed. A rework round is the same
+// task continuing (capped by rounds); only a new task is another attempt of its job.
+test('a rework round is not a new attempt of its job; a new task past the job allowance is refused', {timeout: 3000}, async t => {
   const {session, close} = fixture(t);
   const adapter = events => ({
     async launch() { return {}; }, async resume() { return {}; },
@@ -65,9 +68,12 @@ test('a rework cannot launch a second attempt after its logical job cap', {timeo
   });
   close(() => scheduler.close());
   scheduler.submit({task: 'job', jobId: 'stable-job', profile: 'builder', orders: 'work', review: {completion: 'critic'}});
-  await waitFor(() => session.events.some(e => e.kind === 'task.failed' && e.task === 'job' && e.reason === 'attempts_exhausted'));
-  assert.deepEqual(session.events.filter(e => e.kind === 'task.started' && e.task === 'job').map(e => e.attempt), [1]);
-  assert.equal(scheduler.tasks().job.reason, 'attempts_exhausted');
+  await waitFor(() => scheduler.tasks().job?.state === 'accepted');
+  assert.deepEqual(session.events.filter(e => e.kind === 'task.started' && e.task === 'job').map(e => e.attempt), [1, 2]);
+  assert.equal(session.events.some(e => e.kind === 'task.failed' && e.reason === 'attempts_exhausted'), false);
+  scheduler.submit({task: 'retry', jobId: 'stable-job', retryOf: 'job', replaces: 'job', profile: 'builder', orders: 'again', review: {completion: 'critic'}});
+  await waitFor(() => session.events.some(e => e.kind === 'task.failed' && e.task === 'retry'));
+  assert.equal(session.events.find(e => e.kind === 'task.failed' && e.task === 'retry').reason, 'attempts_exhausted');
 });
 
 test('a worker grant cannot message a reviewer, including its own reviewer', {timeout: 3000}, async t => {
@@ -119,4 +125,29 @@ test('reconciliation completes a crash-interrupted two-file integration without 
   assert.equal(launches, 1);
   assert.notEqual(recovered.tasks().writer.state, 'blocked');
   assert.equal(restarted.events.some(e => e.kind === 'task.blocked' && e.task === 'writer' && e.reason === 'orphaned'), false);
+});
+
+// Decided by Daniel on 2026-09-30, from ACE e3bd01d5: a retry on a slow local model ran 47 minutes to the
+// ceiling, and the retry on Sonnet submitted right after it failed in the same second, "Logical job
+// ceiling exhausted", because the ceiling counted from the job's first start. A job's time is not shared
+// between its attempts: each task's ceiling counts from its own start. The attempt allowance still is.
+test('a retry gets its own clock: the job\'s ceiling is not spent by the attempt before it', {timeout: 3000}, async t => {
+  const {session, close} = fixture(t);
+  let now = Date.parse('2026-09-30T10:00:00Z');
+  const adapter = () => ({
+    async launch() { return {}; }, async resume() { return {}; },
+    async *events() { yield {kind: 'result', status: 'failed', recoverable: true, text: 'ran out'}; }, async cancel() { return {verified: true}; },
+  });
+  const scheduler = createScheduler({session, adapters: {worker: adapter()}, profiles: {builder: {adapter: 'worker', policy: 'read-only'}},
+    strategy: {onSubmitted: () => 'dispatch', onCompleted: () => ({action: 'accept'}), onReviewVerdict: () => ({action: 'accept'}), onTerminal: () => ({submit: []})},
+    limits: {attempts: 3, rounds: 2, minutes: 15, ceiling: 60}, watchdog: {interval: null}, clock: () => now,
+  });
+  close(() => scheduler.close());
+  scheduler.submit({task: 'first', jobId: 'job-slow', profile: 'builder', orders: 'work'});
+  await waitFor(() => ['failed', 'blocked'].includes(scheduler.tasks().first?.state));
+  now += 61 * 60000; // the first attempt used the whole hour
+  scheduler.submit({task: 'second', jobId: 'job-slow', retryOf: 'first', profile: 'builder', orders: 'again'});
+  await waitFor(() => session.events.some(e => e.kind === 'task.started' && e.task === 'second') || session.events.some(e => e.kind === 'task.failed' && e.task === 'second'));
+  assert.equal(session.events.some(e => e.kind === 'task.started' && e.task === 'second'), true, JSON.stringify(session.events.filter(e => e.task === 'second' && e.kind.startsWith('task.')).map(e => [e.kind, e.reason, e.text])));
+  assert.equal(session.events.some(e => e.kind === 'task.failed' && e.task === 'second' && e.reason === 'deadline'), false);
 });

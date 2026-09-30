@@ -7,14 +7,17 @@ import {hostSession} from './remote.js';
 import {socketPathFor} from './bus.js';
 
 const VERSION = 1;
-const MAX_BUFFER = 16 * 1024 * 1024;
+const MAX_BUFFER = 16 * 1024 * 1024; // one message, as received
+// What may sit unsent before the reader counts as stalled: a replay's chunks are written in one tick,
+// so this is larger than any session history, unlike the per-message limit above.
+const MAX_QUEUED = 512 * 1024 * 1024;
 
 function channelFor(socket) {
   const channel = new EventEmitter();
   let buffer = '', queued = [];
   channel.send = message => {
     if (socket.destroyed) throw new Error('View disconnected');
-    if (socket.writableLength > MAX_BUFFER) { socket.destroy(); return; }
+    if (socket.writableLength > MAX_QUEUED) { socket.destroy(); return; }
     socket.write(JSON.stringify(message) + '\n');
   };
   channel.close = () => socket.end();
@@ -79,6 +82,10 @@ export async function createViewServer({session, main, token, onControl = () => 
     channel.on('message', receive);
     channel.once('disconnect', () => { clearTimeout(timer); host?.detach(); sockets.delete(socket); });
   });
+  // The daemon holds the session lock, so a socket already at this path is a dead daemon's leftover
+  // (a crashed listener never removes its file). Found live (ACE d1bc0206): it made every resume
+  // fail with EADDRINUSE. bus.js clears its own socket the same way.
+  try { fs.unlinkSync(socketPath); } catch {}
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(socketPath, resolve); });
   fs.chmodSync(socketPath, 0o600);
   return {

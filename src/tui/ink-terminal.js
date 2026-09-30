@@ -158,6 +158,11 @@ export function createInkTerminal({stdin = process.stdin, stdout = process.stdou
 
   async function mount(initial = {}) {
     if (mounted) return;
+    // React's development build records a performance.measure (with a props diff) for every
+    // component each render, and Node keeps those entries until cleared. Found live: an idle TUI
+    // re-rendering on its tick grew to 3.9 GB. The TUI is never a React dev session: React is only
+    // loaded by the import below, so this selects its production build.
+    process.env.NODE_ENV ??= 'production';
     if (initial.events) projection.replay(initial.events);
     update({...initial, columns: stdout.columns ?? initial.columns ?? 80, rows: stdout.rows ?? initial.rows ?? 24});
     const [{render: inkRender}, React, Ink, {createWorkspace}] = await Promise.all([

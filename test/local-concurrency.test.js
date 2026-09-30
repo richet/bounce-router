@@ -9,6 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {Session} from '../src/core.js';
 import {createScheduler} from '../src/scheduler.js';
+import {createMachineSlots} from '../src/machine-slots.js';
 import {fakeAdapter} from './helpers/fake-adapter.js';
 import {hostless} from './helpers/local-fakes.js';
 
@@ -86,4 +87,97 @@ test('slots are per model: a worker on an idle model starts while another model 
   const done = () => Object.values(scheduler.tasks()).filter(t => ['completed', 'accepted'].includes(t.state)).length;
   const start = Date.now();
   while (done() < 6) { for (const g of gates.values()) g.resolve([{kind: 'result', status: 'completed', text: 'done'}]); if (Date.now() - start > 8000) throw new Error('drain timed out'); await new Promise(r => setTimeout(r, 20)); }
+});
+
+// Found live (ACE d1bc0206, 2026-09-28): a second bounce, started with another home, sent its worker
+// to the same LM Studio while the first one's builder was running; the builder read as "stalled for
+// 604 s". Daniel: this machine runs one local worker at a time, whoever started it.
+test('two bounce processes share the machine\'s local slot: the second one\'s worker waits, says who has it, and starts when it is free', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-machine-conc-')));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const gates = new Map(), launched = [];
+  const first = orders => orders.split('\n')[0];
+  const localResolver = {resolve: async ({profile}) => ({...profile, providerID: 'lmstudio', opencodeConfig: {}}), configure() {}};
+  const localSettings = {endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234', maxConcurrent: 1, pollMs: 20}}};
+  const bounce = (name, pid) => {
+    const home = path.join(root, name);
+    fs.mkdirSync(home);
+    const session = new Session(home, {root: home});
+    const opencode = fakeAdapter(({orders}) => { const gate = Promise.withResolvers(); gates.set(first(orders), gate); launched.push(first(orders)); return gate.promise; });
+    const scheduler = createScheduler({...hostless, session, adapters: {opencode}, profiles: {a: local('a')}, localResolver, gitHead: () => null, localSettings,
+      machineSlots: createMachineSlots({dir: path.join(root, 'machine'), pid, alive: () => true, clock: () => Date.parse('2026-09-28T07:00:00Z')})});
+    t.after(() => scheduler.close());
+    return {session, scheduler};
+  };
+  const one = bounce('one', 111), two = bounce('two', 222);
+
+  const held = one.scheduler.submit({parent: null, profile: 'a', orders: 'first', deadline: null});
+  await waitFor(() => launched.includes('first'));
+  const waiting = two.scheduler.submit({parent: null, profile: 'a', orders: 'second', deadline: null});
+  const said = await waitFor(() => two.session.events.find(e => e.kind === 'task.milestone' && e.task === waiting.task && e.phase === 'queued'));
+  await new Promise(r => setTimeout(r, 100));
+
+  assert.deepEqual(launched, ['first']);
+  assert.equal(said.text, `Waiting for the local model on lmstudio: another bounce is using it (session ${one.session.id.slice(0, 8)}, task ${held.task.slice(0, 8)}, since 2026-09-28T07:00:00.000Z)`);
+
+  gates.get('first').resolve([{kind: 'result', status: 'completed', text: 'done first'}]);
+  await waitFor(() => launched.includes('second'));
+  assert.deepEqual(launched, ['first', 'second']);
+  gates.get('second').resolve([{kind: 'result', status: 'completed', text: 'done second'}]);
+  await waitFor(() => ['completed', 'accepted'].includes(two.scheduler.tasks()[waiting.task]?.state));
+  assert.equal(two.session.events.filter(e => e.kind === 'task.milestone' && /another bounce/.test(e.text)).length, 1, 'said once');
+
+  // and the slot is free again for the first process
+  const again = one.scheduler.submit({parent: null, profile: 'a', orders: 'third', deadline: null});
+  await waitFor(() => launched.includes('third'));
+  gates.get('third').resolve([{kind: 'result', status: 'completed', text: 'done third'}]);
+  await waitFor(() => ['completed', 'accepted'].includes(one.scheduler.tasks()[again.task]?.state));
+});
+
+// Found live (ACE e3bd01d5, 2026-09-29, tasks 7106f34c and 9928ff78): a worker sent back by its check
+// waited for the local model, which another task of the same session was using. Five minutes into the
+// wait the watchdog called it silent, then cancelled it and started a cloud fallback. A task that is
+// waiting for its turn is not a silent worker.
+test('a task sent back and waiting for the local model is not cancelled as silent or stalled', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-wait-watchdog-')));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const project = path.join(root, 'project');
+  fs.mkdirSync(project);
+  fs.writeFileSync(path.join(project, 'file.txt'), 'old\n');
+  const session = new Session(project, {root: path.join(root, 'home')});
+  let round = 0;
+  const opencode = fakeAdapter(({cwd}) => {
+    round += 1;
+    if (round === 2) fs.writeFileSync(path.join(cwd, 'done.txt'), 'done\n');
+    return [{kind: 'native', provider: 'opencode', sessionId: 's1'}, {kind: 'result', status: 'completed', text: `round ${round}`}];
+  });
+  const localResolver = {resolve: async ({profile}) => ({...profile, providerID: 'lmstudio', opencodeConfig: {}}), configure() {}};
+  // free for the first round; by the time the worker is sent back, another bounce has the model
+  let free = false, claims = 0;
+  const machineSlots = {
+    acquire: () => { claims += 1; return round >= 1 && !free ? {ok: false, holders: [{pid: 1, session: 'other-session', task: 'other-task', since: '2026-09-29T05:06:00.000Z'}]} : {ok: true, token: `claim-${claims}`}; },
+    release: () => true,
+    releaseAll() {},
+  };
+  let now = Date.parse('2026-09-29T05:00:00Z');
+  const reviewer = fakeAdapter(() => [{kind: 'result', status: 'completed', text: JSON.stringify({verdict: 'accept', findings: []})}]);
+  const profiles = {a: local('a'), critic: {adapter: 'reviewer', model: 'r', mode: 'yolo', fallback: [], role: 'reviewer', policy: 'read-only'}};
+  const scheduler = createScheduler({...hostless, session, adapters: {opencode, reviewer}, profiles, localResolver, gitHead: () => null, machineSlots,
+    clock: () => now, watchdog: {interval: null},
+    localSettings: {endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234', maxConcurrent: 1, pollMs: 20}}}});
+  t.after(() => scheduler.close());
+
+  const {task} = scheduler.submit({parent: null, profile: 'a', orders: 'write done.txt', owns: ['done.txt'], deadline: null, check: `node -e "require('fs').accessSync('done.txt')"`, review: {completion: 'critic'}});
+  await waitFor(() => session.events.find(e => e.kind === 'task.milestone' && e.task === task && /another bounce is using it/.test(e.text)));
+  now += 400_000;
+  await scheduler.tick();
+  now += 400_000;
+  await scheduler.tick();
+
+  assert.deepEqual(session.events.filter(e => e.kind === 'policy.escalated' && e.task === task).map(e => e.reason), []);
+  assert.equal(scheduler.tasks()[task].state, 'running');
+
+  free = true;
+  await waitFor(() => scheduler.tasks()[task]?.state === 'accepted');
+  assert.deepEqual(session.events.filter(e => e.kind === 'task.check' && e.task === task).map(e => e.passed), [false, true]);
 });

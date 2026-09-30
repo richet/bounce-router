@@ -21,6 +21,7 @@ import {noReviewStrategy} from '../src/strategy.js';
 import {handoffBlock} from '../src/main-service.js';
 import * as reducers from '../src/reducers.js';
 import {fakeAdapter} from './helpers/fake-adapter.js';
+import {findingAnswers} from './helpers/jev-answers.js';
 
 const setup = t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-jev-review-'));
@@ -43,7 +44,7 @@ const waitFor = async (fn, {timeout = 3000, interval = 5} = {}) => {
   }
 };
 const okResponse = body => ({ok: true, status: 200, headers: {get: () => null}, json: async () => body, text: async () => JSON.stringify(body)});
-const answers = (choice, confidence, nouls = {}) => ({decision: {type: 'choice', choice, probabilities: {accept: choice === 'accept' ? confidence : 1 - confidence, rework: choice === 'rework' ? confidence : 1 - confidence}, confidence}, ...Object.fromEntries(Object.entries(nouls).map(([name, noul]) => [name, {type: 'noul', noul}]))});
+const answers = (choice, confidence, nouls = {}) => ({decision: {type: 'choice', choice, probabilities: {accept: choice === 'accept' ? confidence : 1 - confidence, rework: choice === 'rework' ? confidence : 1 - confidence}, confidence}, ...findingAnswers(nouls)});
 const KEY = 'ts-live-key-9f3a';
 const gitStub = async args => args[0] === 'diff' ? 'diff --git a/x b/x\n+x' : args[0] === 'rev-parse' ? 'true\n' : '';
 const BOOKKEEPING = new Set(['orchestration.action.requested', 'orchestration.action.started', 'orchestration.action.settled', 'task.attempt.ended', 'task.cancel.requested', 'task.workspace', 'task.launch.requested', 'task.artifact', 'task.integration.requested', 'task.integrated']);
@@ -115,59 +116,59 @@ test('Jev on: a root task with no completion reviewer gets the jev critic; a con
   assert.equal(JSON.parse(fetchCalls[0].options.body).state.report.summary, 'done, tests pass');
 });
 
-// Observed live (session e9353126, task 6f7aabce): Jev leaned rework at 0.67 with confidence 0.35 on
-// both asks and fired a check, and the task was reported as "Required review unavailable: no confident
-// verdict" with no findings. An unconfident lean is still an answer: it stays gated, but says what it was.
-for (const [lean, probabilities, nouls, reason, wording] of [
-  ['rework', {rework: 0.67, accept: 0.33}, {remaining_work: 0.7}, 'review_not_accepted', /^Review did not accept: Jev leaned rework \(0\.67\) below the 0\.8 confidence bar on both asks; fired: remaining_work\./],
-  ['accept', {accept: 0.6, rework: 0.4}, {}, 'review_uncertain', /^Review uncertain: Jev leaned accept \(0\.60\) below the 0\.8 confidence bar on both asks\./],
-]) test(`an unconfident ${lean} lean is gated and reported as what it was, with its findings`, async t => {
+// Reversed 2026-09-25: an unconfident Jev answer is accepted with advice (see jev-review.test.js).
+// Observed live (session e9353126, task 6f7aabce): Jev leaned rework at 0.67 with confidence 0.35 and
+// fired a check; blocking on it (after an identical re-ask) cost a finished task a gate and an
+// orchestrator turn. With Jev off a completed task is accepted, so a lean is accepted too, with advice.
+for (const [lean, probabilities, nouls, wording] of [
+  ['rework', {rework: 0.67, accept: 0.33}, {remaining_work: 0.7}, /^Jev leaned rework \(probability 0\.67, confidence 0\.35 below the 0\.9 bar\); fired: remaining_work\./],
+  ['accept', {accept: 0.6, rework: 0.4}, {}, /^Jev leaned accept \(probability 0\.60, confidence 0\.35 below the 0\.8 bar\)\.$/],
+]) test(`an unconfident ${lean} lean is accepted with its findings attached as advice`, async t => {
   const {session} = setup(t);
   const worker = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done'}]);
-  const respond = () => ({answers: {decision: {type: 'choice', choice: lean, probabilities, confidence: 0.35}, ...Object.fromEntries(Object.entries(nouls).map(([name, noul]) => [name, {type: 'noul', noul}]))}});
+  const respond = () => ({answers: {decision: {type: 'choice', choice: lean, probabilities, confidence: 0.35}, ...findingAnswers(nouls)}});
   const {profiles, typesafe, jev} = jevScheduler(session, {settings: {enabled: true}, respond});
   const scheduler = createScheduler({session, adapters: {worker, typesafe}, profiles, jev, gitHead: () => null});
   const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null});
-  await waitFor(() => scheduler.tasks()[row.task]?.state === 'blocked');
-  assert.equal(session.events.some(e => e.kind === 'task.rework' || e.kind === 'task.accepted'), false);
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'accepted');
+  assert.equal(session.events.some(e => e.kind === 'task.blocked' || e.kind === 'review.reasked'), false);
+  assert.equal(session.events.filter(e => e.kind === 'jev.verdict').length, 1, 'asked once');
   const finished = session.events.filter(e => e.kind === 'review.finished').map(e => JSON.parse(e.text));
-  assert.deepEqual(finished.map(v => [v.verdict, v.choice, v.fired]), [['unavailable', lean, Object.keys(nouls)], ['unavailable', lean, Object.keys(nouls)]]);
-  const blocked = session.events.findLast(e => e.kind === 'task.blocked');
-  assert.equal(blocked.reason, reason);
-  assert.match(blocked.text, wording);
-  if (lean === 'rework') assert.equal(blocked.text.includes(VERDICT_CHECKS.remaining_work.fix), true, blocked.text);
-  assert.equal(session.events.findLast(e => e.kind === 'policy.escalated' && e.reason === reason)?.text, blocked.text);
+  assert.deepEqual(finished.map(v => [v.verdict, v.choice, v.fired]), [['unavailable', lean, Object.keys(nouls)]]);
+  const accepted = session.events.findLast(e => e.kind === 'task.accepted' && e.task === row.task);
+  assert.match(accepted.advice, wording);
+  if (lean === 'rework') assert.equal(accepted.advice.includes(VERDICT_CHECKS.remaining_work.fix), true, accepted.advice);
   assert.equal(worker.calls.resume, 0);
-  // The coordinator is told what the review answered, not "unavailable".
-  const handoff = handoffBlock(session, [blocked]);
-  assert.equal(handoff.includes(`review gate: blocked · ${reason} · ${blocked.text.slice(0, 60)}`), true, handoff);
-  assert.equal(/unavailable/i.test(handoff), false, handoff);
 });
 
-test('a review that returned no verdict at all is still reported as unavailable', async t => {
+// Rewritten 2026-09-27: a review that gives no verdict no longer holds finished work; it is accepted, and
+// the advice says the review gave none (and why).
+test('a review that returned no verdict at all is accepted with advice saying so', async t => {
   const {session} = setup(t);
   const worker = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done'}]);
   const {profiles, typesafe, jev} = jevScheduler(session, {settings: {enabled: true}, respond: () => { throw Object.assign(new Error('down'), {code: 'http_503'}); }});
   const scheduler = createScheduler({session, adapters: {worker, typesafe}, profiles, jev, gitHead: () => null});
   const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null});
-  await waitFor(() => scheduler.tasks()[row.task]?.state === 'blocked');
-  const blocked = session.events.findLast(e => e.kind === 'task.blocked');
-  assert.equal(blocked.reason, 'review_unavailable');
-  assert.match(blocked.text, /^Required review unavailable/);
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'accepted');
+  assert.equal(session.events.some(e => e.kind === 'task.blocked'), false);
+  assert.equal(session.events.findLast(e => e.kind === 'task.accepted').advice, 'The review gave no verdict (network); check the work yourself before building on it.');
 });
 
-test('a low-confidence rework blocks rather than synthesizing acceptance', async t => {
+// Reversed 2026-09-25 (Daniel: "much rejection of done tasks… even simpler tasks take long"). Live,
+// 159f4746 task 61ce01b4: a sonnet change whose gate passed was blocked by Jev leaning rework at 0.53 and
+// 0.52 (the identical re-ask), then accepted by hand. An unconfident answer means today's behaviour —
+// with Jev off a completed task is accepted — so it is accepted, with Jev's lean attached as advice.
+test('a low-confidence rework is accepted with Jev\'s lean as advice, not blocked and not re-asked', async t => {
   const {session} = setup(t);
   const worker = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done'}]);
   const {profiles, typesafe, jev} = jevScheduler(session, {settings: {enabled: true}, respond: () => ({answers: answers('rework', 0.55, {remaining_work: 0.7})})});
   const scheduler = createScheduler({session, adapters: {worker, typesafe}, profiles, jev, gitHead: () => null});
   const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null});
-  await waitFor(() => scheduler.tasks()[row.task]?.state === 'blocked');
-  assert.equal(session.events.some(e => e.kind === 'task.rework'), false);
-  const verdict = session.events.find(e => e.kind === 'jev.verdict');
-  assert.equal(verdict.verdict, 'unavailable');
-  assert.equal(verdict.choice, 'rework');
-  assert.match(verdict.text, /chose rework below threshold/);
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'accepted');
+  assert.equal(session.events.some(e => e.kind === 'task.rework' || e.kind === 'task.blocked' || e.kind === 'review.reasked'), false);
+  assert.equal(session.events.filter(e => e.kind === 'jev.verdict').length, 1, 'asked once');
+  const accepted = session.events.findLast(e => e.kind === 'task.accepted' && e.task === row.task);
+  assert.match(accepted.advice, /^Jev leaned rework \(probability 0\.\d+, confidence 0\.\d+ below the 0\.9 bar\)/);
   assert.equal(worker.calls.resume, 0);
 });
 
@@ -194,12 +195,14 @@ test('no Jev seam at all: task.started carries exactly today\'s keys and git is 
   const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null});
   await waitFor(() => scheduler.tasks()[row.task]?.state === 'completed');
   const started = session.events.find(e => e.kind === 'task.started');
-  assert.deepEqual(Object.keys(started), ['id', 'time', 'jobId', 'campaignId', 'kind', 'task', 'attempt', 'requested', 'from', 'context', 'seq']);
+  // campaignId left the row with campaigns (2026-09-27).
+  assert.deepEqual(Object.keys(started), ['id', 'time', 'jobId', 'kind', 'task', 'attempt', 'requested', 'from', 'context', 'seq']);
   assert.equal(gitCalls, 0);
   assert.equal(fs.readFileSync(session.file, 'utf8').includes('"head"'), false);
 });
 
-test('Jev does not draw worker starts; a missing key blocks the required review', async t => {
+// Rewritten 2026-09-27: a missing key no longer blocks the review; the work is accepted with advice.
+test('Jev does not draw worker starts; a missing key accepts the work with advice instead of blocking', async t => {
   const cases = [
     {name: 'key present', readKey: () => ({key: KEY, source: 'file'}), verdict: 'jev.verdict'},
     {name: 'key missing', readKey: () => null, verdict: 'jev.skipped'},
@@ -217,8 +220,9 @@ test('Jev does not draw worker starts; a missing key blocks the required review'
     const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null, budget: {starts: 1}});
     await waitFor(() => reducers.TERMINAL.has(scheduler.tasks()[row.task]?.state) || scheduler.tasks()[row.task]?.state === 'blocked');
     const kinds = lifecycleKinds(session.events.filter(e => e.task === row.task));
-    assert.deepEqual(kinds, ['task.submitted', 'budget.reserved', 'task.started', 'task.output', 'task.completed', 'review.started', ...(c.verdict === 'jev.verdict' ? ['model'] : []), c.verdict, 'review.finished', ...(c.verdict === 'jev.verdict' ? ['task.accepted'] : ['policy.escalated', 'task.blocked'])], c.name);
-    assert.equal(session.events.some(e => e.kind === 'task.blocked' || e.kind === 'policy.escalated'), c.verdict !== 'jev.verdict', c.name);
+    assert.deepEqual(kinds, ['task.submitted', 'budget.reserved', 'task.started', 'task.output', 'task.completed', 'review.started', ...(c.verdict === 'jev.verdict' ? ['model'] : []), c.verdict, 'review.finished', 'task.accepted'], c.name);
+    assert.equal(session.events.some(e => e.kind === 'task.blocked' || e.kind === 'policy.escalated'), false, c.name);
+    assert.equal(Boolean(session.events.findLast(e => e.kind === 'task.accepted').advice), c.verdict !== 'jev.verdict', c.name);
     // the one reservation is the worker's own start; the reviewer added none
     const reservations = session.events.filter(e => e.kind === 'budget.reserved' && e.task === row.task);
     assert.equal(reservations.length, 1, c.name);
@@ -251,7 +255,8 @@ test('an explicit review.completion wins; child tasks retain required review', a
   assert.equal(noReview.prepare({parent: null, profile: 'A', orders: 'x'}).review, undefined);
 });
 
-test('Jev unreachable (HTTP 500 after the retry budget): jev.skipped blocks the required gate', async t => {
+// Rewritten 2026-09-27: an unreachable Jev no longer blocks the review; the work is accepted with advice.
+test('Jev unreachable (HTTP 500 after the retry budget): jev.skipped accepts the work with advice', async t => {
   const {session} = setup(t);
   const worker = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done'}]);
   const fetchCalls = [];
@@ -261,7 +266,8 @@ test('Jev unreachable (HTTP 500 after the retry budget): jev.skipped blocks the 
   const jev = createJevDecisions({adapter: typesafe, readSettings: () => ({enabled: true, review: true, routing: {enabled: false, default: null}, confidence: 0.8, model: 'jev-1.13.0'})});
   const scheduler = createScheduler({session, adapters: {worker, typesafe}, profiles, jev, gitHead: () => null});
   const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null});
-  await waitFor(() => scheduler.tasks()[row.task]?.state === 'blocked');
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'accepted');
+  assert.match(session.events.findLast(e => e.kind === 'task.accepted').advice, /^The review gave no verdict/);
   const skipped = session.events.find(e => e.kind === 'jev.skipped');
   assert.equal(skipped.reason, 'http_500');
   assert.match(skipped.text, /unavailable/i);
@@ -335,8 +341,9 @@ test('routing off, low confidence, a policy mismatch, or no Jev at all: auto res
 test('auto is refused at submit when the roster has no writing builder to fall back to; other profiles validate as before', t => {
   const {session} = setup(t);
   const scheduler = createScheduler({session, adapters: {}, profiles: {R: {adapter: 'worker', model: 'r', mode: 'yolo', fallback: [], role: 'analyst', policy: 'read-only'}}, gitHead: () => null});
-  assert.equal(scheduler.validate({parent: null, profile: 'auto', orders: 'x'}), 'profile');
-  assert.equal(scheduler.validate({parent: null, profile: 'nope', orders: 'x'}), 'profile');
+  // The refusal names what to send instead (2026-09-27).
+  assert.equal(scheduler.validate({parent: null, profile: 'auto', orders: 'x'}), 'profile: "auto" is not a profile or agent here; send one of ["R"]');
+  assert.equal(scheduler.validate({parent: null, profile: 'nope', orders: 'x'}), 'profile: "nope" is not a profile or agent here; send one of ["R"]');
   const ok = createScheduler({session, adapters: {}, profiles: roster(), gitHead: () => null});
   assert.equal(ok.validate({parent: null, profile: 'auto', orders: 'x'}), null);
 });
@@ -435,29 +442,26 @@ test('a repository with no commit blocks the required Jev gate', async t => {
 
 // Found live (ACE, task 79981b05): a worker made the change and passed every gate, Jev sent it back,
 // it redid every gate, Jev sent it back with the SAME five checks, and a third identical round began.
-// The rounds cap alone allows that. A rework whose fired checks are the same set as the previous
-// round's is evidence the worker cannot satisfy them: the task is escalated to the orchestrator
-// instead of run again, with both verdicts on record.
-test('a second rework for the same fired checks escalates to the orchestrator instead of running a third identical round', async t => {
+// Rewritten 2026-09-27: a review sends work back at most once. After that one rework round the task is
+// accepted whatever the verdict, with the review's findings as advice — never blocked, never a third round.
+test('after its one rework round a task is accepted with the review\'s findings as advice, whatever the verdict', async t => {
   const {session} = setup(t);
   let turns = 0;
   const worker = fakeAdapter(() => { turns++; return [{kind: 'native', provider: 'worker', sessionId: 's1'}, {kind: 'result', status: 'completed', text: `attempt ${turns}: one-line change, 78 passed`}]; });
   const {profiles, typesafe, jev} = jevScheduler(session, {settings: {enabled: true},
-    respond: () => ({answers: answers('rework', 0.95, {unbacked_tests: 0.9, unverified_claims: 0.9})})});
+    respond: () => ({answers: answers('rework', 0.95, {remaining_work: 0.9, unverified_claims: 0.9})})});
   const scheduler = createScheduler({session, adapters: {worker, typesafe}, profiles, jev, gitHead: () => 'sha', limits: {rounds: 5}});
   t.after(() => scheduler.close());
   const row = scheduler.submit({parent: null, profile: 'A', orders: 'make the change', deadline: null});
-  await waitFor(() => scheduler.tasks()[row.task]?.state === 'blocked');
-  assert.equal(turns, 2, 'the worker ran twice: the original and ONE rework; no third identical round');
-  const escalated = session.events.find(e => e.kind === 'policy.escalated' && e.task === row.task);
-  assert.equal(escalated.reason, 'repeated_findings');
-  assert.equal(escalated.findings.length, 2, 'the repeated findings ride on the escalation');
-  const blocked = session.events.find(e => e.kind === 'task.blocked' && e.task === row.task);
-  assert.equal(blocked.text, 'Sent back twice for the same findings (unbacked_tests, unverified_claims); the worker cannot satisfy them. Accept, resubmit with different orders, or cancel.');
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'accepted');
+  assert.equal(turns, 2, 'the worker ran twice: the original and ONE rework');
   assert.equal(session.events.filter(e => e.kind === 'task.rework' && e.task === row.task).length, 1);
+  assert.equal(session.events.some(e => (e.kind === 'task.blocked' || e.kind === 'policy.escalated') && e.task === row.task), false);
+  const accepted = session.events.findLast(e => e.kind === 'task.accepted' && e.task === row.task);
+  assert.match(accepted.advice, /^Accepted after its one rework round; the review still found: .+ \(remaining_work, unverified_claims\)\. Decide whether a follow-up task is needed\.$/);
 });
 
-test('a rework whose findings DIFFER from the previous round still runs, up to the rounds cap', async t => {
+test('a second, different rework verdict is still not a second rework round', async t => {
   const {session} = setup(t);
   let turns = 0, verdicts = 0;
   const worker = fakeAdapter(() => { turns++; return [{kind: 'native', provider: 'worker', sessionId: 's1'}, {kind: 'result', status: 'completed', text: `attempt ${turns}`}]; });
@@ -467,7 +471,9 @@ test('a rework whose findings DIFFER from the previous round still runs, up to t
   t.after(() => scheduler.close());
   const row = scheduler.submit({parent: null, profile: 'A', orders: 'go', deadline: null});
   await waitFor(() => scheduler.tasks()[row.task]?.state === 'accepted');
-  assert.equal(turns, 3, 'two reworks with different findings, then accepted');
+  assert.equal(turns, 2, 'one rework, then accepted with the second verdict as advice');
+  assert.equal(verdicts, 2);
+  assert.match(session.events.findLast(e => e.kind === 'task.accepted').advice, /^Accepted after its one rework round/);
 });
 
 // Found live (in-place acceptance, non-git folder): an in-place task got the automatic Jev completion

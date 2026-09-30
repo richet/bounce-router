@@ -97,7 +97,8 @@ test('describeModels runs one read-only turn of the agent (no bus, prompt on std
   assert.equal(calls.length, 1);
   assert.equal(calls[0].provider, 'claude');
   assert.equal(calls[0].executable, '/opt/claude');
-  assert.deepEqual(calls[0].args, ['-p', '--output-format', 'stream-json', '--verbose', '--model', 'opus', '--permission-mode', 'plan']);
+  // --no-session-persistence: a roster note is a one-off call, never a session in the user's own history.
+  assert.deepEqual(calls[0].args, ['-p', '--output-format', 'stream-json', '--verbose', '--no-session-persistence', '--model', 'opus', '--permission-mode', 'plan']);
   assert.equal(calls[0].cwd, path.join(root, 'roster-setup'));
   assert.match(calls[0].prompt, /- claude\/haiku-next/);
   assert.equal(fs.readFileSync(path.join(root, 'roster-setup', 'prompt.txt'), 'utf8'), calls[0].prompt);

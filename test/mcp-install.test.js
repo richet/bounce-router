@@ -14,7 +14,8 @@ NODE_ENV = "production"
 `;
 
 test('I1 the entry bounce writes, and writing it twice changes nothing', () => {
-  assert.equal(codexEntry('/usr/local/bin/bounce'), `${MARKER}\n[mcp_servers.bounce]\ncommand = "/usr/local/bin/bounce"\nargs = ["mcp-serve"]\n`);
+  // env_vars: Codex starts an MCP server with a stripped environment; the session's bus must reach it.
+  assert.equal(codexEntry('/usr/local/bin/bounce'), `${MARKER}\n[mcp_servers.bounce]\ncommand = "/usr/local/bin/bounce"\nargs = ["mcp-serve"]\nenv_vars = ["BOUNCE_BUS", "BOUNCE_BUS_TOKEN_FILE"]\n`);
   const once = withCodexEntry(existing, '/usr/local/bin/bounce');
   assert.equal(once.changed, true);
   assert.equal(once.text.includes('[mcp_servers.node_repl]'), true, 'what was already there is untouched');

@@ -15,16 +15,20 @@ export const PROTOCOL_VERSION = '2025-06-18';
 // "not yet" well inside that instead of hanging, and the caller decides whether to ask again or end its turn.
 export const WAIT_SECONDS_MAX = 45;
 
+// Plans are no longer reviewed (2026-09-29); this stub keeps answering an orchestrator that still
+// carries the old habit instead of failing its call.
+const PLAN_WAIT_NOTE = 'plans are no longer reviewed: there is nothing to wait for; dispatch the tasks';
+
 const TOOLS = [
-  {name: 'submit', description: 'Submit a bounce event: task.submitted, plan.submitted, a message to a worker, or a milestone.',
+  {name: 'submit', description: 'Submit a bounce event: task.submitted, a message to a worker, or a milestone.',
     inputSchema: {type: 'object', properties: {event: {type: 'object', description: 'The event, exactly as `bounce publish --event` takes it.'}}, required: ['event']}},
-  {name: 'task_submit', description: 'Submit a task with stable job/retry/campaign/plan identity. retryOf is authorized against this grant and cannot bypass review or limits.',
-    inputSchema: {type: 'object', properties: {task: {type: 'string'}, profile: {type: 'string'}, orders: {type: 'string'}, requires: {type: 'array', items: {type: 'string', enum: ['read', 'exec', 'write']}}, owns: {type: 'array', items: {type: 'string'}}, depends_on: {type: 'array', items: {type: 'string'}}, deadline: {type: ['number', 'null']}, review: {type: 'object'}, steps: {type: 'string'}, risk: {type: 'string'}, size: {type: 'object'}, checkpoint: {type: 'object'}, parent: {type: ['string', 'null']}, jobId: {type: 'string'}, retryOf: {type: 'string'}, campaignId: {type: 'string'}, gate: {type: 'string'}, planId: {type: 'string'}, chunkId: {type: 'string'}, inPlace: {type: 'object', description: 'Run in the real checkout. authorizedBy: the seq of the user message that asked for it; omit it to cite the latest one.', properties: {authorizedBy: {type: 'number'}}}}, required: ['profile', 'orders', 'requires']}},
+  {name: 'task_submit', description: 'Submit a task with stable job/retry identity. retryOf is authorized against this grant and cannot bypass review or limits.',
+    inputSchema: {type: 'object', properties: {task: {type: 'string'}, profile: {type: 'string'}, orders: {type: 'string'}, requires: {type: 'array', items: {type: 'string', enum: ['read', 'exec', 'write']}}, owns: {type: 'array', items: {type: 'string'}}, depends_on: {type: 'array', items: {type: 'string'}}, deadline: {type: ['number', 'null']}, review: {type: 'object'}, steps: {type: 'string'}, check: {type: 'string', description: 'A shell command that proves the work is done. bounce runs it in the worker\'s copy when the worker finishes; only work that passes (exit 0) is put in the checkout.'}, risk: {type: 'string'}, size: {type: 'object'}, checkpoint: {type: 'object'}, parent: {type: ['string', 'null']}, jobId: {type: 'string'}, retryOf: {type: 'string'}, inPlace: {type: 'object', description: 'Run in the real checkout. authorizedBy: the seq of the user message that asked for it; omit it to cite the latest one.', properties: {authorizedBy: {type: 'number'}}}}, required: ['profile', 'orders', 'requires']}},
   {name: 'wait', description: `Wait for the first row matching every field given, up to ${WAIT_SECONDS_MAX} seconds. Answers {waiting: true} when nothing matched yet — end your turn rather than waiting again for long work; bounce wakes you with each outcome.`,
     inputSchema: {type: 'object', properties: {match: {type: 'object'}, seconds: {type: 'number'}, afterSeq: {type: 'number'}}, required: ['match']}},
   {name: 'report', description: 'Report progress or the final result for this worker attempt (workers only).',
     inputSchema: {type: 'object', properties: {report: {type: 'object'}}, required: ['report']}},
-  {name: 'state', description: 'Write where the campaign is, in your own words: the phase, what is done, what is next, and why you changed course. One living note — each call replaces the last, and it is the first thing you are given when you wake.',
+  {name: 'state', description: 'Write where the work is, in your own words: the phase, what is done, what is next, and why you changed course. One living note — each call replaces the last, and it is the first thing you are given when you wake.',
     inputSchema: {type: 'object', properties: {text: {type: 'string'}}, required: ['text']}},
   {name: 'task_get', description: 'One task: state, the AI playing it, lease and elapsed, its last milestones, its findings, its summary or review verdict. Bounded — never the journal itself.',
     inputSchema: {type: 'object', properties: {task: {type: 'string'},
@@ -32,20 +36,13 @@ const TOOLS = [
       required: ['task']}},
   {name: 'tasks_list', description: 'Every task that is still live (or all of them), one line each.',
     inputSchema: {type: 'object', properties: {all: {type: 'boolean'}}, required: []}},
-  {name: 'campaign_start', description: 'Start an authorized campaign with its objective and required gates.', inputSchema: {type: 'object', properties: {objective: {type: 'string'}, required: {type: 'array', items: {type: 'string'}}, campaignId: {type: 'string'}}, required: ['objective', 'required']}},
-  {name: 'campaign_get', description: 'Read a campaign, including its required gates and remaining obligations.', inputSchema: {type: 'object', properties: {campaignId: {type: 'string'}}, required: ['campaignId']}},
-  {name: 'campaign_extend', description: 'Add required gates to an active campaign.', inputSchema: {type: 'object', properties: {campaignId: {type: 'string'}, required: {type: 'array', items: {type: 'string'}}}, required: ['campaignId', 'required']}},
-  {name: 'campaign_complete', description: 'Complete a campaign only after all required gates are satisfied.', inputSchema: {type: 'object', properties: {campaignId: {type: 'string'}}, required: ['campaignId']}},
-  {name: 'campaign_block', description: 'Record a concrete campaign blocker.', inputSchema: {type: 'object', properties: {campaignId: {type: 'string'}, reason: {type: 'string'}}, required: ['campaignId', 'reason']}},
-  {name: 'campaign_pause', description: 'User-only: pause campaign dispatch.', inputSchema: {type: 'object', properties: {campaignId: {type: 'string'}}, required: ['campaignId']}},
-  {name: 'campaign_resume', description: 'User-only: resume campaign dispatch.', inputSchema: {type: 'object', properties: {campaignId: {type: 'string'}}, required: ['campaignId']}},
-  {name: 'plan_wait', description: 'Wait for this plan ID to become accepted, rejected, or unavailable.', inputSchema: {type: 'object', properties: {plan: {type: 'string'}, seconds: {type: 'number'}, afterSeq: {type: 'number'}}, required: ['plan']}},
+  {name: 'plan_wait', description: 'No longer used: plans are not reviewed any more.', inputSchema: {type: 'object', properties: {plan: {type: 'string'}, seconds: {type: 'number'}, afterSeq: {type: 'number'}}, required: ['plan']}},
 ];
 
 const ok = (text, structuredContent) => ({content: [{type: 'text', text}], ...(structuredContent === undefined ? {} : {structuredContent})});
 const fail = (text, detail = null) => ({content: [{type: 'text', text}], isError: true,
   ...(detail?.code ? {structuredContent: {code: detail.code, reason: detail.reason ?? text, ...(detail.repair ? {repair: detail.repair} : {})}} : {})});
-const rowText = row => row ? `${row.kind}${row.task ? ` ${row.task}` : ''}${row.seq ? ` (seq ${row.seq})` : ''}` : 'null';
+const rowText = row => row ? `${row.kind}${row.task ? ` ${row.task}` : ''}${row.seq ? ` (seq ${row.seq})` : ''}${Array.isArray(row.notes) ? row.notes.map(note => `\nnote: ${note}`).join('') : ''}` : 'null';
 
 // `ops` is src/bridge-ops.js's interface, `views` the pure task views: both injected, both the only source
 // of an answer. Returns the JSON-RPC response object, or null for a notification.
@@ -63,26 +60,12 @@ export function createMcpServer({ops, views, version = '0'}) {
     if (name === 'task_submit') {
       if (typeof args.profile !== 'string' || typeof args.orders !== 'string') return fail('task_submit needs profile and orders');
       const result = await ops.submit({kind: 'task.submitted', task: args.task, profile: args.profile, orders: args.orders, requires: args.requires, parent: args.parent ?? null,
-        jobId: args.jobId, retryOf: args.retryOf, campaignId: args.campaignId, gate: args.gate, planId: args.planId, chunkId: args.chunkId, ...Object.fromEntries(['owns', 'depends_on', 'deadline', 'review', 'steps', 'risk', 'size', 'checkpoint', 'inPlace'].filter(key => args[key] !== undefined).map(key => [key, args[key]]))});
+        jobId: args.jobId, retryOf: args.retryOf, ...Object.fromEntries(['owns', 'depends_on', 'deadline', 'review', 'steps', 'check', 'risk', 'size', 'checkpoint', 'inPlace'].filter(key => args[key] !== undefined).map(key => [key, args[key]]))});
       return result.ok ? ok(rowText(result.row), result.row) : fail(`bounce refused it: ${result.reason}`, result);
-    }
-    if (name.startsWith('campaign_') && name !== 'campaign_get') {
-      const kind = `campaign.${name.slice('campaign_'.length)}`;
-      if (typeof args.campaignId !== 'string' && kind !== 'campaign.start') return fail(`${name} needs a campaignId`);
-      const result = await ops.submit({kind, campaignId: args.campaignId, objective: args.objective, required: args.required, reason: args.reason});
-      return result.ok ? ok(rowText(result.row), result.row) : fail(`bounce refused it: ${result.reason}`, result);
-    }
-    if (name === 'campaign_get') {
-      if (typeof args.campaignId !== 'string' || !args.campaignId) return fail('campaign_get needs a campaignId');
-      const view = views.campaign?.(args.campaignId);
-      return view ? ok(JSON.stringify(view), view) : fail(`no such campaign: ${args.campaignId}`);
     }
     if (name === 'plan_wait') {
       if (typeof args.plan !== 'string' || !args.plan) return fail('plan_wait needs a plan id');
-      const seconds = Math.min(Number(args.seconds) > 0 ? Number(args.seconds) : 30, WAIT_SECONDS_MAX);
-      const result = await ops.wait({plan: args.plan, planDecision: true}, {timeout: seconds * 1000, afterSeq: Number(args.afterSeq) || 0});
-      if (!result.ok) return fail(`bounce refused it: ${result.reason}`, result);
-      return result.timedOut ? ok('not yet: no plan decision', {waiting: true, row: null}) : ok(rowText(result.row), {waiting: false, row: result.row});
+      return ok(PLAN_WAIT_NOTE, {waiting: false, row: null});
     }
     if (name === 'wait') {
       if (!args.match || typeof args.match !== 'object') return fail('wait needs a `match` object');

@@ -125,24 +125,19 @@ test('P3 completion rework on the same worker, then accept', async t => {
   assert.equal(scheduler.budgets().roots[row.task].reserved.rounds, 1);
 });
 
-test('P4 rounds cap: two reworks in a row blocks instead of a silent third round', async t => {
+// Rewritten 2026-09-27: a review sends work back at most once, then accepts it with advice (it used to
+// block at the rounds cap / repeated findings). No third round, no block.
+test('P4 rounds cap: after one rework a second rework verdict accepts with advice instead of blocking', async t => {
   const {session} = setup(t);
   const workerAdapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'pass'}]);
   const criticAdapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: '{"verdict":"rework","findings":["still broken"]}'}]);
   const profiles = {A: worker(), C: critic()};
   const scheduler = createScheduler({session, adapters: {worker: workerAdapter, critic: criticAdapter}, profiles});
   const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null, review: {completion: 'C'}, budget: {rounds: 1}});
-  await waitFor(() => scheduler.tasks()[row.task]?.state === 'blocked');
-
-  const escalated = session.events.filter(e => e.kind === 'policy.escalated');
-  assert.equal(escalated.length, 1);
-  // The critic repeats the same finding, so the repeated-findings rule fires at the same moment the
-  // rounds cap would: same outcome (blocked, one rework, no third round), the more specific reason.
-  assert.equal(escalated[0].reason, 'repeated_findings');
-  const blockedRow = session.events.filter(e => e.kind === 'task.blocked').at(-1);
-  assert.equal(blockedRow.text, 'Sent back twice for the same findings; the worker cannot satisfy them. Accept, resubmit with different orders, or cancel.');
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'accepted');
+  assert.equal(session.events.filter(e => e.kind === 'policy.escalated').length, 0);
+  assert.equal(session.events.findLast(e => e.kind === 'task.accepted').advice, 'Accepted after its one rework round; the review still found: still broken. Decide whether a follow-up task is needed.');
   assert.equal(workerAdapter.calls.resume, 1);
-  assert.equal(scheduler.tasks()[row.task].state, 'blocked');
 });
 
 test('P5 depends_on: B holds while A is running or merely completed, launches once A is accepted', async t => {
@@ -283,8 +278,8 @@ test('P8 pending messages fold into the resume message once (A2): round 1 only, 
   // live worker handle for a controlled window in which to inject the two pending messages —
   // without this, a fake adapter resolves fast enough that round 1 could already be resuming
   // before the test gets a chance to append them. The critic reworks twice (the default
-  // limits.rounds cap is 2), so a second resume happens naturally with no manual pacing needed;
-  // a third review attempt then finds the cap spent and blocks.
+  // limits.rounds cap is 2), but a review sends work back only once (2026-09-27), so the second rework
+  // verdict accepts the task with advice instead of a second resume.
   const deferredCritic = {};
   deferredCritic.promise = new Promise(resolve => { deferredCritic.resolve = resolve; });
   let firstCriticLaunch = true;
@@ -303,15 +298,14 @@ test('P8 pending messages fold into the resume message once (A2): round 1 only, 
   assert.equal(session.events.find(e => e.message === m1.id).tier, 'queued');
 
   deferredCritic.resolve();
-  await waitFor(() => scheduler.tasks()[row.task]?.state === 'blocked');
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'accepted');
 
   // `A` is a write-policy (yolo) worker in an isolated copy, so its resume message now carries the
   // appended working-copy paragraph (src/scheduler.js inWorkingCopy) after the folded text.
-  assert.equal(workerAdapter.calls.resume, 2);
+  assert.equal(workerAdapter.calls.resume, 1);
   assert.equal(workerAdapter.resumeCalls[0].message.startsWith('Rework round 1:\n- fix x\nnote one'), true, workerAdapter.resumeCalls[0].message);
-  assert.match(workerAdapter.resumeCalls[0].message, /\n\nYour working copy is .+: it is a copy of the project, and only changes made there are your work\. Writes to the original checkout .+ are refused\.$/);
-  assert.equal(workerAdapter.resumeCalls[1].message.startsWith('Rework round 2:\n- fix y'), true, workerAdapter.resumeCalls[1].message);
-  assert.match(workerAdapter.resumeCalls[1].message, /\n\nYour working copy is .+: it is a copy of the project, and only changes made there are your work\. Writes to the original checkout .+ are refused\.$/);
+  assert.match(workerAdapter.resumeCalls[0].message, /\n\nYour working copy is .+: it is a copy of the project, and only changes made there are your work: bounce integrates them into the original checkout .+ after review, so edit the copy, never the original\. What your orders ask you to deliver, evidence and reports included, goes inside this copy at the path they name: a file saved anywhere else on disk is not delivered\.$/);
+  assert.match(session.events.findLast(e => e.kind === 'task.accepted').advice, /fix y/);
   const deliveredForM1 = session.events.filter(e => e.kind === 'task.delivered' && e.message === m1.id).map(e => e.tier);
   assert.deepEqual(deliveredForM1, ['queued', 'next-turn']);
 });
@@ -428,15 +422,16 @@ test('P15 non-positive limits.rounds throws malformed: limits (A5)', t => {
   assert.throws(() => createScheduler({session, adapters: {}, profiles: {}, limits: {rounds: 0}}), {message: 'malformed: limits'});
 });
 
-test('P4b rounds cap still bites on its own when every rework brings NEW findings', async t => {
+// Rewritten 2026-09-27: new findings after the one rework round are advice, not a block.
+test('P4b one rework even when every rework verdict brings NEW findings, then accepted with them as advice', async t => {
   const {session} = setup(t);
   let n = 0;
   const workerAdapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'pass'}]);
   const criticAdapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: `{"verdict":"rework","findings":["problem ${++n}"]}`}]);
   const scheduler = createScheduler({session, adapters: {worker: workerAdapter, critic: criticAdapter}, profiles: {A: worker(), C: critic()}});
-  const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null, review: {completion: 'C'}, budget: {rounds: 1}});
-  await waitFor(() => scheduler.tasks()[row.task]?.state === 'blocked');
-  assert.equal(session.events.filter(e => e.kind === 'policy.escalated')[0].reason, 'rounds');
-  assert.equal(session.events.filter(e => e.kind === 'task.blocked').at(-1).text, 'rounds exhausted');
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'do it', deadline: null, review: {completion: 'C'}, budget: {rounds: 5}});
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'accepted');
+  assert.equal(session.events.some(e => e.kind === 'task.blocked'), false);
+  assert.equal(session.events.findLast(e => e.kind === 'task.accepted').advice, 'Accepted after its one rework round; the review still found: problem 2. Decide whether a follow-up task is needed.');
   assert.equal(workerAdapter.calls.resume, 1);
 });

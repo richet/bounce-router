@@ -38,21 +38,21 @@ test('an override accept closes a task held at an unconfident gate, and its rewo
   assert.equal(plain.fix.state, 'blocked');
 });
 
+// Rewritten 2026-09-27: review gates no longer hold finished work, so the override is exercised while the
+// review is still running (the orchestrator decides first); it still integrates before accepting.
 test('an override accept integrates the isolated work into the checkout before the task is accepted', {timeout: 5000}, async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-gate-override-'));
   const cwd = path.join(root, 'project'); fs.mkdirSync(path.join(cwd, 'src'), {recursive: true}); fs.writeFileSync(path.join(cwd, 'src', 'a.js'), 'old\n');
   const session = new Session(cwd, {root});
   const worker = fakeAdapter(({cwd: work}) => { fs.writeFileSync(path.join(work, 'src', 'a.js'), 'new\n'); return [{kind: 'result', status: 'completed', text: 'done'}]; });
-  const lean = JSON.stringify({verdict: 'unavailable', findings: [], confidence: 0.3, threshold: 0.8, choice: 'rework', probabilities: {rework: 0.7, accept: 0.3}, fired: ['unbacked_tests'], leanFindings: ['Paste the test output.'], source: 'jev'});
-  const critic = fakeAdapter(() => [{kind: 'result', status: 'completed', text: lean}]);
+  const critic = fakeAdapter(() => ({never: true}));
   const scheduler = createScheduler({session, adapters: {worker, critic}, profiles: {builder: {adapter: 'worker', policy: 'write'}, critic: {adapter: 'critic', policy: 'read-only'}},
     gitHead: () => null, watchdog: {interval: null}});
   t.after(() => { scheduler.close(); fs.rmSync(root, {recursive: true, force: true}); });
   scheduler.submit({task: 'fix', parent: null, profile: 'builder', from: 'orchestrator', owns: ['src/a.js'], requires: ['read', 'exec', 'write'], orders: 'change a', review: {completion: 'critic'}});
-  await waitFor(() => tasks(session.events).fix?.state === 'blocked');
-  assert.equal(session.events.findLast(e => e.kind === 'task.blocked' && e.task === 'fix').reason, 'review_not_accepted');
+  await waitFor(() => tasks(session.events).fix?.state === 'reviewing' && critic.calls.launch === 1);
   assert.equal(fs.readFileSync(path.join(cwd, 'src', 'a.js'), 'utf8'), 'old\n');
-  scheduler.acceptOverride({kind: 'task.accepted', task: 'fix', stage: 'completion', by: 'orchestrator', overrides: 'review_not_accepted', text: 'Re-ran the tests myself.'});
+  scheduler.acceptOverride({kind: 'task.accepted', task: 'fix', stage: 'completion', by: 'orchestrator', overrides: 'reviewing', text: 'Re-ran the tests myself.'});
   await waitFor(() => tasks(session.events).fix?.state === 'accepted');
   assert.equal(fs.readFileSync(path.join(cwd, 'src', 'a.js'), 'utf8'), 'new\n');
   const integrated = session.events.findIndex(e => e.kind === 'task.integrated' && e.task === 'fix');
@@ -74,4 +74,20 @@ test('the orchestrator\'s own accept is not handed back to it as a new outcome',
   assert.deepEqual(pendingMainActions(events).map(action => [action.task, action.kind]), [['plan', 'task.blocked']]);
   events.push(row({kind: 'task.accepted', task: 'plan', stage: 'completion', by: 'orchestrator', from: 'orchestrator', overrides: 'review_uncertain', text: 'Checked it.'}));
   assert.deepEqual(pendingMainActions(events), []);
+});
+
+// "review gate unresolved; preserved candidate must be reviewed, not rerun" refused the orchestrator's own
+// retry of held work (found live). Since 2026-09-27 the retry is its decision: it is accepted.
+test('a retry of a task an older journal held at a review gate is accepted, not refused', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-gate-retry-'));
+  const session = new Session(root, {root});
+  session.append({kind: 'task.submitted', task: 'held', jobId: 'job-held', parent: null, profile: 'builder', orders: 'x', from: 'orchestrator', review: {completion: 'critic'}});
+  session.append({kind: 'task.started', task: 'held', attempt: 1});
+  session.append({kind: 'task.attempt.ended', task: 'held', attempt: 1, verifiedTermination: true});
+  session.append({kind: 'task.reported', task: 'held', attempt: 1, op: 'final', phase: 'done', text: 'done', next: '', outcome: 'completed', summary: 'done', evidence: []});
+  session.append({kind: 'task.completed', task: 'held', summary: 'done'});
+  session.append({kind: 'task.blocked', task: 'held', reason: 'review_not_accepted', text: 'Review did not accept'});
+  const scheduler = createScheduler({session, adapters: {worker: fakeAdapter(() => ({never: true}))}, profiles: {builder: {adapter: 'worker', policy: 'write'}, critic: {adapter: 'worker', policy: 'read-only'}}, gitHead: () => null, watchdog: {interval: null}});
+  t.after(() => { scheduler.close(); fs.rmSync(root, {recursive: true, force: true}); });
+  assert.equal(scheduler.validate({from: 'orchestrator', profile: 'builder', orders: 'redo it differently', retryOf: 'held'}, ), null);
 });

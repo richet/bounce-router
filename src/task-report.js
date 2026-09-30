@@ -11,6 +11,7 @@ export function formatTaskView(view) {
     view.reviewer ? `review: ${view.reviewer}${view.verdict ? ` · ${view.verdict.verdict}` : ' · running'}` : null,
     line('blocked', view.blocker),
     line('reason', view.reason),
+    line('advice', view.advice),
   ].filter(Boolean);
   if (view.milestones.length) rows.push('milestones:', ...view.milestones.map(m => `  ${m.phase}: ${m.text}${m.next ? ` → ${m.next}` : ''}`));
   if (view.findings.total) {

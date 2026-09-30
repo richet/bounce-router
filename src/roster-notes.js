@@ -158,7 +158,7 @@ export async function describeModels({models, agent, catalogs = [], reference = 
   const said = [], results = [];
   try {
     const result = await run({provider: agent.adapter, executable: resolveExecutable(agent.adapter, executables[agent.adapter]),
-      args: invocation(agent.adapter, {model: agent.model, mode: 'plan'}, promptFile), prompt, cwd: dir, signal: controller.signal,
+      args: invocation(agent.adapter, {model: agent.model, mode: 'plan', ephemeral: true}, promptFile), prompt, cwd: dir, signal: controller.signal,
       emit: e => { if (e.kind === 'assistant') said.push(e.text); else if (e.kind === 'result' && e.success) results.push(e.text); }});
     if (controller.signal.aborted) throw new Error(signal?.aborted ? 'cancelled' : `${agent.adapter} did not answer within ${Math.round(timeoutMs / 1000)} s`);
     if (result.status !== 'completed') throw new Error(`${agent.adapter} ${result.status === 'missing' ? 'is not installed' : result.status}`);

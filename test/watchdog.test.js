@@ -420,7 +420,8 @@ test('W13 completion review launch throwing releases the reservation it never co
   const profiles = {W: worker('W'), Crit: {adapter: 'crit', model: 'c', mode: 'yolo', fallback: [], role: 'critic'}};
   const scheduler = createScheduler({session, adapters: {W: workerAdapter, crit: criticAdapter}, profiles, watchdog: {interval: null}});
   const row = scheduler.submit({parent: null, profile: 'W', orders: 'w', deadline: null, review: {completion: 'Crit'}, budget: {starts: 5}});
-  await waitFor(() => scheduler.tasks()[row.task]?.state === 'blocked');
+  // 2026-09-27 (user): a review that cannot start is not decided by bounce; the orchestrator is woken to pick the way on.
+  await waitFor(() => session.events.some(e => e.kind === 'task.blocked' && e.task === row.task));
 
   // peer.joined carries `name`, not `task` — filtered out here like every other task-scoped test.
   const kinds = session.events.filter(e => e.task === row.task && !e.kind.startsWith('orchestration.') && !['task.attempt.ended', 'task.cancel.requested', 'task.workspace', 'task.launch.requested', 'task.artifact'].includes(e.kind)).map(e => e.kind);
@@ -428,6 +429,7 @@ test('W13 completion review launch throwing releases the reservation it never co
     'task.submitted', 'budget.reserved', 'task.started', 'task.output', 'task.completed',
     'budget.reserved', 'review.started', 'review.finished', 'budget.released', 'policy.escalated', 'task.blocked',
   ]);
+  assert.match(session.events.findLast(e => e.kind === 'policy.escalated').text, /^The review could not start\. Decide: /);
   const released = session.events.filter(e => e.kind === 'budget.released' && e.task === row.task);
   assert.equal(released.length, 1);
   assert.deepEqual(released[0].amount, {starts: 1});

@@ -21,7 +21,7 @@ test('an agent is activated on the running scheduler from its file, by the user 
   let refreshed = 0;
   const files = new Map([['scout', {name: 'scout', description: 'Scouts.', policy: 'read-only', prompt: 'Scout.', source: 'user', models: ['lmstudio/loaded']}]]);
   t.after(createLocalActivation({session, scheduler, profiles, settings, readSettings: () => settings, readRoles: () => files, refresh: () => {refreshed++;}}));
-  assert.equal(scheduler.validate({profile: 'scout', orders: 'Read', parent: null}), 'profile');
+  assert.match(scheduler.validate({profile: 'scout', orders: 'Read', parent: null}), /^profile: "scout" is not a profile or agent here; send one of /);
   const result = await activateLocalProfiles(session, ['scout']);
   assert.equal(result.kind, 'local.profiles.activated');
   assert.deepEqual(result.names, ['scout']);

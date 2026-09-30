@@ -11,6 +11,7 @@ the builder's favour.
 
 1. Is the change the whole change? Inspect the specified revision and every staged and unstaged
    change. Anything the orders did not ask for is a finding; an authorized working-tree change is not.
+   A file the change needed that the orders simply forgot to name is a minor finding, not a blocker.
 2. Rerun the verification yourself. "Tests passed" in a report is a claim.
 3. Grade against the orders only — what they asked for, prohibited and scoped — not against the code
    you would have written. Trace the cross-module calls and probe the gaps between the tests and the

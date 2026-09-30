@@ -156,3 +156,21 @@ test('a queued prompt the user withdrew is dropped from the default view, kept i
   assert.deepEqual(conversationEvents(rows).map(row => row.id), ['u2']);
   assert.deepEqual(conversationEvents(rows, {details: true}).map(row => row.id), ['u1', 'w1', 'u2']);
 });
+
+// Found live (bounce live check, scenario 1): the reply to "reply with exactly: ok" opened with the
+// orchestrator's own narration before its tool call, "Trivial request; answer directly and write the
+// state note.", rendered as if it were the answer.
+test('text written just before a tool call reads as a muted thought, and the answer after it stays the answer', () => {
+  const formatter = createFormatter({color: false, compact: true});
+  const rows = conversationEvents([
+    {id: 'u', kind: 'user', text: 'reply with exactly: ok'},
+    {id: 'a1', kind: 'assistant', provider: 'claude', from: 'main', text: 'Trivial request; answer directly and write the state note.'},
+    {id: 't1', kind: 'tool', provider: 'claude', from: 'main', text: 'mcp__bounce__state: {"text":"answered ok"}'},
+    {id: 'a2', kind: 'assistant', provider: 'claude', from: 'main', text: 'ok'},
+    {id: 'm', kind: 'main.terminal', status: 'completed', text: 'ok'},
+  ]);
+  const said = rows.filter(row => row.kind === 'assistant');
+  assert.deepEqual(said.map(row => [row.text, row.narration ?? false]), [['Trivial request; answer directly and write the state note.', true], ['ok', false]]);
+  assert.deepEqual(formatter.event(said[0], 90), ['∴ Trivial request; answer directly and write the state note.', '']);
+  assert.deepEqual(formatter.event(said[1], 90), ['● ok', '']);
+});

@@ -26,6 +26,8 @@ const REQUESTS = {
   initialized: () => ({method: 'initialized'}),
   threadStart: permissions => ({method: 'thread/start', params: permissions.thread}),
   threadResume: ({threadId, permissions}) => ({method: 'thread/resume', params: {threadId, ...permissions.thread}}),
+  threadArchive: threadId => ({method: 'thread/archive', params: {threadId}}),
+  threadUnarchive: threadId => ({method: 'thread/unarchive', params: {threadId}}),
   turnStart: ({threadId, text, model, permissions, userImages = []}) => ({method: 'turn/start',
     params: {threadId, input: [{type: 'text', text}, ...userImages.map(image => ({type: 'localImage', path: image.path}))], ...permissions.turn, ...(model ? {model} : {})}}),
   turnSteer: ({threadId, expectedTurnId, text}) => ({method: 'turn/steer',
@@ -43,7 +45,7 @@ const mapUsage = raw => {
   return usage;
 };
 
-const MAX_LINE = 1024 * 1024; // a line this long is a protocol fault, not a message
+const MAX_LINE = 1024 * 1024; // a notification this long is a protocol fault, not a message
 const MAX_QUEUE = 50;
 const INTERRUPT_MS = 1000; // how long the polite interrupt gets before the signals start
 const REQUEST_TIMEOUT_MS = 10_000;
@@ -212,6 +214,13 @@ function receive(handle, line) {
     if (limitPattern.test(error.message)) error.code = 'limited';
     return pending.reject(error);
   }
+  // Only an answer to a request of ours may be longer than MAX_LINE: thread/resume answers with the
+  // thread's turns (1,116,595 characters found live, dropped here, so the orchestrator never woke).
+  // Anything else that long is dropped, and said.
+  if (line.length > MAX_LINE) {
+    handle.stream.push({kind: 'diagnostic', text: `codex sent a ${line.length}-character ${message.method} line, over the ${MAX_LINE} limit; ignored`});
+    return;
+  }
   if (message.method === 'item/tool/call') {
     void handleReportTool(handle, message);
     return;
@@ -259,7 +268,7 @@ async function pump(handle, source) {
   let terminalEvent = false;
   for await (const event of source) {
     if (event.kind === 'line') {
-      if (event.text.length <= MAX_LINE) receive(handle, event.text);
+      receive(handle, event.text);
       continue;
     }
     if (event.kind === 'diagnostic') {
@@ -357,11 +366,26 @@ export function createCodexLive({spawn = spawnProcess, kill = process.kill, conn
 
     async resume({peer, profile, native = {}, message = '', cwd, dir, userImages = []}) {
       const handle = await connect({profile, peer, cwd, dir});
-      const resumed = await begin(handle, () => request(handle, REQUESTS.threadResume({threadId: native.sessionId, permissions: handle.permissions})));
+      // A thread bounce archived when its task ended (see archive below) is unarchived to continue it.
+      const resumed = await begin(handle, () => request(handle, REQUESTS.threadResume({threadId: native.sessionId, permissions: handle.permissions}))
+        .catch(async error => {
+          try { await request(handle, REQUESTS.threadUnarchive(native.sessionId)); } catch { throw error; }
+          return request(handle, REQUESTS.threadResume({threadId: native.sessionId, permissions: handle.permissions}));
+        }));
       return opened(handle, resumed.thread?.id ?? resumed.threadId ?? native.sessionId ?? null, message, userImages);
     },
 
     events: handle => handle.stream.iterator,
+
+    // Codex saves every thread under ~/.codex, and the ChatGPT app lists them. Found live: a
+    // hundred bounce worker and reviewer threads in Daniel's ChatGPT history. A thread whose task has
+    // ended is archived: out of the list, still recoverable, and unarchived if the task resumes.
+    async archive({profile = {}, native = {}, cwd}) {
+      if (typeof native.sessionId !== 'string' || !native.sessionId) return false;
+      const handle = await connect({profile, peer: 'archive', cwd});
+      try { await begin(handle, () => request(handle, REQUESTS.threadArchive(native.sessionId))); return true; }
+      finally { await stop(handle); }
+    },
 
     // Live steering is only valid for the exact active turn; ordinary delivery stays serial on
     // the thread. `queued` is only for a peer that is gone, a queue that is full, or a turn that would not start.

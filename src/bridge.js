@@ -13,7 +13,8 @@ function formatRow(row, json) {
   if (json) return JSON.stringify(row);
   // A task row leads with its id: the orchestrator needs it for the very next `wait`, and the plain
   // form used to hide it (observed: an orchestrator digging the id out of the tasks/ directory).
-  return `[${row.from}:${row.kind}]${typeof row.task === 'string' ? ` task=${row.task}` : ''} ${row.text ?? ''}`;
+  const notes = Array.isArray(row.notes) ? row.notes.map(note => `\n  note: ${note}`).join('') : '';
+  return `[${row.from}:${row.kind}]${typeof row.task === 'string' ? ` task=${row.task}` : ''} ${row.text ?? ''}${notes}`;
 }
 
 function parseJsonArg(value, label) {

@@ -8,10 +8,11 @@ const contentText = value => Array.isArray(value)
 export default {
   name: 'claude',
   login: ['auth', 'login'],
-  invocation({model, mode, images = []}) {
+  // `ephemeral`: a one-off call is not saved as a Claude Code session (it would fill `claude --resume`).
+  invocation({model, mode, images = [], ephemeral = false}) {
     const imageArgs = images.length ? ['--input-format', 'stream-json'] : [];
     const modelArgs = model ? ['--model', model] : [];
-    return ['-p', '--output-format', 'stream-json', '--verbose', ...modelArgs, ...imageArgs,
+    return ['-p', '--output-format', 'stream-json', '--verbose', ...(ephemeral ? ['--no-session-persistence'] : []), ...modelArgs, ...imageArgs,
       ...(mode === 'yolo' ? ['--dangerously-skip-permissions'] : ['--permission-mode', 'plan'])];
   },
   stdin: prompt => prompt,

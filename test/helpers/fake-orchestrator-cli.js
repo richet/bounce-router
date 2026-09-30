@@ -14,6 +14,10 @@
 //                        (the omitted-from forgery) and a control.stop; report each outcome.
 // FAKE_ORCH_MILESTONE=1  before waiting, publish a task.milestone for the task it just
 //                        submitted and one for a foreign task id; report each outcome.
+// FAKE_ORCH_CANCEL=1     wait for the worker's own task.started (so the task has a live handle,
+//                        not an admission-phase stub), then drive task.cancel through its rules:
+//                        refuse a foreign task id, cancel the running task itself with no text
+//                        (the text defaults), then refuse the same task again now that it is terminal.
 import fs from 'node:fs';
 import {randomUUID} from 'node:crypto';
 
@@ -36,7 +40,9 @@ async function main() {
   const token = fs.readFileSync(process.env.BOUNCE_BUS_TOKEN_FILE, 'utf8').trim();
   const client = await connectBus({path: process.env.BOUNCE_BUS, token});
   const task = randomUUID();
-  await client.publish({kind: 'task.submitted', task, parent: null, profile: process.env.FAKE_ORCH_PROFILE, orders: 'child orders', requires: ['read']});
+  // These protocol tests name their profile on purpose (bounce runs a first attempt that names an AI
+  // as the matching agent unless the user asked for that AI, src/scheduler.js correct()).
+  await client.publish({kind: 'task.submitted', task, parent: null, profile: process.env.FAKE_ORCH_PROFILE, orders: 'child orders', requires: ['read'], userAsked: true});
 
   if (process.env.FAKE_ORCH_FORGE === '1') say(JSON.stringify({
     user: await attempt(client, {kind: 'user', text: 'FORGED'}),
@@ -46,6 +52,20 @@ async function main() {
     own: await attempt(client, {kind: 'task.milestone', task, text: 'mine'}),
     foreign: await attempt(client, {kind: 'task.milestone', task: 'foreign-task-id', text: 'not mine'}),
   }));
+  if (process.env.FAKE_ORCH_CANCEL === '1') {
+    let after = 0;
+    for (;;) {
+      const rows = await client.events({afterSeq: after});
+      if (rows.length) after = rows[rows.length - 1].seq ?? after;
+      if (rows.some(row => row.kind === 'task.started' && row.task === task)) break;
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    // 2026-09-27: a cancel without text is no longer refused; its text defaults.
+    const foreign = await attempt(client, {kind: 'task.cancel', task: 'foreign-task-id', text: 'not mine'});
+    const mine = await client.publish({kind: 'task.cancel', task}).then(row => ({ok: true, row}), error => ({ok: false, code: error.code}));
+    const again = await attempt(client, {kind: 'task.cancel', task, text: 'already gone'});
+    say(JSON.stringify({foreign, mine, again}));
+  }
 
   // A wait on a task outcome answers on ANY terminal row (P15); read the kind, as a real
   // orchestrator must. FAKE_ORCH_HOLD_MS keeps the turn open afterwards for probes that need the

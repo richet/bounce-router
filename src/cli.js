@@ -14,7 +14,6 @@ import {modelCatalog, modelEntries, catalogNotes} from './models.js';
 import {discoverLocalModels, switchLocal} from './local-models.js';
 import {readMachine, resourceReport, createResources} from './resources.js';
 import {taskView, taskList} from './task-view.js';
-import {campaigns} from './orchestration.js';
 import {formatTaskView, formatTaskList} from './task-report.js';
 import {runLocalSetup} from './local-wizard.js';
 import {createLocalSetupView} from './local-setup-view.js';
@@ -33,6 +32,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {spawn, spawnSync} from 'node:child_process';
+import {randomUUID} from 'node:crypto';
 
 import {parseArgs} from 'node:util';
 import {Session, Router, config, saveJSON, dataRoot} from './core.js';
@@ -41,9 +41,15 @@ import {providers, runProcess} from './providers.js';
 import {projectRoot, fingerprint, validate, supervise, pidAlive} from './reload.js';
 import {listSessions, resolveSessionRef, sessionsTable, sessionAge} from './sessions.js';
 import {titleSession, createAsk} from './session-title.js';
+import {askBtw, createBtwAsk} from './btw.js';
 import {createRemoteSession} from './remote.js';
 import {version, checkUpdate, globalInstall, installUpdate} from './update.js';
 import {helpText, helpRows} from './help.js';
+import {codexHome} from './codex-home.js';
+
+// Every Codex process bounce starts — workers, the orchestrator, one-off calls, quota and catalog
+// queries, `bounce login codex` — inherits bounce's own Codex home, never the desktop app's ~/.codex.
+process.env.CODEX_HOME = codexHome();
 const handedText = names => `${names.join(', ')} now let Jev pick their AI per task (models: [auto, …]); the models you chose stay behind it as the fallback. Needs \`bounce jev on\`.`;
 
 // The `profiles` block is an overlay on the shipped roster (validateOrchestration), so a
@@ -213,13 +219,20 @@ async function main() {
   if (positionals[0] === 'mcp' && ['install', 'uninstall'].includes(positionals[1])) {
     const {withCodexEntry, withoutCodexEntry} = await import('./mcp-install.js');
     const installing = positionals[1] === 'install';
-    const codexConfig = path.join(os.homedir(), '.codex', 'config.toml');
     const said = [];
+    // Bounce's own Codex home (src/codex-home.js) holds its entry; the desktop app's ~/.codex never does,
+    // so an entry an older bounce wrote there is removed either way.
+    const codexConfig = path.join(codexHome(), 'config.toml');
     let before = '';
     try { before = fs.readFileSync(codexConfig, 'utf8'); } catch { before = ''; }
     const result = installing ? withCodexEntry(before, process.execPath === process.argv[1] ? 'bounce' : (process.argv[1] ?? 'bounce')) : withoutCodexEntry(before);
-    if (result.changed) { fs.mkdirSync(path.dirname(codexConfig), {recursive: true}); fs.writeFileSync(codexConfig, result.text); }
+    if (result.changed) { fs.mkdirSync(path.dirname(codexConfig), {recursive: true, mode: 0o700}); fs.writeFileSync(codexConfig, result.text); }
     said.push(`codex: ${result.changed ? (installing ? 'registered' : 'removed') : (result.reason ?? 'already current')} · ${codexConfig}`);
+    const appConfig = path.join(os.homedir(), '.codex', 'config.toml');
+    let appText = '';
+    try { appText = fs.readFileSync(appConfig, 'utf8'); } catch {}
+    const cleared = withoutCodexEntry(appText);
+    if (cleared.changed) { fs.writeFileSync(appConfig, cleared.text); said.push(`codex desktop app: bounce's old entry removed · ${appConfig}`); }
     // claude owns its own MCP registry: ask its CLI rather than editing its file.
     const claude = spawnSync('claude', installing ? ['mcp', 'add', '--scope', 'user', 'bounce', '--', 'bounce', 'mcp-serve'] : ['mcp', 'remove', '--scope', 'user', 'bounce'], {encoding: 'utf8'});
     said.push(`claude: ${claude.error ? `not installed here (${claude.error.code})` : claude.status === 0 ? (installing ? 'registered' : 'removed') : (claude.stderr || claude.stdout || 'refused').trim().split('\n')[0]}`);
@@ -246,7 +259,7 @@ async function main() {
       // Codex launches this server from its own config, so the per-session grant never reaches its env:
       // without one, it finds the live session itself and refuses when that answer is not unique.
       ops: createOps({env: process.env, binding}),
-      views: {binding: () => binding.read(), taskView: (task, options) => taskView(events(), task, {journal: journal(), ...options}), taskList: options => taskList(events(), options), campaign: id => campaigns(events())[id] ?? null},
+      views: {binding: () => binding.read(), taskView: (task, options) => taskView(events(), task, {journal: journal(), ...options}), taskList: options => taskList(events(), options)},
       version,
     });
     serveStdio(server);
@@ -398,8 +411,8 @@ async function main() {
   let suggestion = null; // the main worker's proposed next step, offered in the prompt; never sent on its own
   const pendingTurns = [];
   const asides = [];
-  async function noteAside(text) {
-    if (!text) throw new Error('Use /btw <text>');
+  async function steerAside(text) {
+    if (!text) throw new Error('Use /steer <text>');
     const task = agentsOpen ? selectedWorker() : null;
     if (task) {
       if (reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) throw new Error('This worker has finished');
@@ -740,10 +753,10 @@ async function main() {
     }
     // A turn this view did not start — the daemon waking the orchestrator on worker outcomes
     // (main-service.js) — is held exactly like a turn found running at attach: new prompts are
-    // refused with a notice, /btw steers it, Esc cancels it, its terminal row releases the input.
+    // refused with a notice, /steer steers it, Esc cancels it, its terminal row releases the input.
     if (remoteMain && !busy && event?.kind === 'main.starting') {
       attachedTurn = true; busy = true;
-      notice = event.handoff ? 'Orchestrator woke on worker outcomes · /btw steers it, Esc cancels' : 'Existing turn is active · use /btw to steer it';
+      notice = event.handoff ? 'Orchestrator woke on worker outcomes · /steer steers it, Esc cancels' : 'Existing turn is active · /steer steers it · /btw asks aside';
     }
     if (attachedTurn && ['main.terminal', 'main.blocked'].includes(event?.kind)) {
       attachedTurn = false;
@@ -762,6 +775,7 @@ async function main() {
     if (event?.kind === 'progress') progress = clean(event.text);
     terminal?.ingest(event);
     if (event?.kind === 'task.delivered') notice = `Worker ${event.task.slice(0, 8)} · delivery ${event.tier}`;
+    if ((event?.kind === 'btw.answered' || event?.kind === 'btw.failed') && notice === 'btw · answering…') notice = event.kind === 'btw.answered' ? 'btw · answered above' : 'btw · no answer';
     // Vendor streams repeat quota many times per turn; only a changed reading redraws.
     if (event?.kind === 'raw' && !recordQuota(quotas, root, quotaSnapshot(event.provider, event.raw))) return;
     if (renderTimer) return;
@@ -951,6 +965,11 @@ async function main() {
           const task = arg.trim();
           process.send({type: 'control', action: task ? 'cancel' : 'stop', task: task || undefined});
           session.append({kind: 'status', text: task ? `Requested cancel of task ${task.slice(0, 8)}` : 'Requested stop of every running task'});
+        } else if (command === 'unblock') {
+          if (typeof session.unblockMain !== 'function') throw new Error('/unblock needs the orchestrator daemon (run bounce with an orchestrator config)');
+          const result = await session.unblockMain({});
+          notice = result?.accepted ? 'Unblocked · the orchestrator takes new turns again' : 'Nothing to unblock: the orchestrator is not held by an unverified restart';
+          render(); return;
         } else if (command === 'msg') {
           if (orchestration.operation !== 'orchestrator') throw new Error('/msg is only available in orchestrator mode');
           const [task, ...rest] = arg.split(/\s+/); const text = rest.join(' ');
@@ -1030,8 +1049,18 @@ async function main() {
           picker = {kind: 'session', index: 0, notes: [], entries: rows.map(r => ({id: r.id, label: `${r.name ?? r.derivedName} · ${sessionAge(r.updated)} ago · ${r.operation}${r.live ? ' · live' : ''} · ${r.id.slice(0, 8)}`}))};
           notice = 'Pick a session to resume. Esc cancels.';
           return;
+        } else if (command === 'steer') {
+          await steerAside(arg.trim());
+          return;
         } else if (command === 'btw') {
-          await noteAside(arg.trim());
+          // A side question, never a turn: it neither reads busy nor touches router/session.active,
+          // and it journals its own question/answer rows rather than delivering into anything.
+          const question = arg.trim();
+          if (!question) throw new Error('Use /btw <question>');
+          const id = randomUUID().slice(0, 8);
+          notice = 'btw · answering…';
+          render();
+          askBtw({session, settings, orchestration, ask: createBtwAsk({executables: settings.executables}), id, question}).catch(() => {});
           return;
         } else if (command === 'agents' || command === 'zoom' || command === 'attach') {
           if (orchestration.operation !== 'orchestrator') throw new Error('/agents is only available in orchestrator mode');
@@ -1274,13 +1303,25 @@ async function main() {
   for (const event of session.events) terminal.ingest(event);
   await terminal.mount({mouseScroll});
 
-  session.onEvent = scheduleRender;
+  // Found live (ACE d1bc0206): the daemon died and this view kept its last state — the orchestrator
+  // and every worker "working" — for four more hours. A lost daemon is said plainly, once, and the
+  // view stops ticking as if anything were still running.
+  let daemonLostAt = null;
+  session.onEvent = event => {
+    if (event?.kind === 'main.disconnected' && remoteMain && !daemonLostAt) {
+      daemonLostAt = new Date();
+      clearInterval(activityTimer);
+      const at = daemonLostAt.toTimeString().slice(0, 5);
+      notice = `bounce stopped at ${at}, nothing is running · quit, then: bounce --resume ${session.id.slice(0, 8)}`;
+    }
+    scheduleRender(event);
+  };
   // Orchestrator sessions tick so the status glyphs move and the quiet times advance between events:
   // four times a second while the main worker or any agent is working, once a second at rest.
   // unref'd so it never keeps the process alive, and render() is a no-op while suspended.
   if (orchestration.operation === 'orchestrator') {
     let beat = 0;
-    const t = setInterval(() => { const working = busy || (terminal?.snapshot().panes ?? []).some(pane => pane.state === 'running'); if (working || ++beat % 4 === 0) render(); }, 250);
+    const t = setInterval(() => { const working = !daemonLostAt && (busy || (terminal?.snapshot().panes ?? []).some(pane => pane.state === 'running')); if (working || ++beat % 4 === 0) render(); }, 250);
     t.unref?.();
   }
   void refreshQuota(settings, {root, store: quotas, cwd: session.cwd}).then(render, () => {});
@@ -1320,4 +1361,10 @@ const [bridgeCmd] = process.argv.slice(2);
 (['publish', 'wait', 'report'].includes(bridgeCmd) ? runBridge()
   : ['agents', 'mcp-serve'].includes(bridgeCmd) ? main()
   : process.env.BOUNCE_SUPERVISED === '1' && typeof process.send === 'function' ? main() : supervise()
-).catch(error => {console.error(`bounce: ${error.message}`); process.exitCode = 1;});
+).catch(error => {
+  console.error(`bounce: ${error.message}`);
+  process.exitCode = 1;
+  // A detached daemon that fails to start must not linger holding the session lock with its bus
+  // open (found live, ACE d1bc0206: every later resume then failed too). Its log keeps the error.
+  if (process.env.BOUNCE_DETACHED === '1') process.exit(1);
+});

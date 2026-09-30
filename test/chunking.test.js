@@ -44,15 +44,15 @@ test('the lease is 15 minutes and the ceiling 60 unless the config says otherwis
   for (const bad of [0, -5, 1.5, '20', 999]) assert.throws(() => taskLimits({taskMinutes: bad}), /taskMinutes must be a whole number of minutes from 1 to 240/);
   for (const bad of [0, 1.5, '20', 999]) assert.throws(() => taskLimits({taskCeilingMinutes: bad}), /^Error: taskCeilingMinutes must be a whole number of minutes from 1 to 240, and at least taskMinutes$/);
   assert.throws(() => taskLimits({taskMinutes: 30, taskCeilingMinutes: 20}), /taskCeilingMinutes must be a whole number of minutes from 1 to 240, and at least taskMinutes/);
-  const lines = breakdownOrders(15, {jevOn: true, ceiling: 60});
+  const lines = breakdownOrders(15, {ceiling: 60});
   assert.equal(lines[0], 'Break big work down: phases in sequence, each phase made of chunks that run in parallel.');
   assert.equal(lines[1], 'A task runs under a 15-minute lease that bounce renews while the worker makes progress, up to a 60-minute ceiling; a deadline over the ceiling is refused (task.failed, reason size) before anything runs. Size a chunk by scope (one owner, one acceptance), not by minutes: long work is normal.');
   const text = lines.join('\n');
-  for (const part of ['depends_on', 'disjoint owned paths', 'Review each phase before the next one starts', 'never hand one worker the whole job',
-    'A chunk that stops making progress or reaches the ceiling is asked for its conclusion and reported as is: resubmit what is left with that progress in its orders, or record the concrete campaign blocker after bounded recovery.'])
+  for (const part of ['depends_on', 'disjoint owned paths', 'Review each phase before the next one starts', 'For work big enough to need phases, do not hand one worker the whole job',
+    'A chunk that stops making progress or reaches the ceiling is asked for its conclusion and reported as is: resubmit what is left with that progress in its orders, or do the small remaining step yourself.'])
     assert.equal(text.includes(part), true, part);
-  for (const gone of ['No task may be given more than', 'split what is left', 'do not extend it', 'smaller']) assert.equal(text.includes(gone), false, gone);
-  assert.equal(breakdownOrders(15, {ceiling: 60}).join('\n').includes('a deadline over the ceiling, and'), true);
+  for (const gone of ['No task may be given more than', 'split what is left', 'do not extend it', 'smaller',
+    'submit its plan', 'plan.submitted', 'plan.accepted', 'planId', 'chunkId']) assert.equal(text.includes(gone), false, gone);
 });
 
 test('the stall alarm does not fire on a test run: silence means five minutes, and no milestone for ten is still a stall', () => {

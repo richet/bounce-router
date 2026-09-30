@@ -5,7 +5,7 @@
 // because BOUNCE spawns the orchestrator; nothing does that for a client-launched server.
 //
 // So the server finds the session the way `bounce task` already does — from disk — and refuses to guess
-// when the answer is ambiguous: writing into the wrong campaign is worse than not writing.
+// when the answer is ambiguous: writing into the wrong session is worse than not writing.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -94,14 +94,28 @@ test('no live session is a refusal, not a guess at the most recent one', t => {
   assert.match(found.reason, /no live bounce session/i);
 });
 
-test('two live sessions is a refusal that names them: writing into the wrong campaign is worse than not writing', t => {
+test('two live sessions, neither in the caller\'s directory, is a refusal that names them: writing into the wrong session is worse than not writing', t => {
   const dir = root(t);
   session(dir, 'aaaaaaaa-1111'); session(dir, 'bbbbbbbb-2222');
-  const found = liveSessionCredentials(dir, {list: () => [{id: 'aaaaaaaa-1111', live: true}, {id: 'bbbbbbbb-2222', live: true}]});
+  const found = liveSessionCredentials(dir, {cwd: dir, list: () => [{id: 'aaaaaaaa-1111', live: true, cwd: '/nowhere/a'}, {id: 'bbbbbbbb-2222', live: true, cwd: '/nowhere/b'}]});
   assert.equal(found.ok, false);
   assert.match(found.reason, /2 live/);
-  assert.match(found.reason, /aaaaaaaa/);
-  assert.match(found.reason, /BOUNCE_BUS/, 'and says how to be explicit');
+  assert.match(found.reason, /aaaaaaaa in \/nowhere\/a/);
+  assert.match(found.reason, /BOUNCE_SESSION/, 'and says how to be explicit');
+});
+
+// Found live (2026-09-27): an orchestrator's MCP server refused every call with "2 live bounce sessions"
+// while the other session ran in another repository. The caller's cwd names its session.
+test('two live sessions resolve to the one whose workspace is the caller\'s directory', t => {
+  const dir = root(t);
+  session(dir, 'aaaaaaaa-1111'); session(dir, 'bbbbbbbb-2222');
+  const repoA = path.join(dir, 'repo-a'), repoB = path.join(dir, 'repo-b');
+  fs.mkdirSync(path.join(repoA, 'src'), {recursive: true}); fs.mkdirSync(repoB);
+  const list = () => [{id: 'aaaaaaaa-1111', live: true, cwd: repoA}, {id: 'bbbbbbbb-2222', live: true, cwd: repoB}];
+  assert.equal(liveSessionCredentials(dir, {cwd: repoB, list}).session, 'bbbbbbbb-2222');
+  assert.equal(liveSessionCredentials(dir, {cwd: path.join(repoA, 'src'), list}).session, 'aaaaaaaa-1111', 'a subdirectory of the workspace counts');
+  const both = () => [...list(), {id: 'cccccccc-3333', live: true, cwd: repoB}];
+  assert.equal(liveSessionCredentials(dir, {cwd: repoB, list: both}).ok, false, 'two sessions in the same directory stay ambiguous');
 });
 
 test('a live session with no orchestrator token is refused by name', t => {
