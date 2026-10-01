@@ -699,6 +699,8 @@ test('O2 orchestrator single-provider: the orchestrator submits over the bridge,
   // says to pick the lightest AI that fits.
   // Decided by Daniel on 2026-09-30: a failed local attempt is retried on the agent's own next AI first (a
   // second local model, then Sonnet); the chain lines name those profiles so the retry can submit them.
+  // docs/plans/lessons-and-sweep.md §1: the orders say when and how a lesson is recorded.
+  assert.equal(orders.includes('Lessons: when a task redid work that had been accepted, or a check failed twice, the handoff asks whether there is a lesson.'), true);
   assert.equal(orders.includes('Retry first on the agent\'s own next AI: submit the name after the arrow in its chain above (builder~2, then builder~3) with retryOf; it is the lightest AI that has not tried the task. Name a cloud AI yourself only when the cause needs a stronger tier: a mid-tier model (e.g. Sonnet) for routine implementation a local worker could not finish'), true);
   assert.match(orders, /Worker profiles \(one AI each\): .*build_claude \(opus\[1m\]\)/);
   // Found across ACE 159f4746 and d1bc0206: most first attempts ended with the worker blocking itself on
