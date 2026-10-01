@@ -273,3 +273,86 @@ test('startup timeout without process identity blocks with a typed termination-u
   assert.deepEqual(row.failure, {code: 'main_timeout', stage: 'startup'});
   assert.equal((await main.close()).verified, false);
 });
+
+// docs/plans/lessons-and-sweep.md §2 (Daniel, 2026-10-01). Found live (ACE e3bd01d5, 2026-09-30): two held
+// tasks waited 91 minutes with nothing running and nothing waking the orchestrator. After sweepMinutes
+// with nothing in flight and held work waiting, one turn asks what is waiting; answered, it is not
+// repeated until something else happens; a running task or a pending outcome means no sweep.
+test('the quiet sweep asks the orchestrator about held work once, after nothing has happened for sweepMinutes', async t => {
+  const session = fixture(t);
+  let now = Date.parse('2026-10-01T10:00:00Z');
+  const timers = [];
+  const clock = {now: () => now, setTimeout: (fn, ms) => { const timer = {fn, at: now + ms}; timers.push(timer); return timer; }, clearTimeout: timer => { const i = timers.indexOf(timer); if (i >= 0) timers.splice(i, 1); }};
+  // timers are armed after a tick (startup reconciliation is deferred): settle first, then move the clock
+  const advance = async ms => { await new Promise(resolve => setTimeout(resolve, 20)); now += ms; for (const timer of [...timers].filter(timer => timer.at <= now)) { timers.splice(timers.indexOf(timer), 1); timer.fn(); } await new Promise(resolve => setTimeout(resolve, 20)); };
+  session.append({kind: 'task.submitted', task: 'held', from: 'orchestrator', profile: 'builder', orders: 'build'});
+  session.append({kind: 'task.started', task: 'held', attempt: 1});
+  session.append({kind: 'task.artifact', task: 'held', cwd: '/w/1a2b3c4d'});
+  session.append({kind: 'task.blocked', task: 'held', reason: 'unverified', text: 'Nothing that runs this work has verified it, so it waits for you.', time: new Date(now).toISOString()});
+  const mainAdapter = adapter(() => ({events: [{kind: 'result', status: 'completed', text: 'Nothing is waiting beyond the held task; leaving it.'}]}));
+  // one wake per outcome here (the default retries an unresolved outcome once), so the launches count sweeps
+  service(t, session, mainAdapter, {clock, settings: {executables: {}, sweepMinutes: 1}, handoffDelayMs: 5, watchdog: {startupMs: 100, runningMs: 100, retryDelayMs: 5, maxWakeAttempts: 1}});
+  // the held outcome itself wakes the orchestrator first, as before (its wake timer runs on the driven clock too)
+  await advance(10);
+  await until(() => mainAdapter.calls.launch === 1);
+  await until(() => session.events.filter(row => row.kind === 'main.terminal').length === 1);
+  assert.equal(session.events.some(row => row.kind === 'main.requested' && row.sweep), false, 'the first turn is the outcome wake, not a sweep');
+
+  await advance(30_000);
+  assert.equal(mainAdapter.calls.launch, 1, 'half a minute: too soon');
+  await advance(30_000);
+  await until(() => mainAdapter.calls.launch === 2);
+  const sweep = session.events.find(row => row.kind === 'main.requested' && row.sweep);
+  assert.ok(sweep, 'the sweep is a request row marked sweep');
+  const handoff = session.events.find(row => row.kind === 'handoff' && row.sweep);
+  assert.equal(handoff.text.startsWith('Nothing has happened for 1 minutes (delivered by bounce, not typed by the user). Nothing is running; this is waiting on you:\n- task held · profile builder · held · reason: unverified · for 1 min · work in /w/1a2b3c4d\n  Nothing that runs this work has verified it, so it waits for you.'), true, handoff.text);
+  assert.equal(handoff.text.endsWith('or say that nothing is, and end your turn.'), true);
+  assert.equal(session.events.some(row => row.kind === 'status' && /Nothing has happened for 1 minutes and 1 held task\(s\) wait for the orchestrator; asking it\./.test(row.text)), true);
+  await until(() => session.events.filter(row => row.kind === 'main.terminal').length === 2);
+
+  // answered with nothing new since: no second sweep, however long the quiet
+  await advance(10 * 60_000);
+  assert.equal(mainAdapter.calls.launch, 2, 'a sweep answered is not repeated over the same silence');
+
+  // something happens (another task is held) and the quiet period re-arms
+  session.append({kind: 'task.submitted', task: 'second', from: 'orchestrator', profile: 'builder', orders: 'build'});
+  session.append({kind: 'task.started', task: 'second', attempt: 1});
+  session.append({kind: 'task.blocked', task: 'second', reason: 'check_failed', text: 'The task\'s check still fails.', time: new Date(now).toISOString()});
+  await advance(10);
+  await until(() => mainAdapter.calls.launch === 3); // the outcome wake
+  await until(() => session.events.filter(row => row.kind === 'main.terminal').length === 3);
+  await advance(60_000);
+  await until(() => mainAdapter.calls.launch === 4);
+  assert.equal(session.events.filter(row => row.kind === 'main.requested' && row.sweep).length, 2);
+});
+
+test('no sweep while a task runs, with sweepMinutes 0, or with nothing held', async t => {
+  const session = fixture(t);
+  let now = Date.parse('2026-10-01T10:00:00Z');
+  const timers = [];
+  const clock = {now: () => now, setTimeout: (fn, ms) => { const timer = {fn, at: now + ms}; timers.push(timer); return timer; }, clearTimeout: timer => { const i = timers.indexOf(timer); if (i >= 0) timers.splice(i, 1); }};
+  // timers are armed after a tick (startup reconciliation is deferred): settle first, then move the clock
+  const advance = async ms => { await new Promise(resolve => setTimeout(resolve, 20)); now += ms; for (const timer of [...timers].filter(timer => timer.at <= now)) { timers.splice(timers.indexOf(timer), 1); timer.fn(); } await new Promise(resolve => setTimeout(resolve, 20)); };
+  session.append({kind: 'task.submitted', task: 'held', from: 'orchestrator', profile: 'builder', orders: 'build'});
+  session.append({kind: 'task.started', task: 'held', attempt: 1});
+  session.append({kind: 'task.blocked', task: 'held', reason: 'unverified', text: 'waits', time: new Date(now).toISOString()});
+  session.append({kind: 'task.submitted', task: 'busy', from: 'orchestrator', profile: 'builder', orders: 'build'});
+  session.append({kind: 'task.started', task: 'busy', attempt: 1});
+  const mainAdapter = adapter(() => ({events: [{kind: 'result', status: 'completed', text: 'ok'}]}));
+  service(t, session, mainAdapter, {clock, settings: {executables: {}, sweepMinutes: 1}, handoffDelayMs: 5});
+  await advance(10);
+  await until(() => session.events.filter(row => row.kind === 'main.terminal').length === 1);
+  await advance(5 * 60_000);
+  assert.equal(session.events.some(row => row.kind === 'main.requested' && row.sweep), false, 'a running task means nothing is quiet');
+
+  const off = fixture(t);
+  off.append({kind: 'task.submitted', task: 'held', from: 'orchestrator', profile: 'builder', orders: 'build'});
+  off.append({kind: 'task.started', task: 'held', attempt: 1});
+  off.append({kind: 'task.blocked', task: 'held', reason: 'unverified', text: 'waits', time: new Date(now).toISOString()});
+  const offAdapter = adapter(() => ({events: [{kind: 'result', status: 'completed', text: 'ok'}]}));
+  service(t, off, offAdapter, {clock, settings: {executables: {}, sweepMinutes: 0}, handoffDelayMs: 5});
+  await advance(10);
+  await until(() => off.events.filter(row => row.kind === 'main.terminal').length === 1);
+  await advance(60 * 60_000);
+  assert.equal(off.events.some(row => row.kind === 'main.requested' && row.sweep), false, 'sweepMinutes 0 is off');
+});

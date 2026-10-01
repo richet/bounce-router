@@ -160,6 +160,8 @@ export function config(root = dataRoot()) {
   if (value.taskMinutes !== undefined && (!Number.isInteger(value.taskMinutes) || value.taskMinutes < 1 || value.taskMinutes > 240)) throw new Error('taskMinutes must be a whole number of minutes from 1 to 240');
   if (value.taskCeilingMinutes !== undefined && (!Number.isInteger(value.taskCeilingMinutes) || value.taskCeilingMinutes < 1 || value.taskCeilingMinutes > 240 || value.taskCeilingMinutes < (value.taskMinutes ?? 15))) throw new Error('taskCeilingMinutes must be a whole number of minutes from 1 to 240, and at least taskMinutes');
   if (value.reports !== undefined && !['plain', 'structured'].includes(value.reports)) throw new Error('reports must be "plain" or "structured"');
+  // The quiet sweep (docs/plans/lessons-and-sweep.md §2): minutes with nothing in flight and held work waiting before the orchestrator is asked; 0 turns it off.
+  if (value.sweepMinutes !== undefined && (!Number.isInteger(value.sweepMinutes) || value.sweepMinutes < 0 || value.sweepMinutes > 240)) throw new Error('sweepMinutes must be a whole number of minutes from 0 (off) to 240');
   if (!Number.isFinite(value.contextChars) || value.contextChars < 4000 || value.contextChars > 200000) throw new Error('contextChars must be between 4000 and 200000');
   // Cloud workers (claude/codex/muse) have no per-endpoint slot config the way local does — this is
   // their one ceiling, machine-wide, distinct from a local endpoint's own maxConcurrent.
