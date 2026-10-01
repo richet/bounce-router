@@ -11,6 +11,8 @@ import {POLICY_RANK, effectivePolicy, LOCAL_ADAPTERS, playedBy, READ_ONLY_ROLES 
 import {defaultStrategy} from './strategy.js';
 import {reportEvent, validateReport, remainingWork} from './reporting.js';
 import {inspectFinalReport, synthesizeReport, synthesizeReportFromChanges, FINAL_REPORT_INSTRUCTION} from './final-report.js';
+import {lessonsBlock} from './lessons.js';
+import {workersView, idleWorkerOf, nextWorkerName, pendingHandoffFor} from './workers.js';
 import {actionState, createActionRunner, requestAction} from './orchestration.js';
 import {normalizeLocalSettings} from './local-models.js';
 import {createLocalResolver} from './local-resolve.js';
@@ -598,6 +600,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   }
   const validate = (spec, view) => {
     if (spec.retryOf !== undefined && !view[spec.retryOf]) return 'retryOf';
+    if (spec.continues !== undefined && (typeof spec.continues !== 'string' || !view[spec.continues])) return 'continues: name a task of yours that exists';
     if (spec.jobId) {
       const previous = session.events.filter(e => e.kind === 'task.submitted' && e.jobId === spec.jobId);
       if (previous.length && !spec.replaces && !spec.retryOf) return 'job already exists; use retryOf';
@@ -673,6 +676,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
 
   function prepare(spec) {
     spec = correct(spec);
+    spec = assignWorker(spec);
     if (spec.inPlace !== undefined && inPlaceCitation(spec.inPlace) !== null) spec = {...spec, inPlace: {authorizedBy: inPlaceCitation(spec.inPlace)}};
     const predecessor = spec.retryOf ?? spec.replaces;
     const original = predecessor ? rawSubmittedRow(predecessor) : null;
@@ -727,6 +731,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       ...(spec.owns ? {owns: spec.owns} : {}),
       ...(spec.inPlace ? {inPlace: spec.inPlace} : {}),
       jobId: spec.jobId, retryOf: spec.retryOf,
+      ...(spec.continues ? {continues: spec.continues} : {}),
+      ...(spec.worker ? {worker: spec.worker} : {}),
       ...(spec.corrections?.length ? {corrections: spec.corrections} : {}),
     };
     requestAction(session, {actionId: `dispatch:${task}:0`, type: 'dispatch', task}, [{...row, time: stamp()}]);
@@ -775,6 +781,89 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // An isolated write worker works in a copy; orders that name the real checkout by absolute path would
   // send it there (observed live: a heredoc appended to the real file, the copy stayed unchanged and
   // review saw an empty diff). Paths into the checkout are rewritten to the copy.
+  // Whether a task that continues another can resume that task's worker: same profile, a session on
+  // record, an adapter that resumes. {native} to resume with, or {reason} said in the launch row.
+  const continuationOf = (row, profile) => {
+    const earlier = submittedRow(row.continues);
+    if (!earlier) return {reason: 'the earlier task is unknown'};
+    if (earlier.profile !== row.profile) return {reason: `the earlier task ran as ${earlier.profile}, this one as ${row.profile}`};
+    const nativeRow = session.events.findLast(e => e.kind === 'peer.native' && e.from === workerFrom(row.continues) && typeof e.sessionId === 'string');
+    if (!nativeRow) return {reason: 'the earlier task left no session to resume'};
+    if (typeof adapters[profile.adapter]?.resume !== 'function') return {reason: `${profile.adapter} cannot resume a session`};
+    return {native: {provider: nativeRow.provider, sessionId: nativeRow.sessionId}, worker: session.events.findLast(e => e.kind === 'task.launch.requested' && e.task === row.continues && e.worker)?.worker ?? null};
+  };
+  // Standing workers (docs/plans/standing-workers.md §1): a task with no `continues` goes to its agent's idle
+  // standing worker by itself; a named `worker` goes to that one if it is idle. A busy or retired one is not
+  // continued — the task starts a fresh worker and the row says so — so parallel work stays parallel.
+  const assignWorker = spec => {
+    if (spec.continues || spec.retryOf || spec.replaces || spec.inPlace !== undefined || !profiles[spec.profile]) return spec;
+    // `worker: "new"` is the orchestrator asking for a fresh worker on purpose (after wrong work, say).
+    if (spec.worker === 'new') { const {worker: _w, ...rest} = spec; return rest; }
+    const workers = workersView(session.events);
+    if (spec.worker !== undefined) {
+      const named = workers.get(spec.worker);
+      const note = !named ? `worker: ${spec.worker} is not a worker of this session; a fresh one starts`
+        : named.profile !== spec.profile ? `worker: ${spec.worker} plays ${named.profile}, not ${spec.profile}; a fresh ${spec.profile} starts`
+        : named.state !== 'idle' ? `worker: ${spec.worker} is ${named.state}; a fresh ${spec.profile} starts`
+        : !named.sessionId ? `worker: ${spec.worker} left no session to continue; a fresh ${spec.profile} starts` : null;
+      if (note) { const {worker: _w, ...rest} = spec; return {...rest, corrections: [...(spec.corrections ?? []), note]}; }
+      return {...spec, continues: named.lastTask};
+    }
+    const idle = idleWorkerOf(session.events, spec.profile);
+    return idle ? {...spec, continues: idle.lastTask, worker: idle.name} : spec;
+  };
+  // One turn on a standing worker's own session that is not a task (docs/plans/standing-workers.md §3):
+  // read-only, in the checkout, its answer returned. Used to compact a worker and to ask it for a handoff.
+  const HANDOFF_ASK = 'You are being retired; a new worker takes over your job in this project. Write the handoff it should read first: what you did and where it is, what you learned about this project that is not written down, what is unfinished, and what to watch out for. Plain text, under 300 words. Change nothing.';
+  async function workerSideTurn(found, message, {cap = 180_000} = {}) {
+    const profile = {...profiles[found.profile], policy: 'read-only'};
+    const adapter = adapters[profile.adapter];
+    if (typeof adapter?.resume !== 'function') throw new Error(`${profile.adapter} cannot resume a session`);
+    const dir = path.join(session.dir, 'workers', found.name.replace('#', '-'), String(clock()));
+    fs.mkdirSync(dir, {recursive: true});
+    const handle = await adapter.resume({peer: workerFrom(found.lastTask), profile, native: {sessionId: found.sessionId}, message, cwd: session.cwd, dir});
+    let text = '', status = 'timeout';
+    const timer = setTimeout(() => { adapter.cancel(handle).catch(() => {}); }, cap);
+    try { for await (const event of adapter.events(handle)) { if (event.kind === 'result') { status = event.status; text = String(event.text ?? ''); break; } } }
+    finally { clearTimeout(timer); await adapter.cancel(handle).catch(() => {}); }
+    return {status, text};
+  }
+  const workerFor = (worker, verb) => {
+    const found = workersView(session.events).get(worker);
+    if (!found) throw new Error(`no such worker: ${worker}`);
+    if (found.retired) throw new Error(`${worker} is retired`);
+    if (verb && found.state === 'busy') throw new Error(`${worker} is busy on ${found.lastTask}; ${verb} it when it is idle`);
+    if (verb && !found.sessionId) throw new Error(`${worker} left no session to ${verb}`);
+    return found;
+  };
+  // `worker.compacted`: a Claude worker compacts its own context in one turn and keeps what it did (probed
+  // 2026-10-01: ~173k → ~38k tokens). OpenCode's `/compact` through a run does nothing, Codex has none:
+  // those are retired with a handoff instead, and the adapter says which it is through `capabilities`.
+  async function compactWorker({worker, by = 'orchestrator'} = {}) {
+    const found = workerFor(worker, 'compact');
+    const adapterName = profiles[found.profile]?.adapter;
+    if (adapters[adapterName]?.capabilities?.().compacts !== true) throw new Error(`${adapterName} cannot compact a session; retire ${worker} with a handoff instead`);
+    const {status} = await workerSideTurn(found, '/compact');
+    return append({kind: 'worker.compacted', worker, profile: found.profile, by, status});
+  }
+  // `worker.retired`: the orchestrator ends a standing worker; the next fresh worker of that profile opens
+  // with the handoff — given, or written by the retiring worker itself when asked (`ask`).
+  async function retireWorker({worker, handoff = null, ask = false, by = 'orchestrator', context = null} = {}) {
+    const found = workerFor(worker, null);
+    let text = handoff ? String(handoff) : null;
+    if (ask && found.sessionId && found.state !== 'busy') {
+      const asked = await workerSideTurn(found, HANDOFF_ASK);
+      if (asked.text.trim()) { text = asked.text.trim(); append({kind: 'worker.handoff', worker, profile: found.profile, text}); }
+    }
+    return append({kind: 'worker.retired', worker, profile: found.profile, by, ...(text ? {handoff: text} : {}), ...(ask ? {asked: true} : {}), ...(context ? {context} : {})});
+  }
+  // The agent prompt plus the project's lessons for its job, when there are any and the profile has a job.
+  const withLessons = profile => {
+    if (!profile.agent?.prompt || !profile.role) return profile;
+    const block = lessonsBlock(session.cwd, profile.role);
+    if (!block || profile.agent.prompt.includes(block)) return profile;
+    return {...profile, agent: {...profile.agent, prompt: `${profile.agent.prompt}\n\n${block}`}};
+  };
   const toWorkingCopy = (text, workspace) => {
     const source = fs.realpathSync(session.cwd);
     // session.cwd is already resolved; macOS also spells /private/{var,tmp,etc} without the prefix.
@@ -1334,6 +1423,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // OpenCode runs the worker AS its role agent (system prompt, step cap); every other adapter
       // gets the role's prompt ahead of the orders instead, so the role means the same thing whoever
       // answers the dispatch.
+      // The project's lessons for this job ride with the agent prompt (docs/plans/lessons-and-sweep.md).
+      profile = withLessons(profile);
       const roleLead = profile.agent?.prompt && profile.adapter !== 'opencode' ? `${profile.agent.prompt}\n\n---\n\n` : '';
       // Prefer the acknowledged report endpoint, including OpenCode's dedicated MCP tool.
       // Final-answer parsing remains a compatibility path for workers without a grant.
@@ -1348,11 +1439,25 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // OpenCode takes the agent text as its system prompt, apart from the orders (found live: an agent
       // file naming the checkout sent a local worker to write there); it points into the copy too.
       if (owned && profile.agent?.prompt) profile = {...profile, agent: {...profile.agent, prompt: toWorkingCopy(profile.agent.prompt, owned)}};
-      append({kind: 'task.launch.requested', task, attempt, executionKey: `${task}:${attempt}`, context});
-      handle = await adapter.launch({peer: workerFrom(task), profile, orders: owned?.disposable ? `${workerOrders}\n\n${probeOrders(owned)}` : owned ? inWorkingCopy(workerOrders, owned) : workerOrders, cwd: owned?.cwd ?? session.cwd, dir,
-        task, attempt, context, signal: admission?.signal,
+      const orders = owned?.disposable ? `${workerOrders}\n\n${probeOrders(owned)}` : owned ? inWorkingCopy(workerOrders, owned) : workerOrders;
+      // A continuation (docs/plans/standing-workers.md step 2): the earlier task's worker is resumed into
+      // this task's own copy and told where it is, instead of a stranger being launched. Probed with the
+      // real CLIs (2026-10-01): OpenCode, Claude and Codex all edit the new copy once told.
+      const continuation = row.continues ? continuationOf(row, profile) : null;
+      const common = {task, attempt, context, signal: admission?.signal,
         onActivity: LOCAL_ADAPTERS.has(profile.adapter) ? localActivity(task, attempt, context) : undefined,
-        report: requireFinalReport ? ({report: payload}) => report({task, attempt, context, report: payload}) : undefined});
+        report: requireFinalReport ? ({report: payload}) => report({task, attempt, context, report: payload}) : undefined};
+      if (continuation?.native) {
+        append({kind: 'task.launch.requested', task, attempt, executionKey: `${task}:${attempt}`, continued: true, continues: row.continues, worker: continuation.worker, context});
+        const where = owned?.cwd ?? session.cwd;
+        const preface = `You continue the task you did before; this is what happens next. Your working copy for this task is ${where} — the copy you worked in before is gone; nothing you did there is lost: what was accepted is in the project, and this copy was taken from it.`;
+        handle = await adapter.resume({peer: workerFrom(task), profile, native: continuation.native, message: `${preface}\n\n${orders}`, cwd: where, dir, ...common});
+      } else {
+        // A fresh worker of this profile, named; it opens with the handoff a retired one left, if any.
+        const fromBefore = pendingHandoffFor(session.events, row.profile);
+        append({kind: 'task.launch.requested', task, attempt, executionKey: `${task}:${attempt}`, worker: nextWorkerName(session.events, row.profile), ...(row.continues ? {continued: false, continues: row.continues, reason: continuation.reason} : {}), context});
+        handle = await adapter.launch({peer: workerFrom(task), profile, orders: fromBefore ? `From the worker before you, who was retired: ${fromBefore}\n\n${orders}` : orders, cwd: owned?.cwd ?? session.cwd, dir, ...common});
+      }
       if (closed) { await adapter.cancel(handle); return; }
     } catch (error) {
       const verified = admission ? admission.failed(error) : true;
@@ -1442,6 +1547,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       if (owned?.disposable) profile = {...profile, probeSource: fs.realpathSync(session.cwd)};
       // OpenCode takes the agent text as its system prompt, apart from the orders (found live: an agent
       // file naming the checkout sent a local worker to write there); it points into the copy too.
+      if (owned && profile.agent?.prompt) profile = {...profile, agent: {...profile.agent, prompt: toWorkingCopy(profile.agent.prompt, owned)}};
+      profile = withLessons(profile);
       if (owned && profile.agent?.prompt) profile = {...profile, agent: {...profile.agent, prompt: toWorkingCopy(profile.agent.prompt, owned)}};
       append({kind: 'task.launch.requested', task, attempt, executionKey: `${task}:${attempt}`, resumed: true, context});
       if (owned?.disposable) message = `${message}\n\n${probeOrders(owned)}`;
@@ -2787,7 +2894,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     validate: spec => validate(spec, reducers.tasks(session.events)),
     // The submit decoration the bus applies before journaling a peer's task.submitted (Jev review).
     prepare,
-    submit, report, acceptOverride, reworkOverride, cancel, cancelRequest, stop, tick, reconcile,
+    submit, report, acceptOverride, reworkOverride, retireWorker, compactWorker, cancel, cancelRequest, stop, tick, reconcile,
     tasks: () => reducers.tasks(session.events),
     budgets: () => reducers.budgets(session.events),
     spend: () => reducers.spend(session.events),

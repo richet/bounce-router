@@ -14,6 +14,7 @@ import {modelCatalog, modelEntries, catalogNotes} from './models.js';
 import {discoverLocalModels, switchLocal} from './local-models.js';
 import {readMachine, resourceReport, createResources} from './resources.js';
 import {taskView, taskList} from './task-view.js';
+import {rosterLines} from './workers.js';
 import {formatTaskView, formatTaskList} from './task-report.js';
 import {runLocalSetup} from './local-wizard.js';
 import {createLocalSetupView} from './local-setup-view.js';
@@ -259,7 +260,7 @@ async function main() {
       // Codex launches this server from its own config, so the per-session grant never reaches its env:
       // without one, it finds the live session itself and refuses when that answer is not unique.
       ops: createOps({env: process.env, binding}),
-      views: {binding: () => binding.read(), taskView: (task, options) => taskView(events(), task, {journal: journal(), ...options}), taskList: options => taskList(events(), options)},
+      views: {binding: () => binding.read(), taskView: (task, options) => taskView(events(), task, {journal: journal(), ...options}), taskList: options => taskList(events(), options), roster: () => rosterLines(events())},
       version,
     });
     serveStdio(server);

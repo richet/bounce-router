@@ -136,6 +136,10 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     // /btw: a side exchange, dimmed so it reads apart from the main conversation it never joins
     // (src/btw.js never feeds these rows back into the orchestrator's own context).
     if (e.kind === 'btw.asked') return [clip(style.muted(`btw · ${clean(e.text)}`), width), ''];
+    if (e.kind === 'worker.compacted') return [clip(style.muted(`  · ${clean(e.worker)} compacted (${clean(e.status ?? '')})`), width)];
+    if (e.kind === 'worker.handoff') return [clip(style.muted(`  · ${clean(e.worker)} wrote its handoff: ${clean(e.text ?? '')}`), width)];
+    if (e.kind === 'worker.retired') return [clip(style.muted(`  · ${clean(e.worker)} retired${e.handoff ? ' with a handoff for the next one' : ''}`), width)];
+    if (e.kind === 'lesson.learned') return [clip(style.muted(`  · lesson for ${clean(e.agent ?? 'all')}: ${clean(e.text ?? '')}`), width)];
     if (e.kind === 'btw.answered') return [...markdown(e.text, width - 2).map(line => style.muted(line)), ...(e.model ? [style.muted(`  (${clean(e.model)})`)] : []), ''];
     if (e.kind === 'btw.failed') return [style.muted(`btw · no answer (${clean(e.reason ?? 'failed')})`), ''];
     if (e.kind === 'attempt' && e.status === 'started') return event({...e, kind: 'status', text: 'Starting provider…'}, width);

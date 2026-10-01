@@ -8,6 +8,7 @@ import {handoff} from './core.js';
 import {failedAttempts} from './loop-guard.js';
 import {imagePaths, saveImages, providerInput} from './images.js';
 import {cooldowns, tasks, TERMINAL} from './reducers.js';
+import {rosterLines} from './workers.js';
 import {
   OUTCOME_KINDS,
   actionSetKey,
@@ -30,6 +31,11 @@ const HANDOFF_ANSWER_MAX = 12000;
 // How long after a vendor refuses a typed message bounce tries it once more.
 const TYPED_RETRY_MS = 3000;
 const HANDOFF_DELAY_MS = 1000; // several tasks ending together become one wake-up turn
+// The quiet sweep (docs/plans/lessons-and-sweep.md §2): nothing in flight, held work waiting, and no row
+// for sweepMs — the orchestrator is asked once what is waiting on it. Found live (ACE e3bd01d5,
+// 2026-09-30): two held tasks waited 91 minutes with nothing running and nobody noticing.
+const SWEEP_MINUTES = 20;
+const SWEEP_PROMPT = 'Decide what is waiting on you: accept it (task.accepted with what you checked), send it back (task.rework with what to fix), or retry it on another AI (retryOf) — or say that nothing is, and end your turn.';
 const WAKE_PROMPT = 'Continue your orders. Resolve the pending outcomes and decisions above: schedule the successor, name the event being awaited, finish the authorized scope, or report a concrete blocker. If a task you still need is listed as running, wait on it with `bounce wait` before reporting. Do not re-run finished work.';
 
 // A task is the orchestrator's when the root of its `replaces` lineage was submitted by the
@@ -70,6 +76,13 @@ export function handoffBlock(session, ended) {
     // The task's check, as bounce ran it on the accepted work (src/task-check.js).
     const check = row.kind === 'task.accepted' ? session.events.findLast(event => event.kind === 'task.check' && event.task === row.task && typeof event.passed === 'boolean') : null;
     if (check) lines.push(`  check: ${check.passed ? 'passed' : 'FAILED'} (exit code ${check.exit})${check.passed && check.weak ? ', but it only looks for files or text and did not run the work' : ''} · ${String(check.command).slice(0, 500)}`);
+    // A correction of accepted work, or a check that failed twice: the moment a lesson is in hand
+    // (docs/plans/lessons-and-sweep.md). The orchestrator decides whether there is one.
+    const retryOf = session.events.find(event => event.kind === 'task.submitted' && event.task === row.task)?.retryOf;
+    const redid = retryOf && view[retryOf]?.state === 'accepted' && ['task.completed', 'task.accepted', 'task.blocked', 'task.failed'].includes(row.kind);
+    if (redid || (row.kind === 'task.blocked' && row.reason === 'check_failed')) {
+      lines.push(`  ${redid ? `This task redid work that had been accepted (${String(retryOf).slice(0, 8)}).` : 'This check failed twice.'} If there is a lesson a worker should know next time in this project, record it: the lesson tool (or publish lesson.learned) with agent (the job it is for, or all) and text (one sentence, imperative, no task ids). If there is none, say nothing.`);
+    }
     // Work the worker reported as still remaining when it completed: the task is done, these are follow-ups.
     const completed = ['task.completed', 'task.accepted'].includes(row.kind) ? session.events.findLast(event => event.kind === 'task.completed' && event.task === row.task) : null;
     if (completed?.remaining) lines.push(`  remaining (reported by the worker; follow-up work, not done in this task): ${String(completed.remaining).slice(0, HANDOFF_TEXT_MAX)}`);
@@ -89,6 +102,9 @@ export function handoffBlock(session, ended) {
     if (earlier.length) lines.push(`  this job has now failed ${earlier.length + 1} times the same way (${[...earlier.map(a => a.reason), row.reason ?? row.kind].join(', ')}): change the scope or the AI before asking again — bounce refuses a third identical attempt.`);
   }
   lines.push(running.length ? `Still running: ${running.map(t => `${t.id} (${t.profile}, ${t.state})`).join(', ')}` : 'No other task of yours is still running.');
+  // Standing workers (docs/plans/standing-workers.md §3): who exists, what each did, who is idle or heavy.
+  const roster = rosterLines(session.events);
+  if (roster.length) lines.push('Your workers:', ...roster);
   return lines.join('\n');
 }
 
@@ -98,6 +114,7 @@ export function handoffBlock(session, ended) {
 export function createMainService({session, adapters, profile, settings, profiles = {}, readRouting = () => settings,
   orchestratorEnv = {}, brief = '', handoffDelayMs = HANDOFF_DELAY_MS, typedRetryMs = TYPED_RETRY_MS,
   clock = {}, watchdog = {}, onFirstUserPrompt = () => {}}) {
+  const sweepMs = (settings.sweepMinutes ?? SWEEP_MINUTES) * 60000;
   const now = clock.now ?? Date.now;
   const setTimer = clock.setTimeout ?? setTimeout;
   const clearTimer = clock.clearTimeout ?? clearTimeout;
@@ -461,7 +478,7 @@ export function createMainService({session, adapters, profile, settings, profile
   function actionBlock(actions) {
     return handoffBlock(session, actions.map(action => action.row));
   }
-  function start(params, {wake, forceFresh = false, fromQueue = false} = {}) {
+  function start(params, {wake, sweep = false, forceFresh = false, fromQueue = false} = {}) {
     if (closed) return {accepted: false, reason: 'daemon_closed'};
     if (current && (wake || current.unverified)) return {accepted: false, reason: current.unverified ? 'termination_unverified' : 'busy'};
     if (blockedState && ['termination_uncertain', 'orphaned'].includes(blockedState.reason)) return {accepted: false, reason: 'termination_unverified'};
@@ -505,7 +522,9 @@ export function createMainService({session, adapters, profile, settings, profile
     const selected = {...profile, ...(provider === selection.provider ? {mode: selection.mode ?? profile.mode, policy: selection.policy ?? profile.policy} : {}), adapter: provider, model: params.model ??
       (provider === selection.provider ? selection.model : settings.models?.[provider] ?? '')};
     const actions = pendingActions();
-    if (wake && !actions.length) return {accepted: false, reason: 'nothing_pending'};
+    const held = sweep ? heldTasks() : [];
+    if (sweep && !held.length) return {accepted: false, reason: 'nothing_waiting'};
+    if (wake && !sweep && !actions.length) return {accepted: false, reason: 'nothing_pending'};
     const actionKey = actions.length ? actionSetKey(actions) : null;
     const run = {id: params.id ?? randomUUID(), provider, selected, routes, images, wake, actionKey, actions,
       actionIds: actions.map(action => action.actionId), outcomeSeqs: actions.map(action => action.outcomeSeq).filter(Number.isInteger),
@@ -517,16 +536,18 @@ export function createMainService({session, adapters, profile, settings, profile
     // orchestrator was told. A typed prompt carries them too (`wake: false`): the user's own
     // turn is never raced by a synthetic one. The block counts as delivered only once this
     // requestId reaches main.started; a launch that fails leaves the outcomes pending.
-    if (actions.length) run.outcomes = actionBlock(actions);
+    if (sweep) run.outcomes = sweepBlock(held);
+    else if (actions.length) run.outcomes = actionBlock(actions);
     const requested = {kind: 'main.requested', from: 'main', context: session.id, requestId: run.id,
-      wake, text: params.text, provider, model: selected.model ?? '', mode: selected.mode, policy: selected.policy,
+      wake, ...(sweep ? {sweep: true} : {}), text: params.text, provider, model: selected.model ?? '', mode: selected.mode, policy: selected.policy,
       images, actionIds: run.actionIds, outcomeSeqs: run.outcomeSeqs, actionKey,
       attempt: wake && actionKey ? wakeAttempts(session.events, actionKey) + 1 : 1,
       dueAt: wake ? now() : null, ...(params.recoveryOf ? {recoveryOf: params.recoveryOf, rootRequestId: run.rootRequestId} : {})};
     const committed = [requested];
     // A dispatch drained from the queue already journaled its `user` row when it was queued.
     if (!wake && !fromQueue) committed.unshift({kind: 'user', text: params.text, ...(params.typed ? {typed: params.typed} : {}), ...(images.length ? {images} : {})});
-    if (actions.length) committed.push({kind: 'handoff', wake, requestId: run.id,
+    if (sweep) committed.push({kind: 'handoff', wake, sweep: true, requestId: run.id, actionIds: [], outcomeSeqs: [], tasks: held.map(t => t.id), text: `${run.outcomes}\n\n${params.text}`, from: 'bounce'});
+    else if (actions.length) committed.push({kind: 'handoff', wake, requestId: run.id,
       actionIds: run.actionIds, outcomeSeqs: run.outcomeSeqs, tasks: actions.filter(action => action.task).map(action => action.task),
       text: wake ? `${run.outcomes}\n\n${params.text}` : run.outcomes, from: 'bounce'});
     const rows = session.commit(committed, {ref: `main-request:${run.id}`, version: 2});
@@ -598,6 +619,53 @@ export function createMainService({session, adapters, profile, settings, profile
     if (![...HANDOFF_KINDS, 'task.submitted', 'main.disposition'].includes(row.kind)) return;
     reconcile();
   });
+
+  // The quiet sweep. Held work the orchestrator has not decided on, nothing running or under review,
+  // no wake armed and no turn: after sweepMs of no rows, one turn asks what is waiting. A sweep that
+  // was answered with nothing new since is not repeated; the next row of anyone's re-arms it.
+  const QUIET = new Set(['task.usage', 'usage', 'raw', 'delta', 'model', 'checkpoint', 'main.wake.scheduled']);
+  let sweepTimer = null;
+  function heldTasks() {
+    const view = tasks(session.events);
+    return Object.values(view).filter(t => t.state === 'blocked' && orchestratorsTask(session, view, t.id))
+      .map(t => ({...t, since: session.events.findLast(e => e.kind === 'task.blocked' && e.task === t.id), copy: session.events.findLast(e => e.kind === 'task.artifact' && e.task === t.id)?.cwd ?? null}));
+  }
+  function inFlight() {
+    const view = tasks(session.events);
+    return Object.values(view).some(t => !TERMINAL.has(t.state) && !['blocked', 'input_required'].includes(t.state));
+  }
+  function sweepBlock(held) {
+    const minutes = Math.round(sweepMs / 60000);
+    const lines = [`Nothing has happened for ${minutes} minutes (delivered by bounce, not typed by the user). Nothing is running; this is waiting on you:`];
+    for (const t of held) {
+      const age = t.since ? Math.max(0, Math.round((now() - Date.parse(t.since.time)) / 60000)) : null;
+      lines.push(`- task ${t.id} · profile ${t.profile ?? '?'} · held${t.since?.reason ? ` · reason: ${t.since.reason}` : ''}${age !== null ? ` · for ${age} min` : ''}${t.copy ? ` · work in ${t.copy}` : ''}`);
+      if (t.since?.text) lines.push(`  ${String(t.since.text).slice(0, HANDOFF_TEXT_MAX).replace(/\n/g, '\n  ')}`);
+    }
+    return lines.join('\n');
+  }
+  function sweepDue() {
+    if (sweepMs <= 0 || closed || current || wakeTimer || autoWakeSuppressed) return false;
+    // Outcomes still pending do not stop a sweep: once their wake attempts are spent (reconcile arms
+    // nothing more), the sweep is what is left — the 91-minute case was exactly that.
+    if (inFlight() || !heldTasks().length) return false;
+    // answered already, and nothing of anyone's has happened since that sweep
+    const lastSweep = session.events.findLast(e => e.kind === 'main.requested' && e.sweep);
+    if (lastSweep && !session.events.some(e => e.seq > lastSweep.seq && !QUIET.has(e.kind) && !e.kind.startsWith('main.') && !['turn', 'handoff', 'route', 'assistant', 'tool', 'status', 'state'].includes(e.kind))) return false;
+    return true;
+  }
+  function armSweep() {
+    if (sweepTimer) { clearTimer(sweepTimer); sweepTimer = null; }
+    if (!sweepDue()) return;
+    sweepTimer = setTimer(() => {
+      sweepTimer = null;
+      if (!sweepDue()) return;
+      session.append({kind: 'status', from: 'main', context: session.id, text: `Nothing has happened for ${Math.round(sweepMs / 60000)} minutes and ${heldTasks().length} held task(s) wait for the orchestrator; asking it.`});
+      start({text: SWEEP_PROMPT}, {wake: true, sweep: true});
+    }, sweepMs);
+  }
+  const unsubscribeSweep = session.subscribe(row => { if (!QUIET.has(row.kind)) armSweep(); });
+  armSweep();
   const service = {
     state,
     subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
@@ -675,6 +743,8 @@ export function createMainService({session, adapters, profile, settings, profile
       closed = true;
       unsubscribeRoster();
       unsubscribeHandoff();
+      unsubscribeSweep();
+      if (sweepTimer) { clearTimer(sweepTimer); sweepTimer = null; }
       if (wakeTimer) { clearTimer(wakeTimer); wakeTimer = null; wakeTimerKey = null; }
       const run = current;
       if (!run) return {verified: true};

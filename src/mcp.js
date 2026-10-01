@@ -23,13 +23,19 @@ const TOOLS = [
   {name: 'submit', description: 'Submit a bounce event: task.submitted, a message to a worker, or a milestone.',
     inputSchema: {type: 'object', properties: {event: {type: 'object', description: 'The event, exactly as `bounce publish --event` takes it.'}}, required: ['event']}},
   {name: 'task_submit', description: 'Submit a task with stable job/retry identity. retryOf is authorized against this grant and cannot bypass review or limits.',
-    inputSchema: {type: 'object', properties: {task: {type: 'string'}, profile: {type: 'string'}, orders: {type: 'string'}, requires: {type: 'array', items: {type: 'string', enum: ['read', 'exec', 'write']}}, owns: {type: 'array', items: {type: 'string'}}, depends_on: {type: 'array', items: {type: 'string'}}, deadline: {type: ['number', 'null']}, review: {type: 'object'}, steps: {type: 'string'}, check: {type: 'string', description: 'A shell command that proves the work is done. bounce runs it in the worker\'s copy when the worker finishes; only work that passes (exit 0) is put in the checkout.'}, risk: {type: 'string'}, size: {type: 'object'}, checkpoint: {type: 'object'}, parent: {type: ['string', 'null']}, jobId: {type: 'string'}, retryOf: {type: 'string'}, inPlace: {type: 'object', description: 'Run in the real checkout. authorizedBy: the seq of the user message that asked for it; omit it to cite the latest one.', properties: {authorizedBy: {type: 'number'}}}}, required: ['profile', 'orders', 'requires']}},
+    inputSchema: {type: 'object', properties: {task: {type: 'string'}, profile: {type: 'string'}, orders: {type: 'string'}, requires: {type: 'array', items: {type: 'string', enum: ['read', 'exec', 'write']}}, owns: {type: 'array', items: {type: 'string'}}, userAsked: {type: 'boolean', description: 'True when the user asked for this specific AI by name; a first attempt naming a profile without it runs as the matching agent instead.'}, worker: {type: 'string', description: 'A standing worker from the roster (builder#1), or "new" for a fresh one on purpose.'}, continues: {type: 'string', description: 'A task of yours this one continues: its worker\'s session is resumed into this task\'s own copy, with these orders as what happens next. For a follow-up on the same area by the same job; after a correction of wrong work, start fresh instead.'}, depends_on: {type: 'array', items: {type: 'string'}}, deadline: {type: ['number', 'null']}, review: {type: 'object'}, steps: {type: 'string'}, check: {type: 'string', description: 'A shell command that proves the work is done. bounce runs it in the worker\'s copy when the worker finishes; only work that passes (exit 0) is put in the checkout.'}, risk: {type: 'string'}, size: {type: 'object'}, checkpoint: {type: 'object'}, parent: {type: ['string', 'null']}, jobId: {type: 'string'}, retryOf: {type: 'string'}, inPlace: {type: 'object', description: 'Run in the real checkout. authorizedBy: the seq of the user message that asked for it; omit it to cite the latest one.', properties: {authorizedBy: {type: 'number'}}}}, required: ['profile', 'orders', 'requires']}},
   {name: 'wait', description: `Wait for the first row matching every field given, up to ${WAIT_SECONDS_MAX} seconds. Answers {waiting: true} when nothing matched yet — end your turn rather than waiting again for long work; bounce wakes you with each outcome.`,
     inputSchema: {type: 'object', properties: {match: {type: 'object'}, seconds: {type: 'number'}, afterSeq: {type: 'number'}}, required: ['match']}},
   {name: 'report', description: 'Report progress or the final result for this worker attempt (workers only).',
     inputSchema: {type: 'object', properties: {report: {type: 'object'}}, required: ['report']}},
   {name: 'state', description: 'Write where the work is, in your own words: the phase, what is done, what is next, and why you changed course. One living note — each call replaces the last, and it is the first thing you are given when you wake.',
     inputSchema: {type: 'object', properties: {text: {type: 'string'}}, required: ['text']}},
+  {name: 'lesson', description: 'Record a lesson for this project after you corrected a worker\'s work or a check failed twice: one imperative sentence that a worker of that job should know next time here. It lands in .bounce/LESSONS.md and in every later worker\'s prompt for that job.',
+    inputSchema: {type: 'object', properties: {agent: {type: 'string', description: 'The job it is for (an agent name), or "all".'}, text: {type: 'string', description: 'One sentence, imperative, no task ids.'}}, required: ['agent', 'text']}},
+  {name: 'worker_retire', description: 'Retire a standing worker (a name from the roster, e.g. builder#1): its session is not continued again. Give a handoff when the next worker of that job should open with what this one knew, or set ask to true and the retiring worker writes its own handoff first.',
+    inputSchema: {type: 'object', properties: {worker: {type: 'string'}, handoff: {type: 'string', description: 'What the next worker of this job should know, in a few sentences. Optional.'}, ask: {type: 'boolean', description: 'Ask the retiring worker to write the handoff itself (one read-only turn on its session). Its answer opens the next worker.'}}, required: ['worker']}},
+  {name: 'worker_compact', description: 'Ask a standing worker to compact its own context (Claude workers; OpenCode and Codex cannot — retire those with a handoff instead). One turn on its session, nothing changed in the project.',
+    inputSchema: {type: 'object', properties: {worker: {type: 'string'}}, required: ['worker']}},
   {name: 'task_get', description: 'One task: state, the AI playing it, lease and elapsed, its last milestones, its findings, its summary or review verdict. Bounded — never the journal itself.',
     inputSchema: {type: 'object', properties: {task: {type: 'string'},
       full: {type: 'boolean', description: 'Return the finished report/verdict whole instead of the cut summary. Use it once a task is done and you need its findings in full; the default stays bounded so a check never floods your turn.'}},
@@ -60,7 +66,7 @@ export function createMcpServer({ops, views, version = '0'}) {
     if (name === 'task_submit') {
       if (typeof args.profile !== 'string' || typeof args.orders !== 'string') return fail('task_submit needs profile and orders');
       const result = await ops.submit({kind: 'task.submitted', task: args.task, profile: args.profile, orders: args.orders, requires: args.requires, parent: args.parent ?? null,
-        jobId: args.jobId, retryOf: args.retryOf, ...Object.fromEntries(['owns', 'depends_on', 'deadline', 'review', 'steps', 'check', 'risk', 'size', 'checkpoint', 'inPlace'].filter(key => args[key] !== undefined).map(key => [key, args[key]]))});
+        jobId: args.jobId, retryOf: args.retryOf, ...Object.fromEntries(['owns', 'depends_on', 'deadline', 'review', 'steps', 'check', 'continues', 'worker', 'userAsked', 'risk', 'size', 'checkpoint', 'inPlace'].filter(key => args[key] !== undefined).map(key => [key, args[key]]))});
       return result.ok ? ok(rowText(result.row), result.row) : fail(`bounce refused it: ${result.reason}`, result);
     }
     if (name === 'plan_wait') {
@@ -86,6 +92,21 @@ export function createMcpServer({ops, views, version = '0'}) {
       const result = await ops.state(args.text);
       return result.ok ? ok('kept as where you are; it replaces your last note', result.row) : fail(`bounce refused it: ${result.reason}`, result);
     }
+    if (name === 'lesson') {
+      if (typeof args.text !== 'string' || !args.text.trim()) return fail('lesson needs `text`: one sentence, imperative');
+      const result = await ops.lesson({agent: typeof args.agent === 'string' && args.agent.trim() ? args.agent.trim() : 'all', text: args.text});
+      return result.ok ? ok(`kept in .bounce/LESSONS.md for ${result.row.agent}: ${result.row.text}`, result.row) : fail(`bounce refused it: ${result.reason}`, result);
+    }
+    if (name === 'worker_compact') {
+      if (typeof args.worker !== 'string' || !args.worker) return fail('worker_compact needs the `worker` name');
+      const result = await ops.compact({worker: args.worker});
+      return result.ok ? ok(`${result.row.worker} compacted (${result.row.status})`, result.row) : fail(`bounce refused it: ${result.reason}`, result);
+    }
+    if (name === 'worker_retire') {
+      if (typeof args.worker !== 'string' || !args.worker) return fail('worker_retire needs the `worker` name');
+      const result = await ops.retire({worker: args.worker, handoff: typeof args.handoff === 'string' && args.handoff.trim() ? args.handoff : null, ask: args.ask === true});
+      return result.ok ? ok(`${result.row.worker} retired${result.row.handoff ? '; the next ' + result.row.profile + ' opens with your handoff' : ''}`, result.row) : fail(`bounce refused it: ${result.reason}`, result);
+    }
     if (name === 'task_get') {
       if (typeof args.task !== 'string' || !args.task) return fail('task_get needs a `task` id');
       const view = views.taskView(args.task, {report: args.full === true});
@@ -93,7 +114,10 @@ export function createMcpServer({ops, views, version = '0'}) {
     }
     if (name === 'tasks_list') {
       const rows = views.taskList({all: args.all === true});
-      return ok(formatTaskList(rows), rows);
+      const roster = views.roster?.() ?? [];
+      // An MCP structured result is an object: a bare array failed Codex's schema check live ("expected record"),
+      // so every tasks_list call from the orchestrator was refused by its own client (found 2026-10-01).
+      return ok(roster.length ? `${formatTaskList(rows)}\n\nYour workers:\n${roster.join('\n')}` : formatTaskList(rows), {tasks: rows, workers: roster});
     }
     return fail(`no such tool: ${name}`);
   }

@@ -150,6 +150,10 @@ export function createOps({env = process.env, connect = connectBus, clock = () =
     report: payload => withClient(true, async client => ({ok: true, row: await client.report(payload)})),
     // The orchestrator's own memory: one living note it rewrites each turn (docs/plans/orchestrator-memory.md).
     state: text => withClient(false, async client => ({ok: true, row: await client.publish({kind: 'state', text: String(text ?? '')})})),
+    // A lesson for this project's workers (docs/plans/lessons-and-sweep.md): the bus keeps the file and refuses in plain words.
+    retire: ({worker, handoff, ask = false}) => withClient(false, async client => ({ok: true, row: await client.publish({kind: 'worker.retire', worker: String(worker ?? ''), ...(handoff ? {handoff: String(handoff)} : {}), ...(ask ? {ask: true} : {})})})),
+    compact: ({worker}) => withClient(false, async client => ({ok: true, row: await client.publish({kind: 'worker.compact', worker: String(worker ?? '')})})),
+    lesson: ({agent, text}) => withClient(false, async client => ({ok: true, row: await client.publish({kind: 'lesson.learned', agent: String(agent ?? 'all'), text: String(text ?? '')})})),
     wait: (match, {timeout = DEFAULT_WAIT_MS, afterSeq = 0} = {}) => withClient(false, async client => {
       const deadline = clock() + timeout;
       let row = null;

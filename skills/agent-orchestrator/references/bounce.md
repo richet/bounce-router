@@ -40,7 +40,7 @@ ask for `/local setup` or `/local activate` — never substitute a cloud worker.
 
 The bridge is already in your environment as `BOUNCE_BUS` and `BOUNCE_BUS_TOKEN_FILE`.
 
-Prefer bounce's MCP tools when your client has them (`submit`, `wait`, `report`, `task_get`, `tasks_list`):
+Prefer bounce's MCP tools when your client has them (`submit`, `wait`, `report`, `task_get`, `tasks_list`, `lesson`):
 they take and return structured values, and `task_get` answers "what did this task produce" in a screenful.
 The commands below are the same verbs and remain the fallback. Never read a session's `journal.jsonl`
 yourself — it is the raw log, and bounce already summarises it for you.
@@ -55,7 +55,11 @@ brief — the six parts from the skill go here, as text), `deadline` (ms, option
 lease, renewed while the worker makes progress, up to the 60-minute ceiling — long work is normal),
 `depends_on` (task ids, optional), `review` (`{"prelaunch": <profile>, "completion":
 <profile>}`, optional, review-role profiles only), `steps` (the verification steps, as text),
-`check` (one shell command that proves the work is done, optional).
+`check` (one shell command that proves the work is done, optional), `continues` (a task of yours whose
+worker is resumed into this task's copy, for a follow-up on the same area by the same job; after a
+correction of wrong work start fresh instead), `worker` (`builder#1` to pick a standing worker from the
+roster, `new` for a fresh one on purpose; absent, the agent's idle worker is continued by itself).
+`worker_retire` ends a standing worker, with an optional handoff for the next one of that job.
 
 Give a `check` to every task that changes files. It must run the work (its tests, its script) and
 fail when the result is wrong: a check that only looks for a file or a phrase passes on a false
