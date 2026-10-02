@@ -309,21 +309,25 @@ test('window titles and reset text read the way a plan states them', () => {
 });
 
 test('modelPanel: ranked entries each get a labelled row and a bar sized against the top spender', () => {
+  // In and out apart (Daniel, 2026-10-02): two quantities, two bars, each against the top of its own kind.
   const entries = [
-    {model: 'claude-opus-5[1m]', provider: 'claude', tokens: 762000, usage: {}, turns: 1},
-    {model: 'gpt-5-codex', provider: 'codex', tokens: 381000, usage: {}, turns: 1},
-    {model: 'sonnet', provider: null, tokens: 42000, usage: {}, turns: 1},
+    {model: 'claude-opus-5[1m]', provider: 'claude', tokens: 762000, usage: {input: 12000, cache_read: 750000, output: 8000}, turns: 1},
+    {model: 'gpt-5-codex', provider: 'codex', tokens: 381000, usage: {input: 381000, output: 16000}, turns: 1},
+    {model: 'sonnet', provider: null, tokens: 42000, usage: {input: 42000, output: 2000}, turns: 1},
   ];
   const panel = modelPanel(entries, {width: 28});
   assert.deepEqual(panel, [
-    'TOKENS · session, in+out',
-    'claude-opus-5[1m]       762k',
-    '■'.repeat(28),
-    'gpt-5-codex             381k',
-    // Half the top spender's tokens: half the bar, rounded to the nearest cell.
-    '■'.repeat(14) + '□'.repeat(14),
-    'sonnet                   42k',
-    '■'.repeat(2) + '□'.repeat(26),
+    'TOKENS · session · in | out',
+    'claude-opu… 762k in · 8k out',
+    '■'.repeat(25) + ' in',
+    '■'.repeat(12) + '□'.repeat(12) + ' out',
+    'gpt-5-cod… 381k in · 16k out',
+    // Half the top reader's input: half the bar, rounded to the nearest cell.
+    '■'.repeat(13) + '□'.repeat(12) + ' in',
+    '■'.repeat(24) + ' out',
+    'sonnet       42k in · 2k out',
+    '■'.repeat(1) + '□'.repeat(24) + ' in',
+    '■'.repeat(3) + '□'.repeat(21) + ' out',
   ]);
   for (const row of panel) assert.ok(row.length <= 28, `row too wide: ${row}`);
 });
@@ -334,21 +338,21 @@ test('modelPanel: no usage yet hides the section entirely, rather than a placeho
 });
 
 test('modelPanel: a name too long for the width is truncated, the count always stays on the right', () => {
-  const entries = [{model: 'super-duper-extremely-long-model-name-v3', provider: 'claude', tokens: 1234567, usage: {}, turns: 1}];
+  const entries = [{model: 'super-duper-extremely-long-model-name-v3', provider: 'claude', tokens: 1234567, usage: {input: 1234567, output: 5000}, turns: 1}];
   const panel = modelPanel(entries, {width: 28});
-  assert.equal(panel[1], 'super-duper-extremely-… 1.2M');
+  assert.equal(panel[1], 'super-dupe… 1.2M in · 5k out');
   assert.equal(panel[1].length, 28);
 });
 
 test('modelPanel gives up bars, then per-model lines, then one compact line, as the sidebar runs out of rows', () => {
   const entries = [
-    {model: 'claude-opus-5', provider: 'claude', tokens: 762000, usage: {}, turns: 1},
-    {model: 'gpt-5-codex', provider: 'codex', tokens: 84000, usage: {}, turns: 1},
+    {model: 'claude-opus-5', provider: 'claude', tokens: 762000, usage: {input: 762000, output: 9000}, turns: 1},
+    {model: 'gpt-5-codex', provider: 'codex', tokens: 84000, usage: {input: 84000, output: 3000}, turns: 1},
   ];
   const rows = budget => modelPanel(entries, {width: 28, rows: budget});
-  assert.equal(rows(Infinity).length, 5); // title + 2 * (label + bar)
-  assert.deepEqual(rows(3), ['TOKENS · session, in+out', 'claude-opus-5           762k', 'gpt-5-codex              84k']);
-  assert.deepEqual(rows(2), ['TOKENS · session, in+out', 'claude-opus-5 762k · gpt-5-codex 84k']);
+  assert.equal(rows(Infinity).length, 7); // title + 2 * (label + in bar + out bar)
+  assert.deepEqual(rows(3), ['TOKENS · session · in | out', 'claude-opu… 762k in · 9k out', 'gpt-5-codex  84k in · 3k out']);
+  assert.deepEqual(rows(2), ['TOKENS · session · in | out', 'claude-opus-5 762k|9k · gpt-5-codex 84k|3k']);
   // A title with nothing under it says nothing: hidden below a 2-row budget, same as no usage.
   assert.deepEqual(rows(1), []);
 });
@@ -358,7 +362,7 @@ test('modelPanel: below a 2-row budget the section hides entirely rather than sh
   assert.deepEqual(modelPanel(entries, {rows: 1}), []);
   const panel = modelPanel(entries, {rows: 2});
   assert.equal(panel.length, 2);
-  assert.equal(panel[0], 'TOKENS · session, in+out');
+  assert.equal(panel[0], 'TOKENS · session · in | out');
 });
 
 test('usageOrder: the fallback order first, then every profile adapter, deduped, quota-reporting vendors only', () => {

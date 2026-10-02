@@ -336,17 +336,23 @@ const modelBar = (fraction, width, p) => {
 // Ranked by reducers.modelUsage, so entries[0] is already the top spender: its bar is always
 // full and every other bar reads as a share of it. No usage yet means nothing to rank — hidden,
 // not a placeholder. Same bars -> lines -> compact degradation as quotaPanel, for the same reason.
+// In and out apart (Daniel, 2026-10-02): what a model read (input, cache reads included) and what it wrote
+// are two quantities — output is a fraction of a percent of input — so each gets its own bar, scaled against
+// the model that read or wrote the most, and the label row carries both counts.
+const inOf = e => (e.usage?.input ?? 0) + (e.usage?.cache_read ?? 0) || (e.tokens ?? 0);
+const outOf = e => e.usage?.output ?? 0;
+const taggedBar = (fraction, width, tag, p) => { const cells = Math.max(4, width - tag.length - 1); const fill = Math.min(cells, Math.round(Math.max(0, Math.min(1, fraction)) * cells)); return `${p.ok(BAR.used.repeat(fill))}${p.muted(BAR.free.repeat(cells - fill))} ${p.muted(tag)}`; };
 export function modelPanel(entries, {width = 28, rows = Infinity, paint} = {}) {
   const p = {...noPaint, ...paint};
   // Fewer than a title plus one line can't say anything: hidden, same as no usage at all.
   if (!entries?.length || rows < 2) return [];
-  const top = entries[0].tokens || 1;
+  const topIn = Math.max(1, ...entries.map(inOf)), topOut = Math.max(1, ...entries.map(outOf));
   const build = detail => {
-    const title = p.title('TOKENS · session, in+out');
-    if (detail === 'compact') return [title, p.muted(entries.map(e => `${e.model} ${compactTokens(e.tokens)}`).join(' · '))];
+    const title = p.title('TOKENS · session · in | out');
+    if (detail === 'compact') return [title, p.muted(entries.map(e => `${e.model} ${compactTokens(inOf(e))}|${compactTokens(outOf(e))}`).join(' · '))];
     return [title, ...entries.flatMap(e => {
-      const head = modelLabelRow(e.model, compactTokens(e.tokens), width, p);
-      return detail === 'bars' ? [head, modelBar(e.tokens / top, width, p)] : [head];
+      const head = modelLabelRow(e.model, `${compactTokens(inOf(e))} in · ${compactTokens(outOf(e))} out`, width, p);
+      return detail === 'bars' ? [head, taggedBar(inOf(e) / topIn, width, 'in', p), taggedBar(outOf(e) / topOut, width, 'out', p)] : [head];
     })];
   };
   let built = [];
