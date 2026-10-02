@@ -842,3 +842,33 @@ test('worker.retire from the orchestrator reaches the hook; a worker may not ret
   t.after(() => worker.close());
   await assert.rejects(worker.publish({kind: 'worker.retire', worker: 'builder#1'}), error => error.code === -32001);
 });
+
+// Found live (ACE e3bd01d5, 2026-10-01 00:31 UTC): the daemon died of `write EPIPE` at bus.js send ←
+// handlePublish. A peer (one of seven leftover `bounce mcp-serve` bridges) hung up while its reply was
+// in flight; `send` catches what write throws, but a socket error is an event, and the server-side socket
+// had no 'error' listener, so it became an uncaught exception and took the daemon — and the whole session
+// — down. A peer hanging up is its own business; the daemon answers the next one.
+test('a peer that hangs up while its reply is in flight does not take the daemon down', async t => {
+  const {bus} = await setup(t);
+  const crashes = [];
+  const onCrash = error => crashes.push(error);
+  process.on('uncaughtException', onCrash);
+  t.after(() => process.off('uncaughtException', onCrash));
+  const {token} = bus.grant({peer: 'worker:a', tasks: ['t1']});
+  for (let round = 0; round < 30; round += 1) {
+    const {socket, write, waitForLines} = await rawConnect(bus, t);
+    write({jsonrpc: '2.0', id: 0, method: 'auth', params: {token}});
+    await waitForLines(1);
+    // a publish, then the socket is torn down before the reply can be written
+    write({jsonrpc: '2.0', id: 1, method: 'publish', params: {event: {kind: 'task.milestone', task: 't1', text: `round ${round}`}}});
+    socket.destroy();
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.deepEqual(crashes.map(error => error.code ?? error.message), []);
+  // and the daemon is still answering
+  const again = await connect(bus, 'worker:b', {tasks: ['t2']});
+  t.after(() => again.close());
+  const row = await again.publish({kind: 'task.milestone', task: 't2', text: 'still here'});
+  assert.equal(row.text, 'still here');
+});

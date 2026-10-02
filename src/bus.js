@@ -140,6 +140,10 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
       for (const cleanup of pendingWaits) cleanup();
       pendingWaits.clear();
     });
+    // A peer that hangs up while its reply is in flight raises EPIPE/ECONNRESET as an event, not a
+    // throw: without a listener it is an uncaught exception that takes the daemon down (found live,
+    // ACE e3bd01d5, 2026-10-01). The 'close' that follows does the cleanup; the error itself is nothing.
+    socket.on('error', () => {});
 
     function handleLine(line) {
       let msg, parseError = false;
