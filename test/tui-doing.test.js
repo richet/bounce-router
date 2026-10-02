@@ -54,7 +54,7 @@ test('rendered: the header and the main worker\'s rail row say what it is doing,
     transcriptRows: ['…'], view: {columns: 120, rows: 24, busy: true, now, selectedId: 'orchestrator', input: '', notice: '', main: {state: 'running', startedAt: at(60 * 38), doing},
       metadata: {provider: 'claude', model: 'claude-fable-5-1', mode: 'yolo', operation: 'orchestrator', orchestrator: 'main', sessionId: 's', cwd: '/p', quotaLines: []}},
   }), {columns: 120}));
-  assert.match(out.split('\n')[0], /main · claude-fable-5-1 · working 7m · ⏳ waiting on 79981b05/);
+  assert.match(out.split('\n').find(line => /^[●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] main ·/.test(line)) ?? '', /main · claude-fable-5-1 · working 7m · ⏳ waiting on 79981b05/);
   assert.equal(out.includes('⏳ waiting on 79981b05 · 6m'), true, 'the rail row under main');
   assert.equal(out.includes('⚙ bash: deno test · 10s'), true, 'the rail row under the worker');
 });

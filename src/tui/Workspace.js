@@ -192,10 +192,14 @@ export function createWorkspace(React, Ink) {
     }, [view.agentsOpen, view.scroll, boundedScroll, onScrollClamp]);
     const end = transcript.length - boundedScroll;
     const rows = transcript.slice(Math.max(0, end - bodyHeight), end);
+    // The main worker's status line (under the prompt box): glyph, name, model, state, how long, what it is
+    // doing; a narrow column drops the model and the doing so the state and — sidebar hidden — the AI and mode fit.
+    const narrow = columns < 60; // the same bound the agent panes use for a single column
+    const quiet = working && quietFor(main.startedAt, now) ? ` ${quietFor(main.startedAt, now)}` : '';
+    const doing = !narrow && working && doingLine(main.doing, now, 60) ? ` · ${doingLine(main.doing, now, 60)}` : '';
+    const where = view.agentsOpen ? 'Agent workspace · Tab changes pane' : `Conversation · ${view.details ? 'details expanded' : 'details folded'} · /details`;
+    const statusText = `${glyph(mainState, now)} ${view.metadata?.orchestrator ?? 'main'}${!narrow && mainModel ? ` · ${mainModel}` : ''} · ${mainState}${quiet}${doing}${sidebar ? '' : ` · ${view.metadata?.provider ?? 'agent'} · ${view.metadata?.mode ?? 'READY'}`}${narrow ? '' : ` · ${where}`}`;
     const content = React.createElement(Box, {flexDirection: 'column', width: columns, height, flexShrink: 0, overflow: 'hidden'},
-      React.createElement(Box, {height: 1, flexShrink: 0}, React.createElement(Text, {bold: true, color: working ? 'yellow' : 'cyan', wrap: 'truncate-end'}, sidebar
-        ? `${glyph(mainState, now)} ${view.metadata?.orchestrator ?? 'main'}${mainModel ? ` · ${mainModel}` : ''} · ${mainState}${working && quietFor(main.startedAt, now) ? ` ${quietFor(main.startedAt, now)}` : ''}${working && doingLine(main.doing, now, 60) ? ` · ${doingLine(main.doing, now, 60)}` : ''} · ${view.agentsOpen ? 'Agent workspace · Tab changes pane' : `Conversation · ${view.details ? 'details expanded' : 'details folded'} · /details`}`
-        : `bounce · ${view.metadata?.provider ?? 'agent'} · ${view.metadata?.mode ?? 'READY'}`)),
       view.agentsOpen
         ? React.createElement(Box, {position: 'relative', width: columns, height: bodyHeight}, ...visible.slice(0, grid.visible).map((pane, index) => React.createElement(Pane, {
           key: pane.id, pane, selected: pane.id === view.selectedId,
@@ -209,7 +213,7 @@ export function createWorkspace(React, Ink) {
         : React.createElement(Box, {height: bodyHeight, flexDirection: 'column', overflow: 'hidden'}, ...rows.map((text, index) => React.createElement(Text, {key: `${index}:${text}`, wrap: 'truncate-end'}, text || ' '))),
       view.agentsOpen && remaining ? React.createElement(Text, {color: 'gray'}, `+ ${remaining} more agents · Tab cycles`) : null,
       ...menu.map((item, index) => React.createElement(Box, {key: `menu:${index}`, height: 1, flexShrink: 0}, React.createElement(Text, {wrap: 'truncate-end', color: item.selected ? 'cyan' : item.muted ? 'gray' : undefined}, item.text.replace(/\n/g, ' ')))),
-      React.createElement(Box, {height: draft.length + 2, flexShrink: 0, flexDirection: 'column'},
+      React.createElement(Box, {height: draft.length + 3, flexShrink: 0, flexDirection: 'column'},
         React.createElement(Text, {color: 'cyan', wrap: 'truncate-end'}, `── Message ${view.inputTarget ?? 'orchestrator'} · Enter send · Shift+Enter newline ${'─'.repeat(columns)}`),
         ...draft.map((row, index) => React.createElement(Text, {key: `input:${index}`, wrap: 'truncate-end'},
           React.createElement(Text, {color: 'cyan'}, `${index === 0 ? '❯' : ' '} `),
@@ -217,7 +221,10 @@ export function createWorkspace(React, Ink) {
             row.before, React.createElement(Text, {inverse: true}, row.atEnd ? '▏' : row.caret), row.after),
           // The main worker's proposed next step, dim after the caret while the input is empty: Tab takes it, typing replaces it.
           index === 0 && !view.input && view.suggestion ? React.createElement(Text, {color: 'gray'}, ` ${view.suggestion}  ⇥ Tab`) : null)),
-        React.createElement(Text, {color: 'yellow', wrap: 'truncate-end'}, (view.notice ?? '').replace(/\n/g, ' '))));
+        React.createElement(Text, {color: 'yellow', wrap: 'truncate-end'}, (view.notice ?? '').replace(/\n/g, ' ')),
+        // The main worker's status line lives under the prompt box, not above the transcript (Daniel,
+        // 2026-10-01): what it is doing and for how long, and — with the sidebar hidden — which AI and mode.
+        React.createElement(Text, {bold: true, color: working ? 'yellow' : 'cyan', wrap: 'truncate-end'}, statusText)));
     return React.createElement(Box, {flexDirection: 'row', columnGap: sidebar ? 1 : 0, width: total, height}, content,
       sidebar ? React.createElement(Sidebar, {metadata: view.metadata, panes: model.panes, main: allPanes[0], height, now}) : null);
   }

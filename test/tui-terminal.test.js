@@ -141,7 +141,7 @@ test('real Ink three-pane frame keeps the right-bottom worker inside the viewpor
   const frames = [];
   stdout.on('data', chunk => {
     const text = stripAnsi(String(chunk));
-    if (text.includes('bounce ·')) frames.push(text);
+    if (text.includes(' main ·')) frames.push(text); // the main worker's status line, under the prompt since 2026-10-01
   });
   const terminal = createInkTerminal({stdin, stdout});
   await terminal.mount({agentsOpen: true, events: [

@@ -64,14 +64,17 @@ const frame = view => stripAnsi(Ink.renderToString(React.createElement(Workspace
     metadata: {provider: 'claude', model: 'claude-fable-5-1[1m]', mode: 'yolo', operation: 'orchestrator', orchestrator: 'main', sessionId: 's', cwd: '/p', quotaLines: []}, ...view},
 }), {columns: 120}));
 
-test('rendered: the header and the rail say the main worker is working, on what, and for how long; at rest they say ready', () => {
+// 2026-10-01: the main worker's status line sits under the prompt box, not above the transcript.
+const statusLine = out => out.split('\n').find(line => /^[●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] main ·/.test(line)) ?? '';
+test('rendered: the status line under the prompt and the rail say the main worker is working, on what, and for how long; at rest they say ready', () => {
   const now = Date.parse('2026-09-21T05:00:12.000Z'), spin = SPINNER[glyphIndex(now)];
   const busy = frame({busy: true, main: {state: 'running', startedAt: '2026-09-21T04:58:00.000Z'}});
-  assert.equal(busy.split('\n')[0].startsWith(`${spin} main · claude-fable-5-1 · working 2m`), true, busy.split('\n')[0]);
+  assert.equal(statusLine(busy).startsWith(`${spin} main · claude-fable-5-1 · working 2m`), true, statusLine(busy));
+  assert.equal(busy.split('\n')[0].includes('main ·'), false, 'nothing of the main worker above the transcript any more');
   assert.equal(busy.includes(`${spin} main claude-fable-5-1 2m`), true, 'the rail row of the main worker');
   assert.equal(busy.includes(`${spin} builder qwen3-coder-next 12s`), true, 'the rail row of the agent');
   const idle = frame({busy: false, main: {state: 'ready'}});
-  assert.equal(idle.split('\n')[0].startsWith('● main · claude-fable-5-1 · ready'), true, idle.split('\n')[0]);
+  assert.equal(statusLine(idle).startsWith('● main · claude-fable-5-1 · ready'), true, statusLine(idle));
   assert.equal(idle.includes(spin + ' main'), false);
   // the agent pane's title carries the same glyph and the short model, not the whole name
   const open = frame({agentsOpen: true, busy: false, main: {state: 'ready'}});
