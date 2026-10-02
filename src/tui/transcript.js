@@ -138,7 +138,7 @@ export function conversationEvents(events, {details = false} = {}) {
     // in the default view; earlier ones stay in the journal and in /details. Older journals never
     // marked a /tasks status row with `view`, so an unmarked one can't be told apart from an
     // ordinary status row — leave those alone.
-    const view = ['review', 'help', 'quota'].includes(event.kind) ? event.kind : event.kind === 'status' && event.view === 'tasks' ? 'tasks' : null;
+    const view = ['review', 'help', 'quota', 'settings'].includes(event.kind) ? event.kind : event.kind === 'status' && event.view === 'tasks' ? 'tasks' : null;
     if (view) {
       const previous = viewSlots.get(view);
       if (previous) rows[previous.index] = null;

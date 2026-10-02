@@ -97,6 +97,7 @@ export const TUI_SECTIONS = [
     ['/quota', '', 'Show the subscription usage each agent reports'],
     ['/retry', '', 'Clear locally recorded quota cooldowns'],
     ['/unblock', '', 'Continue after a restart when the previous orchestrator is gone'],
+    ['/config', '[key value | unset key]', 'Show or change settings; saved to config.json, validated, says when it applies'],
     ['/update', '[check]', 'Install the latest npm release, or only check'],
     ['/restart', '', 'Test and reload updated code, keeping this session'],
     ['/help', '', 'Show this help'],

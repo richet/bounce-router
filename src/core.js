@@ -132,6 +132,29 @@ export function migrateSettings(raw) {
   return {value, migrated, agents};
 }
 
+// Every rule a settings object must meet, on the merged value (defaults under what the file says). Shared by
+// the loader and by /config, so a value typed in the TUI is refused with the same words the loader would use.
+export function validateSettings(value) {
+  if (!Array.isArray(value.order) || !value.order.length || value.order.some(p => !providers[p]) || new Set(value.order).size !== value.order.length) throw new Error('config.order must be a unique, nonempty list of claude, codex, muse');
+  if (!['yolo', 'plan'].includes(value.mode)) throw new Error('config.mode must be yolo or plan');
+  if (typeof value.sidebar !== 'boolean') throw new Error('config.sidebar must be true or false');
+  if (value.taskMinutes !== undefined && (!Number.isInteger(value.taskMinutes) || value.taskMinutes < 1 || value.taskMinutes > 240)) throw new Error('taskMinutes must be a whole number of minutes from 1 to 240');
+  if (value.taskCeilingMinutes !== undefined && (!Number.isInteger(value.taskCeilingMinutes) || value.taskCeilingMinutes < 1 || value.taskCeilingMinutes > 240 || value.taskCeilingMinutes < (value.taskMinutes ?? 15))) throw new Error('taskCeilingMinutes must be a whole number of minutes from 1 to 240, and at least taskMinutes');
+  if (value.reports !== undefined && !['plain', 'structured'].includes(value.reports)) throw new Error('reports must be "plain" or "structured"');
+  // The quiet sweep (docs/plans/lessons-and-sweep.md §2): minutes with nothing in flight and held work waiting before the orchestrator is asked; 0 turns it off.
+  if (value.sweepMinutes !== undefined && (!Number.isInteger(value.sweepMinutes) || value.sweepMinutes < 0 || value.sweepMinutes > 240)) throw new Error('sweepMinutes must be a whole number of minutes from 0 (off) to 240');
+  if (!Number.isFinite(value.contextChars) || value.contextChars < 4000 || value.contextChars > 200000) throw new Error('contextChars must be between 4000 and 200000');
+  // Cloud workers (claude/codex/muse) have no per-endpoint slot config the way local does — this is
+  // their one ceiling, machine-wide, distinct from a local endpoint's own maxConcurrent.
+  if (!Number.isInteger(value.maxConcurrentCloud) || value.maxConcurrentCloud < 1) throw new Error('maxConcurrentCloud must be a positive integer');
+  if (!Number.isFinite(value.cooldownMinutes) || value.cooldownMinutes < 0) throw new Error('Invalid cooldownMinutes');
+  // A partial skills block keeps the defaults for the fields it leaves out.
+  value.skills = {...defaults().skills, ...(value.skills && typeof value.skills === 'object' ? value.skills : {})};
+  if (!['user', 'project'].includes(value.skills.scope) || typeof value.skills.autoSync !== 'boolean') throw new Error('config.skills must be {scope: "user" or "project", autoSync: true or false}');
+  for (const map of [value.models, value.executables]) if (!map || typeof map !== 'object' || Object.values(map).some(v => typeof v !== 'string')) throw new Error('models and executables must map provider names to strings');
+  return value;
+}
+
 export function config(root = dataRoot()) {
   const file = path.join(root, 'config.json');
   const stored = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {};
@@ -150,27 +173,10 @@ export function config(root = dataRoot()) {
       fs.writeFileSync(file, `${JSON.stringify(forward, null, 2)}\n`, {mode: 0o600});
     } catch {}
   }
-  const value = {...defaults(), ...forward};
+  const value = validateSettings({...defaults(), ...forward});
   // Non-enumerable: this is a report about THIS load, not configuration. It must never round-trip
   // into config.json when a caller saves the settings object back.
   Object.defineProperty(value, 'migratedProfiles', {value: migrated, enumerable: false});
-  if (!Array.isArray(value.order) || !value.order.length || value.order.some(p => !providers[p]) || new Set(value.order).size !== value.order.length) throw new Error('config.order must be a unique, nonempty list of claude, codex, muse');
-  if (!['yolo', 'plan'].includes(value.mode)) throw new Error('config.mode must be yolo or plan');
-  if (typeof value.sidebar !== 'boolean') throw new Error('config.sidebar must be true or false');
-  if (value.taskMinutes !== undefined && (!Number.isInteger(value.taskMinutes) || value.taskMinutes < 1 || value.taskMinutes > 240)) throw new Error('taskMinutes must be a whole number of minutes from 1 to 240');
-  if (value.taskCeilingMinutes !== undefined && (!Number.isInteger(value.taskCeilingMinutes) || value.taskCeilingMinutes < 1 || value.taskCeilingMinutes > 240 || value.taskCeilingMinutes < (value.taskMinutes ?? 15))) throw new Error('taskCeilingMinutes must be a whole number of minutes from 1 to 240, and at least taskMinutes');
-  if (value.reports !== undefined && !['plain', 'structured'].includes(value.reports)) throw new Error('reports must be "plain" or "structured"');
-  // The quiet sweep (docs/plans/lessons-and-sweep.md §2): minutes with nothing in flight and held work waiting before the orchestrator is asked; 0 turns it off.
-  if (value.sweepMinutes !== undefined && (!Number.isInteger(value.sweepMinutes) || value.sweepMinutes < 0 || value.sweepMinutes > 240)) throw new Error('sweepMinutes must be a whole number of minutes from 0 (off) to 240');
-  if (!Number.isFinite(value.contextChars) || value.contextChars < 4000 || value.contextChars > 200000) throw new Error('contextChars must be between 4000 and 200000');
-  // Cloud workers (claude/codex/muse) have no per-endpoint slot config the way local does — this is
-  // their one ceiling, machine-wide, distinct from a local endpoint's own maxConcurrent.
-  if (!Number.isInteger(value.maxConcurrentCloud) || value.maxConcurrentCloud < 1) throw new Error('maxConcurrentCloud must be a positive integer');
-  if (!Number.isFinite(value.cooldownMinutes) || value.cooldownMinutes < 0) throw new Error('Invalid cooldownMinutes');
-  // A partial skills block keeps the defaults for the fields it leaves out.
-  value.skills = {...defaults().skills, ...(value.skills && typeof value.skills === 'object' ? value.skills : {})};
-  if (!['user', 'project'].includes(value.skills.scope) || typeof value.skills.autoSync !== 'boolean') throw new Error('config.skills must be {scope: "user" or "project", autoSync: true or false}');
-  for (const map of [value.models, value.executables]) if (!map || typeof map !== 'object' || Object.values(map).some(v => typeof v !== 'string')) throw new Error('models and executables must map provider names to strings');
   return value;
 }
 export class Session {
