@@ -227,17 +227,23 @@ export function quotaReport(store, order, now = Date.now()) {
   return order.map(provider => {
     const entry = store[provider];
     if (!entry?.windows?.length) return `${provider} · ${entry?.error ?? quotaUnavailable(provider)}`;
-    const windows = entry.windows.map(w => expired(w, now) ? `${w.label} window reset since this reading`
-      : `${w.label} ${w.percent}% used${w.resetsAt ? ` (resets in ${duration(w.resetsAt - now)})` : ''}`);
+    const windows = entry.windows.map(w => expired(w, now) ? `${windowTitle(w.label)} ended since this reading (was ${w.percent}% used)`
+      : `${windowTitle(w.label)} ${w.percent}% used${w.resetsAt ? ` (resets in ${duration(w.resetsAt - now)})` : ''}`);
     return [provider, entry.plan, ...windows, `reported ${since(entry.time, now)}`, entry.error].filter(Boolean).join(' · ');
-  }).join('\n');
+  }).join('\n') + '\nThese are the plan\'s own windows, used by every session and app on the account, not this session alone.';
 }
 
 // --- Sidebar panel -------------------------------------------------------
-// A window is named the way the plan names it, so the sidebar reads like the account page.
-const windowTitles = {'1h': 'Hourly limit', '5h': '5-hour limit', '1d': 'Daily limit', '7d': 'Weekly limit'};
-export const windowTitle = label => windowTitles[label]
-  ?? `${String(label).charAt(0).toUpperCase()}${String(label).slice(1)} limit`;
+// A window is named in words (Daniel, 2026-10-01: "if the bars to the right can't be understood they are
+// not useful"): the span it covers, and for a per-model window, which model. The percentage is "used".
+const windowTitles = {'1h': 'Hourly window', '5h': '5-hour window', '1d': 'Daily window', '7d': 'Weekly'};
+export const windowTitle = label => {
+  const text = String(label);
+  if (windowTitles[text]) return windowTitles[text];
+  const match = /^(1h|5h|1d|7d)\s+(.+)$/.exec(text);
+  if (match) return `${windowTitles[match[1]]}, ${match[2]} only`;
+  return `${text.charAt(0).toUpperCase()}${text.slice(1)} window`;
+};
 // Within a day the wall clock is the quickest read; a weekly window needs the distance instead.
 const clock = ms => new Date(ms).toLocaleTimeString('en-US', {hour: 'numeric', minute: '2-digit'})
   .replace(/\s+/g, '').toLowerCase();
@@ -251,25 +257,15 @@ const planTitle = plan => String(plan).replace(/[_-]+/g, ' ').replace(/\b[a-z]/g
 const BAR = {used: '■', free: '□', tick: '│'};
 // Fill is quota spent; the tick is how much of the window's own clock has run. Fill
 // running ahead of the tick is the sidebar saying this window will not last the window.
+// The bar is the share of the window used, nothing else: the clock tick it used to carry (how far the
+// window had run) read as a mystery mark. When it resets rides on the bar's row, in words.
 export function quotaBar(w, width, now, paint) {
-  const cells = Math.max(4, width);
+  const reset = resetText(w, now);
+  const cells = Math.max(4, reset ? width - reset.length - 1 : width);
   const fill = Math.min(cells, Math.round(Math.min(w.percent, 100) / 100 * cells));
   const tone = w.percent >= 100 ? paint.high : w.percent >= 80 ? paint.warn : paint.ok;
-  const ran = Number.isFinite(w.minutes) && w.minutes > 0 && Number.isFinite(w.resetsAt)
-    ? 1 - (w.resetsAt - now) / (w.minutes * 60000) : null;
-  const tick = ran === null ? -1 : Math.min(cells - 1, Math.max(0, Math.round(ran * cells)));
-  const parts = [];
-  const add = (count, char, p) => {if (count > 0) parts.push(p(char.repeat(count)));};
-  if (tick >= 0 && tick < fill) {
-    add(tick, BAR.used, tone); parts.push(paint.tick(BAR.tick)); add(fill - tick - 1, BAR.used, tone);
-    add(cells - fill, BAR.free, paint.muted);
-  } else if (tick >= fill) {
-    add(fill, BAR.used, tone); add(tick - fill, BAR.free, paint.muted);
-    parts.push(paint.tick(BAR.tick)); add(cells - tick - 1, BAR.free, paint.muted);
-  } else {
-    add(fill, BAR.used, tone); add(cells - fill, BAR.free, paint.muted);
-  }
-  return parts.join('');
+  const bar = tone(BAR.used.repeat(fill)) + paint.muted(BAR.free.repeat(cells - fill));
+  return reset ? `${bar} ${paint.muted(reset)}` : bar;
 }
 // Title left, reset time beside the percentage on the right; the reset drops first when
 // the sidebar is too narrow to hold all three.
@@ -290,12 +286,15 @@ export function quotaPanel(store, order, {width = 30, now = Date.now(), rows = I
     return p.title([provider.toUpperCase(), entry?.plan ? planTitle(entry.plan) : null].filter(Boolean).join(' · '))
       + (cooldowns[provider] > now ? p.muted(' · cooldown') : '');
   };
+  // Title left, "N% used" right; with bars, the bar row carries the reset. An ended window keeps the last
+  // number it had instead of hiding it; a stale reading says how old it is.
   const line = (w, detail, readingTime) => {
-    if (expired(w, now)) return [panelRow(windowTitle(w.label), [], 'reset', width, p)];
+    const title = windowTitle(w.label);
+    if (expired(w, now)) return [panelRow(title, [], 'ended', width, p), p.muted(`${w.percent}% used before it ended`)];
     const age = readingTime != null ? compactAge(readingTime, now) : null;
-    const right = age ? `${w.percent}% · ${age}` : `${w.percent}%`;
-    const head = panelRow(windowTitle(w.label), resetForms(w, now), right, width, p);
-    return detail === 'bars' ? [head, quotaBar(w, width, now, p)] : [head];
+    const used = `${w.percent}% used`;
+    if (detail === 'bars') return [panelRow(title, age ? [`read ${age}`] : [], used, width, p), quotaBar(w, width, now, p)];
+    return [panelRow(title, [...resetForms(w, now), ...(age ? [`read ${age}`] : [])], used, width, p)];
   };
   const build = detail => order.flatMap((provider, index) => {
     const entry = store[provider];
@@ -306,9 +305,13 @@ export function quotaPanel(store, order, {width = 30, now = Date.now(), rows = I
     if (detail === 'compact') return [head(provider), p.muted(quotaShort(entry, now))];
     return [...gap, head(provider), ...windows.flatMap(w => line(w, detail, entry.time))];
   });
+  // One line says what every number below is, once (Daniel, 2026-10-01).
+  // Daniel, 2026-10-01: these are the vendor's windows for the whole subscription — every session and app —
+  // not this session's; the legend says so, and TOKENS below is the one block that is per session.
+  const legend = p.muted('QUOTA · of your whole plan');
   let built = [];
   for (const detail of ['bars', 'lines', 'compact']) {
-    built = build(detail);
+    built = detail === 'compact' ? build(detail) : [legend, ...build(detail)];
     if (built.length <= rows) return built;
   }
   return built.slice(0, Math.max(0, rows));
@@ -339,7 +342,7 @@ export function modelPanel(entries, {width = 28, rows = Infinity, paint} = {}) {
   if (!entries?.length || rows < 2) return [];
   const top = entries[0].tokens || 1;
   const build = detail => {
-    const title = p.title('MODELS');
+    const title = p.title('TOKENS · session, in+out');
     if (detail === 'compact') return [title, p.muted(entries.map(e => `${e.model} ${compactTokens(e.tokens)}`).join(' · '))];
     return [title, ...entries.flatMap(e => {
       const head = modelLabelRow(e.model, compactTokens(e.tokens), width, p);
