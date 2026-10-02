@@ -218,9 +218,9 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     // /help is a reference card, not a status line: headed sections, commands in one colour and
     // their arguments in another, descriptions aligned in a column that wraps under itself.
     // /config's listing and help: a block, one setting per line, not a status line that folds to its first.
-    if (e.kind === 'settings') {
+    if (e.kind === 'settings' || e.kind === 'stats') {
       const [head, ...body] = clean(e.text ?? '').split('\n');
-      return [clip(style.title(`${who(e)} · Settings`), width), ...(head ? [clip(`  ${style.muted(head)}`, width)] : []), ...body.flatMap(line => wrap(line, width - 2).map(row => '  ' + row)), ''];
+      return [clip(style.title(`${who(e)} · ${e.kind === 'stats' ? 'Stats' : 'Settings'}`), width), ...(head ? [clip(`  ${style.muted(head)}`, width)] : []), ...body.flatMap(line => wrap(line, width - 2).map(row => '  ' + row)), ''];
     }
     if (e.kind === 'help') {
       const paint = {title: style.title, name: style.prompt, hint: style.muted, muted: style.muted, key: c.yellow};

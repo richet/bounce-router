@@ -98,6 +98,7 @@ export const TUI_SECTIONS = [
     ['/retry', '', 'Clear locally recorded quota cooldowns'],
     ['/unblock', '', 'Continue after a restart when the previous orchestrator is gone'],
     ['/config', '[key value | unset key]', 'Show or change settings; saved to config.json, validated, says when it applies'],
+    ['/stats', '[tasks]', 'What this session cost and got: outcomes, time by AI, tokens, checks, reviews, workers'],
     ['/update', '[check]', 'Install the latest npm release, or only check'],
     ['/restart', '', 'Test and reload updated code, keeping this session'],
     ['/help', '', 'Show this help'],

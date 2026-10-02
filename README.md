@@ -428,6 +428,10 @@ request's mode or read-only policy. Exhausting the eligible routes ends as `unav
 
 Every turn starts a fresh native CLI process with a handoff. The handoff includes the original request, a bounded recent journal suffix, current request, and Git HEAD/status/diff-stat. It asks the next agent to inspect partially completed work. Full raw provider events and normalized conversation/tool events remain in the journal. Git observation does not commit, stash, reset, or roll back files. Switching is not transactional: an exhausted agent may already have performed side effects.
 
+## What a session cost and got
+
+`/stats` in the TUI, or `bounce stats [SESSION] [--json] [--tasks] [--against SESSION]`, folds a session's journal into one screen — nothing is recorded for it beyond what the journal already holds. Outcome: tasks submitted, accepted (and how many at the first attempt), held, failed, corrections of accepted work, by agent. Time: how long someone was running, the orchestrator's turns, each AI's attempts with totals and medians, quiet gaps over 20 minutes. Tokens in and out by AI (thinking tokens where the adapter reports them), per accepted task. Checks run, passed, failed, only-looking, unrunnable, send-backs; review verdicts and how many fell below the bar; standing workers continued, retired, compacted; lessons recorded; sweeps fired. `--tasks` (or `/stats tasks`) is one line per task with what ate its time; `--against` puts two sessions side by side with the change per line. Every number names what it counts and over which span; what the journal cannot tell — thinking tokens of Claude and Codex workers, money — is named as missing rather than guessed.
+
 ## Quota
 
 `/quota` in the TUI, or `bounce quota [--json]`, reports the subscription usage each agent states about itself. Nothing is estimated: a window appears only because a CLI reported that percentage.

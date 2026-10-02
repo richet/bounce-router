@@ -15,6 +15,7 @@ import {discoverLocalModels, switchLocal} from './local-models.js';
 import {readMachine, resourceReport, createResources} from './resources.js';
 import {taskView, taskList} from './task-view.js';
 import {configCommand, SETTINGS, settingsEntries, nextValue, filterEntries} from './settings-command.js';
+import {sessionStats, formatStats, compareStats, taskLines} from './stats.js';
 import {rosterLines} from './workers.js';
 import {formatTaskView, formatTaskList} from './task-report.js';
 import {runLocalSetup} from './local-wizard.js';
@@ -70,7 +71,7 @@ async function main() {
     image: {type: 'string', multiple: true}, cwd: {type: 'string'}, resume: {type: 'string'}, provider: {type: 'string'}, model: {type: 'string'},
     mode: {type: 'string'}, json: {type: 'boolean'}, verify: {type: 'boolean'}, help: {type: 'boolean', short: 'h'}, version: {type: 'boolean', short: 'v'},
     check: {type: 'boolean'}, scope: {type: 'string'}, force: {type: 'boolean'}, list: {type: 'boolean'}, all: {type: 'boolean'}, session: {type: 'string'}, report: {type: 'boolean'},
-    save: {type: 'boolean'}, 'allow-network': {type: 'boolean'},
+    save: {type: 'boolean'}, 'allow-network': {type: 'boolean'}, tasks: {type: 'boolean'}, against: {type: 'string'},
   }});
   if (values.help) return console.log(helpText(process.stdout.columns || 100));
   if (values.version) return console.log(`bounce ${version}`);
@@ -281,6 +282,21 @@ async function main() {
     }
     const rows = taskList(target.events, {all: Boolean(values.all)});
     return console.log(values.json ? JSON.stringify(rows, null, 2) : formatTaskList(rows));
+  }
+  // bounce stats [--session REF] [--json] [--tasks] [--against REF] (docs/plans/analytics.md): what a session
+  // cost and what it got, from its journal alone.
+  if (positionals[0] === 'stats') {
+    const ref = values.session || positionals[1] || listSessions(root).find(row => row.live)?.id || listSessions(root)[0]?.id;
+    if (!ref) throw new Error('No session to read · start one with `bounce`');
+    const id = resolveSessionRef(root, ref);
+    const events = new Session(process.cwd(), {root, id}).events;
+    if (values.tasks) return console.log(taskLines(events).join('\n'));
+    const stats = sessionStats(events);
+    if (values.against) {
+      const other = new Session(process.cwd(), {root, id: resolveSessionRef(root, values.against)}).events;
+      return console.log(values.json ? JSON.stringify({against: sessionStats(other), session: stats}, null, 2) : compareStats(sessionStats(other), stats).join('\n'));
+    }
+    return console.log(values.json ? JSON.stringify(stats, null, 2) : formatStats(stats, {title: `Session ${id.slice(0, 8)}`}).join('\n'));
   }
   if (positionals[0] === 'task' && positionals[1] === 'compare') {
     const [, , sessionId, taskA, taskB] = positionals;
@@ -1020,6 +1036,10 @@ async function main() {
           const reading = settings.order.map(p => `${p} (${settings.models[p] || 'default'})`).join(' → ');
           const note = arg ? (orchestrating ? `saved · the orchestrator now runs on ${settings.order[0]}` : 'saved') : orchestrating ? 'the first agent is the orchestrator; /order codex,claude moves it' : '/order claude,codex,muse changes it';
           session.append({kind: 'status', text: `Fallback order: ${reading} · ${note}`});
+        } else if (command === 'stats') {
+          const text = arg.trim() === 'tasks' ? ['One line per task: id · agent · AI · attempts · minutes · tokens · checks · state · what ate the time', ...taskLines(session.events)].join('\n')
+            : formatStats(sessionStats(session.events), {title: `Session ${session.id.slice(0, 8)}`}).join('\n');
+          session.append({kind: 'stats', text});
         } else if (command === 'config') {
           // Settings from the prompt (src/settings-command.js): the file keeps what the user set, every value is
           // validated as the loader would, and the row says whether it applies now or at the next session.
