@@ -55,6 +55,10 @@ export function createInkTerminal({stdin = process.stdin, stdout = process.stdou
         events: conversationEvents(events, {details: view.details})};
     }
     events = prepared.events;
+    // Prompts this view still holds (cli.js pendingTurns, sent when the running turn ends) are shown
+    // where they will land, as the user's and marked queued; they are not in the journal yet.
+    const pending = (view.metadata?.pendingPrompts ?? []).map((text, index) => ({id: `pending:${index}:${text}`, kind: 'user', text, queued: true, local: true}));
+    if (pending.length) events = [...events, ...pending];
     const groups = [];
     let count = 0;
     for (let index = events.length - 1; index >= 0 && count < rowLimit; index--) {

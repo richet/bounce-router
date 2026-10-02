@@ -217,13 +217,23 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     }
     // /help is a reference card, not a status line: headed sections, commands in one colour and
     // their arguments in another, descriptions aligned in a column that wraps under itself.
+    // /config's listing and help: a block, one setting per line, not a status line that folds to its first.
+    if (e.kind === 'settings') {
+      const [head, ...body] = clean(e.text ?? '').split('\n');
+      return [clip(style.title(`${who(e)} · Settings`), width), ...(head ? [clip(`  ${style.muted(head)}`, width)] : []), ...body.flatMap(line => wrap(line, width - 2).map(row => '  ' + row)), ''];
+    }
     if (e.kind === 'help') {
       const paint = {title: style.title, name: style.prompt, hint: style.muted, muted: style.muted, key: c.yellow};
       const body = helpRows({width: width - 2, paint, vendor: Array.isArray(e.vendor) ? e.vendor : [], tui: true});
       return [clip(style.help(clean(`${who(e)} · Help`)), width), ...body.map(row => row ? '  ' + row : ''), ''];
     }
-    if (compact && e.kind === 'user' && e.typed) return [...block(style.user('>'), wrap(clean(e.typed), width - 2)), clip(`  ${style.muted('⎿')}  ${style.muted(`expanded to ${withoutBrief(e.text).length.toLocaleString()} chars · /details shows it`)}`, width), ''];
-    if (compact && e.kind === 'user') return [...block(style.user('>'), wrap(clean(withoutBrief(e.text)), width - 2)), ''];
+    // What the user typed is set apart from everything an agent says: the whole prompt in the user colour,
+    // not only its glyph (Daniel, 2026-10-01: "make the difference between user text and agent text more obvious").
+    if (compact && e.kind === 'user' && e.typed) return [...block(style.user('>'), wrap(clean(e.typed), width - 2).map(line => style.user(line))), clip(`  ${style.muted('⎿')}  ${style.muted(`expanded to ${withoutBrief(e.text).length.toLocaleString()} chars · /details shows it`)}`, width), ''];
+    // A prompt typed while a turn runs, still held by this view (cli.js pendingTurns): shown where it will
+    // land, marked queued, until it is sent (Daniel, 2026-10-01: a queued message not on screen "is not good").
+    if (compact && e.kind === 'user' && e.local) return [...block(style.user('>'), wrap(clean(e.text), width - 2).map(line => style.user(line))), clip(`  ${style.muted('⎿')}  ${style.muted('queued · runs when the current turn ends · ↑ to edit')}`, width), ''];
+    if (compact && e.kind === 'user') return [...block(style.user('>'), wrap(clean(withoutBrief(e.text)), width - 2).map(line => style.user(line))), ''];
     if (compact && e.kind === 'assistant' && e.narration) return [...block(style.muted('∴'), wrap(clean(e.text), width - 2).map(line => style.muted(line))), ''];
     if (compact && ['assistant', 'delta', 'result'].includes(e.kind)) return [...block(style.result('●'), markdown(e.text, width - 2).map(line => line ? style.answer(line) : line)), ''];
     const names = {user: 'You', assistant: 'Response', delta: 'Response', result: 'Result',
