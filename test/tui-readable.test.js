@@ -60,7 +60,8 @@ test('blank transcript rows keep their height so blocks and sections stay separa
     transcriptRows: rows, view: {columns: 60, rows: 16, ...extra},
   }), {columns: 60})).split('\n');
   // Ink drops an empty <Text> entirely; the conversation and the orchestrator pane both keep the row.
-  assert.deepEqual(render().slice(1, 8).map(row => row.trim()), ['● Done.', '', 'What changed', '', '- item', '', '> next prompt']);
+  // the transcript starts at the top row: the main worker's status line moved under the prompt box (2026-10-01)
+  assert.deepEqual(render().slice(0, 7).map(row => row.trim()), ['● Done.', '', 'What changed', '', '- item', '', '> next prompt']);
   const pane = render({agentsOpen: true, selectedId: 'main'});
   const start = pane.findIndex(row => row.includes('● Done.'));
   assert.ok(start > 0);

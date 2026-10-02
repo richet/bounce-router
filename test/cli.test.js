@@ -183,13 +183,15 @@ test('bounce quota on an orchestrator config with no profiles block reports the 
   fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify(config));
   const roster = await run(['quota'], bounceEnv(root));
   assert.equal(roster.code, 0, roster.stderr);
-  assert.deepEqual(roster.stdout.trim().split('\n').map(line => line.split(' · ')[0]), ['claude', 'codex']);
+  // the report ends with one line saying these are the plan's windows, not this session's (2026-10-01)
+  const vendors = out => out.trim().split('\n').filter(line => !line.startsWith('These are the plan')).map(line => line.split(' · ')[0]);
+  assert.deepEqual(vendors(roster.stdout), ['claude', 'codex']);
   // Dropping every codex builder from the overlay drops the vendor from the report.
   const codexNames = Object.entries(starterProfiles(config)).filter(([, p]) => p.adapter === 'codex').map(([name]) => name);
   fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify({...config, profiles: Object.fromEntries(codexNames.map(name => [name, null]))}));
   const dropped = await run(['quota'], bounceEnv(root));
   assert.equal(dropped.code, 0, dropped.stderr);
-  assert.deepEqual(dropped.stdout.trim().split('\n').map(line => line.split(' · ')[0]), ['claude']);
+  assert.deepEqual(vendors(dropped.stdout), ['claude']);
 });
 
 test('bounce agents set on a config with no profiles block leaves the config alone; the validated view is the roster plus the agent', async t => {

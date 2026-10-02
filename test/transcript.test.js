@@ -174,3 +174,13 @@ test('text written just before a tool call reads as a muted thought, and the ans
   assert.deepEqual(formatter.event(said[0], 90), ['∴ Trivial request; answer directly and write the state note.', '']);
   assert.deepEqual(formatter.event(said[1], 90), ['● ok', '']);
 });
+
+// /config's listing is a `settings` row: kept in the default view, folded to its latest copy like /help.
+test('a settings row is shown, and a repeated listing folds to the latest', () => {
+  const rows = conversationEvents([
+    {id: 's1', kind: 'settings', text: 'Settings (a):\n  order = ["codex"]'},
+    {id: 'u', kind: 'user', text: '/config sweepMinutes 25'},
+    {id: 's2', kind: 'settings', text: 'Settings (a):\n  order = ["codex"]\n  sweepMinutes = 25'},
+  ]);
+  assert.deepEqual(rows.map(row => row.id), ['u', 's2']);
+});

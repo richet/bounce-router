@@ -199,20 +199,22 @@ test('quota reads as a compact header and a full report', () => {
   assert.equal(quotaShort(store.muse), '');
   assert.equal(quotaShort(undefined), '');
   assert.deepEqual(quotaReport(store, ['codex', 'claude', 'muse'], now).split('\n'), [
-    'codex · plus · 5h 100% used (resets in 1h 23m) · 7d 16% used (resets in 6d 18h) · reported 2m ago',
-    'claude · 5h 5% used · reported just now',
-    'muse · muse does not report quota']);
-  assert.equal(quotaReport({}, ['claude'], now), 'claude · claude reported no quota');
-  assert.equal(quotaReport({}, ['codex'], now), 'codex · codex reported no quota');
+    'codex · plus · 5-hour window 100% used (resets in 1h 23m) · Weekly 16% used (resets in 6d 18h) · reported 2m ago',
+    'claude · 5-hour window 5% used · reported just now',
+    'muse · muse does not report quota',
+    'These are the plan\'s own windows, used by every session and app on the account, not this session alone.']);
+  const tail = '\nThese are the plan\'s own windows, used by every session and app on the account, not this session alone.';
+  assert.equal(quotaReport({}, ['claude'], now), 'claude · claude reported no quota' + tail);
+  assert.equal(quotaReport({}, ['codex'], now), 'codex · codex reported no quota' + tail);
   // A reading whose window has already rolled over never shows its stale percentage.
   const stale = {claude: {provider: 'claude', time: '2026-09-08T04:00:00Z',
     windows: [{label: '5h', percent: 100, resetsAt: now - 60000}, {label: '7d', percent: 30, resetsAt: now + 86400000}]}};
   assert.equal(quotaShort(stale.claude, now), '5h reset · 7d 30%');
   assert.equal(quotaReport(stale, ['claude'], now),
-    'claude · 5h window reset since this reading · 7d 30% used (resets in 1d 0h) · reported 8h 0m ago');
+    'claude · 5-hour window ended since this reading (was 100% used) · Weekly 30% used (resets in 1d 0h) · reported 8h 0m ago' + tail);
 });
 
-test('the sidebar panel draws each window as a bar with its reset time and pace tick', () => {
+test('the sidebar panel names each window in words, says N% used, and draws the share used with the reset on the bar row', () => {
   const now = Date.parse('2026-09-08T12:00:00Z');
   const store = {
     claude: {provider: 'claude', plan: null, time: '2026-09-08T12:00:00Z', windows: [
@@ -223,20 +225,20 @@ test('the sidebar panel draws each window as a bar with its reset time and pace 
     muse: {provider: 'muse', windows: [], error: 'muse does not report quota'},
   };
   const panel = quotaPanel(store, ['claude', 'codex', 'muse'], {width: 30, now});
+  // Every number says what it is (Daniel, 2026-10-01): a legend over the block, the window in words, "N% used",
+  // the bar as the share used and nothing else, and when it resets on the bar's own row.
   assert.deepEqual(panel, [
+    'QUOTA · of your whole plan',
     'CLAUDE',
-    // Two of the five hours have run and 40% is spent, so fill and tick meet at cell 12.
-    '5-hour limit resets 3:00pm 40%',
-    '■'.repeat(12) + '│' + '□'.repeat(17),
-    // Half the week has run against 15% spent, so the tick sits well ahead of the fill.
-    'Weekly limit         4d 0h 15%',
-    '■'.repeat(5) + '□'.repeat(8) + '│' + '□'.repeat(16),
+    '5-hour window         40% used',
+    '■'.repeat(6) + '□'.repeat(10) + ' resets 3:00pm',
+    'Weekly                15% used',
+    '■'.repeat(2) + '□'.repeat(12) + ' resets in 4d 0h',
     // Each provider is its own group, separated by a blank row.
     '',
     'CODEX · Plus',
-    // A full window keeps its reset time by dropping the word that no longer fits.
-    '5-hour limit       1:00pm 100%',
-    '■'.repeat(24) + '│' + '■'.repeat(5),
+    '5-hour window        100% used',
+    '■'.repeat(16) + ' resets 1:00pm',
     '',
     'MUSE',
     'muse does not report quota',
@@ -244,11 +246,12 @@ test('the sidebar panel draws each window as a bar with its reset time and pace 
   for (const row of panel) assert.ok(row.length <= 30, `row too wide: ${row}`);
   // A window with no length reported draws no tick, and one already past its reset says so.
   assert.deepEqual(quotaPanel({claude: {windows: [{label: '5h', percent: 50, resetsAt: null, minutes: null}]}}, ['claude'], {width: 10, now}),
-    ['CLAUDE', '5-hour limit 50%', '■■■■■□□□□□']);
+    ['QUOTA · of your whole plan', 'CLAUDE', '5-hour window 50% used', '■■■■■□□□□□']);
+  // A window that ended since the reading keeps its last number instead of hiding it behind "reset".
   assert.deepEqual(quotaPanel({claude: {windows: [{label: '5h', percent: 90, resetsAt: now - 1, minutes: 300}]}}, ['claude'], {width: 20, now}),
-    ['CLAUDE', '5-hour limit   reset']);
+    ['QUOTA · of your whole plan', 'CLAUDE', '5-hour window  ended', '90% used before it ended']);
   // A cooldown is named beside the provider, not buried in the window rows.
-  assert.equal(quotaPanel(store, ['muse'], {width: 30, now, cooldowns: {muse: now + 1000}})[0], 'MUSE · cooldown');
+  assert.equal(quotaPanel(store, ['muse'], {width: 30, now, cooldowns: {muse: now + 1000}})[1], 'MUSE · cooldown'); // [0] is the legend
 });
 
 // Found live (2026-09-25): /quota already says "reported 1h 35m ago", but the sidebar's own
@@ -263,13 +266,14 @@ test('a stale reading gets a compact age marker in the sidebar row; a fresh one 
       {label: '7d', percent: 78, resetsAt: now + 2 * 86400000 + 63 * 60000, minutes: 10080}]},
   };
   const panel = quotaPanel(store, ['claude', 'codex'], {width: 30, now});
-  // The 5h window already reset since the reading, so it stays a plain "reset" — no percent, no age.
-  assert.equal(panel[0], 'CLAUDE');
-  assert.match(panel[1], /^5-hour limit\s+reset$/);
-  // The 7d window's own reading is 1h35m old: the percent gets a compact age marker.
-  assert.match(panel[2], /^Weekly limit.*1% · 1h ago$/);
+  // The 5h window already ended since the reading: it says so and keeps its last number — no age.
+  assert.equal(panel[1], 'CLAUDE');
+  assert.match(panel[2], /^5-hour window\s+ended$/);
+  assert.equal(panel[3], '40% used before it ended');
+  // The 7d window's own reading is 1h35m old: the row says how old.
+  assert.match(panel[4], /^Weekly\s+read 1h ago 1% used$/);
   // Codex's reading is 30s old — no marker.
-  const codexHead = panel.find(row => row.startsWith('Weekly limit') && row.includes('78%'));
+  const codexHead = panel.find(row => row.startsWith('Weekly') && row.includes('78% used'));
   assert.doesNotMatch(codexHead, / ago$/);
   for (const row of panel) assert.ok(row.length <= 30, `row too wide: ${row}`);
 });
@@ -280,22 +284,23 @@ test('the panel gives up bars, then lines, as the sidebar runs out of rows', () 
     {label: '5h', percent: 100, resetsAt: now + 60 * 60000, minutes: 300},
     {label: '7d', percent: 34, resetsAt: now + 3 * 86400000, minutes: 10080}]}};
   const rows = budget => quotaPanel(store, ['codex'], {width: 30, now, rows: budget});
-  assert.equal(rows(Infinity).length, 5);
-  assert.deepEqual(rows(3), ['CODEX · Plus', '5-hour limit       1:00pm 100%', 'Weekly limit         3d 0h 34%']);
+  assert.equal(rows(Infinity).length, 6); // legend, head, two windows of two rows
+  assert.deepEqual(rows(4), ['QUOTA · of your whole plan', 'CODEX · Plus', '5-hour window 1:00pm 100% used', 'Weekly          3d 0h 34% used']);
+  assert.deepEqual(rows(3), ['CODEX · Plus', '5h 100% · 7d 34%']);
   assert.deepEqual(rows(2), ['CODEX · Plus', '5h 100% · 7d 34%']);
   // Below even the compact form, the panel is cut rather than allowed to push the recap out.
   assert.deepEqual(rows(1), ['CODEX · Plus']);
   // The gap between providers costs a row while there is room; the compact form drops it.
   const two = budget => quotaPanel({...store, claude: store.codex}, ['claude', 'codex'], {width: 30, now, rows: budget});
-  assert.equal(two(Infinity).length, 11);
-  assert.deepEqual(two(7).map(row => row === '' ? 'gap' : row.split(' ')[0]), ['CLAUDE', '5-hour', 'Weekly', 'gap', 'CODEX', '5-hour', 'Weekly']);
+  assert.equal(two(Infinity).length, 12);
+  assert.deepEqual(two(8).map(row => row === '' ? 'gap' : row.split(' ')[0]), ['QUOTA', 'CLAUDE', '5-hour', 'Weekly', 'gap', 'CODEX', '5-hour', 'Weekly']);
   assert.deepEqual(two(6).map(row => row === '' ? 'gap' : row.split(' ')[0]), ['CLAUDE', '5h', 'CODEX', '5h']);
 });
 
 test('window titles and reset text read the way a plan states them', () => {
   const now = Date.parse('2026-09-08T12:00:00Z');
-  assert.deepEqual(['5h', '7d', '1d', '1h', '45m', 'fable weekly'].map(windowTitle),
-    ['5-hour limit', 'Weekly limit', 'Daily limit', 'Hourly limit', '45m limit', 'Fable weekly limit']);
+  assert.deepEqual(['5h', '7d', '1d', '1h', '45m', 'fable weekly', '7d Fable'].map(windowTitle),
+    ['5-hour window', 'Weekly', 'Daily window', 'Hourly window', '45m window', 'Fable weekly window', 'Weekly, Fable only']);
   // Past a day the distance is the only unambiguous form; inside one, the wall clock is quicker.
   assert.equal(resetText({resetsAt: now + 6.75 * 86400000}, now), 'resets in 6d 18h');
   assert.match(resetText({resetsAt: now + 90 * 60000}, now), /^resets \d{1,2}:\d{2}(am|pm)$/);
@@ -304,21 +309,25 @@ test('window titles and reset text read the way a plan states them', () => {
 });
 
 test('modelPanel: ranked entries each get a labelled row and a bar sized against the top spender', () => {
+  // In and out apart (Daniel, 2026-10-02): two quantities, two bars, each against the top of its own kind.
   const entries = [
-    {model: 'claude-opus-5[1m]', provider: 'claude', tokens: 762000, usage: {}, turns: 1},
-    {model: 'gpt-5-codex', provider: 'codex', tokens: 381000, usage: {}, turns: 1},
-    {model: 'sonnet', provider: null, tokens: 42000, usage: {}, turns: 1},
+    {model: 'claude-opus-5[1m]', provider: 'claude', tokens: 762000, usage: {input: 12000, cache_read: 750000, output: 8000}, turns: 1},
+    {model: 'gpt-5-codex', provider: 'codex', tokens: 381000, usage: {input: 381000, output: 16000}, turns: 1},
+    {model: 'sonnet', provider: null, tokens: 42000, usage: {input: 42000, output: 2000}, turns: 1},
   ];
   const panel = modelPanel(entries, {width: 28});
   assert.deepEqual(panel, [
-    'MODELS',
-    'claude-opus-5[1m]       762k',
-    '■'.repeat(28),
-    'gpt-5-codex             381k',
-    // Half the top spender's tokens: half the bar, rounded to the nearest cell.
-    '■'.repeat(14) + '□'.repeat(14),
-    'sonnet                   42k',
-    '■'.repeat(2) + '□'.repeat(26),
+    'TOKENS · session · in | out',
+    'claude-opu… 762k in · 8k out',
+    '■'.repeat(25) + ' in',
+    '■'.repeat(12) + '□'.repeat(12) + ' out',
+    'gpt-5-cod… 381k in · 16k out',
+    // Half the top reader's input: half the bar, rounded to the nearest cell.
+    '■'.repeat(13) + '□'.repeat(12) + ' in',
+    '■'.repeat(24) + ' out',
+    'sonnet       42k in · 2k out',
+    '■'.repeat(1) + '□'.repeat(24) + ' in',
+    '■'.repeat(3) + '□'.repeat(21) + ' out',
   ]);
   for (const row of panel) assert.ok(row.length <= 28, `row too wide: ${row}`);
 });
@@ -329,21 +338,21 @@ test('modelPanel: no usage yet hides the section entirely, rather than a placeho
 });
 
 test('modelPanel: a name too long for the width is truncated, the count always stays on the right', () => {
-  const entries = [{model: 'super-duper-extremely-long-model-name-v3', provider: 'claude', tokens: 1234567, usage: {}, turns: 1}];
+  const entries = [{model: 'super-duper-extremely-long-model-name-v3', provider: 'claude', tokens: 1234567, usage: {input: 1234567, output: 5000}, turns: 1}];
   const panel = modelPanel(entries, {width: 28});
-  assert.equal(panel[1], 'super-duper-extremely-… 1.2M');
+  assert.equal(panel[1], 'super-dupe… 1.2M in · 5k out');
   assert.equal(panel[1].length, 28);
 });
 
 test('modelPanel gives up bars, then per-model lines, then one compact line, as the sidebar runs out of rows', () => {
   const entries = [
-    {model: 'claude-opus-5', provider: 'claude', tokens: 762000, usage: {}, turns: 1},
-    {model: 'gpt-5-codex', provider: 'codex', tokens: 84000, usage: {}, turns: 1},
+    {model: 'claude-opus-5', provider: 'claude', tokens: 762000, usage: {input: 762000, output: 9000}, turns: 1},
+    {model: 'gpt-5-codex', provider: 'codex', tokens: 84000, usage: {input: 84000, output: 3000}, turns: 1},
   ];
   const rows = budget => modelPanel(entries, {width: 28, rows: budget});
-  assert.equal(rows(Infinity).length, 5); // title + 2 * (label + bar)
-  assert.deepEqual(rows(3), ['MODELS', 'claude-opus-5           762k', 'gpt-5-codex              84k']);
-  assert.deepEqual(rows(2), ['MODELS', 'claude-opus-5 762k · gpt-5-codex 84k']);
+  assert.equal(rows(Infinity).length, 7); // title + 2 * (label + in bar + out bar)
+  assert.deepEqual(rows(3), ['TOKENS · session · in | out', 'claude-opu… 762k in · 9k out', 'gpt-5-codex  84k in · 3k out']);
+  assert.deepEqual(rows(2), ['TOKENS · session · in | out', 'claude-opus-5 762k|9k · gpt-5-codex 84k|3k']);
   // A title with nothing under it says nothing: hidden below a 2-row budget, same as no usage.
   assert.deepEqual(rows(1), []);
 });
@@ -353,7 +362,7 @@ test('modelPanel: below a 2-row budget the section hides entirely rather than sh
   assert.deepEqual(modelPanel(entries, {rows: 1}), []);
   const panel = modelPanel(entries, {rows: 2});
   assert.equal(panel.length, 2);
-  assert.equal(panel[0], 'MODELS');
+  assert.equal(panel[0], 'TOKENS · session · in | out');
 });
 
 test('usageOrder: the fallback order first, then every profile adapter, deduped, quota-reporting vendors only', () => {

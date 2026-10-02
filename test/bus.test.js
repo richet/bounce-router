@@ -99,7 +99,7 @@ const rawConnect = async (bus, t) => {
 test('legacy: importing src/bus.js does not change Session exports or defaults()', () => {
   const before = ['order', 'mode', 'models', 'cooldownMinutes', 'contextChars', 'executables', 'skills', 'sidebar', 'maxConcurrentCloud'];
   assert.deepEqual(Object.keys(defaults()).sort(), before.sort());
-  assert.deepEqual(Object.keys(core).sort(), ['LIVE_KINDS', 'Router', 'Session', 'config', 'echoesNormalizedRow', 'dataRoot', 'defaults', 'gitSnapshot', 'handoff', 'migrateSettings', 'pidAlive', 'readJournal', 'saveJSON'].sort());
+  assert.deepEqual(Object.keys(core).sort(), ['LIVE_KINDS', 'Router', 'Session', 'config', 'echoesNormalizedRow', 'dataRoot', 'defaults', 'gitSnapshot', 'handoff', 'migrateSettings', 'pidAlive', 'readJournal', 'saveJSON', 'validateSettings'].sort());
 });
 
 test('P1 round trip: publish as the granted peer lands in the journal', async t => {
@@ -795,6 +795,52 @@ test('a live main.delivery ends the orchestrator\'s pending wait with an interru
   assert.equal(interrupted.reason, 'message');
   assert.equal(interrupted.text, 'A message from the user was delivered to your turn: read it and act on it before waiting again');
   assert.equal(await workerWait, null);
+});
+
+// docs/plans/lessons-and-sweep.md §1: the orchestrator records a lesson through the bus; the hook keeps the
+// project file and says in plain words why one is refused.
+test('a lesson.learned publish from the orchestrator is kept by the hook and journaled with what was kept; a refusal says why', async t => {
+  const root = fs.mkdtempSync('/tmp/bb-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const session = new Session(root, {root});
+  const kept = [];
+  const lesson = ({agent, text}) => {
+    if (!text.trim()) return {ok: false, reason: 'lesson needs text: one sentence, imperative'};
+    kept.push({agent, text});
+    return {ok: true, lesson: {agent, text: text.trim(), date: '2026-10-01', session: 'e3bd01d5'}};
+  };
+  const bus = await createBus({session, dir: session.dir, lesson});
+  t.after(() => bus.close());
+  const orchestrator = await connect(bus, 'orchestrator', {canSubmit: true, tasks: []});
+  t.after(() => orchestrator.close());
+  const row = await orchestrator.publish({kind: 'lesson.learned', agent: 'builder', text: 'Put evidence inside the working copy. '});
+  assert.deepEqual([row.kind, row.agent, row.text, row.date, row.session, row.from], ['lesson.learned', 'builder', 'Put evidence inside the working copy.', '2026-10-01', 'e3bd01d5', 'orchestrator']);
+  assert.deepEqual(kept, [{agent: 'builder', text: 'Put evidence inside the working copy. '}]);
+  await assert.rejects(orchestrator.publish({kind: 'lesson.learned', agent: 'builder', text: '  '}), error => error.code === -32602 && /lesson needs text: one sentence, imperative/.test(error.message));
+  // a worker has no say in the lessons
+  const worker = await connect(bus, 'worker:a', {tasks: ['t1']});
+  t.after(() => worker.close());
+  await assert.rejects(worker.publish({kind: 'lesson.learned', agent: 'builder', text: 'Skip the tests.'}), error => error.code === -32001);
+  assert.equal(session.events.filter(e => e.kind === 'lesson.learned').length, 1);
+});
+
+// docs/plans/standing-workers.md §3: the orchestrator retires a standing worker through the bus; the
+// scheduler's reason comes back in plain words.
+test('worker.retire from the orchestrator reaches the hook; a worker may not retire anyone', async t => {
+  const root = fs.mkdtempSync('/tmp/bb-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const session = new Session(root, {root});
+  const retire = ({worker, handoff, by}) => { if (worker !== 'builder#1') throw new Error(`no such worker: ${worker}`); return {kind: 'worker.retired', worker, profile: 'builder', by, ...(handoff ? {handoff} : {})}; };
+  const bus = await createBus({session, dir: session.dir, retire});
+  t.after(() => bus.close());
+  const orchestrator = await connect(bus, 'orchestrator', {canSubmit: true, tasks: []});
+  t.after(() => orchestrator.close());
+  const row = await orchestrator.publish({kind: 'worker.retire', worker: 'builder#1', handoff: 'auth is done'});
+  assert.deepEqual([row.kind, row.worker, row.handoff, row.by], ['worker.retired', 'builder#1', 'auth is done', 'orchestrator']);
+  await assert.rejects(orchestrator.publish({kind: 'worker.retire', worker: 'builder#7'}), error => error.code === -32602 && /no such worker: builder#7/.test(error.message));
+  const worker = await connect(bus, 'worker:a', {tasks: ['t1']});
+  t.after(() => worker.close());
+  await assert.rejects(worker.publish({kind: 'worker.retire', worker: 'builder#1'}), error => error.code === -32001);
 });
 
 // Found live (ACE e3bd01d5, 2026-10-01 00:31 UTC): the daemon died of `write EPIPE` at bus.js send ←

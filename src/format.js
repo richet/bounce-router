@@ -136,6 +136,10 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     // /btw: a side exchange, dimmed so it reads apart from the main conversation it never joins
     // (src/btw.js never feeds these rows back into the orchestrator's own context).
     if (e.kind === 'btw.asked') return [clip(style.muted(`btw · ${clean(e.text)}`), width), ''];
+    if (e.kind === 'worker.compacted') return [clip(style.muted(`  · ${clean(e.worker)} compacted (${clean(e.status ?? '')})`), width)];
+    if (e.kind === 'worker.handoff') return [clip(style.muted(`  · ${clean(e.worker)} wrote its handoff: ${clean(e.text ?? '')}`), width)];
+    if (e.kind === 'worker.retired') return [clip(style.muted(`  · ${clean(e.worker)} retired${e.handoff ? ' with a handoff for the next one' : ''}`), width)];
+    if (e.kind === 'lesson.learned') return [clip(style.muted(`  · lesson for ${clean(e.agent ?? 'all')}: ${clean(e.text ?? '')}`), width)];
     if (e.kind === 'btw.answered') return [...markdown(e.text, width - 2).map(line => style.muted(line)), ...(e.model ? [style.muted(`  (${clean(e.model)})`)] : []), ''];
     if (e.kind === 'btw.failed') return [style.muted(`btw · no answer (${clean(e.reason ?? 'failed')})`), ''];
     if (e.kind === 'attempt' && e.status === 'started') return event({...e, kind: 'status', text: 'Starting provider…'}, width);
@@ -213,13 +217,23 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     }
     // /help is a reference card, not a status line: headed sections, commands in one colour and
     // their arguments in another, descriptions aligned in a column that wraps under itself.
+    // /config's listing and help: a block, one setting per line, not a status line that folds to its first.
+    if (e.kind === 'settings' || e.kind === 'stats') {
+      const [head, ...body] = clean(e.text ?? '').split('\n');
+      return [clip(style.title(`${who(e)} · ${e.kind === 'stats' ? 'Stats' : 'Settings'}`), width), ...(head ? [clip(`  ${style.muted(head)}`, width)] : []), ...body.flatMap(line => wrap(line, width - 2).map(row => '  ' + row)), ''];
+    }
     if (e.kind === 'help') {
       const paint = {title: style.title, name: style.prompt, hint: style.muted, muted: style.muted, key: c.yellow};
       const body = helpRows({width: width - 2, paint, vendor: Array.isArray(e.vendor) ? e.vendor : [], tui: true});
       return [clip(style.help(clean(`${who(e)} · Help`)), width), ...body.map(row => row ? '  ' + row : ''), ''];
     }
-    if (compact && e.kind === 'user' && e.typed) return [...block(style.user('>'), wrap(clean(e.typed), width - 2)), clip(`  ${style.muted('⎿')}  ${style.muted(`expanded to ${withoutBrief(e.text).length.toLocaleString()} chars · /details shows it`)}`, width), ''];
-    if (compact && e.kind === 'user') return [...block(style.user('>'), wrap(clean(withoutBrief(e.text)), width - 2)), ''];
+    // What the user typed is set apart from everything an agent says: the whole prompt in the user colour,
+    // not only its glyph (Daniel, 2026-10-01: "make the difference between user text and agent text more obvious").
+    if (compact && e.kind === 'user' && e.typed) return [...block(style.user('>'), wrap(clean(e.typed), width - 2).map(line => style.user(line))), clip(`  ${style.muted('⎿')}  ${style.muted(`expanded to ${withoutBrief(e.text).length.toLocaleString()} chars · /details shows it`)}`, width), ''];
+    // A prompt typed while a turn runs, still held by this view (cli.js pendingTurns): shown where it will
+    // land, marked queued, until it is sent (Daniel, 2026-10-01: a queued message not on screen "is not good").
+    if (compact && e.kind === 'user' && e.local) return [...block(style.user('>'), wrap(clean(e.text), width - 2).map(line => style.user(line))), clip(`  ${style.muted('⎿')}  ${style.muted('queued · runs when the current turn ends · ↑ to edit')}`, width), ''];
+    if (compact && e.kind === 'user') return [...block(style.user('>'), wrap(clean(withoutBrief(e.text)), width - 2).map(line => style.user(line))), ''];
     if (compact && e.kind === 'assistant' && e.narration) return [...block(style.muted('∴'), wrap(clean(e.text), width - 2).map(line => style.muted(line))), ''];
     if (compact && ['assistant', 'delta', 'result'].includes(e.kind)) return [...block(style.result('●'), markdown(e.text, width - 2).map(line => line ? style.answer(line) : line)), ''];
     const names = {user: 'You', assistant: 'Response', delta: 'Response', result: 'Result',

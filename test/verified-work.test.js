@@ -462,3 +462,23 @@ test('strategy: every way of accepting finished work holds it when it changed fi
   // a first objection still sends the work back before anything is held
   assert.equal(defaultStrategy.onReviewVerdict('t', objection, view, held()).action, 'rework');
 });
+
+// docs/plans/lessons-and-sweep.md §1: a worker reads the project's lessons for its job after its agent prompt —
+// in the orders for a cloud worker, in the agent definition for a local one — and not another job's.
+test('a worker is handed the project\'s lessons for its job with its agent prompt, and not another job\'s', async t => {
+  let launched = null;
+  const f = setup(t, {worker: args => { launched = args; write(args.cwd, 'export const state = "new";\n'); return [{kind: 'result', status: 'completed', text: ownReport('state is now "new"')}]; }});
+  fs.mkdirSync(path.join(f.session.cwd, '.bounce'), {recursive: true});
+  fs.writeFileSync(path.join(f.session.cwd, '.bounce', 'LESSONS.md'), '# Lessons\n\n- Put evidence inside the working copy. <!-- builder · 2026-09-29 · d1bc0206 -->\n- Say PASS or FAIL first. <!-- reviewer · 2026-09-30 · e3bd01d5 -->\n- A check must run the work. <!-- all · 2026-09-29 · d1bc0206 -->\n');
+  f.scheduler.close();
+  const profiles = {builder: {adapter: 'worker', model: 'w', mode: 'yolo', fallback: [], role: 'builder', policy: 'write', agent: {name: 'builder', description: 'builds', policy: 'write', prompt: 'You are a builder.'}}};
+  const scheduler = createScheduler({session: f.session, adapters: f.adapters, profiles, requireFinalReport: true, gitHead: () => null});
+  t.after(() => scheduler.close());
+  const {task} = scheduler.submit({parent: null, profile: 'builder', orders: 'Make state "new" in src/x.js', owns: ['src/x.js'], deadline: null, check: says('new')});
+  await waitFor(() => ['completed', 'accepted', 'blocked', 'failed'].includes(scheduler.tasks()[task]?.state));
+
+  const block = 'Lessons from earlier sessions in this project:\n- Put evidence inside the working copy.\n- A check must run the work.';
+  assert.equal(launched.profile.agent.prompt, `You are a builder.\n\n${block}`, 'the agent definition a local worker runs as');
+  assert.equal(launched.orders.startsWith(`You are a builder.\n\n${block}\n\n---\n\nMake state "new"`), true, launched.orders.slice(0, 300));
+  assert.equal(launched.orders.includes('PASS or FAIL'), false, 'the reviewer\'s line is not the builder\'s');
+});

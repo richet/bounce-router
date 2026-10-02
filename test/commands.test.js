@@ -4,7 +4,7 @@ import {commandCatalog, classifyInput, inputDisposition} from '../src/commands.j
 
 test('classifyInput classifies every TUI command exactly once', () => {
   const expected = {
-    immediate: ['provider', 'model', 'local', 'order', 'mode', 'note', 'btw', 'steer', 'rename', 'sessions', 'skills', 'review', 'quota', 'retry', 'operation', 'stop', 'unblock', 'msg', 'agents', 'tasks', 'help', 'detach', 'details', 'sidebar', 'jev'],
+    immediate: ['provider', 'model', 'local', 'order', 'mode', 'note', 'btw', 'steer', 'rename', 'sessions', 'skills', 'review', 'quota', 'retry', 'operation', 'stop', 'unblock', 'config', 'stats', 'msg', 'agents', 'tasks', 'help', 'detach', 'details', 'sidebar', 'jev'],
     turn: ['continue'],
     lifecycle: ['login', 'new', 'resume', 'update', 'restart', 'quit'],
   };
@@ -19,7 +19,7 @@ test('classifyInput classifies every TUI command exactly once', () => {
     }
   }
   assert.equal(new Set(seen).size, seen.length);
-  assert.equal(seen.length, 32);
+  assert.equal(seen.length, 34);
 });
 
 test('classifyInput folds /typesafe into /jev, keeping its arguments', () => {

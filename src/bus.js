@@ -14,7 +14,7 @@ const DECIDABLE = new Set(['blocked', 'reviewing', 'input_required']);
 
 // Peers publish from a positive allowlist: everything a session, the scheduler or the daemon writes is refused regardless of `from`,
 // because handoff() folds user/note rows into every later prompt and Router reads cooldown rows.
-const PEER_KINDS = new Set(['plan.submitted', 'task.submitted', 'task.milestone', 'task.blocked', 'task.input_required', 'task.usage', 'task.activity', 'message', 'task.accepted', 'task.rework', 'task.cancel', 'agents.defined', 'state']);
+const PEER_KINDS = new Set(['plan.submitted', 'task.submitted', 'task.milestone', 'task.blocked', 'task.input_required', 'task.usage', 'task.activity', 'message', 'task.accepted', 'task.rework', 'task.cancel', 'agents.defined', 'state', 'lesson.learned', 'worker.retire', 'worker.compact']);
 const USER_ONLY_PREFIX = 'control.';
 // The scheduler alone owns task lifecycle transitions; a peer may report progress
 // (milestone/blocked/input_required/usage/activity), ask for work (submitted) or
@@ -106,7 +106,7 @@ export async function reapStaleSockets({platform = process.platform, uid = proce
 // being refused, so it never costs the orchestrator a whole turn over an old habit.
 const PLAN_NOT_REVIEWED_NOTE = 'plans are no longer reviewed: dispatch the tasks themselves (task.submitted)';
 
-export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = AUTH_TIMEOUT, validate = () => null, prepare = null, report: receiveReport = null, accept: acceptOverride = null, rework: reworkOverride = null, cancel: cancelOverride = null}) {
+export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = AUTH_TIMEOUT, validate = () => null, prepare = null, report: receiveReport = null, lesson: receiveLesson = null, retire: retireWorker = null, compact: compactWorker = null, accept: acceptOverride = null, rework: reworkOverride = null, cancel: cancelOverride = null}) {
   const grants = new Map(); // peer -> {peer, tasks, canSubmit, context, token, file, sockets}
   const tokenToPeer = new Map();
   const tokensDir = path.join(dir, 'tokens');
@@ -213,6 +213,8 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         const problem = validate(e);
         if (problem) return refuse(id, -32602, `invalid event: ${problem}`);
         if (e.retryOf !== undefined && (!authenticated.tasks.includes(e.retryOf) || typeof e.retryOf !== 'string')) return refuse(id, -32001, 'unauthorized retry');
+        // A continuation resumes another task's worker (docs/plans/standing-workers.md): only a task of one's own.
+        if (e.continues !== undefined && (!authenticated.tasks.includes(e.continues) || typeof e.continues !== 'string')) return refuse(id, -32001, 'unauthorized continuation');
       } else if (e.kind === 'plan.submitted') {
         // Plans are no longer reviewed (2026-09-29): a refusal here cost the orchestrator a whole turn
         // for an old habit, so an authorized peer gets an ok with a note instead — nothing is journaled.
@@ -254,6 +256,33 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
           if (typeof e.text !== 'string' || !e.text.trim()) e = {...e, text: 'Cancelled by the orchestrator (no reason given)'};
           if (TERMINAL.has(tasks(session.events)[e.task]?.state)) return refuse(id, -32602, 'invalid event: task is already terminal, nothing to cancel');
         }
+      } else if (e.kind === 'worker.retire') {
+        // The orchestrator ends a standing worker (docs/plans/standing-workers.md §3); the scheduler says why not.
+        if (peer !== 'orchestrator' && peer !== 'user') return refuse(id, -32001, 'unauthorized');
+        if (typeof retireWorker !== 'function') return refuse(id, -32601, 'workers are not kept in this session');
+        if (typeof e.worker !== 'string' || !e.worker) return refuse(id, -32602, 'invalid event: worker.retire needs the worker name, e.g. builder#1');
+        let retired;
+        try { retired = await retireWorker({worker: e.worker, handoff: e.handoff ?? null, ask: e.ask === true, by: peer}); }
+        catch (error) { return refuse(id, -32602, `invalid event: ${error.message}`); }
+        send({jsonrpc: '2.0', id, result: retired});
+        return;
+      } else if (e.kind === 'worker.compact') {
+        if (peer !== 'orchestrator' && peer !== 'user') return refuse(id, -32001, 'unauthorized');
+        if (typeof compactWorker !== 'function') return refuse(id, -32601, 'workers are not kept in this session');
+        if (typeof e.worker !== 'string' || !e.worker) return refuse(id, -32602, 'invalid event: worker.compact needs the worker name, e.g. builder#1');
+        let compacted;
+        try { compacted = await compactWorker({worker: e.worker, by: peer}); }
+        catch (error) { return refuse(id, -32602, `invalid event: ${error.message}`); }
+        send({jsonrpc: '2.0', id, result: compacted});
+        return;
+      } else if (e.kind === 'lesson.learned') {
+        // A lesson is the orchestrator's (docs/plans/lessons-and-sweep.md): one line for a job in this
+        // project, kept in .bounce/LESSONS.md by the hook, which says in plain words why one is refused.
+        if (peer !== 'orchestrator' && peer !== 'user') return refuse(id, -32001, 'unauthorized');
+        if (typeof receiveLesson !== 'function') return refuse(id, -32601, 'lessons are not kept in this session');
+        const kept = receiveLesson({agent: e.agent, text: e.text});
+        if (!kept.ok) return refuse(id, -32602, `invalid event: ${kept.reason}`);
+        e = {...e, ...kept.lesson};
       } else if (e.kind === 'message') {
         if (typeof e.to !== 'string' || !e.to) return refuse(id, -32602, 'invalid event');
         // A worker is addressable only by a grant that owns its task (the scheduler turns the text into

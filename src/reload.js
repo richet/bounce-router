@@ -25,6 +25,7 @@ export {pidAlive};
 import {createBus, connectBus} from './bus.js';
 import {validateOrchestration, LOCAL_ADAPTERS} from './profiles.js';
 import {rolesFor} from './agents.js';
+import {recordLesson, lessonsBlock} from './lessons.js';
 import {normalizeLocalSettings, discoverLocalModels, localCandidates} from './local-models.js';
 import {createLocalActivation} from './local-activation.js';
 import {providers} from './providers.js';
@@ -322,6 +323,9 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
         '`bounce agents` lists the team in force; `bounce agents show NAME` prints one.', '',
       ];
     })(),
+    // The project's lessons (docs/plans/lessons-and-sweep.md): every line, with its job, and how one is recorded.
+    ...(() => { const block = lessonsBlock(session.cwd, 'orchestrator'); return block ? ['', block, ''] : []; })(),
+    'Lessons: when a task redid work that had been accepted, or a check failed twice, the handoff asks whether there is a lesson. If there is, record it with the lesson tool (or publish lesson.learned): agent (the job it is for, or all) and text (one sentence, imperative, no task ids). It lands in .bounce/LESSONS.md in the project and in every later worker\'s prompt for that job; a person deletes a line to withdraw it. Record what a worker should do differently here, not what happened.', '',
     `Worker profiles (one AI each): ${Object.entries(profiles).filter(([name, p]) => name !== orchestrator && name !== JEV_REVIEWER && !p.derived).map(([name, p]) => p.model ? `${name} (${p.model})` : name).join(', ') || 'none configured'} — name one only when the user asks for that AI, or for a retry (see above).`,
     ...(jev && autoFallback ? [`    auto → ${routingOn ? 'Jev (TypeSafe) routes each task: to the agent above whose job the orders clearly describe (that agent\'s own models then decide the AI), otherwise by the tier the orders need — the first fitting worker profile of that tier in the provider order; unconfident picks go to' : 'Jev routing is off (/jev routing on): resolves to'} ${autoFallback}`] : []),
     'Local discovery checks eligibility at dispatch. A downloaded model is not necessarily loaded or tool-capable.',
@@ -356,6 +360,8 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     'you a message during the wait: it is in your turn now — read it and act on it before anything else.',
     'Fields: parent (null for a root task), profile (a name above), orders (the brief, required), deadline (ms, optional),',
     'jobId (stable logical job) and retryOf (the previous task attempt). A retry continues the same job; use retryOf rather than parent, which creates dependent work instead of retrying the job.',
+    'Workers stand: a worker is a session per agent that outlives its tasks (builder#1, builder#2 …; the handoff and tasks_list list them with what each has done, how long idle, and its last context size). A new task for an agent goes to its idle worker by itself; a busy one means a second worker starts, so parallel work stays parallel. `worker: "builder#1"` names one; `worker: "new"` asks for a fresh one on purpose — do that after a correction of wrong work. Retire one with worker_retire (or publish worker.retire) when its context has grown heavy or its work went wrong; give a handoff when the next worker should open with what it knew, or set ask: true and the retiring worker writes its own handoff (one read-only turn). A Claude worker can compact instead (worker_compact): one turn on its session, its context shrinks, it keeps what it did; OpenCode and Codex workers cannot — retire those. bounce reports; you decide.',
+    'continues (a task of yours): the worker that did that task is resumed, with its memory of the project, into this task\'s own copy, and told where it is. Use it for a follow-up on the same area by the same job — it saves the worker re-reading the project. After a correction of wrong work, start fresh instead: a session that produced the wrong result keeps the misunderstanding that produced it. bounce launches fresh and says why when the earlier task ran on another profile or left no session.',
     'depends_on (task ids, optional), review ({"prelaunch": <profile>, "completion": <profile>}, optional, review-role profiles only),',
     'steps (the verification steps, as text) — required when the completion reviewer is a verifier profile, refused with reason `steps` without it.',
     'check (one shell command that proves the work is done, optional but give one to every task that changes files; it must run the work — its tests, its script — and fail when the result is wrong, because a check that only looks for a file or a phrase passes on a false report; bounce tells you when you submit one, and passing it does not count as verification): bounce runs it in the worker\'s copy when the worker finishes, in a plain shell with its own environment (give a tool that is not on the path its full path), and only work that passes (exit 0) reaches the checkout by itself. A failure goes back to the worker once with what the check printed. Work that changed files and that no such check has verified (the check still fails, could not run, only looks, or was not given) is kept in the worker\'s copy and comes to you as task.blocked (reason `check_failed`, `check_unrunnable` or `unverified`) with the folder it is in and what the review said: that is not a failure, it is work waiting for you. Read or run it there, then accept it (task.accepted with what you checked, which puts it in the checkout), send it back, or retry it on another AI.',
@@ -508,7 +514,12 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
       reportTokens.set(peer, true);
       return {BOUNCE_REPORT_BUS: bus.path, BOUNCE_REPORT_TOKEN_FILE: grant.file};
     }, strategy: strategyOverride ?? orchestration.strategy, jev});
-  bus = await createBus({session, dir: session.dir, validate: scheduler.validate, prepare: scheduler.prepare, report: scheduler.report, accept: scheduler.acceptOverride, rework: scheduler.reworkOverride, cancel: scheduler.cancelRequest});
+  // A lesson lands in the project's .bounce/LESSONS.md for a job this project has (docs/plans/lessons-and-sweep.md).
+  const keepLesson = ({agent, text}) => {
+    const kept = recordLesson(session.cwd, {agent, text}, {agents: new Set([...readRoles().values()].filter(role => !role.error).map(role => role.name)), session: session.id});
+    return kept;
+  };
+  bus = await createBus({session, dir: session.dir, validate: scheduler.validate, prepare: scheduler.prepare, report: scheduler.report, lesson: keepLesson, retire: scheduler.retireWorker, compact: scheduler.compactWorker, accept: scheduler.acceptOverride, rework: scheduler.reworkOverride, cancel: scheduler.cancelRequest});
   const userGrant = bus.grant({peer: 'user', canSubmit: true, tasks: [], context: session.id});
   // daemon.json is written AFTER the SIGTERM/SIGINT handlers are installed (below), never here:
   // it is the daemon's discovery record, so the moment it exists a `stop`/SIGTERM can arrive, and

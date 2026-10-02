@@ -157,7 +157,8 @@ export function createClaudeLive({connect = nodeConnect, fs = nodeFs, kill = pro
     },
 
     capabilities() {
-      return {live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'], executionPolicies: ['read-only', 'plan', 'yolo'], quota: 'stream'};
+      // compacts: `/compact` on a resumed session works headless (probed 2026-10-01: ~173k → ~38k tokens).
+      return {live: true, resume: true, modelPin: true, compacts: true, policies: ['yolo', 'plan'], executionPolicies: ['read-only', 'plan', 'yolo'], quota: 'stream'};
     },
 
     pending: dir => readPending(pendingPath(dir)),

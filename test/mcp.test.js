@@ -31,7 +31,7 @@ test('M1 it is an MCP server: initialize, then the bridge verbs as tools', async
   assert.deepEqual(init.result.capabilities, {tools: {}});
   assert.equal(await s.handle({jsonrpc: '2.0', method: 'notifications/initialized'}), null, 'a notification is answered with nothing');
   const list = await s.handle({jsonrpc: '2.0', id: 2, method: 'tools/list'});
-  assert.deepEqual(list.result.tools.map(tool => tool.name).sort(), ['plan_wait', 'report', 'state', 'submit', 'task_get', 'task_submit', 'tasks_list', 'wait']);
+  assert.deepEqual(list.result.tools.map(tool => tool.name).sort(), ['lesson', 'plan_wait', 'report', 'state', 'submit', 'task_get', 'task_submit', 'tasks_list', 'wait', 'worker_compact', 'worker_retire']);
   const submit = list.result.tools.find(tool => tool.name === 'submit');
   assert.equal(submit.inputSchema.required.includes('event'), true);
   assert.match(submit.description, /task\.submitted/);
@@ -80,7 +80,9 @@ test('M2 a tool call is a verb call, and the answer is structured, not text to p
   assert.deepEqual(got.result.structuredContent, view);
   assert.match(got.result.content[0].text, /^land · reviewing/);
   const listed = await call(s, 'tasks_list', {});
-  assert.equal(listed.result.structuredContent.length, 1);
+  // an object, never a bare array: Codex's client refused the array as "expected record" (live, 2026-10-01)
+  assert.equal(listed.result.structuredContent.tasks.length, 1);
+  assert.deepEqual(listed.result.structuredContent.workers, []);
   const reported = await call(s, 'report', {report: {op: 'milestone', phase: 'read', text: 'x', next: 'y'}});
   assert.equal(reported.result.structuredContent.phase, 'read');
   // its own memory, written through the same interface: one living note, each call replacing the last

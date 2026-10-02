@@ -32,7 +32,7 @@ test('the sidebar is on by default and /sidebar off gives its columns back to th
     assert.match(shown, /BOUNCE/);
     assert.doesNotMatch(hidden, /BOUNCE|CLAUDE usage 9%/);
     // The compact header carries the provider and mode once the rail is gone.
-    assert.match(hidden, /bounce · claude · plan/);
+    assert.match(hidden, /main · .* · claude · plan/);
     assert.match(hidden, /my draft/);
     assert.ok(hidden.split('\n').every(line => stringWidth(line) <= 120));
   }
@@ -154,7 +154,7 @@ test('resizing across sidebar breakpoint preserves selected pane and input', {ti
 
 test('narrow layout retains compact status and the draft without a squeezed sidebar', () => {
   const output = frame(58, true);
-  assert.match(output, /bounce · claude · plan/);
+  assert.match(output, /main · .* · claude · plan/);
   assert.match(output, /my draft/);
   assert.doesNotMatch(output, /BOUNCE/);
   assert.ok(output.split('\n').every(line => stringWidth(line) <= 58));

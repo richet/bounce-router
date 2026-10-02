@@ -14,6 +14,9 @@ import {modelCatalog, modelEntries, catalogNotes} from './models.js';
 import {discoverLocalModels, switchLocal} from './local-models.js';
 import {readMachine, resourceReport, createResources} from './resources.js';
 import {taskView, taskList} from './task-view.js';
+import {configCommand, SETTINGS, settingsEntries, nextValue, filterEntries} from './settings-command.js';
+import {sessionStats, formatStats, compareStats, taskLines} from './stats.js';
+import {rosterLines} from './workers.js';
 import {formatTaskView, formatTaskList} from './task-report.js';
 import {runLocalSetup} from './local-wizard.js';
 import {createLocalSetupView} from './local-setup-view.js';
@@ -68,7 +71,7 @@ async function main() {
     image: {type: 'string', multiple: true}, cwd: {type: 'string'}, resume: {type: 'string'}, provider: {type: 'string'}, model: {type: 'string'},
     mode: {type: 'string'}, json: {type: 'boolean'}, verify: {type: 'boolean'}, help: {type: 'boolean', short: 'h'}, version: {type: 'boolean', short: 'v'},
     check: {type: 'boolean'}, scope: {type: 'string'}, force: {type: 'boolean'}, list: {type: 'boolean'}, all: {type: 'boolean'}, session: {type: 'string'}, report: {type: 'boolean'},
-    save: {type: 'boolean'}, 'allow-network': {type: 'boolean'},
+    save: {type: 'boolean'}, 'allow-network': {type: 'boolean'}, tasks: {type: 'boolean'}, against: {type: 'string'},
   }});
   if (values.help) return console.log(helpText(process.stdout.columns || 100));
   if (values.version) return console.log(`bounce ${version}`);
@@ -259,7 +262,7 @@ async function main() {
       // Codex launches this server from its own config, so the per-session grant never reaches its env:
       // without one, it finds the live session itself and refuses when that answer is not unique.
       ops: createOps({env: process.env, binding}),
-      views: {binding: () => binding.read(), taskView: (task, options) => taskView(events(), task, {journal: journal(), ...options}), taskList: options => taskList(events(), options)},
+      views: {binding: () => binding.read(), taskView: (task, options) => taskView(events(), task, {journal: journal(), ...options}), taskList: options => taskList(events(), options), roster: () => rosterLines(events())},
       version,
     });
     serveStdio(server);
@@ -279,6 +282,21 @@ async function main() {
     }
     const rows = taskList(target.events, {all: Boolean(values.all)});
     return console.log(values.json ? JSON.stringify(rows, null, 2) : formatTaskList(rows));
+  }
+  // bounce stats [--session REF] [--json] [--tasks] [--against REF] (docs/plans/analytics.md): what a session
+  // cost and what it got, from its journal alone.
+  if (positionals[0] === 'stats') {
+    const ref = values.session || positionals[1] || listSessions(root).find(row => row.live)?.id || listSessions(root)[0]?.id;
+    if (!ref) throw new Error('No session to read · start one with `bounce`');
+    const id = resolveSessionRef(root, ref);
+    const events = new Session(process.cwd(), {root, id}).events;
+    if (values.tasks) return console.log(taskLines(events).join('\n'));
+    const stats = sessionStats(events);
+    if (values.against) {
+      const other = new Session(process.cwd(), {root, id: resolveSessionRef(root, values.against)}).events;
+      return console.log(values.json ? JSON.stringify({against: sessionStats(other), session: stats}, null, 2) : compareStats(sessionStats(other), stats).join('\n'));
+    }
+    return console.log(values.json ? JSON.stringify(stats, null, 2) : formatStats(stats, {title: `Session ${id.slice(0, 8)}`}).join('\n'));
   }
   if (positionals[0] === 'task' && positionals[1] === 'compare') {
     const [, , sessionId, taskA, taskB] = positionals;
@@ -567,6 +585,29 @@ async function main() {
     try { orchestration = validateOrchestration(settings, undefined, {roles}); }
     catch (error) { notice = `Configuration not applied: ${error.message}`; }
   }
+  // /config's panel (src/settings-command.js): the rows are the settings, Enter flips a boolean, cycles a choice or
+  // asks for a value, `u` returns a setting to its default, every change saved and validated on the spot.
+  // Daniel, 2026-10-01: a listing is not what other harnesses do; a panel is.
+  function openConfigPanel(index = 0, notes = [], filter = '') {
+    const all = settingsEntries(root);
+    const entries = filterEntries(all, filter);
+    picker = {kind: 'config', all, entries, index: Math.max(0, Math.min(index, entries.length - 1)), notes, filter};
+  }
+  // Typing in the panel filters the rows (by key or by what the setting does); the cursor stays on the same
+  // setting when it survives the filter, else goes to the first row.
+  function refilterConfig(filter) {
+    const current = picker.entries[picker.index]?.key;
+    const entries = filterEntries(picker.all, filter);
+    picker = {...picker, entries, filter, index: Math.max(0, entries.findIndex(e => e.key === current)), notes: []};
+  }
+  function applyConfig(entry, value, index) {
+    const filter = picker?.filter ?? '';
+    try {
+      const result = configCommand(value === undefined ? ['unset', entry.key] : [entry.key, value], {root, settings});
+      openConfigPanel(index, [result.text], filter);
+    } catch (error) { openConfigPanel(index, [`${entry.key}: ${error.message}`], filter); }
+    render();
+  }
   // Shared by the /operation command and its picker (menu, also behind Ctrl+O) — one place
   // applies a mode change: open an (empty) overlay on the shipped roster on the first switch to
   // orchestrator, validate the whole config, persist, and — when the chosen mode is not the one
@@ -683,6 +724,15 @@ async function main() {
       menu.push([`Resume a session in this workspace · ${picker.entries.length} found`, style.title]);
       for (let i = start; i < end; i++) menu.push([`${i === picker.index ? '\u203a' : ' '} ${picker.entries[i].label}`, i === picker.index ? style.selected : plain]);
       menu.push(['\u2191/\u2193 choose \u00b7 Enter resume \u00b7 Esc cancel', style.muted]);
+    } else if (picker?.kind === 'config') {
+      const selected = picker.entries[picker.index];
+      const explain = selected ? inputLayout(`${selected.key}: ${selected.meta.help}`, width - 2, 4).rows.map(row => `  ${row}`) : ['  No setting matches that filter · Backspace to widen it'];
+      const {start, end} = windowAround(picker.entries.length, picker.index, Math.max(1, menuBudget - 3 - picker.notes.length - explain.length));
+      menu.push([`Settings · ${path.join(root, 'config.json')} · what the file does not set is a default${picker.filter ? ` · filter: ${picker.filter}` : ' · type to filter'}`, style.title]);
+      for (let i = start; i < end; i++) menu.push([`${i === picker.index ? '\u203a' : ' '} ${picker.entries[i].label}`, i === picker.index ? style.selected : picker.entries[i].set ? style.result : plain]);
+      for (const row of explain) menu.push([row, style.muted]);
+      for (const note of picker.notes) menu.push([note, style.diagnostic]);
+      menu.push(['\u2191/\u2193 choose \u00b7 type to filter, Backspace widens \u00b7 Enter change (flips a yes/no, cycles a choice, asks for a number or text) \u00b7 Delete or Ctrl+D resets to the default \u00b7 Esc close', style.muted]);
     } else if (picker?.kind === 'operation') {
       menu.push(['Operation mode', style.title]);
       picker.entries.forEach((name, i) => menu.push([`${i === picker.index ? '\u203a' : ' '} ${name}${name === sessionOperation ? '  (running)' : name === orchestration.operation ? '  (saved)' : ''}`, i === picker.index ? style.selected : plain]));
@@ -726,7 +776,7 @@ async function main() {
       metadata: {
         ...headerProvider({settings, orchestration, active: session.active}), mode: settings.mode,
         cwd: session.cwd, sessionId: session.id, name: reducers.sessionName(session.events), operation: sessionOperation, pendingOperation: pendingOperation(), jev: jevSidebarLabel(settings.jev),
-        orchestrator: orchestration.orchestrator ?? 'main', pendingTurns: pendingTurns.length,
+        orchestrator: orchestration.orchestrator ?? 'main', pendingTurns: pendingTurns.length, pendingPrompts: [...pendingTurns],
         ownQueued: remoteMain ? reducers.queuedPrompts(session.events).length : 0,
         // The sidebar spends 11 rows on the header block, the AGENTS list and the two gaps, plus
         // one per worker; whatever is left (sidebarRows) is split between MODELS and quota, with
@@ -986,6 +1036,18 @@ async function main() {
           const reading = settings.order.map(p => `${p} (${settings.models[p] || 'default'})`).join(' → ');
           const note = arg ? (orchestrating ? `saved · the orchestrator now runs on ${settings.order[0]}` : 'saved') : orchestrating ? 'the first agent is the orchestrator; /order codex,claude moves it' : '/order claude,codex,muse changes it';
           session.append({kind: 'status', text: `Fallback order: ${reading} · ${note}`});
+        } else if (command === 'stats') {
+          const text = arg.trim() === 'tasks' ? ['One line per task: id · agent · AI · attempts · minutes · tokens · checks · state · what ate the time', ...taskLines(session.events)].join('\n')
+            : formatStats(sessionStats(session.events), {title: `Session ${session.id.slice(0, 8)}`}).join('\n');
+          session.append({kind: 'stats', text});
+        } else if (command === 'config') {
+          // Settings from the prompt (src/settings-command.js): the file keeps what the user set, every value is
+          // validated as the loader would, and the row says whether it applies now or at the next session.
+          const words = parsedCommand?.parts ?? arg.split(/\s+/).filter(Boolean);
+          if (!words.length || words[0] === 'list') { openConfigPanel(); render(); return; }
+          const result = configCommand(words, {root, settings});
+          session.append({kind: result.changed ? 'status' : 'settings', text: result.text});
+          if (result.changed && SETTINGS[result.changed.key]?.applies === 'now') render();
         } else if (command === 'sidebar') {
           if (!['', 'on', 'off'].includes(arg)) throw new Error('Use /sidebar [on|off]');
           settings.sidebar = arg ? arg === 'on' : !settings.sidebar; save();
@@ -1169,7 +1231,22 @@ async function main() {
     if (picker) {
       const move = key.name === 'up' ? -1 : key.name === 'down' ? 1 : 0;
       if (move) picker.index = (picker.index + move + picker.entries.length) % picker.entries.length;
-      else if (key.name === 'escape') {const kind = picker.kind; picker = null; notice = kind === 'import' ? 'Import cancelled. Nothing changed.' : kind === 'operation' ? 'Operation unchanged.' : kind === 'session' ? 'Session unchanged.' : 'Model unchanged.';}
+      else if (key.name === 'escape') {const kind = picker.kind; picker = null; notice = kind === 'import' ? 'Import cancelled. Nothing changed.' : kind === 'operation' ? 'Operation unchanged.' : kind === 'session' ? 'Session unchanged.' : kind === 'config' ? 'Settings closed · what you changed is saved' : 'Model unchanged.';}
+      else if (picker.kind === 'config') {
+        const entry = picker.entries[picker.index], index = picker.index;
+        if (key.name === 'return' && entry) {
+          const next = nextValue(entry);
+          if (next !== null) { applyConfig(entry, next, index); return; }
+          const filter = picker.filter;
+          openTextPrompt({label: entry.key, hint: `${entry.meta.help} · now ${JSON.stringify(entry.value)} · type the new value, Enter saves, Esc keeps it`,
+            onAnswer: value => { if (!value.trim()) { openConfigPanel(index, [], filter); render(); return; } applyConfig(entry, value, index); }});
+          return;
+        }
+        // Delete or Ctrl+D returns the setting to its default; Backspace edits the filter; letters filter.
+        if (key.name === 'delete' || (key.ctrl && key.name === 'd')) { if (!entry) return; if (entry.set) applyConfig(entry, undefined, index); else { picker.notes = [`${entry.key} is already the default`]; render(); } return; }
+        if (key.name === 'backspace') { refilterConfig(picker.filter.slice(0, -1)); render(); return; }
+        if (str && !key.ctrl && !key.meta && str.length === 1 && str >= ' ') { refilterConfig(picker.filter + str); render(); return; }
+      }
       else if (picker.kind === 'import') {
         if (str === ' ' || key.name === 'space') {picker.chosen.has(picker.index) ? picker.chosen.delete(picker.index) : picker.chosen.add(picker.index);}
         else if (str === 'a') for (let i = 0; i < picker.entries.length; i++) picker.chosen.add(i);

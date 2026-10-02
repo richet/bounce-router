@@ -281,3 +281,23 @@ test('the transcript hides the orchestrator request row and a route that repeats
   const handoff = {kind: 'handoff', from: 'bounce', wake: true, text: 'Worker outcomes not yet handed to you:\n- task 1 · task.blocked · reason: unverified\n\nContinue your orders.'};
   assert.equal(compact.event(handoff, 120)[0].includes('Worker outcomes not yet handed to you'), true);
 });
+
+// Daniel, 2026-10-01: a prompt typed while a turn runs was held by the view and showed nowhere until it
+// was sent. A pending prompt is a user row marked `local`: shown where it will land, tagged queued.
+test('a prompt still queued in this view is shown as the user\'s, tagged queued', () => {
+  const compact = createFormatter({color: false, compact: true});
+  assert.deepEqual(compact.event({kind: 'user', text: 'and then run the tests', queued: true, local: true}, 80), [
+    '> and then run the tests',
+    '  ⎿  queued · runs when the current turn ends · ↑ to edit',
+    '',
+  ]);
+  // once sent, it is an ordinary prompt
+  assert.deepEqual(compact.event({kind: 'user', text: 'and then run the tests', queued: true, requestId: 'r1'}, 80), ['> and then run the tests', '']);
+});
+
+// /config's listing is a block, one setting per line; a status row would fold it to its first line.
+test('a settings row renders as a block with one line per setting', () => {
+  const compact = createFormatter({color: false, compact: true});
+  const rows = compact.event({kind: 'settings', text: 'Settings (x/config.json; what the file does not set is a default):\n  order = ["codex"] · provider order · applies now\n  sweepMinutes = 20 (default) · quiet minutes · applies next session'}, 120);
+  assert.deepEqual(rows, ['Bounce · Settings', '  Settings (x/config.json; what the file does not set is a default):', '    order = ["codex"] · provider order · applies now', '    sweepMinutes = 20 (default) · quiet minutes · applies next session', '']);
+});
