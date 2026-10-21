@@ -55,24 +55,28 @@ export function conversationEvents(events, {details = false} = {}) {
   let lastAnswer = null;
   let lastProvider;
   let sawOperation = false;
+  // The delta block still being streamed. Rows bounce journals meanwhile (a session title, a status,
+  // a native id) do not end it; only the conversation moving on does. Seen live 2026-10-02: the
+  // `session.titled` row landed between two deltas and the first answer rendered cut in half.
+  let openDelta = null;
 
   for (const event of events) {
     // A reported model is header metadata with no text; it would only split a progress run.
     if (event.kind === 'model') continue;
     if (event.kind === 'user' || event.kind === 'main.starting') lastAnswer = null;
+    if (['user', 'assistant', 'tool', 'result', 'error', 'main.starting', 'main.terminal', 'handoff', 'note'].includes(event.kind)) openDelta = null;
     if (event.kind === 'assistant') {
       lastAnswer = event.text?.trim();
       lastProvider = event.provider;
     }
-    // Muse streams an answer as many small deltas, each its own journal row. They read as one
-    // block; the row's id changes as it grows so a cached rendering of it is not reused.
+    // A streamed answer is many small deltas, each its own journal row. They read as one block;
+    // the row's id changes as it grows so a cached rendering of it is not reused.
     if (event.kind === 'delta' && !details) {
-      const previous = rows.at(-1);
-      if (previous?.kind === 'delta' && previous.provider === event.provider) {
-        previous.text += event.text ?? '';
-        previous.id = `${previous.first}+${++previous.merged}`;
-      } else rows.push({...event, first: event.id, merged: 1});
-      lastAnswer = rows.at(-1).text.trim();
+      if (openDelta && openDelta.provider === event.provider) {
+        openDelta.text += event.text ?? '';
+        openDelta.id = `${openDelta.first}+${++openDelta.merged}`;
+      } else { openDelta = {...event, first: event.id, merged: 1}; rows.push(openDelta); }
+      lastAnswer = openDelta.text.trim();
       lastProvider = event.provider;
       continue;
     }

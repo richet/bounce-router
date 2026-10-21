@@ -9,9 +9,14 @@ export const catalogQueries = Object.fromEntries(Object.entries(adapters).map(([
 
 // A failed or empty catalog is reported, never thrown: one signed-out agent must
 // not hide the models of the others.
-export async function queryCatalog(provider, executable = provider, {spawn, timeout = 20000, cwd} = {}) {
+export async function queryCatalog(provider, executable = provider, {spawn, timeout = 20000, cwd, settings, discover} = {}) {
   const query = catalogQueries[provider];
   if (!query) return {provider, models: [], account: null, error: `Unknown provider: ${provider}`};
+  // A local provider lists what its server reports (opencode: LM Studio), not a CLI protocol.
+  if (typeof query.list === 'function') {
+    try { return {provider, ...(await query.list({settings, ...(discover ? {discover} : {})}))}; }
+    catch (error) { return {provider, models: [], account: null, error: error.message}; }
+  }
   const {out, error} = await queryLines({executable, args: query.args, requests: query.requests, read: query.read,
     spawn, timeout, cwd, messages: {missing: `${provider} CLI not installed`, timeout: `${provider} did not answer in time`,
       closed: `${provider} exited before listing models`}});
@@ -23,7 +28,7 @@ let cache = {time: 0, value: null};
 export async function modelCatalog(settings, {maxAge = 300000, ...options} = {}) {
   if (cache.value && Date.now() - cache.time < maxAge) return cache.value;
   const value = await Promise.all(Object.keys(providers).map(provider =>
-    queryCatalog(provider, resolveExecutable(provider, settings.executables?.[provider]), options)));
+    queryCatalog(provider, resolveExecutable(provider, settings.executables?.[provider]), {settings, ...options})));
   cache = {time: Date.now(), value};
   return value;
 }
@@ -34,7 +39,8 @@ export function modelEntries(catalogs, {order = [], models = {}} = {}) {
   const entries = [];
   for (const catalog of [...catalogs].sort((a, b) => rank(a.provider) - rank(b.provider))) {
     if (!catalog.models.length) continue;
-    entries.push({provider: catalog.provider, id: '', label: 'Provider default',
+    // A provider that cannot run without a chosen model has no default row (opencode).
+    if (!adapters[catalog.provider]?.requiresModel) entries.push({provider: catalog.provider, id: '', label: 'Provider default',
       description: catalog.account ? `Signed in as ${catalog.account}` : 'The CLI picks the model',
       current: !models[catalog.provider]});
     for (const model of catalog.models) entries.push({provider: catalog.provider, id: model.id,
@@ -44,4 +50,4 @@ export function modelEntries(catalogs, {order = [], models = {}} = {}) {
   return entries;
 }
 export const catalogNotes = catalogs => catalogs.filter(c => !c.models.length)
-  .map(c => `${c.provider}: ${c.error} · try /login ${c.provider}`);
+  .map(c => `${c.provider}: ${c.error} · ${catalogQueries[c.provider]?.hint ?? `try /login ${c.provider}`}`);

@@ -265,7 +265,8 @@ export function displayEvents(events) {
       const last = result.findLast(row => row.kind === 'route');
       if (last && last.provider === event.provider && last.model === event.model) continue;
     }
-    const previous = result.at(-1);
+    // A row bounce journals mid-stream (a status, a native id) does not split the answer's deltas.
+    const previous = result.findLast(row => ['user', 'assistant', 'delta', 'tool', 'result', 'error'].includes(row.kind));
     if (event.kind === 'delta' && previous?.kind === 'delta' && previous.provider === event.provider) {
       previous.text += event.text;
     } else result.push({...event});

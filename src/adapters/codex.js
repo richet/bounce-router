@@ -7,11 +7,15 @@ export default {
   login: ['login'],
   // `ephemeral`: a one-off call (a session title, a /btw answer, a roster note) never lands in
   // ~/.codex, where the ChatGPT app would list it.
-  invocation({model, mode, images = [], ephemeral = false}) {
+  // `resume`: `codex exec resume ID` continues that thread (a classic turn on the same provider, Router.run).
+  // The resume subcommand has no `--sandbox` flag (codex-cli 0.154 `exec resume --help`), so plan mode
+  // pins the sandbox through its config override instead.
+  resumes: true,
+  invocation({model, mode, images = [], ephemeral = false, resume = null}) {
     const imageArgs = images.flatMap(image => ['--image', image.path]);
     const modelArgs = model ? ['--model', model] : [];
-    return ['exec', '--json', '--skip-git-repo-check', ...(ephemeral ? ['--ephemeral'] : []), ...modelArgs, ...imageArgs,
-      ...(mode === 'yolo' ? ['--dangerously-bypass-approvals-and-sandbox'] : ['--sandbox', 'read-only']), '-'];
+    const sandbox = mode === 'yolo' ? ['--dangerously-bypass-approvals-and-sandbox'] : resume ? ['-c', 'sandbox_mode="read-only"'] : ['--sandbox', 'read-only'];
+    return ['exec', ...(resume ? ['resume', resume] : []), '--json', '--skip-git-repo-check', ...(ephemeral ? ['--ephemeral'] : []), ...modelArgs, ...imageArgs, ...sandbox, '-'];
   },
   stdin: prompt => prompt,
   normalize(message) {
