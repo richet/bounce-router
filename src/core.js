@@ -21,7 +21,7 @@ export const defaults = () => ({order: ['claude', 'codex', 'muse'], mode: 'yolo'
 // Kinds folded in memory only: never journaled, delivered straight to onEvent.
 export const LIVE_KINDS = new Set(['progress', 'task.activity', 'tool.started', 'tool.finished']);
 // A vendor's raw stream row whose content bounce already stores as its own normalized row (the
-// assistant text, the tool result, the thinking-token tick that becomes `progress`). Found live (ACE
+// assistant text, the tool result, the thinking-token tick that becomes `progress`). Found live (session
 // d1bc0206): these were 75% of a 21 MB journal. They are delivered live, never journaled; raw rows
 // that carry anything not stored elsewhere (rate limits, init, results, heartbeats) are kept.
 export const echoesNormalizedRow = event => event.kind === 'raw' && event.provider === 'claude'

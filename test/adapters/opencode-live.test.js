@@ -4,9 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {spawn, spawnSync} from 'node:child_process';
-import net from 'node:net';
-import {createOpencodeLive, toolsFor, mapUsage, scrubCredentials, probeSandbox} from '../../src/adapters/opencode-live.js';
+import {createOpencodeLive, toolsFor, mapUsage, scrubCredentials, nativeConfig} from '../../src/adapters/opencode-live.js';
 
 // The OpenCode adapter is the claude adapter's twin: one `opencode run` per turn, prompt on stdin,
 // JSON lines out, exit = turn end. The fake prints the event shapes observed from the real binary
@@ -53,6 +51,116 @@ test('launch: the prompt goes in on stdin, the worker runs in the real tree as i
   const config = logged('CONFIG');
   assert.deepEqual(config.provider, {lmstudio: {options: {baseURL: 'http://127.0.0.1:1234/v1'}}}, 'the provider block bounce built is passed through');
   assert.deepEqual(config.agent.analyst, {description: 'Scouts.', mode: 'primary', prompt: 'You scout.', maxSteps: 12, tools: toolsFor('read-only')});
+});
+
+// opencode 2.x (2.0.29 source, then live): `run` talks to a server, so --standalone makes it a private
+// one that sees our config; there is no --dir (the directory is $PWD) and no --pure; the config is 2.x's
+// own shape. The fake behaves as 2.x does: --dir/--pure exit 1, it works where PWD says, bash is shell.
+const v2 = {versionOf: () => ({version: '2.0.29', major: 2})};
+
+test('opencode 2.x: a private server per turn, the directory from PWD, and the config in 2.x\'s own shape', async t => {
+  const {cwd, dir, logged} = setup(t, {FAKE_OC_VERSION: '2.0.29', FAKE_OC_WRITE: 'src/v2.txt:here', PWD: '/somewhere/else'});
+  const adapter = createOpencodeLive(v2);
+  const profile = profileFor({policy: 'write', providerID: 'lmstudio', model: 'qwen-loaded',
+    opencodeConfig: {provider: {lmstudio: {npm: '@ai-sdk/openai-compatible', name: 'lmstudio', options: {baseURL: 'http://127.0.0.1:1234/v1'},
+      models: {'qwen-loaded': {name: 'qwen-loaded', options: {temperature: 0.7, top_k: 20, max_tokens: 2048, reasoningEffort: 'none'}}}}}},
+    agent: {name: 'scout', description: 'Finds.', prompt: 'You scout.', maxSteps: 12}});
+  const handle = await adapter.launch({peer: 'worker:t1', profile, orders: 'say hello', cwd, dir});
+  const events = await drain(adapter, handle);
+  assert.deepEqual(events.at(-1), {kind: 'result', status: 'completed', text: 'echo: say hello'});
+  assert.deepEqual(logged('ARGV'), ['run', '--standalone', '--format', 'json', '--agent', 'scout', '-m', 'lmstudio/qwen-loaded']);
+  assert.equal(fs.readFileSync(path.join(cwd, 'src/v2.txt'), 'utf8'), 'here', 'it worked where PWD said: the worker\'s directory, not bounce\'s');
+  const config = logged('CONFIG');
+  assert.deepEqual(Object.keys(config).sort(), ['agents', 'mcp', 'permissions', 'plugins', 'providers']);
+  assert.deepEqual(config.providers.lmstudio.models['qwen-loaded'].body, {temperature: 0.7, top_k: 20, max_tokens: 2048, reasoning_effort: 'none'});
+  assert.deepEqual(config.agents.scout, {description: 'Finds.', mode: 'primary', system: 'You scout.', steps: 12,
+    permissions: [{action: 'execute', resource: '*', effect: 'deny'}, {action: 'subagent', resource: '*', effect: 'deny'}, {action: 'websearch', resource: '*', effect: 'deny'},
+      {action: 'webfetch', resource: '*', effect: 'deny'}, {action: 'skill', resource: '*', effect: 'deny'}, {action: 'question', resource: '*', effect: 'deny'}]});
+  assert.deepEqual(config.permissions, [{action: 'external_directory', resource: '*', effect: 'allow'}]);
+});
+
+test('opencode 2.x: a shell command is reported like a 1.x bash one', async t => {
+  const {cwd, dir} = setup(t, {FAKE_OC_VERSION: '2.0.29', FAKE_OC_SCENARIO: 'commands'});
+  const adapter = createOpencodeLive(v2);
+  const handle = await adapter.launch({peer: 'worker:t1', profile: profileFor({}), orders: 'run the checks', cwd, dir});
+  const commands = (await drain(adapter, handle)).filter(event => event.kind === 'command');
+  assert.deepEqual(commands.map(command => [command.command, command.exit]), [['deno test -A tests/version_test.ts 2>&1', 0], ['deno lint', 1]]);
+});
+
+// 2.x lists an MCP server's tools only once it has connected, and a turn's first step does not wait
+// (observed live: every worker's first request went out without bounce_report). A worker with a report
+// grant gets a server bounce starts itself, and its turn starts once bounce_report has connected.
+const grant = {BOUNCE_REPORT_BUS: '/tmp/r.sock', BOUNCE_REPORT_TOKEN_FILE: '/tmp/r.tok'};
+const lines = (dir, prefix) => fs.readFileSync(path.join(dir, 'fake.log'), 'utf8').split('\n').filter(line => line.startsWith(`${prefix} `)).map(line => JSON.parse(line.slice(prefix.length + 1)));
+const waitForLog = async (dir, prefix) => { for (let i = 0; i < 100 && !lines(dir, prefix).length; i++) await new Promise(resolve => setTimeout(resolve, 20)); return lines(dir, prefix); };
+
+test('opencode 2.x: a turn with a report tool starts on its own server only once bounce_report has connected, and the server ends with the turn', async t => {
+  const {cwd, dir, logged} = setup(t, {FAKE_OC_VERSION: '2.0.29', FAKE_OC_MCP_MS: '300'});
+  const adapter = createOpencodeLive(v2);
+  const handle = await adapter.launch({peer: 'worker:t1', profile: profileFor({report: grant, providerID: 'lmstudio', model: 'm'}), orders: 'say hello', cwd, dir});
+  const events = await drain(adapter, handle);
+  assert.deepEqual(events.at(-1), {kind: 'result', status: 'completed', text: 'echo: say hello'});
+  assert.deepEqual(logged('SERVE'), ['serve', '--stdio', '--port', '0']);
+  const argv = logged('ARGV');
+  assert.deepEqual([argv[0], argv[1]], ['run', '--server']);
+  assert.match(argv[2], /^http:\/\/127\.0\.0\.1:\d+$/);
+  assert.deepEqual(argv.slice(3), ['--format', 'json', '--agent', 'bounce-worker', '-m', 'lmstudio/m']);
+  assert.equal(argv.includes('--standalone'), false);
+  assert.deepEqual(lines(dir, 'RUN_SAW'), ['connected'], 'the turn started after bounce_report connected, not while it was pending');
+  assert.deepEqual(await waitForLog(dir, 'SERVE_END'), [true], 'the server ended with the turn');
+  assert.equal(events.some(event => event.kind === 'diagnostic' && /bounce_report/.test(event.text)), false);
+});
+
+// One setup per test: setup() restores the environment it saved, so two in one test leak the first's.
+for (const [state, env, options] of [['failed', {FAKE_OC_MCP_STATE: 'failed', FAKE_OC_MCP_MS: '0'}, {}], ['pending', {FAKE_OC_MCP_MS: '60000'}, {mcpReadyMs: 200}]]) {
+  test(`opencode 2.x: a report tool that is still ${state} does not hold the turn; the journal says it ran without it`, async t => {
+    const {cwd, dir} = setup(t, {FAKE_OC_VERSION: '2.0.29', ...env});
+    const adapter = createOpencodeLive({...v2, ...options});
+    const handle = await adapter.launch({peer: 'worker:t1', profile: profileFor({report: grant}), orders: 'say hello', cwd, dir});
+    const events = await drain(adapter, handle);
+    assert.match(events[0].text, new RegExp(`^bounce_report was ${state} after \\d+ ms: the turn runs without it$`));
+    assert.deepEqual(events.at(-1), {kind: 'result', status: 'completed', text: 'echo: say hello'});
+  });
+}
+
+test('opencode 2.x: cancelling a turn on its own server ends the server too', async t => {
+  const ready = path.join(os.tmpdir(), `oc-ready-${process.pid}-v2`);
+  const {cwd, dir} = setup(t, {FAKE_OC_VERSION: '2.0.29', FAKE_OC_SCENARIO: 'hold', FAKE_OC_MCP_MS: '0', FAKE_OC_READY: ready});
+  t.after(() => fs.rmSync(ready, {force: true}));
+  const adapter = createOpencodeLive(v2);
+  const handle = await adapter.launch({peer: 'worker:t1', profile: profileFor({report: grant}), orders: 'hold', cwd, dir});
+  for (let i = 0; i < 200 && !fs.existsSync(ready); i++) await new Promise(resolve => setTimeout(resolve, 20));
+  const cancelled = await adapter.cancel(handle);
+  assert.equal(cancelled.verified, true);
+  assert.deepEqual(await waitForLog(dir, 'SERVE_END'), [true]);
+});
+
+test('nativeConfig: sampling goes in the model body verbatim, max_tokens is the cap field, and LM Studio discovery and Claude Code skills stay out', () => {
+  const native = nativeConfig({$schema: 'https://opencode.ai/config.json',
+    provider: {lmstudio: {npm: '@ai-sdk/openai-compatible', name: 'lmstudio', options: {baseURL: 'http://127.0.0.1:1234/v1', apiKey: 'k'},
+      models: {m: {name: 'm', options: {temperature: 0.6, repeat_penalty: 1, reasoningEffort: 'none'}, limit: {context: 131072, output: 2048}}, plain: {name: 'plain'}}}},
+    mcp: {bounce: {type: 'local', command: ['node', 'mcp-report.js'], enabled: true, environment: {BOUNCE_REPORT_TASK: 't1'}}}});
+  assert.deepEqual(native.plugins, ['-opencode.provider.lmstudio', '-opencode.config.compatibility']);
+  assert.deepEqual(native.providers.lmstudio, {name: 'lmstudio', package: '@opencode/ai/providers/openai-compatible',
+    settings: {baseURL: 'http://127.0.0.1:1234/v1', apiKey: 'k'}, compatibility: {maxTokensField: 'max_tokens'},
+    models: {m: {name: 'm', capabilities: {tools: true}, limit: {context: 131072, output: 2048}, body: {temperature: 0.6, repeat_penalty: 1, reasoning_effort: 'none'}},
+      plain: {name: 'plain', capabilities: {tools: true}}}});
+  for (const never of ['repetition_penalty', 'chat_template_kwargs', 'extra_body', 'reasoningEffort']) assert.equal(Object.hasOwn(native.providers.lmstudio.models.m.body, never), false, never);
+  assert.deepEqual(native.mcp, {servers: {bounce: {type: 'local', command: ['node', 'mcp-report.js'], environment: {BOUNCE_REPORT_TASK: 't1'}, disabled: false, codemode: false}}},
+    'out of code mode, so bounce_report is a tool of its own');
+});
+
+test('nativeConfig: a tools-off conclusion denies every tool but the report; a read-only worker cannot edit or run anything', () => {
+  const deniedOf = tools => nativeConfig({agent: {w: {description: 'd', mode: 'primary', maxSteps: 2, tools}}}).agents.w.permissions
+    .filter(rule => rule.effect === 'deny').map(rule => rule.action);
+  const off = deniedOf({...Object.fromEntries(Object.keys(toolsFor('write')).map(tool => [tool, false])), bounce_report: true});
+  for (const action of ['read', 'grep', 'glob', 'edit', 'write', 'patch', 'shell', 'subagent', 'execute']) assert.equal(off.includes(action), true, action);
+  assert.equal(off.includes('bounce_report'), false);
+  const readOnly = deniedOf(toolsFor('read-only'));
+  assert.deepEqual(['edit', 'write', 'patch', 'shell'].map(action => readOnly.includes(action)), [true, true, true, true]);
+  assert.deepEqual(['read', 'grep', 'glob'].map(action => readOnly.includes(action)), [false, false, false]);
+  assert.equal(nativeConfig({agent: {w: {tools: toolsFor('write')}}}).agents.w.permissions.some(rule => rule.effect === 'allow'), false,
+    'no explicit allow: it would override opencode\'s own ask before a .env edit');
 });
 
 test('the policy tier is the tools map: read-only and plan can change nothing; write and yolo edit and run commands', () => {
@@ -296,64 +404,6 @@ test('an open step heartbeats as activity until the per-step cap, so a long gene
   assert.equal(beats.every(at => at < 200 + 40 + 60), true, `a beat after the cap: ${beats.join(', ')} ms`);
 });
 
-// The probing reviewer: it may read and run commands, never change the tree. OpenCode's bash can write
-// anywhere, so the whole opencode process runs under macOS sandbox-exec: writes to the project are refused
-// by the OS, temp dirs stay writable, and the network reaches only the model endpoint.
-test('a probe worker has read tools and bash, and runs sandboxed: it cannot write the project', async t => {
-  assert.deepEqual(toolsFor('probe'), {read: true, grep: true, glob: true, write: false, edit: false, apply_patch: false, bash: true,
-    todowrite: false, task: false, websearch: false, webfetch: false, skill: false, question: false, invalid: false});
-  const adapter = createOpencodeLive({});
-  assert.equal(adapter.capabilities().executionPolicies.includes('probe'), true);
-  const {cwd, dir} = setup(t, {FAKE_OC_WRITE: 'src/probe-wrote.txt:x'});
-  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-probe-log-'));
-  t.after(() => fs.rmSync(outside, {recursive: true, force: true}));
-  process.env.FAKE_OC_LOG = path.join(outside, 'fake.log');
-  const handle = await adapter.launch({peer: 'worker:t12', profile: profileFor({policy: 'probe', opencodeConfig: {provider: {lmstudio: {options: {baseURL: 'http://127.0.0.1:1234/v1'}}}}}), orders: 'probe it', cwd, dir});
-  assert.equal(handle.args[0], '-p', 'launched through sandbox-exec with an inline profile');
-  await drain(adapter, handle);
-  assert.equal(fs.existsSync(path.join(cwd, 'src/probe-wrote.txt')), false, 'the project write was refused');
-  assert.equal(fs.existsSync(path.join(outside, 'fake.log')), true, 'a temp dir outside the project stays writable');
-  // the same worker without probe writes the tree, as a yolo worker does
-  const free = await adapter.launch({peer: 'worker:t13', profile: profileFor({}), orders: 'write it', cwd, dir});
-  await drain(adapter, free);
-  assert.equal(fs.readFileSync(path.join(cwd, 'src/probe-wrote.txt'), 'utf8'), 'x');
-});
-
-test('a probe workspace is writable while its original source remains denied', t => {
-  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-probe-workspace-'));
-  const source = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-probe-source-'));
-  t.after(() => { fs.rmSync(workspace, {recursive: true, force: true}); fs.rmSync(source, {recursive: true, force: true}); });
-  const policy = probeSandbox(workspace, '/tmp/home', source);
-  const code = `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(path.join(workspace, 'cache.txt'))}, 'cache'); try { fs.writeFileSync(${JSON.stringify(path.join(source, 'source.txt'))}, 'bad'); process.exit(2); } catch (error) { if (!['EPERM','EACCES'].includes(error.code)) throw error; }`;
-  const result = spawnSync('/usr/bin/sandbox-exec', ['-p', policy, process.execPath, '--input-type=module', '-e', code], {encoding: 'utf8'});
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(fs.readFileSync(path.join(workspace, 'cache.txt'), 'utf8'), 'cache');
-  assert.equal(fs.existsSync(path.join(source, 'source.txt')), false);
-  assert.match(policy, new RegExp(`allow file-write\\*[^]*subpath ${JSON.stringify(fs.realpathSync(workspace)).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
-  assert.match(policy, new RegExp(`deny file-write\\* \\(subpath ${JSON.stringify(fs.realpathSync(source)).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
-});
-
-test('a report grant opens only its assigned Unix bus socket inside the probe sandbox', async t => {
-  if (process.platform !== 'darwin') return t.skip('macOS sandbox-exec only');
-  const root = fs.mkdtempSync('/private/tmp/oc-report-socket-');
-  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
-  const allowed = path.join(root, 'allowed.sock');
-  const forbidden = path.join(root, 'forbidden.sock');
-  const serverA = net.createServer(socket => socket.end());
-  const serverB = net.createServer(socket => socket.end());
-  await Promise.all([new Promise(resolve => serverA.listen(allowed, resolve)), new Promise(resolve => serverB.listen(forbidden, resolve))]);
-  t.after(() => { serverA.close(); serverB.close(); });
-  const policy = probeSandbox(root, '/tmp/home', null, allowed);
-  const code = `const net = require('node:net'); const one = path => new Promise(resolve => { const socket = net.createConnection(path); socket.once('connect', () => { socket.destroy(); resolve('connected'); }); socket.once('error', error => resolve(error.code)); }); (async () => { process.stdout.write(JSON.stringify([await one(process.argv[1]), await one(process.argv[2])])); })();`;
-  const child = spawn('/usr/bin/sandbox-exec', ['-p', policy, process.execPath, '-e', code, allowed, forbidden]);
-  let stdout = '', stderr = '';
-  child.stdout.on('data', chunk => { stdout += chunk; });
-  child.stderr.on('data', chunk => { stderr += chunk; });
-  const exit = await new Promise(resolve => child.once('close', resolve));
-  assert.equal(exit, 0, stderr);
-  assert.deepEqual(JSON.parse(stdout), ['connected', 'EPERM']);
-});
-
 test('the report tool survives a tools-off conclusion and a grant for another task is not injected', async t => {
   const {cwd, dir} = setup(t, {FAKE_OC_SCENARIO: 'loop', FAKE_OC_CONCLUDE: 'answer'});
   const adapter = createOpencodeLive({});
@@ -414,7 +464,7 @@ test('empty steps after an answer end the turn AS that answer; empty steps with 
 
 test('capabilities: the same ladder as before, live and resumable', () => {
   assert.deepEqual(createOpencodeLive().capabilities(), {live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'],
-    executionPolicies: ['read-only', 'probe', 'plan', 'write', 'yolo'], quota: 'stream', commands: true});
+    executionPolicies: ['read-only', 'plan', 'write', 'yolo'], quota: 'stream', commands: true});
 });
 
 test('the answer is the last text that says something: a stray closing fence after the report is not the result', async t => {
@@ -524,7 +574,7 @@ test('a step cap with no answer at all is a clean failure, not a fake result', a
 
 // A conclusion turn (tools off, asked once for its answer) has no step-time bound of its own — a
 // reasoning model can spend minutes generating on a single step within its 2-step cap (observed
-// live, ACE session d1bc0206: a reasoning model ran 6.5 minutes on the conclusion turn and produced
+// live, session d1bc0206: a reasoning model ran 6.5 minutes on the conclusion turn and produced
 // nothing). A wall-clock bound cuts that turn off and treats it exactly like a conclusion that said
 // nothing, instead of leaving the task hanging on it.
 test('a conclusion turn that never answers is cut off at its wall-clock bound, promptly', async t => {
@@ -544,7 +594,7 @@ test('a conclusion turn that never answers is cut off at its wall-clock bound, p
 // A write worker edits its isolated copy; the real checkout it was copied from is fenced by the OS, so an
 // absolute path back into it fails loudly instead of silently bypassing integration and review.
 // User, 2026-09-27: "codex and claude code already work like this; local workers should also be allowed
-// the same". A local write worker runs its tools directly, never under sandbox-exec; only a probe is fenced.
+// the same". A local write worker runs its tools directly, never under sandbox-exec.
 test('a local write worker launches unsandboxed, like a Claude or Codex worker, and edits its copy', async t => {
   const {cwd, dir} = setup(t, {FAKE_OC_WRITE: 'src/free.txt:ok'});
   const adapter = createOpencodeLive({});
@@ -554,7 +604,7 @@ test('a local write worker launches unsandboxed, like a Claude or Codex worker, 
   assert.equal(fs.readFileSync(path.join(cwd, 'src/free.txt'), 'utf8'), 'ok');
 });
 
-// Found live (ACE 43387649): opencode hit maxSteps 60 with no runtime notice in the stream — the turn just
+// Found live (session 43387649): opencode hit maxSteps 60 with no runtime notice in the stream — the turn just
 // ended after 60 finished steps, the model's own "## Maximum Steps Reached" heading the only text. The cap
 // went unrecorded, so bounce's step renewal (scheduler) never fired. The step count is the signal.
 test('a turn that used its whole step budget is a step cap even when opencode prints no notice', async t => {
@@ -565,8 +615,8 @@ test('a turn that used its whole step budget is a step cap even when opencode pr
   assert.equal(events.filter(e => e.kind === 'diagnostic' && e.reason === 'step_cap').length, 1);
 });
 
-// What bounce saw the worker run is the evidence of a report bounce has to write itself (Daniel,
-// 2026-09-28). Found live: 45 of 86 local attempts answered in plain text and wrote no report.
+// What bounce saw the worker run is the evidence of a report bounce has to write itself
+// (2026-09-28). Found live: 45 of 86 local attempts answered in plain text and wrote no report.
 test('a finished shell command is passed on with its exit code and the end of its output, colours removed', async t => {
   const {cwd, dir} = setup(t, {FAKE_OC_SCENARIO: 'commands'});
   const adapter = createOpencodeLive();

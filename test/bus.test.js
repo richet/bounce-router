@@ -843,7 +843,7 @@ test('worker.retire from the orchestrator reaches the hook; a worker may not ret
   await assert.rejects(worker.publish({kind: 'worker.retire', worker: 'builder#1'}), error => error.code === -32001);
 });
 
-// Found live (ACE e3bd01d5, 2026-10-01 00:31 UTC): the daemon died of `write EPIPE` at bus.js send ←
+// Found live (session e3bd01d5, 2026-10-01 00:31 UTC): the daemon died of `write EPIPE` at bus.js send ←
 // handlePublish. A peer (one of seven leftover `bounce mcp-serve` bridges) hung up while its reply was
 // in flight; `send` catches what write throws, but a socket error is an event, and the server-side socket
 // had no 'error' listener, so it became an uncaught exception and took the daemon — and the whole session

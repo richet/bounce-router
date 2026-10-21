@@ -41,7 +41,7 @@ export function hostSession({session, child, main = null}) {
     }
   };
   child.on('message', onMessage);
-  // The history goes in chunks, the last one inside session.replay itself. Found live (ACE d1bc0206): as
+  // The history goes in chunks, the last one inside session.replay itself. Found live (session d1bc0206): as
   // one message a 20.1 MB history exceeded the view channel's 16 MB message limit, the connection was
   // dropped, and the TUI hung waiting for it. Sent in one tick, so no live row can land in between.
   const chunks = [];
@@ -67,7 +67,7 @@ export function hostSession({session, child, main = null}) {
 // daemon-owned; this proxy intentionally does not expose Session.commit. append/publish
 // build a provisional row immediately (no seq), then the parent's reply (or its broadcast
 // of the same row, whichever arrives first) replaces it in place.
-// Found live (ACE d1bc0206): a daemon started before history replays were chunked closed every view
+// Found live (session d1bc0206): a daemon started before history replays were chunked closed every view
 // before the history arrived, and the TUI waited forever. A view whose daemon goes away before the
 // history arrives fails with what to do instead.
 const lostBeforeReplay = () => new Error(`the session's daemon closed the connection before sending its history; it may be running older bounce code — stop it with: bounce stop ${process.env.BOUNCE_SESSION?.slice(0, 8) || '<session>'}, then resume`);

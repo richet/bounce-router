@@ -1,6 +1,6 @@
-// Decided by Daniel on 2026-09-29, to be measured on real sessions: a worker ends with a plain answer
+// Decided on 2026-09-29, to be measured on real sessions: a worker ends with a plain answer
 // and bounce makes the report from it, instead of asking for a report in a fixed format. Found live
-// (ACE e3bd01d5): of 67 reports 18 were rejected as invalid and 19 rewritten by bounce. `reports:
+// (session e3bd01d5): of 67 reports 18 were rejected as invalid and 19 rewritten by bounce. `reports:
 // "structured"` in config.json brings the fixed format back.
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -113,7 +113,7 @@ test('reports: "structured" keeps the fixed format, and only the two values are 
   assert.throws(() => createScheduler({session: f.session, adapters: {}, profiles: {}, reportFormat: 'json'}), /reportFormat/);
 });
 
-// Found live (ACE e3bd01d5, task p7_stack_ergonomics_review, 2026-09-30): a reviewer wrote a proper review
+// Found live (session e3bd01d5, task p7_stack_ergonomics_review, 2026-09-30): a reviewer wrote a proper review
 // ending "**FAIL** — 3 blockers and 4 majors", and bounce marked the task failed (reported_failure): the
 // verdict was read as the worker's own status. For a reviewer the verdict is the deliverable; the review
 // itself succeeded. Only "Blocked:" about the reviewing still ends the task that way.

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {normalizeLocalSettings} from '../src/local-models.js';
-import {opencodeProviderConfig, checkOpencodeBridge} from '../src/local-opencode-config.js';
+import {opencodeProviderConfig, samplingOptions, checkOpencodeBridge} from '../src/local-opencode-config.js';
 
 test('builds provider config for the default lmstudio endpoint', () => {
   const settings = normalizeLocalSettings();
@@ -145,4 +145,30 @@ test('contextTokens on the endpoint becomes the model\'s context limit for OpenC
   assert.deepEqual(result.config.provider.lmstudio.models.m, {name: 'm', limit: {context: 131072, output: 32768}});
   assert.deepEqual(opencodeProviderConfig({settings: normalizeLocalSettings(), model: 'm'}).config.provider.lmstudio.models.m, {name: 'm'});
   for (const bad of [0, -1, 1.5, '131072', 500]) assert.throws(() => normalizeLocalSettings({endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234', contextTokens: bad}}}), /contextTokens must be a whole number of tokens, at least 4096/);
+});
+
+// An agent's sampling lands as the model's `options`: OpenCode passes them to @ai-sdk/openai-compatible,
+// which copies every key it does not own verbatim to the top level of the request body. So each key is
+// the exact name LM Studio honours, and thinking off is the SDK's own reasoningEffort ("none").
+test('samplingOptions names each declared key as LM Studio reads it, and nothing undeclared', () => {
+  assert.deepEqual(samplingOptions({thinking: 'off', temperature: 0.7, topP: 0.8, topK: 20, minP: 0, presencePenalty: 1.5,
+    frequencyPenalty: 0.2, repeatPenalty: 1, maxTokens: 2048, seed: 7}), {temperature: 0.7, top_p: 0.8, top_k: 20, min_p: 0,
+    presence_penalty: 1.5, frequency_penalty: 0.2, repeat_penalty: 1, max_tokens: 2048, seed: 7, reasoningEffort: 'none'});
+  assert.deepEqual(samplingOptions({thinking: 'on', temperature: 1}), {temperature: 1}, 'thinking on is the server default: nothing is sent');
+  assert.deepEqual(samplingOptions(), {});
+  assert.deepEqual(samplingOptions(undefined), {});
+  const all = samplingOptions({thinking: 'off', repeatPenalty: 1.1});
+  for (const never of ['repetition_penalty', 'chat_template_kwargs', 'extra_body', 'reasoning_effort', 'reasoning', 'topK', 'topP'])
+    assert.equal(Object.hasOwn(all, never), false, `${never} is never sent`);
+});
+
+test('the generated model block carries the sampling as options; a declared maxTokens is also the output limit OpenCode plans with', () => {
+  const sampling = {thinking: 'off', temperature: 0.7, topK: 20, maxTokens: 2048};
+  const plain = opencodeProviderConfig({settings: normalizeLocalSettings(), model: 'm', sampling}).config.provider.lmstudio;
+  assert.deepEqual(plain.models.m, {name: 'm', options: {temperature: 0.7, top_k: 20, max_tokens: 2048, reasoningEffort: 'none'}});
+  assert.deepEqual(plain.options, {baseURL: 'http://127.0.0.1:1234/v1'}, 'the provider options stay connection-only');
+  const capped = normalizeLocalSettings({endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234', contextTokens: 131072}}});
+  assert.deepEqual(opencodeProviderConfig({settings: capped, model: 'm', sampling}).config.provider.lmstudio.models.m.limit, {context: 131072, output: 2048});
+  assert.deepEqual(opencodeProviderConfig({settings: capped, model: 'm', sampling: {temperature: 1}}).config.provider.lmstudio.models.m,
+    {name: 'm', options: {temperature: 1}, limit: {context: 131072, output: 32768}}, 'no maxTokens: the limit stays what it was');
 });

@@ -26,7 +26,7 @@ export const JEV_TIER_CONFIDENCE = 0.6;
 // The bar for sending finished work back once: its own bar, as TypeSafe asks (one per action, chosen
 // on one's own cases by what a wrong call costs). A Choice between two options reports a confidence of
 // 2 × probability − 1 (checked against 95 recorded verdicts), so 0.9 is a probability of 0.95. Measured
-// on the real Jev over the 27 accepted build tasks of ACE e3bd01d5, 6 of them later found wrong: 0.9
+// on the real Jev over the 27 accepted build tasks of session e3bd01d5, 6 of them later found wrong: 0.9
 // sends back 4 wrong and 2 good, 0.8 sends back 4 and 5, 0.6 sends back 5 and 8. A needless send-back
 // costs a worker round, and a wrong result missed here is still read by the orchestrator.
 export const JEV_SEND_BACK_CONFIDENCE = 0.9;
@@ -261,7 +261,7 @@ export const VERDICT_QUESTIONS = {
       true: example('The orders ask to add, edit or remove files.',
         'Add a --version flag to the CLI, with a test.', 'Write scripts/install-smoke.sh.'),
       false: example('The orders ask only to read, run or report.',
-        'Review remove.ts and report findings only; do not change code.', 'Where does Ace validate workspace names?'),
+        'Review remove.ts and report findings only; do not change code.', 'Where does the app validate workspace names?'),
     },
   },
 };

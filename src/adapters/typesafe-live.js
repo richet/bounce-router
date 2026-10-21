@@ -117,7 +117,7 @@ async function askVerdict({stream, client, state, profile, settings, controller}
   let result;
   try {
     // The service refuses a state over its token limit, and characters are a poor measure of tokens:
-    // found live (ACE e3bd01d5), 8 of 31 reviews were refused and the work accepted unreviewed, their
+    // found live (session e3bd01d5), 8 of 31 reviews were refused and the work accepted unreviewed, their
     // diffs long test logs. A refused review is asked again with half the diff, down to DIFF_CHARS_MIN.
     for (let shown = DIFF_CHARS, asked = state; ; ) {
       try {

@@ -37,7 +37,7 @@ test('rendered: the suggestion sits dim after the caret while the input is empty
   assert.match(typed, /❯ re/);
 });
 
-// Found live (ACE session): the prefill never appeared. It was computed from the main.terminal
+// Found live (a session): the prefill never appeared. It was computed from the main.terminal
 // row's text, which only carries a failure reason, and only on a daemon-woken turn; a turn's
 // answer lives in its last `assistant` row. The answer of a turn is that row, after the turn's
 // own prompt (user or handoff), and only when the turn completed.

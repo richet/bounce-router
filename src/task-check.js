@@ -1,6 +1,6 @@
-// A task's check: the command its orders name as proof the work is done (Daniel, 2026-09-28). bounce
+// A task's check: the command its orders name as proof the work is done (2026-09-28). bounce
 // runs it itself, in the worker's copy, once the worker has finished; only work that passes is put
-// in the checkout. Found live (ACE d1bc0206, task 99bd27ea): work nobody had verified was integrated
+// in the checkout. Found live (session d1bc0206, task 99bd27ea): work nobody had verified was integrated
 // after its one send-back, because the only judge was a review of the report's wording.
 import {spawn} from 'node:child_process';
 import {vendorEnv} from './adapters/live-common.js';
@@ -25,7 +25,7 @@ function onlyLooks(part) {
 }
 
 // A check made only of commands that look for files or text proves that they exist, not that the
-// work is right. Found live (ACE e3bd01d5): under such checks a local builder wrote the report the
+// work is right. Found live (session e3bd01d5): under such checks a local builder wrote the report the
 // check looked for ("VERDICT: PASS", 0 assertions) beside its own run's "VERDICT: FAIL".
 export const weakCheck = command => String(command).split(/&&|\|\||[;|\n]/).every(onlyLooks);
 

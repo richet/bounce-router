@@ -44,7 +44,7 @@ test('the orders say who to submit to: the job first, auto next, a named AI only
   assert.deepEqual(choosingOrders({agents: false, routingOn: false, localOn: false}), [], 'no agents and no routing: there is nothing to choose between but profiles');
 });
 
-// Found live (ACE session): the orchestrator dispatched an analyst, then spent 19 tool calls of its own
+// Found live (a session): the orchestrator dispatched an analyst, then spent 19 tool calls of its own
 // answering the same question and wrote the next task from its own findings; the analyst's whole
 // 15-minute slot was wasted.
 test('the orders tell the orchestrator to hand off what it dispatched instead of doing it itself', () => {
@@ -54,7 +54,7 @@ test('the orders tell the orchestrator to hand off what it dispatched instead of
   assert.equal(text.includes('cancel the task first'), true);
 });
 
-// Found live (ACE session): the orchestrator spent 1560 s of a 2115 s turn inside seven `bounce wait`
+// Found live (a session): the orchestrator spent 1560 s of a 2115 s turn inside seven `bounce wait`
 // calls — a 35-minute turn held open, its whole context live, doing nothing bounce would not have
 // done for it with a handoff. And a /steer delivered into that turn was read only when the wait returned.
 test('the orders make ending the turn the rule after dispatch, and a wait short and for a dependent step only', () => {

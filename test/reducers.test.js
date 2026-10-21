@@ -47,10 +47,10 @@ test('a fallback attempt is not stale because the task it replaced was', () => {
   assert.equal(quiet.verdicts.includes('silent'), true, 'its own 5 minutes of silence, measured from t1');
   assert.equal(quiet.lastProgressAt, t1, 'measured from its own start, not the lineage root\'s');
 
-  // A fresh attempt is owed a full lease (Daniel, 2026-09-22). Live, this fallback launched with 58 s
+  // A fresh attempt is owed a full lease (2026-09-22). Live, this fallback launched with 58 s
   // left of the lineage's lease — the predecessor had burned 14 of the 15 minutes — so it could only fail.
-  // The lease runs from THIS attempt's start. Since 2026-09-30 so does the ceiling (Daniel: a job's time
-  // is not shared between its attempts; ACE e3bd01d5 lost two Sonnet retries to a ceiling a slow local
+  // The lease runs from THIS attempt's start. Since 2026-09-30 so does the ceiling (the user: a job's time
+  // is not shared between its attempts; session e3bd01d5 lost two Sonnet retries to a ceiling a slow local
   // retry had spent). The attempt allowance is what stops a job buying more time by failing over and over.
   assert.equal(quiet.startedAt, t1, 'elapsed and the ceiling are measured from this attempt\'s own start');
   assert.equal(quiet.ceilingAt, t1 + 3600000);

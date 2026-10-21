@@ -1,4 +1,4 @@
-export {opencodeProviderConfig} from './local-opencode-provider.js';
+export {opencodeProviderConfig, samplingOptions} from './local-opencode-provider.js';
 import {opencodeProviderConfig} from './local-opencode-provider.js';
 
 // ---------------------------------------------------------------------------------------------

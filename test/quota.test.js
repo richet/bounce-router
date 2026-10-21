@@ -225,7 +225,7 @@ test('the sidebar panel names each window in words, says N% used, and draws the 
     muse: {provider: 'muse', windows: [], error: 'muse does not report quota'},
   };
   const panel = quotaPanel(store, ['claude', 'codex', 'muse'], {width: 30, now});
-  // Every number says what it is (Daniel, 2026-10-01): a legend over the block, the window in words, "N% used",
+  // Every number says what it is (2026-10-01): a legend over the block, the window in words, "N% used",
   // the bar as the share used and nothing else, and when it resets on the bar's own row.
   assert.deepEqual(panel, [
     'QUOTA · of your whole plan',
@@ -309,7 +309,7 @@ test('window titles and reset text read the way a plan states them', () => {
 });
 
 test('modelPanel: ranked entries each get a labelled row and a bar sized against the top spender', () => {
-  // In and out apart (Daniel, 2026-10-02): two quantities, two bars, each against the top of its own kind.
+  // In and out apart (2026-10-02): two quantities, two bars, each against the top of its own kind.
   const entries = [
     {model: 'claude-opus-5[1m]', provider: 'claude', tokens: 762000, usage: {input: 12000, cache_read: 750000, output: 8000}, turns: 1},
     {model: 'gpt-5-codex', provider: 'codex', tokens: 381000, usage: {input: 381000, output: 16000}, turns: 1},

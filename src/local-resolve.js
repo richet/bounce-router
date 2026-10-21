@@ -26,7 +26,7 @@ export function createLocalResolver({local, discover = discoverLocalModels} = {}
     // from one catalog, so asking for the raw ref of a model already loaded under an alias makes it
     // load a second copy of the weights (observed live as a worker that hung on a zero-token row).
     const model = localResolved.instance ?? localResolved.model;
-    const opencode = opencodeProviderConfig({settings, endpoint: localResolved.endpoint, model});
+    const opencode = opencodeProviderConfig({settings, endpoint: localResolved.endpoint, model, sampling: profile.localOptions?.sampling});
     return {...profile, model, localResolved, apiKeyEnv: settings.endpoints[localResolved.endpoint].apiKeyEnv,
       opencodeConfig: opencode.config, providerID: opencode.providerID};
   }

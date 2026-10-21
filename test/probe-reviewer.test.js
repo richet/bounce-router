@@ -1,8 +1,8 @@
 // The probing reviewer (docs/plans/probing-reviewer.md). Found live: a read-only reviewer was
 // told to run probes it had no tool for, reasoned through the whole tree for 60 minutes instead, and was
-// killed while writing its conclusion, taking every finding with it. A `probe` worker may read and run
-// commands but never change anything; a reviewer states each finding as it confirms it, and bounce keeps
-// them, so a stopped review still hands its findings on.
+// killed while writing its conclusion, taking every finding with it. A reviewer runs commands like any
+// write worker (its orders, not a sandbox, keep it from changing the tree); it states each finding as it
+// confirms it, and bounce keeps them, so a stopped review still hands its findings on.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -19,31 +19,31 @@ const root = t => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-pr
 const waitFor = async (fn, {timeout = 2000} = {}) => { const start = Date.now(); for (;;) { const v = fn(); if (v) return v; if (Date.now() - start > timeout) throw new Error('timed out'); await new Promise(r => setTimeout(r, 5)); } };
 const MIN = 60000;
 
-test('P1 probe is a policy: an agent file may declare it, it ranks between read-only and plan, and it passes the review gate', async t => {
-  assert.equal(agentMetadata('---\nname: rev\ndescription: d\npolicy: probe\n---\nbody').policy, 'probe');
-  assert.throws(() => agentMetadata('---\nname: rev\ndescription: d\npolicy: delete\n---\nbody'), {message: 'policy must be read-only, probe or write'});
-  assert.equal(effectivePolicy({policy: 'probe', mode: 'yolo'}), 'probe');
-  assert.deepEqual(['read-only', 'probe', 'plan', 'write', 'yolo'].map(p => POLICY_RANK[p]), [0, 1, 2, 3, 4]);
+test('P1 a policy is read-only or write, and a write reviewer passes the review gate', async t => {
+  assert.throws(() => agentMetadata('---\nname: rev\ndescription: d\npolicy: probe\n---\nbody'), {message: 'policy must be read-only or write'});
+  assert.throws(() => agentMetadata('---\nname: rev\ndescription: d\npolicy: delete\n---\nbody'), {message: 'policy must be read-only or write'});
+  assert.equal(effectivePolicy({policy: 'write', mode: 'yolo'}), 'yolo');
+  assert.deepEqual(['read-only', 'plan', 'write', 'yolo'].map(p => POLICY_RANK[p]), [0, 1, 2, 3]);
   const dir = root(t);
   const session = new Session(dir, {root: dir});
   const scheduler = createScheduler({session, adapters: {A: fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done'}])},
-    profiles: {build: {adapter: 'A', model: 'w', mode: 'yolo', fallback: []}, rev: {adapter: 'A', model: 'w', mode: 'yolo', fallback: [], policy: 'probe'}}, watchdog: {interval: null}});
+    profiles: {build: {adapter: 'A', model: 'w', mode: 'yolo', fallback: []}, rev: {adapter: 'A', model: 'w', mode: 'yolo', fallback: [], policy: 'write'}}, watchdog: {interval: null}});
   t.after(() => scheduler.close());
   const row = scheduler.submit({parent: null, profile: 'build', orders: 'x', deadline: null, review: {completion: 'rev'}});
   await waitFor(() => session.events.find(e => e.task === row.task && (e.kind === 'task.started' || e.kind === 'task.failed')));
-  assert.equal(session.events.some(e => e.task === row.task && e.kind === 'task.failed' && e.reason === 'review'), false, 'a probe reviewer is a reviewer');
+  assert.equal(session.events.some(e => e.task === row.task && e.kind === 'task.failed' && e.reason === 'review'), false, 'a write reviewer is a reviewer');
 });
 
-test('P2 a probe agent keeps command tools by skipping unsupported AIs', t => {
+test('P2 a reviewer that runs commands can be played by every AI it lists, none skipped', t => {
   const dir = root(t);
   fs.mkdirSync(agentStore(dir), {recursive: true});
-  fs.writeFileSync(path.join(agentStore(dir), 'reviewer.md'), serializeAgent({name: 'reviewer', description: 'Reviews.', policy: 'probe',
+  fs.writeFileSync(path.join(agentStore(dir), 'reviewer.md'), serializeAgent({name: 'reviewer', description: 'Reviews.', policy: 'write',
     models: ['claude/sonnet', 'codex/gpt-5.6-terra', 'lmstudio/qwen3.8-27b-mlx@4bit'], prompt: 'Review.'}));
   const view = validateOrchestration({operation: 'orchestrator', mode: 'yolo', orchestrator: 'main', order: ['claude', 'codex', 'muse'],
     models: {claude: 'sonnet', codex: 'gpt-5.6-terra'}, profiles: {main: {adapter: 'claude'}}}, undefined, {roles: loadAgents(dir)});
   const chain = Object.values(view.profiles).filter(p => p.role === 'reviewer');
-  assert.deepEqual(chain.map(p => [p.adapter, p.policy, p.agent.policy]), [['codex', 'probe', 'probe'], ['opencode', 'probe', 'probe']]);
-  assert.equal(view.skipped.every(item => item.reason === 'adapter cannot run isolated checks'), true);
+  assert.deepEqual(chain.map(p => [p.adapter, p.policy]), [['claude', 'write'], ['codex', 'write'], ['opencode', 'write']]);
+  assert.deepEqual(view.skipped.filter(item => item.agent === 'reviewer'), []);
 });
 
 test('P3 a reviewer\'s FINDING lines are kept as they come, and a stopped review hands them on in its deadline row', async t => {
@@ -94,7 +94,7 @@ test('P4 a conclusion still being written is waited for up to the cap; one that 
 
 test('P5 the orders split a heavy review by risk area', () => {
   const text = breakdownOrders(15, {ceiling: 60}).join('\n');
-  assert.equal(text.includes('A review of a whole phase, or of more than one risk area, is heavy: split it into one reviewer per area (for example locking and journaling, ownership, the CLI), each with the verification commands for its area. Reviewers probe: they run commands but cannot change the tree.'), true);
+  assert.equal(text.includes('A review of a whole phase, or of more than one risk area, is heavy: split it into one reviewer per area (for example locking and journaling, ownership, the CLI), each with the verification commands for its area. Reviewers run commands; their orders, not a sandbox, keep them from changing the tree.'), true);
 });
 
 // Found live: the reviewer hit its step cap, its notice did not parse as a verdict, and the

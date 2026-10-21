@@ -40,7 +40,7 @@ const still = findings => (findings.length ? `found: ${findings.map(finding => S
 
 const sentBack = (task, api) => Boolean(api.lastRework?.(task)) || api.roundsUsed(task) >= api.roundsCap(task);
 
-// A task's check that failed decides before any review (Daniel, 2026-09-28): the work goes back once
+// A task's check that failed decides before any review (2026-09-28): the work goes back once
 // with what the check printed; if it still fails, the work is kept and handed to the orchestrator,
 // never put in the checkout. Null when the task names no check, or it passed.
 function failedCheckIntent(task, api) {
@@ -91,12 +91,12 @@ export const defaultStrategy = {
     // orchestrator gets what the reviewer said and picks the way forward with the tools it has.
     if (v.verdict === 'unreadable') {
       const said = String(v.excerpt ?? '').trim();
-      return {action: 'escalate', reason: 'review_unreadable', text: `${v.launchFailed ? 'The review could not start.' : 'The review ended without a verdict bounce could read.'} Decide: accept the work (task.accepted with what you checked), send it back (task.rework with what to fix), or check it another way — another reviewer, a probe, or yourself.${said ? ` The reviewer said: ${said.slice(-600)}` : ' The reviewer said nothing.'}`};
+      return {action: 'escalate', reason: 'review_unreadable', text: `${v.launchFailed ? 'The review could not start.' : 'The review ended without a verdict bounce could read.'} Decide: accept the work (task.accepted with what you checked), send it back (task.rework with what to fix), or check it another way — another reviewer, an analyst, or yourself.${said ? ` The reviewer said: ${said.slice(-600)}` : ' The reviewer said nothing.'}`};
     }
     const findings = v.findings ?? v.questions ?? [];
     // A worker cannot rework away what it already reported as left: when the only findings are that the
     // report names remaining work and that acceptance is not met, and the worker's report says what
-    // remains, the task is accepted and the orchestrator decides the follow-up. Found live (ACE d1bc0206,
+    // remains, the task is accepted and the orchestrator decides the follow-up. Found live (session d1bc0206,
     // f17544d3): a live proof that also found two product bugs was sent back for them and then failed.
     const remaining = String(api.remainingOf?.(task) ?? '').trim();
     const fired = Array.isArray(v.fired) ? v.fired : [];

@@ -29,7 +29,7 @@ test('idle frames produce no writes and typing leaves transcript untouched',()=>
  assert.equal(frameDiff(before,['title','transcript','❯ /m']),'\x1b[3;1H\x1b[2K❯ /m');
  assert.equal(frameDiff(['a','b'],['a']),'\x1b[2;1H\x1b[2K');
 });
-// Daniel, 2026-09-27: the Codex desktop app is off limits — its bundled CLI is never a candidate.
+// 2026-09-27: the Codex desktop app is off limits — its bundled CLI is never a candidate.
 test('Codex discovery respects override and PATH and never falls back to the desktop app\'s bundled CLI',()=>{
  const options={env:{PATH:'/bin'},home:'/user',accessible:p=>p==='/Applications/ChatGPT.app/Contents/Resources/codex'||p==='/Applications/Codex.app/Contents/Resources/codex'};
  assert.equal(resolveExecutable('codex',undefined,options),'codex');

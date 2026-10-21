@@ -1,4 +1,4 @@
-// docs/plans/analytics.md (Daniel, 2026-10-01): what a session cost and what it got, folded from the journal.
+// docs/plans/analytics.md (2026-10-01): what a session cost and what it got, folded from the journal.
 // The fold is checked on a journal written here with known counts; the same fold run on the real journals
 // is checked by hand against the figures in docs/PROGRESS.md.
 import test from 'node:test';

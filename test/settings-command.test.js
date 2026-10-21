@@ -1,4 +1,4 @@
-// /config (Daniel, 2026-10-01): settings seen and changed from the TUI; the file keeps only what the user set;
+// /config (2026-10-01): settings seen and changed from the TUI; the file keeps only what the user set;
 // a wrong value is refused with the loader's own words; each line says whether it applies now or next session.
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -54,7 +54,7 @@ test('/config key value saves only that key, validated like the loader, and says
   assert.doesNotThrow(() => config(root), 'the file the command wrote loads');
 });
 
-// Daniel, 2026-10-01: "/config lists it but fails to be interactive in the way other harnesses are". The panel's
+// 2026-10-01: "/config lists it but fails to be interactive in the way other harnesses are". The panel's
 // rows and what Enter does on each come from here; the TUI only moves the cursor and shows the lines.
 test('the panel rows carry value and provenance, and Enter flips a boolean, cycles a choice, and types the rest', t => {
   const root = home(t);
@@ -71,7 +71,7 @@ test('the panel rows carry value and provenance, and Enter flips a boolean, cycl
   assert.equal(nextValue(by.order), null, 'a list is typed');
 });
 
-// Daniel, 2026-10-01: filter the options as you type, and explain what each does.
+// 2026-10-01: filter the options as you type, and explain what each does.
 test('every setting has an explanation, and typing filters the rows by key or by what they do', t => {
   const root = home(t);
   const entries = settingsEntries(root);

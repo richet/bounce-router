@@ -25,14 +25,14 @@ import {
 // journal — each ended only by the user cancelling. The row itself carries the question that was waiting.
 const HANDOFF_KINDS = OUTCOME_KINDS;
 const HANDOFF_TEXT_MAX = 2000; // per task: a final report summary or failure text, never a transcript
-// The worker's answer goes with it whole: found live (ACE e3bd01d5), the orchestrator asked for the full
+// The worker's answer goes with it whole: found live (session e3bd01d5), the orchestrator asked for the full
 // answer after 41 of 43 handoffs. Answers were 1,140 characters at the median and 10,588 at most.
 const HANDOFF_ANSWER_MAX = 12000;
 // How long after a vendor refuses a typed message bounce tries it once more.
 const TYPED_RETRY_MS = 3000;
 const HANDOFF_DELAY_MS = 1000; // several tasks ending together become one wake-up turn
 // The quiet sweep (docs/plans/lessons-and-sweep.md §2): nothing in flight, held work waiting, and no row
-// for sweepMs — the orchestrator is asked once what is waiting on it. Found live (ACE e3bd01d5,
+// for sweepMs — the orchestrator is asked once what is waiting on it. Found live (session e3bd01d5,
 // 2026-09-30): two held tasks waited 91 minutes with nothing running and nobody noticing.
 const SWEEP_MINUTES = 20;
 const SWEEP_PROMPT = 'Decide what is waiting on you: accept it (task.accepted with what you checked), send it back (task.rework with what to fix), or retry it on another AI (retryOf) — or say that nothing is, and end your turn.';
@@ -162,7 +162,7 @@ export function createMainService({session, adapters, profile, settings, profile
   const replayRequest = session.events.findLast(event => event.kind === 'main.requested'
     && !session.events.some(later => later.seq > event.seq && later.requestId === event.requestId
       && ['main.starting', 'main.started', 'main.terminal', 'main.blocked'].includes(later.kind)));
-  // Found live (ACE d1bc0206): a turn orphaned by a crash blocked the orchestrator on every later restart,
+  // Found live (session d1bc0206): a turn orphaned by a crash blocked the orchestrator on every later restart,
   // for good — nothing cleared it. A turn whose vendor process was recorded and is now gone ended with
   // it; one with no record (older journals) stays blocked until the user says it is gone (unblock).
   const startedRow = requestId => session.events.findLast(event => event.kind === 'main.started' && event.requestId === requestId);
@@ -372,8 +372,8 @@ export function createMainService({session, adapters, profile, settings, profile
           : await adapter.launch({...options, orders: text});
       } catch (error) {
         // The thread this session last used cannot be reopened. Found live: the thread was still in the
-        // app's ~/.codex after bounce moved Codex to its own home ("no rollout found", ACE 36ecaacd), and
-        // a reopen that never answered left a session silent (ACE d1bc0206). Whatever the reason, a fresh
+        // app's ~/.codex after bounce moved Codex to its own home ("no rollout found", session 36ecaacd), and
+        // a reopen that never answered left a session silent (session d1bc0206). Whatever the reason, a fresh
         // thread from the session's handoff carries the conversation forward. A usage limit or a missing
         // executable is not the thread's fault: those go to the next provider, as before.
         if (!run.resumed || run.cancelled || closed || run.finished || ['limited', 'missing'].includes(error?.code)) throw error;
@@ -425,7 +425,7 @@ export function createMainService({session, adapters, profile, settings, profile
       const status = run.cancelled || closed ? 'interrupted' : result?.status;
       if (['limited', 'missing'].includes(status)) return status;
       // A message the user typed, refused by the vendor before the orchestrator said or did anything,
-      // is tried once more. Found live (ACE e3bd01d5): "model 'gpt-6-sol' is not enabled" on the first
+      // is tried once more. Found live (session e3bd01d5): "model 'gpt-6-sol' is not enabled" on the first
       // message of a session, which was answered when typed again a minute later. A turn that had
       // started working is never run twice, and an outcome bounce handed over has its own retries.
       if (status === 'failed' && !run.wake && !run.retried && !run.spoke) {

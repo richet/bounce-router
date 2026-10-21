@@ -34,7 +34,7 @@ test('overlay: a two-profile table sits on top of the whole shipped roster, in s
   assert.equal(view.profiles.main.model, 'opus', 'the user\'s main');
   assert.equal(view.profiles.claude_haiku.adapter, 'claude');
   assert.deepEqual(view.profiles.build.fallback, ['build_claude', 'claude_fable'], 'shipped fallbacks are kept');
-  assert.equal(view.profiles.scout.policy, 'probe');
+  assert.equal(view.profiles.scout.policy, 'write');
   // every shipped profile is validated like a user-written one: mode, policy and role defaults
   for (const name of shipped.slice(1)) assert.deepEqual([view.profiles[name].mode, view.profiles[name].policy, view.profiles[name].role], ['yolo', 'write', 'builder'], name);
   assert.equal(routingFallback(view.profiles), 'build');
@@ -143,7 +143,7 @@ test('P4 error messages, one case each', () => {
   assert.throws(() => validateOrchestration({...base, profiles: {main: {adapter: 'claude', mode: 'sideways'}}}),
     {message: 'profile main: mode must be yolo or plan'});
   assert.throws(() => validateOrchestration({...base, profiles: {main: {adapter: 'claude', policy: 'delete'}}}),
-    {message: 'profile main: policy must be write, read-only or probe'});
+    {message: 'profile main: policy must be write or read-only'});
   assert.throws(() => validateOrchestration({...base, profiles: {main: {adapter: 'claude'}, build: {adapter: 'claude', fallback: ['ghost']}}}),
     {message: 'profile build: fallback must list known profiles'});
   // Phase 8 §4: the role vocabulary is free-form now (any non-empty label except the reserved

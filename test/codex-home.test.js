@@ -1,4 +1,4 @@
-// Daniel, 2026-09-27: the Codex desktop app is off limits. Every Codex process bounce starts uses
+// 2026-09-27: the Codex desktop app is off limits. Every Codex process bounce starts uses
 // bounce's own Codex home (threads, config, MCP entry, sign-in), never the app's ~/.codex.
 import test from 'node:test';
 import assert from 'node:assert/strict';

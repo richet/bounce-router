@@ -1,4 +1,4 @@
-// Found live (ACE d1bc0206, task f17544d3): a live-proof worker completed, and listed two real product bugs
+// Found live (session d1bc0206, task f17544d3): a live-proof worker completed, and listed two real product bugs
 // it had found as remaining. Jev read that as unfinished (remaining_work, unmet_acceptance at 0.83) and sent
 // it back; the rework then exhausted the job and the evidence-backed result was failed. A worker cannot
 // rework away what it already reported as left: the task is accepted and the orchestrator gets the follow-ups.
@@ -28,5 +28,5 @@ test('a review with no readable verdict goes to the orchestrator with what the r
   const decision = defaultStrategy.onReviewVerdict('t', [{verdict: 'unreadable', excerpt: 'I think it is fine, mostly.'}], view, api(''));
   assert.equal(decision.action, 'escalate');
   assert.equal(decision.reason, 'review_unreadable');
-  assert.match(decision.text, /^The review ended without a verdict bounce could read\. Decide: accept the work \(task\.accepted with what you checked\), send it back \(task\.rework with what to fix\), or check it another way — another reviewer, a probe, or yourself\. The reviewer said: I think it is fine, mostly\.$/);
+  assert.match(decision.text, /^The review ended without a verdict bounce could read\. Decide: accept the work \(task\.accepted with what you checked\), send it back \(task\.rework with what to fix\), or check it another way — another reviewer, an analyst, or yourself\. The reviewer said: I think it is fine, mostly\.$/);
 });

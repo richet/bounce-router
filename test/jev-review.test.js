@@ -154,7 +154,7 @@ test('a review that returned no verdict at all is accepted with advice saying so
   assert.equal(session.events.findLast(e => e.kind === 'task.accepted').advice, 'The review gave no verdict (network); check the work yourself before building on it.');
 });
 
-// Reversed 2026-09-25 (Daniel: "much rejection of done tasks… even simpler tasks take long"). Live,
+// Reversed 2026-09-25 (the user: "much rejection of done tasks… even simpler tasks take long"). Live,
 // 159f4746 task 61ce01b4: a sonnet change whose gate passed was blocked by Jev leaning rework at 0.53 and
 // 0.52 (the identical re-ask), then accepted by hand. An unconfident answer means today's behaviour —
 // with Jev off a completed task is accepted — so it is accepted, with Jev's lean attached as advice.
@@ -419,7 +419,7 @@ test('a rework whose worker cannot be resumed falls back to the next AI, exactly
   }
 });
 
-// Found live (ACE): a repository that has no commit yet — `git init` and nothing tracked — is inside a
+// Found live : a repository that has no commit yet — `git init` and nothing tracked — is inside a
 // work tree, so the no-repository skip did not fire, and every diff Jev was shown was empty. A worker
 // that made the change and passed every gate was sent back for rework three times on `empty_diff`.
 test('a repository with no commit blocks the required Jev gate', async t => {
@@ -440,7 +440,7 @@ test('a repository with no commit blocks the required Jev gate', async t => {
   assert.equal(asked, 1);
 });
 
-// Found live (ACE, task 79981b05): a worker made the change and passed every gate, Jev sent it back,
+// Found live (task 79981b05): a worker made the change and passed every gate, Jev sent it back,
 // it redid every gate, Jev sent it back with the SAME five checks, and a third identical round began.
 // Rewritten 2026-09-27: a review sends work back at most once. After that one rework round the task is
 // accepted whatever the verdict, with the review's findings as advice — never blocked, never a third round.

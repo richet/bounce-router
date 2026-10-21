@@ -139,7 +139,7 @@ test('logical retry preserves job budget identity across changed instructions, i
   const first = scheduler.submit({task: 'first', profile: 'reader', orders: 'Review', owns: ['src/a.js'], budget: {starts: 2}});
   await ended;
   const retryEnded = next(session, e => e.kind === 'orchestration.action.settled' && e.task === 'retry');
-  // Found live (ACE session 159f4746, task d59ce7f5): a green fix stayed blocked on a two-line
+  // Found live (session 159f4746, task d59ce7f5): a green fix stayed blocked on a two-line
   // change outside `owns`, and a retryOf could not widen `owns` to recover — prepare() always
   // forced the original's. A retry's own declared `owns` now replaces the inherited list;
   // omitting it (as most retries do) still inherits, same as before.

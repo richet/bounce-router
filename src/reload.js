@@ -75,7 +75,7 @@ export async function validate(root = projectRoot, emit = () => {}) {
 function daemonJsonPath(dir) { return path.join(dir, 'daemon.json'); }
 
 // A detached daemon used to run with stdio 'ignore', so whatever killed it was lost. Found live
-// (ACE d1bc0206): the daemon died at 08:14 with nothing on record, and the TUI showed its tasks as
+// (session d1bc0206): the daemon died at 08:14 with nothing on record, and the TUI showed its tasks as
 // working for four more hours. Its stdout and stderr now go to <session>/daemon.log (V8's own
 // out-of-memory message included), rotated once past 10 MB.
 const DAEMON_LOG_MAX = 10 * 1024 * 1024;
@@ -90,7 +90,7 @@ const daemonLogTail = dir => { try { return fs.readFileSync(path.join(dir, 'daem
 
 // A bounce daemon for this session that holds its lock but never became ready (no daemon.json of
 // its own) is stuck, and every resume fails behind it with "already open in another bounce process".
-// Found live (ACE d1bc0206): a daemon that failed to start kept the lock for half an hour. Such a
+// Found live (session d1bc0206): a daemon that failed to start kept the lock for half an hour. Such a
 // process — this session's own daemon command line, alive past `minAgeMs` — is stopped (SIGTERM,
 // then SIGKILL) so the resume can start a fresh one. Anything else holding the lock is left alone.
 const elapsedMs = etime => {
@@ -184,13 +184,13 @@ export function defaultTarget(profiles = {}, orchestrator = 'main', {routingOn =
 export function choosingOrders({agents = false, routingOn = false, localOn = false} = {}) {
   if (!agents && !routingOn) return [];
   return ['Who to submit to — the job, not the AI:',
-    ...(agents ? ['    1. An agent, by the job the task is: analyst to inspect and run checks, builder to implement (and, when its orders say so, to own shared files and run the full gate), reviewer to review, debugger to root-cause a failure that resisted a first attempt. Analysts and verifiers run commands in disposable workspaces by default. Explicit read-only profiles are for source-only inspection.'] : []),
+    ...(agents ? ['    1. An agent, by the job the task is: analyst to inspect and run checks, builder to implement (and, when its orders say so, to own shared files and run the full gate), reviewer to review, debugger to root-cause a failure that resisted a first attempt. Analysts, reviewers and debuggers run commands in their own working copy like any write agent; their orders say what they must not change. Read-only agents are for source-only inspection.'] : []),
     ...(routingOn ? [`    ${agents ? '2' : '1'}. \`auto\` when no agent is clearly the job: Jev routes it.`] : []),
     `    ${[agents, routingOn].filter(Boolean).length + 1}. A worker profile by name ONLY when the user asks for that specific AI (add \`userAsked: true\` to the task), or for a retry (\`retryOf\`); bounce refuses a first attempt that names a profile otherwise.`,
     'After a failed attempt, you may name the next profile for the retry yourself and say why; first attempts still follow the ordering above. Retry first on the agent\'s own next AI: submit the name after the arrow in its chain above (builder~2, then builder~3) with retryOf; it is the lightest AI that has not tried the task. Name a cloud AI yourself only when the cause needs a stronger tier: a mid-tier model (e.g. Sonnet) for routine implementation a local worker could not finish; the top tier (e.g. Opus) only for hard design, cross-module debugging, or work a mid-tier attempt already failed.',
     routingOn ? 'Do not pick a tier or a model yourself: for an agent or `auto`, Jev weighs the orders and picks the AI per task.'
       : 'An agent runs on the AIs in the order its file lists them; naming a profile skips that list.',
-    'Every task.submitted declares requires: ["read"], ["read", "exec"], or ["read", "exec", "write"] to match its deliverables; running a command needs exec even with no edits. Probe tasks run in disposable copies. Never ask a read-only analyst to run git, checks, lint or tests.',
+    'Every task.submitted declares requires: ["read"], ["read", "exec"], or ["read", "exec", "write"] to match its deliverables; running a command needs exec even with no edits. Never ask a read-only analyst to run git, checks, lint or tests.',
     'A live container check (starting Docker, inspecting or running one) needs requires including "docker", and only a worker that may write gets it: a read-only or probing analyst never reaches Docker, because a container can write the checkout. Send live container checks to a builder.',
     'Once you have dispatched a task, end your turn: say in a line what you dispatched and what comes next, then stop. bounce wakes you with each outcome as your next turn (a `handoff` row), so nothing is lost. Do not hold your turn open in `bounce wait` while workers run — a turn held open keeps its whole context live and idle (observed: 74% of a 35-minute turn spent waiting), and do not investigate the same question yourself in parallel — that spends the worker\'s whole slot for nothing. If you must take the work back, cancel the task first.',
     ...(localOn ? ['Local models are part of the normal path, not a special request: an agent runs on a local model when one fits the task, at no cost — do not wait for the user to ask for them, and do not route around them by naming a cloud profile.',
@@ -233,7 +233,7 @@ export const breakdownOrders = (minutes, {ceiling = Math.max(TASK_CEILING_MINUTE
   'phases run in sequence without you polling. Each chunk gets disjoint owned paths, its own acceptance and how to verify it.',
   'Owned paths are where a chunk\'s work lands, not a fence: they tell the worker where its work belongs and help you plan chunks that can run side by side. Bounce integrates whatever the worker actually changed, and refuses only a file that changed in the checkout in the meantime (a conflict) — never tell a worker to stop over a change outside its owned paths.',
   'Acceptance must be reachable with the authority you grant: never require live proof (Docker, a real run) from a worker whose orders forbid it — grant it (`requires` docker) or plan the live check as its own task.',
-  'A review of a whole phase, or of more than one risk area, is heavy: split it into one reviewer per area (for example locking and journaling, ownership, the CLI), each with the verification commands for its area. Reviewers probe: they run commands but cannot change the tree.',
+  'A review of a whole phase, or of more than one risk area, is heavy: split it into one reviewer per area (for example locking and journaling, ownership, the CLI), each with the verification commands for its area. Reviewers run commands; their orders, not a sandbox, keep them from changing the tree.',
   'Review each phase before the next one starts: read what the chunks produced, integrate, run the gate, then submit the next',
   'phase. A chunk that stops making progress or reaches the ceiling is asked for its conclusion and reported as is: resubmit what is left with that progress in its orders, or do the small remaining step yourself.',
   'bounce continues a worker that hits its step limit while progressing (up to 3 times); when a local worker still fails, read the actual cause in its outcome (step limit, blocked, or an error) before switching AI, and prefer retrying the same local worker when the cause was the step limit or a fixable command mistake.', ''];
@@ -331,7 +331,7 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     'Local discovery checks eligibility at dispatch. A downloaded model is not necessarily loaded or tool-capable.',
     'If the user asks for a LOCAL worker specifically and no agent can run on one, report that and point to /local on and /local setup; do not quietly substitute a cloud worker for that request.',
     'Capacity waits, progress and failures are journaled. Do not infer a worker crash from silence alone; inspect its latest task state.',
-    'A local worker (… via opencode) uses the workspace and tools allowed by its policy: read-only agents read and search but cannot run commands; probe agents can run sandboxed verification commands; write agents edit files and run commands in their assigned workspace. Its answer is its report. Never ask a read-only analyst to claim it ran tests; delegate execution to a command-capable worker and cite its results.',
+    'A local worker (… via opencode) uses the workspace and tools allowed by its policy: read-only agents read and search but cannot run commands; write agents edit files and run commands in their assigned workspace. Its answer is its report. Never ask a read-only analyst to claim it ran tests; delegate execution to a command-capable worker and cite its results.',
     'Require observed tests from local builders, and review their diff as you would any worker\'s.',
     // The view prefills the input from this line (src/tui/suggestion.js): Tab accepts it, Enter sends it.
     // Found live (session 159f4746): it sent a user-requested commit to workers seven times; none had git.

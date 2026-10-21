@@ -174,7 +174,7 @@ test('a report synthesized from an artifact names the changed files and a per-fi
   assert.equal(synthesis.report.text, 'src/a.js: +3 -2\nsrc/b.js: +1 -0\nsrc/c.js: -2');
 });
 
-// Found live (ACE d1bc0206, task 99bd27ea): a 17-line change to a 1124-line file was reported as
+// Found live (session d1bc0206, task 99bd27ea): a 17-line change to a 1124-line file was reported as
 // `+1141 -127` (the whole new file, and the lines of the old file's 4096-character preview).
 test('a report synthesized from an artifact counts the lines that changed when the artifact has them', () => {
   const artifact = {
@@ -194,7 +194,7 @@ test('a report synthesized from an artifact bounds the file list in its summary'
   assert.equal(synthesis.report.summary, 'No summary from the worker; it changed 8 file(s): src/f0.js, src/f1.js, src/f2.js, src/f3.js, src/f4.js, and 3 more');
 });
 
-test('a report a local model wrote as tool-call markup is read from its parameters (ACE d1bc0206 seq 1685)', () => {
+test('a report a local model wrote as tool-call markup is read from its parameters (session d1bc0206 seq 1685)', () => {
   const answer = '</parameter>\n<parameter=next>\n\n</parameter>\n<parameter=summary>\nP4 task execution fully implemented: src/tasks/operations/run.ts, contract tests (287 total, 0 failures).\n</parameter>\n<parameter=remaining>\n\n</parameter>\n<parameter=evidence>\n[]\n</parameter>\n</function>\n</tool_call>';
   const inspected = inspectFinalReport(answer);
   assert.equal(inspected.diagnostic, 'malformed_report: phase (required string)');

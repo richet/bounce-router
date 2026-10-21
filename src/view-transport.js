@@ -83,7 +83,7 @@ export async function createViewServer({session, main, token, onControl = () => 
     channel.once('disconnect', () => { clearTimeout(timer); host?.detach(); sockets.delete(socket); });
   });
   // The daemon holds the session lock, so a socket already at this path is a dead daemon's leftover
-  // (a crashed listener never removes its file). Found live (ACE d1bc0206): it made every resume
+  // (a crashed listener never removes its file). Found live (session d1bc0206): it made every resume
   // fail with EADDRINUSE. bus.js clears its own socket the same way.
   try { fs.unlinkSync(socketPath); } catch {}
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(socketPath, resolve); });

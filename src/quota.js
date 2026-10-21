@@ -234,7 +234,7 @@ export function quotaReport(store, order, now = Date.now()) {
 }
 
 // --- Sidebar panel -------------------------------------------------------
-// A window is named in words (Daniel, 2026-10-01: "if the bars to the right can't be understood they are
+// A window is named in words (2026-10-01: "if the bars to the right can't be understood they are
 // not useful"): the span it covers, and for a per-model window, which model. The percentage is "used".
 const windowTitles = {'1h': 'Hourly window', '5h': '5-hour window', '1d': 'Daily window', '7d': 'Weekly'};
 export const windowTitle = label => {
@@ -305,8 +305,8 @@ export function quotaPanel(store, order, {width = 30, now = Date.now(), rows = I
     if (detail === 'compact') return [head(provider), p.muted(quotaShort(entry, now))];
     return [...gap, head(provider), ...windows.flatMap(w => line(w, detail, entry.time))];
   });
-  // One line says what every number below is, once (Daniel, 2026-10-01).
-  // Daniel, 2026-10-01: these are the vendor's windows for the whole subscription — every session and app —
+  // One line says what every number below is, once (2026-10-01).
+  // 2026-10-01: these are the vendor's windows for the whole subscription — every session and app —
   // not this session's; the legend says so, and TOKENS below is the one block that is per session.
   const legend = p.muted('QUOTA · of your whole plan');
   let built = [];
@@ -336,7 +336,7 @@ const modelBar = (fraction, width, p) => {
 // Ranked by reducers.modelUsage, so entries[0] is already the top spender: its bar is always
 // full and every other bar reads as a share of it. No usage yet means nothing to rank — hidden,
 // not a placeholder. Same bars -> lines -> compact degradation as quotaPanel, for the same reason.
-// In and out apart (Daniel, 2026-10-02): what a model read (input, cache reads included) and what it wrote
+// In and out apart (2026-10-02): what a model read (input, cache reads included) and what it wrote
 // are two quantities — output is a fraction of a percent of input — so each gets its own bar, scaled against
 // the model that read or wrote the most, and the label row carries both counts.
 const inOf = e => (e.usage?.input ?? 0) + (e.usage?.cache_read ?? 0) || (e.tokens ?? 0);

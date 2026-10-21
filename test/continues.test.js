@@ -1,5 +1,5 @@
-// docs/plans/standing-workers.md step 2 (Daniel, 2026-10-01): a task that continues an earlier one resumes
-// that task's worker session into the new task's own copy instead of launching a stranger. Measured on ACE
+// docs/plans/standing-workers.md step 2 (2026-10-01): a task that continues an earlier one resumes
+// that task's worker session into the new task's own copy instead of launching a stranger. Measured on session
 // e3bd01d5: 21 of 54 local builder sessions were continuations, each re-reading 13 files and 1.4 minutes
 // before its first edit. Probed 2026-10-01 with the real CLIs: OpenCode, Claude and Codex all edit the new
 // copy when resumed into it and told where it is.
@@ -152,7 +152,7 @@ test('a retired worker is not continued: the next task starts a fresh worker, op
   assert.deepEqual([f.rows('task.launch.requested', fresh.task)[0].worker, f.adapters.worker.calls.resume], ['builder#3', 0]);
 });
 
-// docs/plans/standing-workers.md §3, step 4 (Daniel, 2026-10-01: "introduce the handoff too and check on
+// docs/plans/standing-workers.md §3, step 4 (2026-10-01: "introduce the handoff too and check on
 // compact"). Probed with the real Claude CLI: `/compact` on a resumed session cut the next turn's context from
 // ~173k to ~38k tokens and the worker still knew what it had done. A retiring worker can be asked for its own
 // handoff: one more turn on its session, read-only, and its answer opens the next worker of that job.

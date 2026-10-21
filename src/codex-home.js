@@ -1,4 +1,4 @@
-// Bounce's own Codex home. Daniel, 2026-09-27: the Codex desktop app is off limits. Found live: bounce's
+// Bounce's own Codex home. 2026-09-27: the Codex desktop app is off limits. Found live: bounce's
 // Codex threads landed in ~/.codex, which the ChatGPT app lists; bounce's MCP entry lived in the app's
 // config.toml, so the app started `bounce mcp-serve` itself; and without a standalone `codex` bounce ran
 // the binary bundled inside ChatGPT.app. Every Codex process bounce starts uses this home instead: its

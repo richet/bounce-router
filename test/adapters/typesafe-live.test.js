@@ -163,7 +163,7 @@ test('cancel aborts an in-flight request; the stream ends with a skipped unavail
   assert.equal(lastVerdict(events).verdict, 'unavailable');
 });
 
-// Found live (ACE e3bd01d5, 2026-09-29): 8 of 31 completion reviews were refused by the service,
+// Found live (session e3bd01d5, 2026-09-29): 8 of 31 completion reviews were refused by the service,
 // `TypeSafe HTTP 400: {"detail":{"error_type":"max_tokens_exceeded"}}`, and the work was accepted
 // unreviewed. The changes held long test logs; 80,000 characters of those are more tokens than the
 // same length of source.

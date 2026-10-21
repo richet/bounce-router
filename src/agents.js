@@ -14,8 +14,9 @@ import {normalizeLocalSettings} from './local-models.js';
 // The orchestration skill ships the defaults (analyst, builder, debugger, reviewer), so a fresh
 // install has a working team with no file on disk; nothing but `orchestrator` is built in.
 //
-// `policy` is an attribute the file opts into, not what an agent is. `maxSteps` reaches runtimes
-// that can cap steps (OpenCode). `readPaths`/`writePaths`/`commands` apply when the AI is local.
+// `policy` is an attribute the file opts into, not what an agent is: read-only, or write (the default).
+// `maxSteps` reaches runtimes that can cap steps (OpenCode). `readPaths`/`writePaths`/`commands` apply
+// when the AI is local.
 export const SKILL = 'agent-orchestrator';
 export const agentStore = root => path.join(root, 'agents');
 export const projectAgentStore = cwd => path.join(cwd, '.bounce', 'agents');
@@ -26,6 +27,27 @@ export const AUTO_MODEL = 'auto';
 const MODEL_REF = /^[a-z0-9][a-z0-9_-]*\/\S+$/;
 const list = value => value.trim().replace(/^\[([\s\S]*)\]$/, '$1').split(',').map(item => item.trim().replace(/^(["'])([\s\S]*)\1$/, '$2')).filter(Boolean);
 const NAME = /^[a-z0-9][a-z0-9_-]*$/;
+// How the job wants a LOCAL model to sample: sent with each of its requests, so agents sharing one
+// loaded model each get their own. A cloud model in `models:` ignores them (same job, different
+// brain). Each key is optional; one left out falls through to the server's per-model default.
+// src/local-opencode-config.js names them on the wire.
+const number = (min, max, {integer = false, above = false} = {}) => value => {
+  const parsed = Number(value);
+  return value !== '' && Number.isFinite(parsed) && (!integer || Number.isInteger(parsed)) && (above ? parsed > min : parsed >= min) && parsed <= max ? parsed : undefined;
+};
+export const SAMPLING = {
+  thinking: {parse: value => ['on', 'off'].includes(value) ? value : undefined, rule: 'on or off'},
+  temperature: {parse: number(0, 2), rule: 'a number from 0 to 2'},
+  topP: {parse: number(0, 1, {above: true}), rule: 'a number above 0, up to 1'},
+  topK: {parse: number(0, 1000, {integer: true}), rule: 'an integer from 0 to 1000'},
+  minP: {parse: number(0, 1), rule: 'a number from 0 to 1'},
+  presencePenalty: {parse: number(-2, 2), rule: 'a number from -2 to 2'},
+  frequencyPenalty: {parse: number(-2, 2), rule: 'a number from -2 to 2'},
+  repeatPenalty: {parse: number(0, 2, {above: true}), rule: 'a number above 0, up to 2'},
+  // OpenCode never asks for more than 32000 output tokens, whatever it is told.
+  maxTokens: {parse: number(1, 32000, {integer: true}), rule: 'an integer from 1 to 32000'},
+  seed: {parse: number(0, Number.MAX_SAFE_INTEGER, {integer: true}), rule: 'a non-negative integer'},
+};
 const FRONTMATTER = /^﻿?---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/;
 
 export function agentMetadata(text) {
@@ -40,8 +62,7 @@ export function agentMetadata(text) {
   if (fields.name === 'orchestrator') throw new Error('orchestrator is reserved; it is derived from the session, never declared as a role');
   if (!fields.description) throw new Error('frontmatter needs a description');
   const policy = fields.policy ?? 'write';
-  // probe: reads and runs commands, never changes the tree (docs/plans/probing-reviewer.md).
-  if (!['read-only', 'probe', 'write'].includes(policy)) throw new Error('policy must be read-only, probe or write');
+  if (!['read-only', 'write'].includes(policy)) throw new Error('policy must be read-only or write');
   let maxSteps;
   if (fields.maxSteps !== undefined) {
     maxSteps = Number(fields.maxSteps);
@@ -60,8 +81,15 @@ export function agentMetadata(text) {
   for (const key of ['readPaths', 'writePaths', 'commands']) {
     for (const entry of lists[key] ?? []) if (entry.includes('\0') || (key !== 'commands' && (entry.startsWith('/') || entry.split('/').some(part => part === '..')))) throw new Error(`${key} must be relative workspace paths`);
   }
+  const sampling = {};
+  for (const [key, {parse, rule}] of Object.entries(SAMPLING)) {
+    if (fields[key] === undefined) continue;
+    sampling[key] = parse(fields[key]);
+    if (sampling[key] === undefined) throw new Error(`${key} must be ${rule}`);
+  }
   const prompt = text.slice(block[0].length).trim();
-  return {name: fields.name, description: fields.description, policy, ...(maxSteps ? {maxSteps} : {}), ...lists, prompt};
+  return {name: fields.name, description: fields.description, policy, ...(maxSteps ? {maxSteps} : {}), ...lists,
+    ...(Object.keys(sampling).length ? {sampling} : {}), prompt};
 }
 
 // The canonical on-disk form, used by everything that writes an agent (the bridge command, setup):
@@ -70,6 +98,7 @@ export function serializeAgent(agent) {
   const lines = ['---', `name: ${agent.name}`, `description: ${agent.description}`, `policy: ${agent.policy ?? 'write'}`];
   if (agent.maxSteps) lines.push(`maxSteps: ${agent.maxSteps}`);
   for (const key of LISTS) if (agent[key]?.length) lines.push(`${key}: [${agent[key].join(', ')}]`);
+  for (const key of Object.keys(SAMPLING)) if (agent.sampling?.[key] !== undefined) lines.push(`${key}: ${agent.sampling[key]}`);
   lines.push('---', '', (agent.prompt ?? '').trim(), '');
   return lines.join('\n');
 }
@@ -147,8 +176,8 @@ export function handAIsToJev(roles, {orchestrator = 'main'} = {}) {
   return changed;
 }
 
-// Roles that cannot change anything: read-only, or probe (runs commands, writes nothing).
-export const readOnlyRoles = roles => new Set([...roles.values()].filter(role => !role.error && ['read-only', 'probe'].includes(role.policy)).map(role => role.name));
+// Roles that cannot change anything.
+export const readOnlyRoles = roles => new Set([...roles.values()].filter(role => !role.error && role.policy === 'read-only').map(role => role.name));
 
 // What every entry point calls. It never writes: the shipped agents are layered in from the skill.
 export function rolesFor(root, {cwd} = {}) {

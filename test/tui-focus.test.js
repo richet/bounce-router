@@ -21,15 +21,15 @@ const T = '02a9a23d-8722-4f50-b4f5-6204afd58a78';
 
 test('a run of the orchestrator\'s own tool calls is one line naming how many and the last one; details still shows them all', () => {
   const events = [ev(1, 'user', {text: 'continue'}),
-    call(2, 'Read', {file_path: '/repo/docs/PROGRESS.md'}), output(3, '1  # Ace\n2\n3  Design\n4  more\n5  more'),
+    call(2, 'Read', {file_path: '/repo/docs/PROGRESS.md'}), output(3, '1  # Notes\n2\n3  Design\n4  more\n5  more'),
     ev(4, 'status', {provider: 'claude', from: 'main', text: 'hook_started'}),
     call(5, 'Bash', {command: 'ls', description: 'List the tree'}), output(6, 'a\nb'),
     ev(7, 'assistant', {provider: 'claude', text: 'Here is the plan.'}),
     call(8, 'Read', {file_path: '/repo/src/x.ts'})];
   const lines = render(events);
   assert.deepEqual(lines.filter(line => line.includes('tool call')), ['  ⚙ 2 tool calls · last: Bash(List the tree)', '  ⚙ 1 tool call · last: Read(/repo/src/x.ts)']);
-  assert.equal(lines.some(line => line.includes('# Ace') || line.includes('+2 lines')), false, 'no pasted file content in the folded view');
-  assert.equal(render(events, {details: true}).some(line => line.includes('# Ace')), true);
+  assert.equal(lines.some(line => line.includes('# Notes') || line.includes('+2 lines')), false, 'no pasted file content in the folded view');
+  assert.equal(render(events, {details: true}).some(line => line.includes('# Notes')), true);
 });
 
 test('a worker\'s outcome is a block you can read: its whole summary wrapped, and a worker waiting on you is marked with its whole question and how to answer', () => {

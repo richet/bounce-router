@@ -255,7 +255,7 @@ test('classic formatter (no compact) still renders a tool row as a full block', 
   assert.ok(tool.length > 1, 'classic keeps the multi-line tool block (byte-identical path unchanged)');
 });
 
-// Daniel, 2026-09-30, reading the transcript: the wake prompt bounce types at the orchestrator
+// 2026-09-30, reading the transcript: the wake prompt bounce types at the orchestrator
 // ("Continue your orders…") and the "Orchestrator selected codex" line repeated every turn are
 // bounce talking to the orchestrator, not the conversation. The journal keeps both rows; the
 // transcript shows a route only when the AI changes, and a request row never.
@@ -282,7 +282,7 @@ test('the transcript hides the orchestrator request row and a route that repeats
   assert.equal(compact.event(handoff, 120)[0].includes('Worker outcomes not yet handed to you'), true);
 });
 
-// Daniel, 2026-10-01: a prompt typed while a turn runs was held by the view and showed nowhere until it
+// 2026-10-01: a prompt typed while a turn runs was held by the view and showed nowhere until it
 // was sent. A pending prompt is a user row marked `local`: shown where it will land, tagged queued.
 test('a prompt still queued in this view is shown as the user\'s, tagged queued', () => {
   const compact = createFormatter({color: false, compact: true});

@@ -1,6 +1,6 @@
-// Found live (ACE d1bc0206, task 99bd27ea, 2026-09-28): a local worker ended twice without an answer,
+// Found live (session d1bc0206, task 99bd27ea, 2026-09-28): a local worker ended twice without an answer,
 // bounce wrote its report from the file changes, the review objected both times, and after the one
-// send-back the work was put into the checkout with nobody having verified it. Daniel, same day:
+// send-back the work was put into the checkout with nobody having verified it. The same day:
 // a task can name a check that bounce runs in the worker's copy, and the work is integrated only
 // if it passes; work that nothing verified is kept and handed to the orchestrator, not integrated;
 // and a report bounce has to write carries what bounce saw the worker run.
@@ -292,7 +292,7 @@ test('strategy: a check that cannot run is handed to the orchestrator at once', 
   assert.deepEqual([decision.action, decision.reason], ['escalate', 'check_unrunnable']);
 });
 
-// Found live (ACE e3bd01d5, tasks b882c673 and 03437d4d): the check ran a script the task was to
+// Found live (session e3bd01d5, tasks b882c673 and 03437d4d): the check ran a script the task was to
 // write, `sh scripts/install-smoke.sh`. The script was missing (exit 127, "No such file or
 // directory"), bounce read that as a check that cannot run, and held the work for the orchestrator
 // instead of telling the worker. Only a tool the shell cannot find is the check's own fault.
@@ -313,7 +313,7 @@ test('a check whose script is missing is failing work: it goes back to the worke
 });
 
 // A check that only looks for files or text (see test/task-check.test.js) still runs, but passing it
-// verifies nothing (Daniel, 2026-09-29).
+// verifies nothing (2026-09-29).
 const looksForNew = 'grep -q new src/x.js';
 
 test('a weak check is taken, the orchestrator is told at once that passing it will not count, and the work waits for it', async t => {
@@ -369,9 +369,9 @@ test('a worker sent back by a weak check is told to report what happened, not to
   ]]);
 });
 
-// Found live (ACE e3bd01d5): of 21 first checks that failed, 6 (3 local, 3 Sonnet) failed because the
+// Found live (session e3bd01d5): of 21 first checks that failed, 6 (3 local, 3 Sonnet) failed because the
 // worker had saved what the orders asked for outside its working copy, where the project's agent file
-// sends evidence (/private/tmp/ace-work-<date>/evidence). Each cost a rework round.
+// sends evidence (/private/tmp/app-work-<date>/evidence). Each cost a rework round.
 test('a worker is told that what its orders ask it to deliver goes inside its working copy', async t => {
   let orders = null;
   const f = setup(t, {worker: args => {
@@ -385,7 +385,7 @@ test('a worker is told that what its orders ask it to deliver goes inside its wo
   assert.equal(orders.includes('so edit the copy, never the original. What your orders ask you to deliver, evidence and reports included, goes inside this copy at the path they name: a file saved anywhere else on disk is not delivered.'), true, orders);
 });
 
-// Found live (ACE e3bd01d5): the handoff carried a summary of at most 2,000 characters, and the
+// Found live (session e3bd01d5): the handoff carried a summary of at most 2,000 characters, and the
 // orchestrator then asked for the whole answer 41 times out of 43. Answers were 1,140 characters at the
 // median and 10,588 at most.
 test('the handoff carries the worker\'s answer in full, and says how to get the rest of one that is too long', async t => {
@@ -416,7 +416,7 @@ test('the handoff carries the worker\'s answer in full, and says how to get the 
   assert.equal(handoffBlock(f.session, [f.rows('task.accepted', third.task).at(-1)]).includes('answer, in the worker'), false);
 });
 
-// Decided by Daniel on 2026-09-29. Found live (ACE e3bd01d5): 6 results that were wrong were put in the
+// Decided on 2026-09-29. Found live (session e3bd01d5): 6 results that were wrong were put in the
 // checkout as soon as their worker finished, and the orchestrator, who caught all 6 by reading them, had
 // each one corrected afterwards. Work now reaches the checkout by itself only when a check that runs it
 // has passed; anything else waits in the worker's copy for the orchestrator to accept it.

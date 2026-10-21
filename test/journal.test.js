@@ -114,7 +114,7 @@ test('subscriber errors are bounded so a broken subscriber cannot grow memory fo
   assert.equal(session.subscriberErrors.at(-1).row.text, '149');
 });
 
-// Found live (ACE d1bc0206): 75% of a 21 MB journal was Claude's raw stream (assistant 5.4 MB, user tool
+// Found live (session d1bc0206): 75% of a 21 MB journal was Claude's raw stream (assistant 5.4 MB, user tool
 // results 7.8 MB, thinking-token ticks 1.3 MB), each already stored as its own normalized row, and the
 // whole history then overflowed the view channel on resume. Those raw rows reach listeners live only;
 // raw rows that carry anything not stored elsewhere (rate limits, init, results, heartbeats) stay.

@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {agentMetadata, serializeAgent, writeAgent, loadAgents, readOnlyRoles, rolesFor, agentStore, projectAgentStore, installedSkillAgents} from '../src/agents.js';
-import {validateOrchestration} from '../src/profiles.js';
+import {validateOrchestration, playedBy} from '../src/profiles.js';
 
 // An agent is the job: one markdown file, frontmatter for what bounce routes on, body as the worker's
 // system prompt, `models:` for the AIs that may play it in fallback order. The orchestration skill
@@ -36,8 +36,65 @@ Own only your paths.
   assert.throws(() => agentMetadata('---\nname: x\ndescription: d\nmodels: [sonnet]\n---\n'), /provider\/model refs/);
   assert.throws(() => agentMetadata('---\nname: x\ndescription: d\nwritePaths: [../out]\n---\n'), /relative workspace paths/);
   assert.throws(() => agentMetadata('---\nname: orchestrator\ndescription: d\n---\n'), /reserved/);
-  assert.throws(() => agentMetadata('---\nname: x\ndescription: d\npolicy: root\n---\n'), /policy must be read-only, probe or write/);
+  assert.throws(() => agentMetadata('---\nname: x\ndescription: d\npolicy: root\n---\n'), /policy must be read-only or write/);
+  assert.throws(() => agentMetadata('---\nname: x\ndescription: d\npolicy: probe\n---\n'), /policy must be read-only or write/, 'probe is gone: an agent reads only, or writes');
   assert.throws(() => agentMetadata('---\nname: x\ndescription: d\nmaxSteps: 0\n---\n'), /between 1 and 500/);
+});
+
+// Sampling is the job's, sent with each request only when a local model plays it: four agents can
+// share one loaded model and still each think (or not) and sample their own way.
+test('agentMetadata: sampling keys are flat, validated, and only the declared ones are kept', () => {
+  const meta = agentMetadata(`---
+name: scout
+description: Finds things fast.
+policy: read-only
+thinking: off
+temperature: 0.7
+topP: 0.8
+topK: 20
+minP: 0
+presencePenalty: 1.5
+frequencyPenalty: -0.5
+repeatPenalty: 1.0
+maxTokens: 2048
+seed: 7
+---
+Scout.
+`);
+  assert.deepEqual(meta.sampling, {thinking: 'off', temperature: 0.7, topP: 0.8, topK: 20, minP: 0, presencePenalty: 1.5,
+    frequencyPenalty: -0.5, repeatPenalty: 1, maxTokens: 2048, seed: 7});
+  assert.deepEqual(agentMetadata('---\nname: b\ndescription: d\nthinking: on\ntemperature: 0.6\n---\n').sampling, {thinking: 'on', temperature: 0.6});
+  assert.equal(Object.hasOwn(agentMetadata('---\nname: b\ndescription: d\n---\n'), 'sampling'), false, 'nothing declared, nothing carried');
+  for (const [line, message] of [
+    ['thinking: maybe', /thinking must be on or off/], ['thinking: false', /thinking must be on or off/],
+    ['temperature: 2.5', /temperature must be a number from 0 to 2/], ['temperature: hot', /temperature must be/], ['temperature:', /temperature must be/],
+    ['topP: 0', /topP must be a number above 0, up to 1/], ['topP: 1.1', /topP must be/],
+    ['topK: 2.5', /topK must be an integer from 0 to 1000/], ['topK: -1', /topK must be/],
+    ['minP: 1.5', /minP must be a number from 0 to 1/],
+    ['presencePenalty: 3', /presencePenalty must be a number from -2 to 2/], ['frequencyPenalty: -2.1', /frequencyPenalty must be/],
+    ['repeatPenalty: 0', /repeatPenalty must be a number above 0, up to 2/],
+    ['maxTokens: 0', /maxTokens must be an integer from 1 to 32000/], ['maxTokens: 32001', /maxTokens must be/], ['maxTokens: 1e3x', /maxTokens must be/],
+    ['seed: -1', /seed must be a non-negative integer/],
+  ]) assert.throws(() => agentMetadata(`---\nname: x\ndescription: d\n${line}\n---\n`), message, line);
+  const round = agentMetadata(serializeAgent(meta));
+  assert.deepEqual(round, meta, 'serializeAgent writes the sampling keys back flat');
+});
+
+test('sampling reaches a local backend of the job only; a cloud fallback and the cloud AI Jev picks never carry it', t => {
+  const dir = root(t);
+  fs.mkdirSync(agentStore(dir), {recursive: true});
+  fs.writeFileSync(path.join(agentStore(dir), 'scout.md'), serializeAgent({name: 'scout', description: 'Finds.', policy: 'read-only',
+    models: ['lmstudio/qwen', 'claude/sonnet'], sampling: {thinking: 'off', temperature: 0.7, maxTokens: 4096}, prompt: 'Scout.'}));
+  fs.writeFileSync(path.join(agentStore(dir), 'plain.md'), serializeAgent({name: 'plain', description: 'Plain.', policy: 'read-only', models: ['lmstudio/qwen'], prompt: 'P.'}));
+  const view = validateOrchestration(orchestration({}, {local: {enabled: true}}), undefined, {roles: loadAgents(dir)});
+  const [local, cloud] = [view.profiles.scout, view.profiles['scout~2']];
+  assert.equal(local.adapter, 'opencode');
+  assert.deepEqual(local.localOptions, {maxOutputTokens: 4096, sampling: {thinking: 'off', temperature: 0.7, maxTokens: 4096}});
+  assert.equal(cloud.adapter, 'claude');
+  assert.equal(Object.hasOwn(cloud, 'localOptions'), false, 'a cloud model is the same job on a different brain: no sampling');
+  assert.deepEqual(view.profiles.plain.localOptions, {maxOutputTokens: 2048}, 'an agent that declares nothing sends nothing');
+  assert.deepEqual(playedBy(local, 'lmstudio/other', null, {endpoint: 'lmstudio', model: 'other'}).localOptions, local.localOptions, 'a local model Jev picks plays the job the same way');
+  assert.equal(Object.hasOwn(playedBy(local, 'main', view.profiles.main), 'localOptions'), false);
 });
 
 test('serializeAgent round-trips through agentMetadata, and writeAgent refuses to clobber a hand-edited file', t => {
@@ -64,7 +121,7 @@ test('the shipped agents come from the orchestration skill and are present with 
   const roles = loadAgents(root(t));
   assert.deepEqual([...roles.keys()].sort(), ['analyst', 'builder', 'debugger', 'reviewer']);
   assert.equal(roles.get('reviewer').source, 'skill');
-  assert.deepEqual([...readOnlyRoles(roles)].sort(), ['analyst', 'debugger', 'reviewer']);
+  assert.deepEqual([...readOnlyRoles(roles)], [], 'every shipped agent writes: the reviewer and analyst run checks like a builder');
   assert.deepEqual(roles.get('builder').models, ['auto'], 'shipped agents name no AI: Jev picks one per task when it is on, else any signed-in AI plays them');
   assert.equal(roles.get('builder').policy, 'write');
 });
@@ -115,13 +172,12 @@ test('agents become profiles: one hidden backend per models entry, chained as fa
   assert.equal(Object.hasOwn(local, 'writePaths') || Object.hasOwn(local, 'localOnly'), false, 'no scope to carry: it works in the project like any worker');
 });
 
-test('probe agents keep only command-capable providers rather than losing their tools', t => {
+test('an agent that runs checks is played by every provider in order: none is skipped for being unable to sandbox', t => {
   const view = validateOrchestration(orchestration(), undefined, {roles: loadAgents(root(t))});
-  const chain = ['reviewer', 'reviewer~2'].map(name => view.profiles[name]);
-  assert.deepEqual(chain.map(p => [p.adapter, p.model, p.policy]), [['codex', 'gpt-5.6-terra', 'probe'], ['opencode', 'auto', 'probe']]);
-  assert.deepEqual(chain.map(p => p.fallback), [['reviewer~2'], []]);
-  assert.deepEqual([view.profiles['builder~4'].adapter, view.profiles['builder~4'].policy], ['opencode', 'write']);
-  assert.deepEqual(view.skipped.map(s => [s.agent, s.ref]), [['analyst', 'claude/sonnet'], ['analyst', 'muse/'], ['debugger', 'claude/sonnet'], ['debugger', 'muse/'], ['reviewer', 'claude/sonnet'], ['reviewer', 'muse/']]);
+  const chain = ['reviewer', 'reviewer~2', 'reviewer~3', 'reviewer~4'].map(name => view.profiles[name]);
+  assert.deepEqual(chain.map(p => [p.adapter, p.model, p.policy]), [['claude', 'sonnet', 'write'], ['codex', 'gpt-5.6-terra', 'write'], ['muse', '', 'write'], ['opencode', 'auto', 'write']]);
+  assert.deepEqual(chain.map(p => p.fallback), [['reviewer~2'], ['reviewer~3'], ['reviewer~4'], []]);
+  assert.deepEqual(view.skipped, []);
 });
 
 test('models naming providers this machine has no adapter for are skipped, and an unplayable agent is not offered', t => {
@@ -159,10 +215,13 @@ test('the orchestrator profile is never derived from an agent, and a plan sessio
   const view = validateOrchestration(orchestration(), undefined, {roles: loadAgents(dir)});
   assert.equal(view.profiles.main.adapter, 'claude', 'the config orchestrator stays; main.md is ignored for it');
   assert.equal(view.profiles['main~2'], undefined);
-  const plan = validateOrchestration(orchestration({}, {mode: 'plan'}), undefined, {roles: loadAgents(root(t))});
-  assert.deepEqual([...new Set(Object.values(plan.profiles).filter(p => p.derived).map(p => p.role))].sort(), ['analyst', 'debugger', 'reviewer'], 'builder is not offered in a plan session');
-  assert.equal(plan.skipped.filter(item => item.agent === 'builder').length, 4, 'one skip per backend the write agent would have had');
-  assert.equal(plan.skipped.find(item => item.agent === 'builder').reason, 'a plan session runs read-only agents only');
+  const planned = root(t);
+  fs.mkdirSync(agentStore(planned), {recursive: true});
+  fs.writeFileSync(path.join(agentStore(planned), 'scout.md'), serializeAgent({name: 'scout', description: 'Finds.', policy: 'read-only', models: ['claude/sonnet'], prompt: 'Scout.'}));
+  const plan = validateOrchestration(orchestration({}, {mode: 'plan'}), undefined, {roles: loadAgents(planned)});
+  assert.deepEqual([...new Set(Object.values(plan.profiles).filter(p => p.derived).map(p => p.role))], ['scout'], 'only a read-only agent is offered: every shipped agent writes');
+  for (const agent of ['analyst', 'builder', 'debugger', 'reviewer']) assert.equal(plan.skipped.filter(item => item.agent === agent).length, 4, `${agent}: one skip per backend it would have had`);
+  assert.equal(plan.skipped.find(item => item.agent === 'reviewer').reason, 'a plan session runs read-only agents only');
 });
 
 // ---------------------------------------------------------------- the bridge command: bounce agents
@@ -218,7 +277,7 @@ test('agents set validates the file against this machine, writes it in the chose
   // list and show read the layered set; remove takes only a file in a writable store.
   const list = agentsCommand(['list'], options());
   assert.match(list.text, /^  coder · write · project · claude\/sonnet, lmstudio\/auto \(via opencode\)$/m);
-  assert.match(list.text, /^  reviewer · probe · skill · auto \(Jev\), codex\/gpt-5.6-terra, lmstudio\/auto \(via opencode\)$/m);
+  assert.match(list.text, /^  reviewer · write · skill · auto \(Jev\), claude\/sonnet, codex\/gpt-5.6-terra, muse, lmstudio\/auto \(via opencode\)$/m);
   assert.equal(agentsCommand(['show', 'coder'], options()).text, fs.readFileSync(set.report.file, 'utf8'));
   assert.throws(() => agentsCommand(['show', 'nope'], options()), /no agent named nope/);
   assert.throws(() => agentsCommand(['remove', 'reviewer'], options()), /shipped with skill agent-orchestrator/);

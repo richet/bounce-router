@@ -89,9 +89,9 @@ test('slots are per model: a worker on an idle model starts while another model 
   while (done() < 6) { for (const g of gates.values()) g.resolve([{kind: 'result', status: 'completed', text: 'done'}]); if (Date.now() - start > 8000) throw new Error('drain timed out'); await new Promise(r => setTimeout(r, 20)); }
 });
 
-// Found live (ACE d1bc0206, 2026-09-28): a second bounce, started with another home, sent its worker
+// Found live (session d1bc0206, 2026-09-28): a second bounce, started with another home, sent its worker
 // to the same LM Studio while the first one's builder was running; the builder read as "stalled for
-// 604 s". Daniel: this machine runs one local worker at a time, whoever started it.
+// 604 s". The user: this machine runs one local worker at a time, whoever started it.
 test('two bounce processes share the machine\'s local slot: the second one\'s worker waits, says who has it, and starts when it is free', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-machine-conc-')));
   t.after(() => fs.rmSync(root, {recursive: true, force: true}));
@@ -134,7 +134,7 @@ test('two bounce processes share the machine\'s local slot: the second one\'s wo
   await waitFor(() => ['completed', 'accepted'].includes(one.scheduler.tasks()[again.task]?.state));
 });
 
-// Found live (ACE e3bd01d5, 2026-09-29, tasks 7106f34c and 9928ff78): a worker sent back by its check
+// Found live (session e3bd01d5, 2026-09-29, tasks 7106f34c and 9928ff78): a worker sent back by its check
 // waited for the local model, which another task of the same session was using. Five minutes into the
 // wait the watchdog called it silent, then cancelled it and started a cloud fallback. A task that is
 // waiting for its turn is not a silent worker.

@@ -1,4 +1,4 @@
-// Found live: every Codex worker and reviewer thread bounce ran stayed in ~/.codex, listed in Daniel's
+// Found live: every Codex worker and reviewer thread bounce ran stayed in ~/.codex, listed in the user's
 // ChatGPT app. A task's vendor threads are archived once the task has a final outcome; a completed task
 // may still be reworked on the same thread, so completion alone keeps it.
 import test from 'node:test';
@@ -30,7 +30,7 @@ test('a task\'s vendor thread is archived when the task is accepted, not when it
   assert.deepEqual(session.events.filter(e => e.kind === 'task.thread.archived').map(e => [e.provider, e.sessionId]), [['codex', 'thread-1']]);
 });
 
-// Found live (ACE d1bc0206): two workers dead since a daemon crash stayed "orphaned" and kept every
+// Found live (session d1bc0206): two workers dead since a daemon crash stayed "orphaned" and kept every
 // orchestrator turn refused. A worker whose recorded process is gone is cancelled as lost on restart.
 test('on restart a worker whose recorded process is gone is cancelled as lost; one with no record stays orphaned', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-worker-lost-'));

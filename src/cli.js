@@ -71,7 +71,7 @@ async function main() {
     image: {type: 'string', multiple: true}, cwd: {type: 'string'}, resume: {type: 'string'}, provider: {type: 'string'}, model: {type: 'string'},
     mode: {type: 'string'}, json: {type: 'boolean'}, verify: {type: 'boolean'}, help: {type: 'boolean', short: 'h'}, version: {type: 'boolean', short: 'v'},
     check: {type: 'boolean'}, scope: {type: 'string'}, force: {type: 'boolean'}, list: {type: 'boolean'}, all: {type: 'boolean'}, session: {type: 'string'}, report: {type: 'boolean'},
-    save: {type: 'boolean'}, 'allow-network': {type: 'boolean'}, tasks: {type: 'boolean'}, against: {type: 'string'},
+    save: {type: 'boolean'}, fix: {type: 'boolean'}, 'allow-network': {type: 'boolean'}, tasks: {type: 'boolean'}, against: {type: 'string'},
   }});
   if (values.help) return console.log(helpText(process.stdout.columns || 100));
   if (values.version) return console.log(`bounce ${version}`);
@@ -218,7 +218,7 @@ async function main() {
   // CONTRACT.md #5 bullet 4: the built-in A/B, legacy CLI path, no daemon. Unknown session/task
   // is a thrown Error, which the top-level .catch prints to stderr and exits 1 (same convention
   // as every other legacy command's error here, e.g. Session's own "Session not found").
-  // Registering that server with the agents, so nobody edits a config by hand (Daniel: "let bounce do it").
+  // Registering that server with the agents, so nobody edits a config by hand (the user: "let bounce do it").
   if (positionals[0] === 'mcp' && ['install', 'uninstall'].includes(positionals[1])) {
     const {withCodexEntry, withoutCodexEntry} = await import('./mcp-install.js');
     const installing = positionals[1] === 'install';
@@ -324,6 +324,17 @@ async function main() {
         child.once('close', code => {clearTimeout(timer); console.log(`${provider} (${resolveExecutable(provider, settings.executables[provider])}): ${code === 0 ? clean(out.trim()) : 'not available'} · ${quotaShort(quotas[provider]) || quotas[provider]?.error || quotaUnavailable(provider)}`); resolve();});
       });
     }
+    // Local workers run through opencode, whose 1.x and 2.x are driven differently: say which one
+    // bounce found and whether it can drive it; --fix installs a verified one for bounce alone.
+    const {opencodeVersion, opencodeStatus, fixOpencode, FIX_VERSION} = await import('./opencode-version.js');
+    const opencode = resolveExecutable('opencode', settings.executables.opencode);
+    const status = opencodeStatus(opencodeVersion(opencode));
+    console.log(`opencode (${opencode}): ${status.text}`);
+    if (!status.ok && values.fix) {
+      console.log(`Installing opencode ${FIX_VERSION} for bounce…`);
+      const fixed = fixOpencode({root});
+      console.log(`opencode (${fixed.binary}): ${opencodeStatus(opencodeVersion(fixed.binary)).text} · saved as executables.opencode`);
+    } else if (!status.ok) console.log(`  bounce doctor --fix installs opencode ${FIX_VERSION} under ${path.join(root, 'opencode')} and points bounce at it; your own opencode is left alone`);
     return;
   }
   if (positionals.length && !['run', 'dev'].includes(positionals[0])) throw new Error('Unknown command. Use --help.');
@@ -587,7 +598,7 @@ async function main() {
   }
   // /config's panel (src/settings-command.js): the rows are the settings, Enter flips a boolean, cycles a choice or
   // asks for a value, `u` returns a setting to its default, every change saved and validated on the spot.
-  // Daniel, 2026-10-01: a listing is not what other harnesses do; a panel is.
+  // 2026-10-01: a listing is not what other harnesses do; a panel is.
   function openConfigPanel(index = 0, notes = [], filter = '') {
     const all = settingsEntries(root);
     const entries = filterEntries(all, filter);
@@ -1380,7 +1391,7 @@ async function main() {
   for (const event of session.events) terminal.ingest(event);
   await terminal.mount({mouseScroll});
 
-  // Found live (ACE d1bc0206): the daemon died and this view kept its last state — the orchestrator
+  // Found live (session d1bc0206): the daemon died and this view kept its last state — the orchestrator
   // and every worker "working" — for four more hours. A lost daemon is said plainly, once, and the
   // view stops ticking as if anything were still running.
   let daemonLostAt = null;
@@ -1442,6 +1453,6 @@ const [bridgeCmd] = process.argv.slice(2);
   console.error(`bounce: ${error.message}`);
   process.exitCode = 1;
   // A detached daemon that fails to start must not linger holding the session lock with its bus
-  // open (found live, ACE d1bc0206: every later resume then failed too). Its log keeps the error.
+  // open (found live, session d1bc0206: every later resume then failed too). Its log keeps the error.
   if (process.env.BOUNCE_DETACHED === '1') process.exit(1);
 });

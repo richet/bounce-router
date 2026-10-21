@@ -1007,7 +1007,7 @@ test('a withdrawn prompt is skipped by the restart rebuild, not re-queued', {tim
     'the withdrawn prompt is never dispatched on restart');
 });
 
-// Found live (ACE 36ecaacd): after bounce moved Codex to its own home, the orchestrator's thread was
+// Found live (session 36ecaacd): after bounce moved Codex to its own home, the orchestrator's thread was
 // still in the app's ~/.codex, and every turn failed with "no rollout found for thread id …".
 test('a resume whose vendor thread is gone starts a fresh thread from the session handoff, and says so', async t => {
   const f = fixture(t, 'codex');
@@ -1030,8 +1030,8 @@ test('a resume whose vendor thread is gone starts a fresh thread from the sessio
   assert.equal(original.events.findLast(e => e.kind === 'status').text, 'The orchestrator\'s previous codex thread could not be reopened (no rollout found for thread id native-thread); started a fresh one from this session\'s handoff.');
 });
 
-// Found live (ACE d1bc0206, 2026-09-28): the thread was there, but reopening it failed ("codex
-// app-server request timed out: thread/resume"), twice, and the session went silent. Daniel: a thread
+// Found live (session d1bc0206, 2026-09-28): the thread was there, but reopening it failed ("codex
+// app-server request timed out: thread/resume"), twice, and the session went silent. The user: a thread
 // that cannot be reopened for any reason is replaced by a fresh one from the handoff.
 async function secondTurnAfterFailedResume(t, message, extra) {
   const f = fixture(t, 'codex');
@@ -1078,7 +1078,7 @@ test('a resume refused for a usage limit starts no fresh thread: the provider is
   assert.equal(f.session.events.some(e => e.kind === 'status' && /could not be reopened/.test(e.text)), false);
 });
 
-// Found live (ACE d1bc0206): a turn orphaned by a crash blocked the orchestrator on every later restart,
+// Found live (session d1bc0206): a turn orphaned by a crash blocked the orchestrator on every later restart,
 // and nothing cleared it. A turn whose recorded process is gone ended with it; one with no record waits for
 // the user's /unblock, and only a safety block can be cleared that way.
 test('a restart ends an orphaned turn whose recorded process is gone, and /unblock clears one with no record', async t => {
@@ -1107,7 +1107,7 @@ test('a restart ends an orphaned turn whose recorded process is gone, and /unblo
   assert.notEqual(restarted.state().state, 'blocked', 'an unblock survives the next restart');
 });
 
-// Found live (ACE e3bd01d5, 2026-09-28 22:58): the first message typed into the session was refused by
+// Found live (session e3bd01d5, 2026-09-28 22:58): the first message typed into the session was refused by
 // the vendor ("model 'gpt-6-sol' is not enabled …", status 400). bounce showed the error and stopped;
 // the same message typed again a minute later was answered.
 function refusingFixture(t, turns) {

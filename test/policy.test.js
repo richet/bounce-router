@@ -45,7 +45,7 @@ const lifecycleKinds = rows => {
 
 const worker = () => ({adapter: 'worker', model: 'w', mode: 'yolo', fallback: []});
 const critic = () => ({adapter: 'critic', model: 'c', mode: 'yolo', fallback: [], role: 'critic'});
-const verifier = () => ({adapter: 'verifier', model: 'v', mode: 'yolo', fallback: [], role: 'verifier', policy: 'probe'});
+const verifier = () => ({adapter: 'verifier', model: 'v', mode: 'yolo', fallback: [], role: 'verifier'});
 
 test('P1 prelaunch reject: worker never launches, task ends rejected with the questions', async t => {
   const {session} = setup(t);
@@ -238,7 +238,6 @@ test('P6c completion verifier receives steps verbatim, dir ends review-completio
   const row = scheduler.submit({parent: null, profile: 'A', orders: 'the brief', deadline: null, review: {completion: 'V'}, steps: '1. do a\n2. do b'});
   await waitFor(() => scheduler.tasks()[row.task]?.state === 'accepted');
   assert.equal(seenOrders.split('\n\n')[0], '1. do a\n2. do b');
-  assert.match(seenOrders, /disposable workspace/);
   assert.equal(seenDir.endsWith('review-completion-1'), true);
 });
 
@@ -316,7 +315,7 @@ test('P9 malformed review/steps/budget submissions throw and publish nothing', t
   const scheduler = createScheduler({session, adapters: {worker: fakeAdapter(() => []), verifier: fakeAdapter(() => []), critic: fakeAdapter(() => [])}, profiles});
   const before = session.events.length;
 
-  assert.throws(() => scheduler.submit({parent: null, profile: 'A', orders: 'x', deadline: null, review: {completion: 'builderProfile'}}), {message: 'malformed: review'});
+  assert.throws(() => scheduler.submit({parent: null, profile: 'A', orders: 'x', deadline: null, review: {completion: 'ghost'}}), {message: 'malformed: review'});
   assert.equal(session.events.length, before);
 
   assert.throws(() => scheduler.submit({parent: null, profile: 'A', orders: 'x', deadline: null, review: {completion: 'V'}}), {message: 'malformed: steps'});

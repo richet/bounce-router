@@ -1,4 +1,4 @@
-// Analytics (docs/plans/analytics.md, Daniel, 2026-10-01): what a session cost and what it got, folded from
+// Analytics (docs/plans/analytics.md, 2026-10-01): what a session cost and what it got, folded from
 // the journal alone. Every figure names what it counts, over which span, in which unit; a figure that cannot
 // be known from the journal says so instead of guessing. The numbers that drove this week's decisions came
 // from scratch scripts over the same rows; this is those scripts, kept.

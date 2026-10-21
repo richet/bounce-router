@@ -47,7 +47,7 @@ test('closing a view flushes an explicit quit control before disconnecting', {ti
   assert.equal((await quit).action, 'quit');
 });
 
-// Found live (ACE d1bc0206): a daemon that died left bus.view behind; every resume then failed
+// Found live (session d1bc0206): a daemon that died left bus.view behind; every resume then failed
 // "Daemon did not become ready" because listen() hit EADDRINUSE on the dead socket.
 test('a view server starts over the socket a dead daemon left behind', {timeout: 5000}, async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-view-stale-'));
@@ -67,7 +67,7 @@ test('a view server starts over the socket a dead daemon left behind', {timeout:
   channel.close();
 });
 
-// Found live (ACE d1bc0206): the session's replay was one 20.1 MB message and the view channel drops
+// Found live (session d1bc0206): the session's replay was one 20.1 MB message and the view channel drops
 // any message over 16 MB, so every attach hung with the TUI waiting for a session that never came.
 test('a view attaches to a session whose history is larger than one channel message allows', {timeout: 60000}, async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-view-large-'));

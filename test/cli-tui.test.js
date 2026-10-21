@@ -391,7 +391,7 @@ test('Up on an empty input withdraws this view\'s own queued prompt for editing;
   assert.equal(calls.at(-1)[1].text, 'queued reply text');
 });
 
-// Found live (ACE d1bc0206): the daemon died at 08:14 and the TUI kept showing the orchestrator and
+// Found live (session d1bc0206): the daemon died at 08:14 and the TUI kept showing the orchestrator and
 // its workers as working for four more hours. A lost daemon now says so, with how to restart it.
 test('a daemon that disconnects is shown as stopped, with the command to resume the session', {timeout: 15000}, async t => {
   const {session, listeners, waitFor, output} = await harness(t);

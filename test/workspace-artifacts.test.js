@@ -152,7 +152,7 @@ test('a copyRoot puts each working copy at <copyRoot>/<8 hex>, and its artifact 
   assert.throws(() => createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'inside', copyRoot: path.join(source, 'w')}), /outside source/);
 });
 
-// Found live (ACE 159f4746, task 92136dbf): the copy had no .git, so a worker that needed `git log` blocked
+// Found live (session 159f4746, task 92136dbf): the copy had no .git, so a worker that needed `git log` blocked
 // with "not a git repository". Each copy now gets its own clone sharing the source's objects: git works in
 // it, a commit there stays there, and only file changes are integrated.
 test('a copy of a git checkout has its own git: history and status work, and its commits never reach the source', () => {
@@ -162,7 +162,7 @@ test('a copy of a git checkout has its own git: history and status work, and its
   write(source, 'a.txt', 'dirty\n');
   const sourceHead = git(source, 'rev-parse', 'HEAD');
   const copy = createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'git'});
-  // Found live (ACE 36ecaacd, task 7bafef8e): with the user's uncommitted edits showing in `git status`, a
+  // Found live (session 36ecaacd, task 7bafef8e): with the user's uncommitted edits showing in `git status`, a
   // worker took them for its own out-of-scope changes and reverted them. The copy starts from a baseline
   // commit of the checkout as it was, so status is clean and `git diff` is only the worker's own work.
   assert.equal(git(copy.cwd, 'log', '--format=%s'), 'bounce: baseline of the checkout this copy was made from (its uncommitted changes included)\nFirst commit');
@@ -179,7 +179,7 @@ test('a copy of a git checkout has its own git: history and status work, and its
   assert.equal(fs.existsSync(path.join(plain.cwd, '.git')), false);
 });
 
-// Found live (ACE d1bc0206, task 99bd27ea): the text a review read was the first 4096 characters of
+// Found live (session d1bc0206, task 99bd27ea): the text a review read was the first 4096 characters of
 // the old file followed by the first 4096 of the new one. The worker's change sat past that point in
 // two files of 33 KB and 40 KB: of 121 lines it added, the review was shown 1.
 const longFile = change => Array.from({length: 400}, (_, index) => change(index + 1) ?? `export const line${index + 1} = ${index + 1};`).join('\n') + '\n';
@@ -254,7 +254,7 @@ test('a file that changed in the checkout since the copy says its diff is only a
   assert.equal(artifact.diff.startsWith('--- a/src/long.js\n+++ b/src/long.js\n[bounce could not read this file as it was before the change, so this is not a diff: the first 4096 characters before (-) and after (+)]\n-export const line1 = 1;\n'), true);
 });
 
-// Found live (ACE e3bd01d5): 8 of 31 reviews were refused as too long, their diffs 75,000 to 750,000
+// Found live (session e3bd01d5): 8 of 31 reviews were refused as too long, their diffs 75,000 to 750,000
 // characters of test logs under evidence/. TypeSafe: "Accuracy falls as the state grows with content
 // unrelated to the decision. Send only the fields the question needs."
 test('what a review is sent leaves out evidence and logs, and names them', () => {

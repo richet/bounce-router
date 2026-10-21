@@ -114,7 +114,7 @@ function giveGit(source, copy) {
     fs.mkdirSync(path.join(copy, '.git', 'info'), {recursive: true});
     fs.appendFileSync(path.join(copy, '.git', 'info', 'exclude'), '\n/.attempt-workspace.json\n');
     // The checkout as the copy got it — the user's uncommitted edits included — becomes a baseline
-    // commit, so `git status` starts clean and `git diff` is only the worker's own work. Found live (ACE
+    // commit, so `git status` starts clean and `git diff` is only the worker's own work. Found live (session
     // 36ecaacd, task 7bafef8e): a worker read the user's uncommitted edits as its own out-of-scope
     // changes and reverted them. Local identity, no hooks, no signing: the commit never leaves the copy.
     git(copy, 'add', '-A');
@@ -136,9 +136,9 @@ function shortCopyDir(root) {
 }
 
 // `copyRoot` puts the working copy at a short path of its own (<copyRoot>/<8 hex>) instead of under
-// `dir`. Found live (ACE d1bc0206): a local model typing the default ~200-character path, three
+// `dir`. Found live (session d1bc0206): a local model typing the default ~200-character path, three
 // UUIDs deep, garbled it (`de83` for `dee3`, a doubled segment) and spent its steps on "File not found".
-export function createAttemptWorkspace({cwd, dir, owns, attemptId, disposable = false, copyRoot}) {
+export function createAttemptWorkspace({cwd, dir, owns, attemptId, copyRoot}) {
   const source = fs.realpathSync(cwd);
   const allowed = ownList(owns);
   const resolvedDir = fs.existsSync(dir) ? fs.realpathSync(dir) : path.resolve(dir);
@@ -151,7 +151,7 @@ export function createAttemptWorkspace({cwd, dir, owns, attemptId, disposable = 
   giveGit(source, workspace);
   const baseline = manifest(workspace);
   const baselineHash = manifestHash(baseline);
-  const result = {id: path.basename(workspace), attemptId, cwd: workspace, source, dir, owns: allowed, baseline, baselineHash, ...(disposable ? {disposable: true} : {})};
+  const result = {id: path.basename(workspace), attemptId, cwd: workspace, source, dir, owns: allowed, baseline, baselineHash};
   atomicJSON(path.join(workspace, '.attempt-workspace.json'), {...result, cwd: undefined});
   return result;
 }
@@ -193,7 +193,7 @@ function lineDiff(before, after) {
   }
 }
 
-// What a review reads of one change: its real line diff. Found live (ACE d1bc0206, task 99bd27ea):
+// What a review reads of one change: its real line diff. Found live (session d1bc0206, task 99bd27ea):
 // this was the first 4096 characters of the old file and then of the new one, so a change past that
 // point was never shown — of 121 lines a worker added to files of 33 KB and 40 KB, the review saw 1.
 // A file whose earlier content cannot be read any more gets those previews, and says so.
@@ -216,7 +216,7 @@ function describeChange(source, change) {
 
 function describeChanges(source, changes) {
   const described = changes.map(change => ({path: change.path, ...describeChange(source, change)}));
-  // The shortest change first: a review reads a bounded length of this text, and found live (ACE
+  // The shortest change first: a review reads a bounded length of this text, and found live (session
   // e3bd01d5) long test logs under evidence/ came before, and hid, the source changes under src/.
   const shortestFirst = [...described].sort((left, right) => left.text.length - right.text.length || left.path.localeCompare(right.path));
   return {
@@ -246,7 +246,7 @@ function diffParts(artifact) {
 }
 
 // What a review is sent: the changes without the evidence and logs the worker saved, which are named
-// instead. Found live (ACE e3bd01d5): test logs made a review 75,000 to 750,000 characters long, the
+// instead. Found live (session e3bd01d5): test logs made a review 75,000 to 750,000 characters long, the
 // service refused 8 of 31, and a reviewer reads less well the more it is given that the decision
 // does not need.
 export function reviewDiff(artifact) {

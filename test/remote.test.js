@@ -295,7 +295,7 @@ test('main provider selection is applied before UI events and survives view repl
   assert.equal(remote.main.model, 'gpt-6-astra');
 });
 
-// Found live (ACE d1bc0206): a daemon started before replays were chunked closed every view before its
+// Found live (session d1bc0206): a daemon started before replays were chunked closed every view before its
 // history arrived, and the TUI waited forever. A view whose daemon is gone before the history comes
 // fails with what to do, instead of hanging.
 test('a daemon that disconnects before sending the session history fails the attach with the fix, not a hang', async () => {

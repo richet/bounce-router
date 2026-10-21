@@ -77,7 +77,7 @@ const reportInstruction = profile => reportsByTool(profile)
 // the CLI (observed: `bounce`/`bounce --help` probes costing minutes per task). Every field a
 // report can carry is named here once, so the first report is the right one.
 // How a worker ends when no fixed format is asked of it (config.json `reports`, "plain" by default since
-// 2026-09-29): its own words are its report. Found live (ACE e3bd01d5): of 67 reports in the fixed format
+// 2026-09-29): its own words are its report. Found live (session e3bd01d5): of 67 reports in the fixed format
 // 18 were rejected as invalid and 19 rewritten by bounce. To be measured on real sessions against Jev's
 // ranking of wrong work; `reports: "structured"` brings the fixed format back.
 const PLAIN_ENDING = 'End your last turn with a plain answer in your own words: what you did, each check you ran with the last lines it printed, and what is left of this assignment. No JSON and no report call for the end. If you could not finish, begin the answer with "Blocked:" or "Failed:" and say why.';
@@ -358,7 +358,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
 
   // The machine gate, last before the launch: another bounce process (another home, a benchmark) may
   // be running a local worker on the same server, which this process cannot see in its own journal.
-  // Found live (ACE d1bc0206): two of them queued inside LM Studio and one read as "stalled for 604 s".
+  // Found live (session d1bc0206): two of them queued inside LM Studio and one read as "stalled for 604 s".
   // The task waits here, says once who has the model, and is bounded by its own deadline like the
   // rest of the admission.
   async function admitMachine({profile, key, task, attempt, context, signal}) {
@@ -511,7 +511,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const final = session.events.findLast(e => e.kind === 'task.reported' && e.task === task && e.attempt === attempt);
     if (!final) return false;
     // "Done, but X remains" completes: the work is kept and reviewed like any other, and X reaches
-    // the orchestrator as a follow-up. Found live (ACE d1bc0206): blocking it threw away finished work
+    // the orchestrator as a follow-up. Found live (session d1bc0206): blocking it threw away finished work
     // whose "remaining" was another task's job (router wiring, a live check), and it was redone on Opus.
     // A worker that only ran out of steps is continued first.
     if (final.outcome === 'completed' && remainingWork(final.remaining)) {
@@ -565,7 +565,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // orchestrator turns). Each is said in `corrections` on the journaled row and as a task.corrected row.
   function correct(spec) {
     const corrections = [];
-    // Found live (ACE d1bc0206): 11 of 23 first attempts named `build_claude` (Opus) directly, skipping the
+    // Found live (session d1bc0206): 11 of 23 first attempts named `build_claude` (Opus) directly, skipping the
     // builder agent's own order (local, then Sonnet, then Opus). A first attempt from the orchestrator runs
     // as the matching agent; a profile is for a retry, or for an AI the user asked for (`userAsked: true`).
     const named = profiles[spec.profile];
@@ -648,8 +648,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         if (!names.length) return 'review';
         for (const n of names) {
           const p = profiles[n];
-          // A reviewer is whoever cannot change anything: by declared policy, not by the label it wears.
-          if (!p || !(['read-only', 'probe'].includes(effectivePolicy(p)) || READONLY_ROLES.has(p.role))) return 'review';
+          if (!p) return 'review';
         }
       }
     }
@@ -777,7 +776,6 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     : error.code === 'limited' ? {reason: 'limited', text: error.message}
     : {reason: 'error', text: error.message};
 
-  const probeOrders = workspace => `Run commands in your current disposable workspace (${workspace.cwd}). Tests may write caches and output here; none of these changes are integrated into the source. Do not edit source files to make checks pass. Source checkout: ${workspace.source}. The copy has its own Git: its first commit is the checkout as copied, so git status and git diff there show only changes made in the copy. Report observed commands and results.`;
   // An isolated write worker works in a copy; orders that name the real checkout by absolute path would
   // send it there (observed live: a heredoc appended to the real file, the copy stayed unchanged and
   // review saw an empty diff). Paths into the checkout are rewritten to the copy.
@@ -890,16 +888,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return workspace;
   }
   function workspaceFor(task, profile, attempt) {
-    if (effectivePolicy(profile) !== 'probe' && POLICY_RANK[effectivePolicy(profile)] < POLICY_RANK.write) return null;
+    if (POLICY_RANK[effectivePolicy(profile)] < POLICY_RANK.write) return null;
     const prior = existingWorkspace(task);
-    const sameKind = prior && Boolean(prior.disposable) === (effectivePolicy(profile) === 'probe');
-    // A task never turns its own throwaway copy into one that is integrated, or the reverse. A retry
-    // on another AI is another task: when its kind differs from its predecessor's, it gets a copy of
-    // its own. Found on the real path (2026-09-28): a review retried on a cloud profile after the local
-    // reviewer gave no answer was refused here before it started.
-    const own = workspaces.has(task) || session.events.some(e => e.kind === 'task.workspace' && e.task === task);
-    if (prior && !sameKind && own) throw new Error('workspace policy changed; submit a new scoped task');
-    if (prior && sameKind) {
+    if (prior) {
       workspaces.set(task, prior); return {...prior, attemptId: `${task}-${attempt}`};
     }
     const relative = path.relative(fs.realpathSync(session.cwd), fs.realpathSync(session.dir));
@@ -909,10 +900,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // owns is a hint for the worker and the orchestrator, not a fence any more (2026-09-29): every
     // working copy owns everything, so any change the worker makes is part of its artifact; what
     // actually protects the checkout is integrateArtifact's conflict check against the real file.
-    const workspace = createAttemptWorkspace({cwd: session.cwd, dir, owns: ['**'], attemptId: `${task}-${attempt}`, disposable: effectivePolicy(profile) === 'probe',
+    const workspace = createAttemptWorkspace({cwd: session.cwd, dir, owns: ['**'], attemptId: `${task}-${attempt}`,
       ...(nested ? {} : {copyRoot: path.join(session.root, 'w')})});
     workspaces.set(task, workspace);
-    append({kind: 'task.workspace', task, attempt, purpose: workspace.disposable ? 'probe' : 'publish', cwd: workspace.cwd, metadata: path.join(workspace.cwd, '.attempt-workspace.json'), baselineHash: workspace.baselineHash});
+    append({kind: 'task.workspace', task, attempt, purpose: 'publish', cwd: workspace.cwd, metadata: path.join(workspace.cwd, '.attempt-workspace.json'), baselineHash: workspace.baselineHash});
     return workspace;
   }
   function artifactFor(task) {
@@ -1213,7 +1204,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
             if (session.events.some(e => e.kind === 'task.attempt.ended' && e.task === task && e.attempt === endedAttempt)) return;
             append({kind: 'task.attempt.ended', task, attempt: endedAttempt, verifiedTermination: true, from, context});
             let artifact = null;
-            if (owned && !owned.disposable) {
+            if (owned) {
               artifact = captureArtifact(owned);
               append({kind: 'task.artifact', task, attempt: reducers.tasks(session.events)[task]?.attempt,
                 artifactId: artifact.id, digest: artifact.digest, resultHash: artifact.resultHash,
@@ -1270,7 +1261,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
               // An adapter marks a failure of its RUNTIME (process died, endpoint down, step cap, no answer) as
               // recoverable. Work is never thrown away (2026-09-27): a step-capped worker still progressing is
               // continued first; then an attempt that changed files or said something ends completed, its
-              // report synthesized from what it produced. Found live (ACE d1bc0206): local builders did real
+              // report synthesized from what it produced. Found live (session d1bc0206): local builders did real
               // work, then their turn ended without an answer, and the draft was discarded to a cloud fallback.
               // Only an attempt that produced nothing — or a vendor/limit error — fails (and falls back).
               const attempt = reducers.tasks(session.events)[task]?.attempt ?? null;
@@ -1317,7 +1308,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // that ends after a cancel) can journal the task's end in between.
   const producedWork = (answer, artifact) => Boolean(String(answer ?? '').trim() || artifact?.changes?.length);
   // A report bounce has to write has no evidence of the worker's own: it carries what bounce saw the
-  // worker run instead (Daniel, 2026-09-28: only when the report is missing or wrongly built). Found
+  // worker run instead (2026-09-28: only when the report is missing or wrongly built). Found
   // live: 45 of 86 local attempts answered in plain text, and the review of such a report could only
   // object that nothing backed it.
   function withObserved(task, synthesis) {
@@ -1435,11 +1426,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // (docs/plans/in-place-tasks.md §3) — `owned` stays null, so the ordinary
       // cwd/orders fallbacks below already do the right thing with no further branching.
       owned = row.inPlace ? null : workspaceFor(task, profile, attempt);
-      if (owned?.disposable) profile = {...profile, probeSource: fs.realpathSync(session.cwd)};
       // OpenCode takes the agent text as its system prompt, apart from the orders (found live: an agent
       // file naming the checkout sent a local worker to write there); it points into the copy too.
       if (owned && profile.agent?.prompt) profile = {...profile, agent: {...profile.agent, prompt: toWorkingCopy(profile.agent.prompt, owned)}};
-      const orders = owned?.disposable ? `${workerOrders}\n\n${probeOrders(owned)}` : owned ? inWorkingCopy(workerOrders, owned) : workerOrders;
+      const orders = owned ? inWorkingCopy(workerOrders, owned) : workerOrders;
       // A continuation (docs/plans/standing-workers.md step 2): the earlier task's worker is resumed into
       // this task's own copy and told where it is, instead of a stranger being launched. Probed with the
       // real CLIs (2026-10-01): OpenCode, Claude and Codex all edit the new copy once told.
@@ -1525,7 +1515,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       : continueMessage !== null
         ? [continueMessage, ...pending.map(m => m.text)].join('\n')
         // A worker whose report bounce had to write is told that, not that "its report" lacks something:
-        // found live (ACE d1bc0206, 99bd27ea), a worker stopped mid-fix was sent findings about a report
+        // found live (session d1bc0206, 99bd27ea), a worker stopped mid-fix was sent findings about a report
         // it never wrote.
         : reportByBounce(task)
           ? [`Rework round ${round}. Your last turn ended without your final report, so bounce wrote one from what it saw you do.`,
@@ -1544,15 +1534,13 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // (docs/plans/in-place-tasks.md §3) — `owned` stays null, so the ordinary
       // cwd/orders fallbacks below already do the right thing with no further branching.
       owned = row.inPlace ? null : workspaceFor(task, profile, attempt);
-      if (owned?.disposable) profile = {...profile, probeSource: fs.realpathSync(session.cwd)};
       // OpenCode takes the agent text as its system prompt, apart from the orders (found live: an agent
       // file naming the checkout sent a local worker to write there); it points into the copy too.
       if (owned && profile.agent?.prompt) profile = {...profile, agent: {...profile.agent, prompt: toWorkingCopy(profile.agent.prompt, owned)}};
       profile = withLessons(profile);
       if (owned && profile.agent?.prompt) profile = {...profile, agent: {...profile.agent, prompt: toWorkingCopy(profile.agent.prompt, owned)}};
       append({kind: 'task.launch.requested', task, attempt, executionKey: `${task}:${attempt}`, resumed: true, context});
-      if (owned?.disposable) message = `${message}\n\n${probeOrders(owned)}`;
-      else if (owned) message = inWorkingCopy(message, owned);
+      if (owned) message = inWorkingCopy(message, owned);
       // A reportOnly turn asks in plain words on purpose (requestPlainAnswer): the JSON schema
       // reminder below is for every OTHER resume, never appended onto that one turn back.
       handle = await adapter.resume({peer: workerFrom(task), profile, native, message: reportOnly ? message : reportEnv ? `${message}\n\n${contractFor(profile)}` : LOCAL_ADAPTERS.has(profile.adapter) ? `${message}\n\n${endingLine}` : message, cwd: owned?.cwd ?? session.cwd, dir, checkpoint: row.checkpoint,
@@ -1662,7 +1650,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     }
   }
 
-  // A review worker: read-only, never journals task.activity's siblings as anything but
+  // A review worker: never journals task.activity's siblings as anything but
   // live activity, never emits task.completed/task.failed — only review.started/finished,
   // ending in a verdict the caller (prelaunch/completion policy) acts on. The handle lives in
   // its own `reviews` map (A3, separate from a worker's `handles`) for the window between
@@ -1674,7 +1662,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     let admission;
     const launchState = {task, peer, pending: true, requestedAt: clock()};
     reviews.set(peer, launchState);
-    let handle, owned = null;
+    let handle;
     try {
       if (LOCAL_ADAPTERS.has(profile.adapter)) {
         reviews.set(peer, launchState);
@@ -1683,18 +1671,15 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       }
       const captured = artifactFor(task);
       const workerProfile = profiles[submittedRow(task)?.profile];
-      const reportOnly = stage === 'completion' && workerProfile && POLICY_RANK[effectivePolicy(workerProfile)] < POLICY_RANK.write;
-      const reviewState = captured ? {orders: review.orders, report: review.report, diff: reviewDiff(captured.artifact), files: captured.artifact.files, baseHead: captured.artifact.baselineHash}
+      // An analysis is graded on its report: a task that declared it needs no write and changed nothing
+      // has no diff worth reviewing, even when the agent that ran it could have written. A task that
+      // declared nothing (the legacy form) is not assumed to be one.
+      const requires = submittedRow(task)?.requires;
+      const analysis = Boolean(captured) && !captured.artifact.changes.length && Array.isArray(requires) && !requires.includes('write');
+      const reportOnly = stage === 'completion' && ((workerProfile && POLICY_RANK[effectivePolicy(workerProfile)] < POLICY_RANK.write) || analysis);
+      const reviewState = captured && !analysis ? {orders: review.orders, report: review.report, diff: reviewDiff(captured.artifact), files: captured.artifact.files, baseHead: captured.artifact.baselineHash}
         : reportOnly ? {kind: 'report', orders: review.orders, report: review.report, diff: '', files: [], baseHead: null} : null;
-      if (effectivePolicy(profile) === 'probe') {
-        const source = captured?.row.cwd ?? session.cwd;
-        const probeDir = path.join(os.tmpdir(), 'bounce-review-workspaces', session.id, task);
-        fs.mkdirSync(probeDir, {recursive: true, mode: 0o700});
-        owned = createAttemptWorkspace({cwd: source, dir: probeDir, owns: ['**'], attemptId: `review-${stage}-${round}`, disposable: true});
-        profile = {...profile, probeSource: fs.realpathSync(source)};
-        orders = `${orders}\n\n${probeOrders(owned)}`;
-      }
-      handle = await adapter.launch({peer, profile, orders, cwd: owned?.cwd ?? captured?.row.cwd ?? session.cwd, dir, task, attempt: round, context, signal: admission?.signal, review, reviewState});
+      handle = await adapter.launch({peer, profile, orders, cwd: captured?.row.cwd ?? session.cwd, dir, task, attempt: round, context, signal: admission?.signal, review, reviewState});
       if (closed) { await adapter.cancel(handle); releaseReview(peer, launchState, context); return {verdict: 'unreadable', cancelled: true}; }
       if (launchState.cancelReason) {
         const stopped = await adapter.cancel(handle);
@@ -2063,7 +2048,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // The same job, failed the same way this many times, is a loop: bounce stops rather than running it
     // again, and says what to change. Found live: ten identical reviewer tasks, each killed at the ceiling.
     // An attempt of a job is a task, not a start: a rework round, a step renewal or a resume is the same
-    // task continuing, capped by its own limits. Found live (ACE d1bc0206): one rework plus one retry used
+    // task continuing, capped by its own limits. Found live (session d1bc0206): one rework plus one retry used
     // up a job, and a completed, evidence-backed result was failed "attempt allowance exhausted".
     const jobTasks = new Set(session.events.filter(e => e.kind === 'task.started' && e.purpose !== 'report' && e.jobId === row.jobId && e.task !== task).map(e => e.task));
     if (row.jobId && jobTasks.size >= (suppliedLimits.attempts ?? 3)) {
@@ -2532,7 +2517,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       if (r.verdicts.includes('blocked')) { await handleBlocked(r); continue; }
       if (r.verdicts.includes('deadline')) { await handleLeaseEnd(r, now); continue; }
       // A task waiting for its turn (the local model, memory) has no worker to be silent: found live
-      // (ACE e3bd01d5), two tasks sent back by their check were cancelled as silent while they waited
+      // (session e3bd01d5), two tasks sent back by their check were cancelled as silent while they waited
       // for the local model, and redone on a cloud fallback.
       if (launchingAttempts.get(r.task)?.phase === 'admission') continue;
       for (const reason of ['silent', 'stalled']) if (r.verdicts.includes(reason)) await handleSignature(r, reason, now);
@@ -2571,7 +2556,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         // A follow-up (retryOf) reusing this same workspace diffs against what's now in the
         // checkout, not the pre-integration copy it started from — see advanceBaseline.
         const workspace = existingWorkspace(action.task);
-        if (workspace && !workspace.disposable) workspaces.set(action.task, advanceBaseline(workspace, artifact));
+        if (workspace) workspaces.set(action.task, advanceBaseline(workspace, artifact));
         append(continuation);
       } catch (error) {
         append({kind: 'task.blocked', task: action.task, reason: 'integration_interrupted', text: `Artifact integration interrupted: ${error.message}; durable manifest retained for restart recovery`});
@@ -2729,7 +2714,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       text: 'Worker exit was verified, but no durable outcome was recorded; inspect preserved work and submit an explicit retry'});
   }
   // A worker whose process was recorded (task.started pid) and is gone ended with the daemon that
-  // ran it: cancelled as lost, never a fallback, so it does not hold the orchestrator. Found live (ACE
+  // ran it: cancelled as lost, never a fallback, so it does not hold the orchestrator. Found live (session
   // d1bc0206): two such workers, dead for hours, kept every orchestrator turn refused.
   const workerGone = task => { const pid = session.events.findLast(e => e.task === task && e.kind === 'task.started')?.pid; return Number.isSafeInteger(pid) && !processAlive(pid) ? pid : null; };
   for (const t of Object.values(initialView)) if (!executionEnded(t.id) && (MID_FLIGHT.has(t.state) || t.state === 'queued') && (t.attempt != null || session.events.some(row => row.task === t.id && ['task.local_selected', 'task.launch.requested', 'review.started'].includes(row.kind))) && !handles.has(t.id)) {
@@ -2807,8 +2792,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       append({kind: 'task.failed', task, reason: 'attempts_exhausted', text: 'Logical job attempt allowance exhausted; retain progress and request a scope decision', context});
       return false;
     }
-    // A job's time is not shared between its attempts (Daniel, 2026-09-30): the ceiling counts from this
-    // task's own first start. Found live (ACE e3bd01d5): a retry on a slow local model ran to the ceiling,
+    // A job's time is not shared between its attempts (2026-09-30): the ceiling counts from this
+    // task's own first start. Found live (session e3bd01d5): a retry on a slow local model ran to the ceiling,
     // and the retry on Sonnet submitted right after it was refused in the same second.
     const own = starts.find(e => e.task === task);
     if (own && clock() >= Date.parse(own.time) + ceilingMs) {

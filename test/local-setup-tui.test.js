@@ -92,7 +92,7 @@ test('TUI setup loaded stays interactive during a held main turn, saves on conse
   const localStatus=session.events.findLast(e=>e.kind==='status'&&e.text?.includes('OpenCode:'));
   assert.doesNotMatch(localStatus.text,/NOT READY/);
   assert.match(localStatus.text,/run \/local verify to prove the bridge/);
-  assert.match(localStatus.text,/Agents a local model may play: analyst \(lmstudio\/loaded, probe\)/);
+  assert.match(localStatus.text,/Agents a local model may play: analyst \(lmstudio\/loaded, write\)/);
   await answer('/local setup loaded','analyst (');
   child.stdin.write('\u001b');await wait(()=>output.includes('Local setup cancelled'));
   assert.equal(cancels,0);assert.equal(runs,1);

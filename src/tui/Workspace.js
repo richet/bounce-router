@@ -222,8 +222,8 @@ export function createWorkspace(React, Ink) {
           // The main worker's proposed next step, dim after the caret while the input is empty: Tab takes it, typing replaces it.
           index === 0 && !view.input && view.suggestion ? React.createElement(Text, {color: 'gray'}, ` ${view.suggestion}  ⇥ Tab`) : null)),
         React.createElement(Text, {color: 'yellow', wrap: 'truncate-end'}, (view.notice ?? '').replace(/\n/g, ' ')),
-        // The main worker's status line lives under the prompt box, not above the transcript (Daniel,
-        // 2026-10-01): what it is doing and for how long, and — with the sidebar hidden — which AI and mode.
+        // The main worker's status line lives under the prompt box, not above the transcript
+        // (2026-10-01): what it is doing and for how long, and — with the sidebar hidden — which AI and mode.
         React.createElement(Text, {bold: true, color: working ? 'yellow' : 'cyan', wrap: 'truncate-end'}, statusText)));
     return React.createElement(Box, {flexDirection: 'row', columnGap: sidebar ? 1 : 0, width: total, height}, content,
       sidebar ? React.createElement(Sidebar, {metadata: view.metadata, panes: model.panes, main: allPanes[0], height, now}) : null);

@@ -1,6 +1,5 @@
 import {spawn as spawnProcess} from 'node:child_process';
 import fs from 'node:fs';
-import path from 'node:path';
 import codex from './codex.js';
 import {connectBus} from '../bus.js';
 import {resolveExecutable} from '../executable.js';
@@ -105,20 +104,12 @@ const request = (handle, {method, params}) => new Promise((resolve, reject) => {
 const ANSI = /\x1b\[[0-9;]*m/g;
 export const vendorTracing = text => /^\s*\d{4}-\d\d-\d\dT[\d:.]+Z\s+(TRACE|DEBUG|INFO|WARN|ERROR)\s+[\w]+(::[\w]+)+/.test(String(text ?? '').replace(ANSI, ''));
 
-function permissionsFor(profile = {}, peer, cwd) {
-  // probe runs commands and writes nothing: exactly what codex's read-only sandbox enforces.
-  const effective = profile.policy === 'read-only' || profile.policy === 'probe' ? 'read-only' : profile.mode === 'plan' ? 'plan' : 'yolo';
+function permissionsFor(profile = {}, peer) {
+  const effective = profile.policy === 'read-only' ? 'read-only' : profile.mode === 'plan' ? 'plan' : 'yolo';
   const dynamicTools = reportGrant(profile, peer) ? {dynamicTools: [REPORT_TOOL_SPEC]} : {};
   if (effective === 'yolo') {
     return {thread: {approvalPolicy: 'never', sandbox: 'danger-full-access', ...dynamicTools},
       turn: {approvalPolicy: 'never', sandboxPolicy: {type: 'dangerFullAccess'}}};
-  }
-  if (profile.policy === 'probe' && profile.probeSource) {
-    const isolated = fs.realpathSync(cwd);
-    const source = fs.realpathSync(profile.probeSource);
-    if (source === isolated || source.startsWith(`${isolated}${path.sep}`) || isolated.startsWith(`${source}${path.sep}`)) throw new Error('probeSource must be separate from cwd');
-    return {thread: {approvalPolicy: 'never', sandbox: 'workspace-write', ...dynamicTools},
-      turn: {approvalPolicy: 'never', sandboxPolicy: {type: 'workspaceWrite', writableRoots: [isolated], excludeSlashTmp: true, excludeTmpdirEnvVar: true}}};
   }
   return {thread: {approvalPolicy: 'on-request', sandbox: 'read-only', ...dynamicTools},
     turn: {approvalPolicy: 'on-request', sandboxPolicy: {type: 'readOnly'}}};
@@ -318,12 +309,8 @@ export function createCodexLive({spawn = spawnProcess, kill = process.kill, conn
     const executable = resolveExecutable('codex', profile.executables?.codex);
     // keepStdin: requests are written for the life of the peer, so the pipe is never ended early.
     const report = reportGrant(profile, peer);
-    const permissions = permissionsFor(profile, peer, cwd);
+    const permissions = permissionsFor(profile, peer);
     const env = vendorEnv(process.env, profile.orchestratorEnv);
-    if (profile.policy === 'probe' && profile.probeSource) {
-      env.TMPDIR = path.join(fs.realpathSync(cwd), '.probe-tmp');
-      fs.mkdirSync(env.TMPDIR, {recursive: true, mode: 0o700});
-    }
     // dynamicTools is negotiated through initialize.capabilities.experimentalApi. The grant itself
     // is intentionally never inherited by the child environment.
     const live = spawnLive({executable, args: ['app-server'], cwd,
@@ -353,7 +340,7 @@ export function createCodexLive({spawn = spawnProcess, kill = process.kill, conn
 
   return {
     name: 'codex',
-    capabilities: () => ({live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'], executionPolicies: ['read-only', 'probe', 'plan', 'yolo'], quota: 'query'}),
+    capabilities: () => ({live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'], executionPolicies: ['read-only', 'plan', 'yolo'], quota: 'query'}),
 
     async launch({peer, profile, orders = '', cwd, dir, userImages = []}) {
       const handle = await connect({profile, peer, cwd, dir});
@@ -378,7 +365,7 @@ export function createCodexLive({spawn = spawnProcess, kill = process.kill, conn
     events: handle => handle.stream.iterator,
 
     // Codex saves every thread under ~/.codex, and the ChatGPT app lists them. Found live: a
-    // hundred bounce worker and reviewer threads in Daniel's ChatGPT history. A thread whose task has
+    // hundred bounce worker and reviewer threads in the user's ChatGPT history. A thread whose task has
     // ended is archived: out of the list, still recoverable, and unarchived if the task resumes.
     async archive({profile = {}, native = {}, cwd}) {
       if (typeof native.sessionId !== 'string' || !native.sessionId) return false;

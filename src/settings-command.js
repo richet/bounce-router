@@ -1,5 +1,5 @@
 // /config: see and change bounce's settings from the TUI instead of editing ~/.bounce/config.json by hand
-// (Daniel, 2026-10-01: "having to configure a config.json file manually is a hassle"). The file stays the
+// (2026-10-01: "having to configure a config.json file manually is a hassle"). The file stays the
 // truth and keeps only what the user set; every change goes through the same validation as the loader, so a
 // refused value is refused with the loader's words. What takes effect at once and what waits for the next
 // session is said on every line, because a daemon reads most settings when it starts.

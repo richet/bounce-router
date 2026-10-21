@@ -213,26 +213,6 @@ test('X2b read-only policy wins over yolo mode in App Server thread and turn set
   });
 });
 
-test('X2c a probe worker gets the read-only sandbox: it runs commands, the OS refuses writes', async t => {
-  const h = harness(t);
-  const handle = await h.launch({orders: 'probe it', profile: {mode: 'yolo', policy: 'probe'}});
-  await take(h.adapter.events(handle), 1);
-  assert.deepEqual(h.methods('thread/start')[0].params, {approvalPolicy: 'on-request', sandbox: 'read-only'});
-  assert.equal(h.adapter.capabilities().executionPolicies.includes('probe'), true);
-});
-
-test('X2d a probe workspace uses workspace-write only for the isolated cwd', async t => {
-  const h = harness(t);
-  const source = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-probe-source-'));
-  t.after(() => fs.rmSync(source, {recursive: true, force: true}));
-  const handle = await h.launch({orders: 'probe it', profile: {mode: 'yolo', policy: 'probe', probeSource: source}});
-  await take(h.adapter.events(handle), 1);
-  assert.deepEqual(h.methods('thread/start')[0].params, {approvalPolicy: 'never', sandbox: 'workspace-write'});
-  assert.deepEqual(h.methods('turn/start')[0].params.sandboxPolicy, {type: 'workspaceWrite', writableRoots: [fs.realpathSync(h.root)], excludeSlashTmp: true, excludeTmpdirEnvVar: true});
-  assert.equal(h.methods('turn/start')[0].params.approvalPolicy, 'never');
-  await assert.rejects(() => h.launch({orders: 'bad probe', profile: {policy: 'probe', probeSource: h.root}}), /separate from cwd/);
-});
-
 test('X3 a mid-turn deliver waits: the second turn/start follows the first turn/completed', async t => {
   const h = harness(t, {delay: 120});
   const handle = await h.launch({orders: 'first'});
@@ -343,7 +323,7 @@ test('X6 the reader ignores malformed, null and unmatched lines, and says when i
   assert.deepEqual(rows[4], {kind: 'result', status: 'completed', text: 'survivor'});
   assert.equal(handle.threadId, 't-9'); // the forged id resolved nothing
   assert.deepEqual(adapter.capabilities(),
-    {live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'], executionPolicies: ['read-only', 'probe', 'plan', 'yolo'], quota: 'query'});
+    {live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'], executionPolicies: ['read-only', 'plan', 'yolo'], quota: 'query'});
 });
 
 test('the vendor process sees no bus keys, is detached, and gets the task cwd', async t => {

@@ -308,7 +308,7 @@ export function attemptLease(events, task, {defaultDeadlineMs = 3600000, ceiling
   const ownStart = events.findLast(e => e.kind === 'task.started' && e.task === task);
   const start = reviewing ? review : ownStart ?? rootStart;
   if (!start) return null;
-  // The ceiling counts from this task's own first start, not the task it replaces (Daniel, 2026-09-30).
+  // The ceiling counts from this task's own first start, not the task it replaces (2026-09-30).
   const startedAt = Date.parse((ownStart ?? rootStart ?? start).time);
   const leaseFrom = Date.parse(start.time);
   const submitted = events.find(e => e.kind === 'task.submitted' && e.task === root);

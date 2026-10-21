@@ -22,7 +22,7 @@ test('classifyInput classifies every TUI command exactly once', () => {
   assert.equal(seen.length, 34);
 });
 
-test('classifyInput reads /exit as /quit (Daniel, 2026-10-02: "there\'s no /exit command")', () => {
+test('classifyInput reads /exit as /quit (2026-10-02: "there\'s no /exit command")', () => {
   assert.deepEqual(classifyInput('/exit'), {kind: 'lifecycle', command: 'quit', parts: [], arg: ''});
 });
 test('classifyInput folds /typesafe into /jev, keeping its arguments', () => {

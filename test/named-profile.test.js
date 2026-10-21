@@ -1,4 +1,4 @@
-// Found live (ACE d1bc0206): 11 of 23 first attempts named `build_claude` (Opus) directly, skipping the
+// Found live (session d1bc0206): 11 of 23 first attempts named `build_claude` (Opus) directly, skipping the
 // builder agent's own order (local, then Sonnet, then Opus), although the orders already said not to.
 import test from 'node:test';
 import assert from 'node:assert/strict';

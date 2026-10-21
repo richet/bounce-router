@@ -1,4 +1,4 @@
-// Observed live (ACE session 159f4746, seq 8857): the orchestrator answered pending task outcomes
+// Observed live (session 159f4746, seq 8857): the orchestrator answered pending task outcomes
 // with "waiting on your go-ahead for P4" but recorded no durable successor or named wait, so the
 // outcomes stayed pending, kept re-waking it, and after 2 continuation attempts main.blocked
 // wake_retry_exhausted stopped the main loop. A turn that closes by asking the user one question

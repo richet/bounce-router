@@ -307,7 +307,7 @@ test('a persisted loaded-only load policy — the old default — migrates to on
 // whole escaped-JSON orders twice — once as `Running ·` when the command started, once as the tool row when
 // it finished. The command is as unbounded as its output was.
 // The orchestrator dispatches by shelling `bounce publish --event '<json>'`, so a whole brief — kind,
-// profile and 3 KB of orders — used to land on screen as escaped JSON, twice per task (Daniel, 2026-09-22:
+// profile and 3 KB of orders — used to land on screen as escaped JSON, twice per task (2026-09-22:
 // "look at that json", "fold it too.. if I want to see it I can go to the agents view"). The orders reach
 // the worker and the journal either way; the chat says what the call was.
 test('a bounce event is folded to what it is, not the escaped JSON it was typed as', () => {

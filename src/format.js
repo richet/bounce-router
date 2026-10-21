@@ -145,7 +145,7 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     if (e.kind === 'attempt' && e.status === 'started') return event({...e, kind: 'status', text: 'Starting provider…'}, width);
     // The request row repeats what the user typed, or is the fixed wake prompt bounce types at the
     // orchestrator ("Continue your orders…"): bounce talking to the orchestrator, not the
-    // conversation (Daniel, 2026-09-30). The journal keeps it; the transcript shows nothing.
+    // conversation (2026-09-30). The journal keeps it; the transcript shows nothing.
     if (e.kind === 'main.requested') return [];
     if (e.kind.startsWith('main.')) {
       const label = {'main.starting': 'Starting', 'main.started': 'Running', 'main.terminal': 'Finished', 'main.blocked': 'Blocked', 'main.delivery': 'Message'}[e.kind] ?? 'Orchestrator';
@@ -228,10 +228,10 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
       return [clip(style.help(clean(`${who(e)} · Help`)), width), ...body.map(row => row ? '  ' + row : ''), ''];
     }
     // What the user typed is set apart from everything an agent says: the whole prompt in the user colour,
-    // not only its glyph (Daniel, 2026-10-01: "make the difference between user text and agent text more obvious").
+    // not only its glyph (2026-10-01: "make the difference between user text and agent text more obvious").
     if (compact && e.kind === 'user' && e.typed) return [...block(style.user('>'), wrap(clean(e.typed), width - 2).map(line => style.user(line))), clip(`  ${style.muted('⎿')}  ${style.muted(`expanded to ${withoutBrief(e.text).length.toLocaleString()} chars · /details shows it`)}`, width), ''];
     // A prompt typed while a turn runs, still held by this view (cli.js pendingTurns): shown where it will
-    // land, marked queued, until it is sent (Daniel, 2026-10-01: a queued message not on screen "is not good").
+    // land, marked queued, until it is sent (2026-10-01: a queued message not on screen "is not good").
     if (compact && e.kind === 'user' && e.local) return [...block(style.user('>'), wrap(clean(e.text), width - 2).map(line => style.user(line))), clip(`  ${style.muted('⎿')}  ${style.muted('queued · runs when the current turn ends · ↑ to edit')}`, width), ''];
     if (compact && e.kind === 'user') return [...block(style.user('>'), wrap(clean(withoutBrief(e.text)), width - 2).map(line => style.user(line))), ''];
     if (compact && e.kind === 'assistant' && e.narration) return [...block(style.muted('∴'), wrap(clean(e.text), width - 2).map(line => style.muted(line))), ''];
@@ -260,7 +260,7 @@ export function displayEvents(events) {
   for (const event of events) {
     if (['raw', 'usage', 'checkpoint', 'session'].includes(event.kind) || !event.text) continue;
     // "Orchestrator selected codex" says something the first time and when the AI changes; the copy
-    // journaled at every turn start says nothing new (Daniel, 2026-09-30).
+    // journaled at every turn start says nothing new (2026-09-30).
     if (event.kind === 'route') {
       const last = result.findLast(row => row.kind === 'route');
       if (last && last.provider === event.provider && last.model === event.model) continue;

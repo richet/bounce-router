@@ -123,7 +123,7 @@ test('between local models of one tier, the one the agent\'s own list names play
 // agent's file names is offered even when it is not loaded — loaded ones still rank first, and a model
 // nobody named stays out until it is loaded, so the machine's big models are never picked by surprise.
 test('an unloaded local model is offered when the agent names it, and never when nobody does', () => {
-  const named = new Map([['reviewer', {...agentMetadata('---\nname: reviewer\ndescription: Reads for defects.\npolicy: probe\nmodels: [auto, lmstudio/dense-27b, claude/sonnet]\n---\nYou review.\n'), source: 'user', file: '/x/reviewer.md'}]]);
+  const named = new Map([['reviewer', {...agentMetadata('---\nname: reviewer\ndescription: Reads for defects.\npolicy: write\nmodels: [auto, lmstudio/dense-27b, claude/sonnet]\n---\nYou review.\n'), source: 'user', file: '/x/reviewer.md'}]]);
   const profiles = validateOrchestration(settings, undefined, {roles: named}).profiles;
   const cold = localCandidates(catalogs([model('coder-30b'), model('dense-27b', {...onDisk, size: 16 * 1024 ** 3}), model('huge-139b', {...onDisk, ref: 'lmstudio/huge-139b'})]), {...cache, 'lmstudio/huge-139b': {tier: 'strongest', capabilities: 'Very large.'}});
   const options = {profiles, notes: {}, locals: cold, head: profiles.reviewer, confidence: 0.8};

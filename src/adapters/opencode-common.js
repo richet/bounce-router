@@ -9,11 +9,9 @@ export const READ_TOOLS = ['read', 'grep', 'glob'];
 export const WRITE_TOOLS = ['write', 'edit', 'apply_patch', 'bash'];
 // No todo list either: it gave a stuck model something to do forever instead of answering.
 export const NEVER_TOOLS = ['todowrite', 'task', 'websearch', 'webfetch', 'skill', 'question', 'invalid'];
-// A probe worker reads and runs commands (bash) but gets no editing tool; the sandbox in
-// opencode-live.js makes sure bash cannot write the project either.
 export function toolsFor(policy) {
   const writes = policy === 'write' || policy === 'yolo';
-  return Object.fromEntries([...READ_TOOLS.map(tool => [tool, true]), ...WRITE_TOOLS.map(tool => [tool, writes || (policy === 'probe' && tool === 'bash')]), ...NEVER_TOOLS.map(tool => [tool, false])]);
+  return Object.fromEntries([...READ_TOOLS.map(tool => [tool, true]), ...WRITE_TOOLS.map(tool => [tool, writes]), ...NEVER_TOOLS.map(tool => [tool, false])]);
 }
 
 // CONTRACT §5: {input, cache_read, cache_write, output}, integers only, absent keys absent.

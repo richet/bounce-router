@@ -35,7 +35,7 @@ export const CLI_USAGE = [
   ['bounce sessions', '[--json]', 'List sessions: name, age, mode, id, workspace (● = live)'],
   ['bounce rename', 'SESSION NAME', 'Name a session (SESSION = name, id or id prefix; --resume takes the same)'],
   ['bounce task compare', 'SESSION A B', 'Built-in A/B: compare two tasks (tokens, wall, rounds) from the log'],
-  ['bounce doctor', '', 'Report workspace, data dir, mode, order and each agent\'s version and quota'],
+  ['bounce doctor [--fix]', '', 'Report workspace, data dir, mode, order, each agent\'s version and quota, and whether bounce can drive the installed opencode; --fix installs one it can'],
   ['bounce update', '[--check]', 'Check for or install the latest npm release'],
   ['bounce dev', '', 'Improve bounce itself; validate/reload after changes'],
 ];

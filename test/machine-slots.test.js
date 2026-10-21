@@ -1,6 +1,6 @@
-// The local model is one machine's resource, not one bounce home's. Found live (ACE d1bc0206,
+// The local model is one machine's resource, not one bounce home's. Found live (session d1bc0206,
 // 2026-09-28): a second bounce, started with another home, queued its worker on the same LM Studio
-// slot and the first one's builder sat "stalled for 604 s". Daniel: the machine runs one at a time.
+// slot and the first one's builder sat "stalled for 604 s". The user: the machine runs one at a time.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';

@@ -21,6 +21,14 @@ test('resolve addresses the loaded instance identifier and builds the provider c
   assert.equal(profile.model, 'auto', 'the input profile is not mutated');
 });
 
+test('the job\'s sampling reaches the model block OpenCode is started with, and its maxTokens is the room the model must have', async () => {
+  const sampling = {thinking: 'off', temperature: 0.7, maxTokens: 2048};
+  const resolved = await createLocalResolver({local, discover: async () => catalog}).resolve({profile: {...profile, localOptions: {maxOutputTokens: 2048, sampling}}});
+  assert.deepEqual(resolved.opencodeConfig.provider.lmstudio.models.loaded.options, {temperature: 0.7, max_tokens: 2048, reasoningEffort: 'none'});
+  await assert.rejects(createLocalResolver({local, discover: async () => catalog}).resolve({profile: {...profile, localOptions: {maxOutputTokens: 16384, sampling: {maxTokens: 16384}}}}),
+    {code: 'LOCAL_MODEL_UNAVAILABLE'}, 'an 8k model cannot hold a 16k answer');
+});
+
 test('a model with no loaded instance is addressed by its ref and loaded on demand', async () => {
   const unloaded = [{provider: 'local', backend: 'lmstudio', endpoint: 'lmstudio', models: [
     {id: 'model', ref: 'lmstudio/model', type: 'llm', tools: true, ready: null, instances: [], context: 8192}]}];

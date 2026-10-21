@@ -1,4 +1,4 @@
-// Observed live (ACE session 159f4746): tasks 43387649 (blocked report_incomplete) and 151ed901
+// Observed live (session 159f4746): tasks 43387649 (blocked report_incomplete) and 151ed901
 // (blocked worker_blocked) stayed parked forever after fresh tasks (01416607, 56ae277e) replaced
 // them, because bounce never linked a successor's acceptance back to the task it replaced. With
 // blocked tasks no longer expiring (ba96be9), that kept waking the orchestrator about outcomes it

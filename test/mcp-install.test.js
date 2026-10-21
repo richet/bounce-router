@@ -1,4 +1,4 @@
-// bounce registers its own MCP server (Daniel, 2026-09-22: "let bounce do it"), the way `skills sync` writes
+// bounce registers its own MCP server (2026-09-22: "let bounce do it"), the way `skills sync` writes
 // agent skill directories: idempotent, never touching an entry it did not write, and undoable.
 import test from 'node:test';
 import assert from 'node:assert/strict';
