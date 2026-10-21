@@ -2,3 +2,5 @@ node_modules/
 .bounce/
 .DS_Store
 *.log
+docs/
+.claude/
