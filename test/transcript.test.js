@@ -43,6 +43,18 @@ test('streamed deltas read as one answer block and the result that repeats them 
   ]);
   assert.deepEqual(rows.map(row => [row.kind, row.id, row.text]), [['delta', 'd1+3', 'Hi — picked up']]);
   assert.equal(conversationEvents([{id: 'd1', kind: 'delta', provider: 'muse', text: 'Hi'}, {id: 'd2', kind: 'delta', provider: 'muse', text: '!'}], {details: true}).length, 2);
+  // Rows bounce journals while the answer streams (seen live: the session title, a native id, a status)
+  // do not cut the answer in two, and the result that repeats the whole of it is still dropped.
+  const interleaved = conversationEvents([
+    {id: 'u1', kind: 'user', text: 'hi'},
+    {id: 'd1', kind: 'delta', provider: 'claude', text: 'Hi Daniel. '}, {id: 'd2', kind: 'delta', provider: 'claude', text: "I'm in "},
+    {id: 't1', kind: 'session.titled', name: 'greeting', source: 'model'},
+    {id: 'n1', kind: 'peer.native', provider: 'claude', sessionId: 'sid'},
+    {id: 's1', kind: 'status', provider: 'claude', text: 'status'},
+    {id: 'd3', kind: 'delta', provider: 'claude', text: 'bounce-router.'},
+    {id: 'r1', kind: 'result', provider: 'claude', success: true, text: "Hi Daniel. I'm in bounce-router."},
+  ]);
+  assert.deepEqual(interleaved.filter(row => ['delta', 'result'].includes(row.kind)).map(row => [row.kind, row.id, row.text]), [['delta', 'd1+3', "Hi Daniel. I'm in bounce-router."]]);
 });
 
 test('a run of progress readings for the same thing collapses to its latest value', () => {
