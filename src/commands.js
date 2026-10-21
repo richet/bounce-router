@@ -7,7 +7,7 @@ export const commandCatalog = {
 };
 
 // A second spelling of one command classifies as the command itself.
-export const commandAliases = {typesafe: 'jev'};
+export const commandAliases = {typesafe: 'jev', exit: 'quit'};
 
 const kinds = new Map(Object.entries(commandCatalog).flatMap(([kind, commands]) => commands.map(command => [command, kind])));
 

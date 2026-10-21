@@ -78,7 +78,7 @@ export const TUI_SECTIONS = [
     ['/steer', 'TEXT', 'Steer the focused agent live; when idle, save an aside for its next turn'],
     ['/review', '', 'Show the full text of every session work item'],
     ['/detach', '', 'Close this view; orchestrator and workers keep running'],
-    ['/quit', '', 'Stop this session and exit (Esc cancels an active turn)'],
+    ['/quit', '', 'Stop this session and exit; /exit does the same (Esc cancels an active turn)'],
   ]},
   {title: 'Skills', rows: [
     ['/skills', '', 'List bounce skills and where each agent has them'],
