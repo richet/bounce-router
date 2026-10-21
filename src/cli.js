@@ -995,7 +995,7 @@ async function main() {
           return;
         }
         if (command === 'provider') {
-          if (!providers[arg]) throw new Error('Choose claude, codex, or muse');
+          if (!providers[arg]) throw new Error('Choose claude, codex, muse, or opencode');
           router.select(arg); settings.order = [arg, ...settings.order.filter(p => p !== arg)]; save();
         } else if (command === 'model') {
           if (!arg || arg === 'refresh') { await openModelPicker(arg === 'refresh'); return; }
@@ -1034,7 +1034,7 @@ async function main() {
           }
           // Explicit profile fallback takes precedence over this legacy provider order.
           const reading = settings.order.map(p => `${p} (${settings.models[p] || 'default'})`).join(' → ');
-          const note = arg ? (orchestrating ? `saved · the orchestrator now runs on ${settings.order[0]}` : 'saved') : orchestrating ? 'the first agent is the orchestrator; /order codex,claude moves it' : '/order claude,codex,muse changes it';
+          const note = arg ? (orchestrating ? `saved · the orchestrator now runs on ${settings.order[0]}` : 'saved') : orchestrating ? 'the first agent is the orchestrator; /order codex,claude moves it' : '/order claude,codex,muse,opencode changes it';
           session.append({kind: 'status', text: `Fallback order: ${reading} · ${note}`});
         } else if (command === 'stats') {
           const text = arg.trim() === 'tasks' ? ['One line per task: id · agent · AI · attempts · minutes · tokens · checks · state · what ate the time', ...taskLines(session.events)].join('\n')
@@ -1077,7 +1077,7 @@ async function main() {
         } else if (command === 'login') {
           // Validate before the screen flips, so a typo never drops the user out of the TUI.
           const provider = arg || selected();
-          if (!providers[provider]) throw new Error('Choose claude, codex, or muse');
+          if (!providers[provider]) throw new Error('Choose claude, codex, muse, or opencode');
           leave();
           process.stdout.write(`\nbounce: handing this terminal to \u2018${provider} login\u2019. Finish it here; bounce returns when it exits.\n\n`);
           let outcome;

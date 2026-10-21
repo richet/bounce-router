@@ -55,19 +55,9 @@ const STEP_BEAT_CAP_MS = 15 * 60_000;
 const CONCLUDE_TIMEOUT_MS = 90_000;
 const BEAT = Symbol('beat');
 
-// The policy tier becomes the agent's tools map — the same ladder the vendor CLIs get as flags.
-// A read-only or plan worker has no tool that can change anything; write/yolo edit and run
-// commands in the real tree, exactly as a claude or codex yolo worker does.
-const READ_TOOLS = ['read', 'grep', 'glob'];
-const WRITE_TOOLS = ['write', 'edit', 'apply_patch', 'bash'];
-// No todo list either: it gave a stuck model something to do forever instead of answering.
-const NEVER_TOOLS = ['todowrite', 'task', 'websearch', 'webfetch', 'skill', 'question', 'invalid'];
-// A probe worker reads and runs commands (bash) but gets no editing tool; the sandbox below makes
-// sure bash cannot write the project either.
-export function toolsFor(policy) {
-  const writes = policy === 'write' || policy === 'yolo';
-  return Object.fromEntries([...READ_TOOLS.map(tool => [tool, true]), ...WRITE_TOOLS.map(tool => [tool, writes || (policy === 'probe' && tool === 'bash')]), ...NEVER_TOOLS.map(tool => [tool, false])]);
-}
+// toolsFor and mapUsage live in opencode-common.js (shared with the classic adapter) and are re-exported.
+export {toolsFor, mapUsage} from './opencode-common.js';
+import {toolsFor, mapUsage, READ_TOOLS, WRITE_TOOLS, NEVER_TOOLS} from './opencode-common.js';
 
 // The OS-level fence for a probe worker (docs/plans/probing-reviewer.md): macOS sandbox-exec around the
 // whole opencode process. Writes are refused everywhere except the temp dirs and opencode's own state,
@@ -107,15 +97,6 @@ export const CONTRACT = {
 const effectiveTier = (profile = {}) =>
   profile.policy === 'read-only' ? 'read-only' : profile.policy === 'probe' ? 'probe' : profile.mode === 'plan' ? 'plan' : profile.policy === 'write' ? 'write' : 'yolo';
 
-// CONTRACT §5: {input, cache_read, cache_write, output}, integers only, absent keys absent.
-export const mapUsage = raw => {
-  const usage = {};
-  if (Number.isInteger(raw?.input)) usage.input = raw.input;
-  if (Number.isInteger(raw?.cache?.read)) usage.cache_read = raw.cache.read;
-  if (Number.isInteger(raw?.cache?.write)) usage.cache_write = raw.cache.write;
-  if (Number.isInteger(raw?.output)) usage.output = raw.output;
-  return usage;
-};
 
 // A local model needs no vendor credential, so none reaches it: opencode would otherwise pick up
 // ANTHROPIC_API_KEY & co. from the environment and could route a "local" worker to a paid API.

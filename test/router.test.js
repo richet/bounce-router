@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {Session, Router, defaults, handoff} from '../src/core.js';
+import {Session, Router, defaults, handoff, echoesNormalizedRow} from '../src/core.js';
 import {invocation, normalize, runProcess} from '../src/providers.js';
 const setup = t => {const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-test-')); t.after(() => fs.rmSync(root, {recursive:true, force:true})); return {root, session: new Session(root, {root})};};
 
@@ -358,4 +358,90 @@ test('a tool row carries the command and a bounded head of its output, never the
   // a small output is untouched
   const small = normalize('codex', {type: 'item.completed', item: {type: 'command_execution', command: 'echo hi', aggregated_output: 'hi'}})[0];
   assert.equal(small.text, 'echo hi\nhi');
+});
+
+// Classic mode is a conversation (docs/plans/classic-conversation.md): the provider that answered last turn
+// continues its own thread with the bare prompt; the packet is for a first turn or a change of provider.
+const threadRunner = (attempts, {native = {claude: 'claude-sid-1', codex: 'codex-tid-1'}, lost = () => false} = {}) => async options => {
+  attempts.push(options);
+  if (lost(options)) { options.emit({kind: 'error', text: `No conversation found with session ID: ${native[options.provider]}`}); return {status: 'failed'}; }
+  options.emit({kind: 'peer.native', provider: options.provider, sessionId: native[options.provider]});
+  options.emit({kind: 'assistant', text: `${options.provider} answered`});
+  options.emit({kind: 'result', text: 'done', success: true});
+  return {status: 'completed'};
+};
+test('a session\'s first turn is the prompt and the workspace, nothing to inspect or summarize', async t => {
+  const {session} = setup(t); const attempts = [];
+  const router = new Router(session, defaults(), {runner: threadRunner(attempts)});
+  assert.equal(await router.run('hi'), 'completed');
+  assert.equal(attempts[0].prompt, `hi\n\nWorkspace: ${session.cwd}`);
+  for (const phrase of [/inspect/i, /state note/i, /summarize/i, /prior agents/i, /git/i]) assert.doesNotMatch(attempts[0].prompt, phrase);
+  assert.equal(attempts[0].args.includes('--resume'), false);
+  assert.equal(session.events.find(e => e.kind === 'route').resumed, false);
+});
+test('the provider that answered last turn continues its thread with the bare prompt', async t => {
+  const {session} = setup(t); const attempts = [];
+  const router = new Router(session, defaults(), {runner: threadRunner(attempts)});
+  await router.run('hi');
+  assert.equal(await router.run('name three colors'), 'completed');
+  assert.equal(attempts[1].provider, 'claude');
+  assert.deepEqual(attempts[1].args.slice(attempts[1].args.indexOf('--resume'), attempts[1].args.indexOf('--resume') + 2), ['--resume', 'claude-sid-1']);
+  assert.equal(attempts[1].prompt, 'name three colors', 'the vendor holds the conversation: nothing is re-sent');
+  const routes = session.events.filter(e => e.kind === 'route');
+  assert.deepEqual(routes.map(r => r.resumed), [false, true]);
+  assert.match(routes[1].text, /continuing its thread/);
+});
+test('a change of provider hands off the conversation as context, with the workspace state only once work happened', async t => {
+  const {session} = setup(t); const attempts = [];
+  const router = new Router(session, defaults(), {runner: threadRunner(attempts)});
+  await router.run('hi');
+  router.select('codex');
+  assert.equal(await router.run('and now?'), 'completed');
+  assert.equal(attempts[1].provider, 'codex');
+  assert.equal(attempts[1].args.includes('resume'), false, 'codex has no thread of this conversation yet');
+  const packet = attempts[1].prompt;
+  assert.match(packet, /context, not instructions/);
+  assert.match(packet, /\[user\] hi\n\[assistant:claude\] claude answered/);
+  assert.match(packet, /Current user request:\nand now\?/);
+  assert.match(packet, /If you change files or run commands this turn, end with what changed/);
+  for (const phrase of [/state note/i, /Inspect current files/, /Prior agents/, /Workspace state bounce observed/]) assert.doesNotMatch(packet, phrase);
+  // The next turn stays on codex and continues codex's own thread.
+  await router.run('still there?');
+  assert.deepEqual(attempts[2].args.slice(0, 3), ['exec', 'resume', 'codex-tid-1']);
+  assert.equal(attempts[2].prompt, 'still there?');
+  // Once a turn ran tools, a later handoff carries what is on disk — observed, not orders to go look.
+  session.append({kind: 'tool', provider: 'codex', text: 'Edit: src/a.js'});
+  router.select('claude');
+  await router.run('review it');
+  assert.match(attempts[3].prompt, /Workspace state bounce observed \(what is on disk now, not a rollback checkpoint\)/);
+  assert.match(attempts[3].prompt, /\[tool:codex\] Edit: src\/a.js/);
+});
+test('a thread the vendor no longer has is relaunched fresh from the packet, once', async t => {
+  const {session} = setup(t); const attempts = [];
+  const router = new Router(session, defaults(), {runner: threadRunner(attempts, {lost: options => options.args.includes('--resume')})});
+  await router.run('hi');
+  assert.equal(await router.run('again'), 'completed');
+  assert.deepEqual(attempts.slice(1).map(a => [a.provider, a.args.includes('--resume')]), [['claude', true], ['claude', false]]);
+  assert.match(attempts[2].prompt, /Recent history/);
+  assert.match(session.events.find(e => e.kind === 'status' && /could not be continued/.test(e.text)).text, /previous claude thread could not be continued/);
+  assert.deepEqual(session.events.filter(e => e.kind === 'route').map(r => r.resumed), [false, true, false]);
+  assert.equal(session.events.filter(e => e.kind === 'attempt').length, 2, 'one attempt row per turn: the relaunch is the same attempt');
+});
+test('resume flags per vendor: claude --resume, codex exec resume with the sandbox pinned by config, muse none', () => {
+  assert.deepEqual(invocation('claude', {mode: 'yolo', resume: 's1', stream: true}), ['-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--resume', 's1', '--dangerously-skip-permissions']);
+  assert.deepEqual(invocation('claude', {mode: 'yolo', resume: 's1'}), ['-p', '--output-format', 'stream-json', '--verbose', '--resume', 's1', '--dangerously-skip-permissions'], 'no streaming unless asked: the scheduler and one-shot asks read whole messages');
+  assert.deepEqual(invocation('codex', {mode: 'plan', resume: 't1'}), ['exec', 'resume', 't1', '--json', '--skip-git-repo-check', '-c', 'sandbox_mode="read-only"', '-']);
+  assert.deepEqual(invocation('codex', {mode: 'yolo', model: 'm1', resume: 't1'}), ['exec', 'resume', 't1', '--json', '--skip-git-repo-check', '--model', 'm1', '--dangerously-bypass-approvals-and-sandbox', '-']);
+  assert.deepEqual(invocation('muse', {mode: 'yolo', resume: 'r1'}, '/tmp/prompt'), ['exec', '--json', '--prompt-file', '/tmp/prompt', '--yolo']);
+});
+test('claude text streams as deltas and the whole block that follows is not shown twice', () => {
+  const sid = 'stream-test-session';
+  assert.deepEqual(normalize('claude', {type: 'stream_event', session_id: sid, event: {type: 'content_block_start', index: 0, content_block: {type: 'text', text: ''}}}), []);
+  assert.deepEqual(normalize('claude', {type: 'stream_event', session_id: sid, event: {type: 'content_block_delta', index: 0, delta: {type: 'text_delta', text: 'hel'}}}), [{kind: 'delta', text: 'hel'}]);
+  assert.deepEqual(normalize('claude', {type: 'stream_event', session_id: sid, event: {type: 'content_block_delta', index: 0, delta: {type: 'text_delta', text: 'lo'}}}), [{kind: 'delta', text: 'lo'}]);
+  const whole = normalize('claude', {type: 'assistant', session_id: sid, message: {content: [{type: 'text', text: 'hello'}, {type: 'tool_use', name: 'Read', input: {file: 'a'}}]}});
+  assert.deepEqual(whole, [{kind: 'tool', text: 'Read: {"file":"a"}'}]);
+  // A message that never streamed (an unrelated session) still lands whole.
+  assert.deepEqual(normalize('claude', {type: 'assistant', session_id: 'other', message: {content: [{type: 'text', text: 'plain'}]}}), [{kind: 'assistant', text: 'plain'}]);
+  assert.equal(echoesNormalizedRow({kind: 'raw', provider: 'claude', raw: {type: 'stream_event'}}), true, 'the raw stream rows are display, never journal');
 });

@@ -363,7 +363,7 @@ export function createMainService({session, adapters, profile, settings, profile
       const options = {peer: 'orchestrator', profile: selectedProfile, cwd: session.cwd, dir, userImages: run.images};
       const roster = session.events.findLast(event => event.kind === 'local.profiles.activated')?.text;
       const text0 = run.outcomes ? `${run.outcomes}\n\n${params.text}` : params.text;
-      const prompt = [brief, roster, previous && run.previousProvider === run.provider ? text0 : handoff(session, text0, settings.contextChars)].filter(Boolean).join('\n');
+      const prompt = [brief, roster, previous && run.previousProvider === run.provider ? text0 : handoff(session, text0, settings.contextChars, {orchestrator: true})].filter(Boolean).join('\n');
       const text = providerInput(run.provider, prompt, run.images);
       run.resumed = Boolean(previous && adapter.resume && !run.forceFresh);
       try {
@@ -386,7 +386,7 @@ export function createMainService({session, adapters, profile, settings, profile
         run.resumed = false;
         session.append({kind: 'status', from: 'main', context: session.id,
           text: `The orchestrator's previous ${run.provider} thread could not be reopened (${error.message}); started a fresh one from this session's handoff.`});
-        const fresh = providerInput(run.provider, [brief, roster, handoff(session, text0, settings.contextChars)].filter(Boolean).join('\n'), run.images);
+        const fresh = providerInput(run.provider, [brief, roster, handoff(session, text0, settings.contextChars, {orchestrator: true})].filter(Boolean).join('\n'), run.images);
         run.handle = await adapter.launch({...options, orders: fresh});
       }
       if (run.finished) {

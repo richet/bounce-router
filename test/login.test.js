@@ -34,6 +34,10 @@ test('installed provider receives native login arguments; failures do not sugges
 
 test('invalid providers are rejected before spawning', async () => {
   for (const provider of ['invalid', 'toString', '__proto__', undefined]) {
-    await assert.rejects(login(provider, {executables: {}}, process.cwd()), /Choose claude, codex, or muse/);
+    await assert.rejects(login(provider, {executables: {}}, process.cwd()), /Choose claude, codex, muse, or opencode/);
   }
+});
+
+test('a local provider has nothing to sign in to, and says where its setup lives', async () => {
+  await assert.rejects(login('opencode', {executables: {}}, process.cwd()), /opencode runs local models; there is nothing to sign in to\. \/local setup configures LM Studio, \/model picks the model\./);
 });

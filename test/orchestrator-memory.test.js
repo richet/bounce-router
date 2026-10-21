@@ -45,7 +45,7 @@ test('S1 the view of the work: what each job has done, and a repeat nobody could
 test('S2 the packet leads with the orchestrator\'s own state, then the facts, then the transcript', () => {
   const state = 'Phase p2-verdicts. Locking review failed twice at the ceiling on the 27B — not retrying it there; next is the same scope on codex. Docker and CLI areas untouched.';
   const session = {cwd: '/w', file: '/w/journal.jsonl', events: [...journal, at(59, {kind: 'state', text: state, from: 'orchestrator'})]};
-  const packet = handoff(session, 'carry on');
+  const packet = handoff(session, 'carry on', 48000, {orchestrator: true});
   assert.match(packet, /Where you are \(your own note, rewritten each turn\):\n/);
   assert.equal(packet.indexOf(state) < packet.indexOf('reviewer · 3 attempts'), true, 'its own words come first');
   assert.equal(packet.indexOf('reviewer · 3 attempts') < packet.indexOf('Recent history'), true, 'then the facts, then raw history');
@@ -59,7 +59,7 @@ test('S3 only the latest state is carried, and an over-budget one is carried in 
   const session = {cwd: '/w', file: '/w/journal.jsonl', events: [...journal,
     at(58, {kind: 'state', text: older, from: 'orchestrator'}),
     at(59, {kind: 'state', text: newest, from: 'orchestrator'})]};
-  const packet = handoff(session, 'carry on');
+  const packet = handoff(session, 'carry on', 48000, {orchestrator: true});
   assert.equal(packet.includes(older), false, 'the superseded state is history, not context');
   assert.equal(packet.includes(newest), true, 'bounce never cuts its memory for it');
   assert.match(packet, new RegExp(`your state note is ${newest.length} characters, over the ${STATE_MAX} budget`));
@@ -68,7 +68,7 @@ test('S3 only the latest state is carried, and an over-budget one is carried in 
 
 test('S4 a session with no state note yet is asked for one, once', () => {
   const session = {cwd: '/w', file: '/w/journal.jsonl', events: journal};
-  const packet = handoff(session, 'carry on');
+  const packet = handoff(session, 'carry on', 48000, {orchestrator: true});
   assert.match(packet, /You wrote no state note last turn: end this turn with one/);
   assert.match(packet, /reviewer · 3 attempts/, 'the facts are there either way');
 });

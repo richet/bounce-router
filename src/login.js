@@ -7,13 +7,16 @@ const installationUrls = {
   claude: 'https://code.claude.com/docs/en/quickstart',
   codex: 'https://learn.chatgpt.com/docs/codex/cli',
   muse: 'https://dev.meta.ai/',
+  opencode: 'https://opencode.ai/docs/',
 };
 
 // Shared by shell login and /login; the TUI retains errors in its transcript.
 // Inherit stdio so the vendor's browser/device prompt owns the real terminal.
 export function login(provider, settings, cwd) {
   return new Promise((resolve, reject) => {
-    if (!Object.hasOwn(providers, provider)) return reject(new Error('Choose claude, codex, or muse'));
+    if (!Object.hasOwn(providers, provider)) return reject(new Error('Choose claude, codex, muse, or opencode'));
+    // A local model has no account: there is nothing to sign in to.
+    if (!providers[provider].login) return reject(new Error(`${provider} runs local models; there is nothing to sign in to. /local setup configures LM Studio, /model picks the model.`));
     const override = settings.executables[provider];
     const executable = resolveExecutable(provider, override);
     prepareCodexHome(executable);

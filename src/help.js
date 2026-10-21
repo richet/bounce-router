@@ -46,7 +46,7 @@ export const TUI_SECTIONS = [
     ['/model', '', 'Pick from every model your signed-in agents report'],
     ['/model', 'ID', 'Set the selected agent\'s model; "default" resets'],
     ['/model refresh', '', 'Re-ask each agent for its catalog, then pick'],
-    ['/order', '[claude,codex,muse]', 'Show the fallback order, or save a new one'],
+    ['/order', '[claude,codex,muse,opencode]', 'Show the fallback order, or save a new one'],
     ['/mode', 'yolo|plan', 'YOLO is the default; plan uses restrictive provider flags'],
     ['/login', 'NAME', 'Open the vendor\'s native login flow'],
   ]},

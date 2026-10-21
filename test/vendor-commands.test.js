@@ -104,7 +104,8 @@ test('the journal keeps the expansion as the request and the typed line for the 
   const user = session.events.find(e => e.kind === 'user');
   assert.equal(user.typed, '/triage REC-7');
   assert.match(user.text, /Triage \*\*REC-7\*\* end-to-end\./);
-  assert.match(attempts[0].prompt, /Current user request:\nCommand: \/triage \(claude · project\)[^\n]*\n\nTriage \*\*REC-7\*\* end-to-end\./);
+  // A first turn is the request itself (docs/plans/classic-conversation.md): the expansion, then the workspace.
+  assert.match(attempts[0].prompt, /^Command: \/triage \(claude · project\)[^\n]*\n\nTriage \*\*REC-7\*\* end-to-end\.\n\nWorkspace: /);
   // A later turn's history carries the instructions, not just the slash line.
   await router.run('Carry on');
   assert.match(attempts[1].prompt, /\[user\] Command: \/triage[\s\S]*end-to-end/);

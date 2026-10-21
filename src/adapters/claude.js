@@ -1,6 +1,8 @@
 const describe = value => typeof value === 'string' ? value : JSON.stringify(value ?? '');
 // Tool results arrive as content blocks; show their text rather than a JSON dump.
 const foregroundTasks = new Set();
+// Text blocks seen streaming per session, so the whole block in the following `assistant` row is skipped.
+const streamed = new Map();
 const contentText = value => Array.isArray(value)
   ? value.map(part => part?.type === 'text' ? part.text : part?.type === 'image' ? '[image]' : describe(part)).join('\n')
   : describe(value);
@@ -9,10 +11,17 @@ export default {
   name: 'claude',
   login: ['auth', 'login'],
   // `ephemeral`: a one-off call is not saved as a Claude Code session (it would fill `claude --resume`).
-  invocation({model, mode, images = [], ephemeral = false}) {
+  // `resume`: continue that Claude Code session (a classic turn on the same provider, Router.run).
+  // `stream`: text arrives as `delta` rows instead of landing whole with the result (measured 2026-10-02:
+  // an 8-second answer showed nothing for 8 seconds). Only the classic conversation asks for it — the
+  // scheduler and the one-shot asks (titles, /btw, roster notes) read the assembled `assistant` row, which
+  // normalize() withholds once a block has streamed.
+  resumes: true,
+  invocation({model, mode, images = [], ephemeral = false, resume = null, stream = false}) {
     const imageArgs = images.length ? ['--input-format', 'stream-json'] : [];
     const modelArgs = model ? ['--model', model] : [];
-    return ['-p', '--output-format', 'stream-json', '--verbose', ...(ephemeral ? ['--no-session-persistence'] : []), ...modelArgs, ...imageArgs,
+    return ['-p', '--output-format', 'stream-json', '--verbose', ...(stream ? ['--include-partial-messages'] : []), ...(ephemeral ? ['--no-session-persistence'] : []),
+      ...(resume ? ['--resume', resume] : []), ...modelArgs, ...imageArgs,
       ...(mode === 'yolo' ? ['--dangerously-skip-permissions'] : ['--permission-mode', 'plan'])];
   },
   stdin: prompt => prompt,
@@ -21,8 +30,19 @@ export default {
     const add = (kind, text, extra = {}) => events.push({kind, text: describe(text), ...extra});
     const model = raw.message?.model ?? raw.model ?? raw.payload?.model ?? raw.payload?.model_id;
     if (typeof model === 'string' && model.trim()) events.push({kind: 'model', model});
+    // A streamed text block arrives as deltas and then again whole in the `assistant` message; the deltas
+    // are the transcript (as Muse's are), the whole block is dropped so the answer is not shown twice.
+    if (raw.type === 'stream_event') {
+      const event = raw.event ?? {};
+      const key = raw.session_id ?? '';
+      if (event.type === 'content_block_start' && event.content_block?.type === 'text') streamed.set(key, (streamed.get(key) ?? 0) + 1);
+      if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta' && event.delta.text) add('delta', event.delta.text);
+    }
     if (raw.type === 'assistant') for (const block of raw.message?.content ?? []) {
-      if (block.type === 'text') add('assistant', block.text);
+      if (block.type === 'text') {
+        const key = raw.session_id ?? '', pending = streamed.get(key) ?? 0;
+        if (pending > 0) streamed.set(key, pending - 1); else add('assistant', block.text);
+      }
       if (block.type === 'tool_use') add('tool', `${block.name}: ${describe(block.input)}`);
     }
     if (raw.type === 'user') for (const block of raw.message?.content ?? []) {
