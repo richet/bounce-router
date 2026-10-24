@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
 
-// What you typed in this workspace before, across sessions, for ↑ and Ctrl+R (docs/plans/interactive-polish.md
+// What you typed in this workspace before, across sessions, for ↑ and Ctrl+R (docs/ARCHITECTURE.md § TUI
 // step 4). One JSON array per workspace under the data dir, newest last. A prompt that starts with a space is not
 // kept — the shell convention for "don't remember this" — and neither is one over 10 000 characters.
 const MAX_LENGTH = 10_000;

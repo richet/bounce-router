@@ -150,7 +150,7 @@ function formatRow(row, json) {
 }
 
 // Derives Phase 2's single orchestration profile from legacy settings — real adapters
-// arrive in Phase 3; see docs/local-orchestration.md "Process model".
+// arrive in Phase 3; see docs/ARCHITECTURE.md § Core.
 // A session opened in the home folder: every worker — a local model with a shell included — runs
 // from there. Said once, at the top of the session; null anywhere else.
 export function homeSessionWarning(cwd, home = os.homedir()) {
@@ -323,7 +323,7 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
         '`bounce agents` lists the team in force; `bounce agents show NAME` prints one.', '',
       ];
     })(),
-    // The project's lessons (docs/plans/lessons-and-sweep.md): every line, with its job, and how one is recorded.
+    // The project's lessons (docs/ARCHITECTURE.md § Standing workers): every line, with its job, and how one is recorded.
     ...(() => { const block = lessonsBlock(session.cwd, 'orchestrator'); return block ? ['', block, ''] : []; })(),
     'Lessons: when a task redid work that had been accepted, or a check failed twice, the handoff asks whether there is a lesson. If there is, record it with the lesson tool (or publish lesson.learned): agent (the job it is for, or all) and text (one sentence, imperative, no task ids). It lands in .bounce/LESSONS.md in the project and in every later worker\'s prompt for that job; a person deletes a line to withdraw it. Record what a worker should do differently here, not what happened.', '',
     `Worker profiles (one AI each): ${Object.entries(profiles).filter(([name, p]) => name !== orchestrator && name !== JEV_REVIEWER && !p.derived).map(([name, p]) => p.model ? `${name} (${p.model})` : name).join(', ') || 'none configured'} — name one only when the user asks for that AI, or for a retry (see above).`,
@@ -514,7 +514,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
       reportTokens.set(peer, true);
       return {BOUNCE_REPORT_BUS: bus.path, BOUNCE_REPORT_TOKEN_FILE: grant.file};
     }, strategy: strategyOverride ?? orchestration.strategy, jev});
-  // A lesson lands in the project's .bounce/LESSONS.md for a job this project has (docs/plans/lessons-and-sweep.md).
+  // A lesson lands in the project's .bounce/LESSONS.md for a job this project has (docs/ARCHITECTURE.md § Standing workers).
   const keepLesson = ({agent, text}) => {
     const kept = recordLesson(session.cwd, {agent, text}, {agents: new Set([...readRoles().values()].filter(role => !role.error).map(role => role.name)), session: session.id});
     return kept;

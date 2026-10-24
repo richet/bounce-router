@@ -1,4 +1,4 @@
-// Standing workers (docs/plans/standing-workers.md §1, 2026-10-01): a worker is a session per agent
+// Standing workers (docs/ARCHITECTURE.md § Standing workers, 2026-10-01): a worker is a session per agent
 // that outlives its tasks. Nothing is stored for it beyond the journal: a fresh launch names a worker on its
 // `task.launch.requested` row (`builder#1`), a continuation carries the name of the worker it resumed, and
 // `worker.retired` ends one. This view folds those rows into who exists, what each has done, and who is idle.

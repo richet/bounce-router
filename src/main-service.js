@@ -31,7 +31,7 @@ const HANDOFF_ANSWER_MAX = 12000;
 // How long after a vendor refuses a typed message bounce tries it once more.
 const TYPED_RETRY_MS = 3000;
 const HANDOFF_DELAY_MS = 1000; // several tasks ending together become one wake-up turn
-// The quiet sweep (docs/plans/lessons-and-sweep.md §2): nothing in flight, held work waiting, and no row
+// The quiet sweep (docs/ARCHITECTURE.md § Standing workers): nothing in flight, held work waiting, and no row
 // for sweepMs — the orchestrator is asked once what is waiting on it. Found live (session e3bd01d5,
 // 2026-09-30): two held tasks waited 91 minutes with nothing running and nobody noticing.
 const SWEEP_MINUTES = 20;
@@ -77,7 +77,7 @@ export function handoffBlock(session, ended) {
     const check = row.kind === 'task.accepted' ? session.events.findLast(event => event.kind === 'task.check' && event.task === row.task && typeof event.passed === 'boolean') : null;
     if (check) lines.push(`  check: ${check.passed ? 'passed' : 'FAILED'} (exit code ${check.exit})${check.passed && check.weak ? ', but it only looks for files or text and did not run the work' : ''} · ${String(check.command).slice(0, 500)}`);
     // A correction of accepted work, or a check that failed twice: the moment a lesson is in hand
-    // (docs/plans/lessons-and-sweep.md). The orchestrator decides whether there is one.
+    // (docs/ARCHITECTURE.md § Standing workers). The orchestrator decides whether there is one.
     const retryOf = session.events.find(event => event.kind === 'task.submitted' && event.task === row.task)?.retryOf;
     const redid = retryOf && view[retryOf]?.state === 'accepted' && ['task.completed', 'task.accepted', 'task.blocked', 'task.failed'].includes(row.kind);
     if (redid || (row.kind === 'task.blocked' && row.reason === 'check_failed')) {
@@ -102,7 +102,7 @@ export function handoffBlock(session, ended) {
     if (earlier.length) lines.push(`  this job has now failed ${earlier.length + 1} times the same way (${[...earlier.map(a => a.reason), row.reason ?? row.kind].join(', ')}): change the scope or the AI before asking again — bounce refuses a third identical attempt.`);
   }
   lines.push(running.length ? `Still running: ${running.map(t => `${t.id} (${t.profile}, ${t.state})`).join(', ')}` : 'No other task of yours is still running.');
-  // Standing workers (docs/plans/standing-workers.md §3): who exists, what each did, who is idle or heavy.
+  // Standing workers (docs/ARCHITECTURE.md § Standing workers): who exists, what each did, who is idle or heavy.
   const roster = rosterLines(session.events);
   if (roster.length) lines.push('Your workers:', ...roster);
   return lines.join('\n');

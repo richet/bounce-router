@@ -1,6 +1,6 @@
 // One-process bridge client for workers: `bounce publish` and `bounce wait` speak
 // straight to src/bus.js over BOUNCE_BUS / BOUNCE_BUS_TOKEN_FILE. Never imports
-// cli.js, reload.js or core.js, and never spawns anything — see docs/local-orchestration.md
+// cli.js, reload.js or core.js, and never spawns anything — see docs/ARCHITECTURE.md § Core
 // "Process model". bridgeCommand is pure I/O in, {stdout, exitCode} out so callers
 // (src/cli.js, tests) never touch process.exit themselves.
 import fs from 'node:fs';

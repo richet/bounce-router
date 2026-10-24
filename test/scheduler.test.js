@@ -214,7 +214,7 @@ test('a recoverable failure after the worker said something completes from what 
 });
 
 // A step-capped worker that was still making progress is continued on its own session first
-// (docs/plans/step-renewal.md) — before its partial answer is taken as the result.
+// (docs/ARCHITECTURE.md § Tasks) — before its partial answer is taken as the result.
 test('a step-capped runtime failure while progressing renews the worker\'s steps before anything is synthesized', async t => {
   const {session} = setup(t);
   let turn = 0;

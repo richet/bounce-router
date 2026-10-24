@@ -1,4 +1,4 @@
-// opencode 2.x answers stream to classic (docs/plans/interactive-polish.md step 3): `opencode run` prints a text part
+// opencode 2.x answers stream to classic (docs/ARCHITECTURE.md § Classic mode): `opencode run` prints a text part
 // only once it is whole, but its server's event stream carries the text and the thinking as they are written.
 import './helpers/env.js';
 import test from 'node:test';

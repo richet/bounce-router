@@ -1,4 +1,4 @@
-// The prompt editor in the real CLI (docs/plans/interactive-polish.md step 4): keys typed into a forked TUI in
+// The prompt editor in the real CLI (docs/ARCHITECTURE.md § TUI): keys typed into a forked TUI in
 // classic mode, with a fake claude answering, and the draft read back from the frames it draws.
 import './helpers/env.js';
 import test from 'node:test';

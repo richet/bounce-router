@@ -8,7 +8,7 @@ import {CONTRACT} from '../src/adapters/opencode-live.js';
 import {parseOpencodeVersion} from '../src/opencode-version.js';
 
 // Every local-worker defect that reached a user in 2026-09 was a belief about the opencode binary
-// that nobody had checked against the binary (docs/plans/local-design-v2.md §0). This holds the
+// that nobody had checked against the binary (docs/ARCHITECTURE.md § Local workers). This holds the
 // INSTALLED binary to what the adapter takes on faith. Skipped where opencode is not installed.
 const binary = resolveExecutable('opencode');
 const installed = path.isAbsolute(binary) && fs.existsSync(binary);

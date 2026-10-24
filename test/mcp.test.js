@@ -1,4 +1,4 @@
-// The MCP transport (docs/plans/bridge-interface.md): the second skin over src/bridge-ops.js, so the
+// The MCP transport (docs/ARCHITECTURE.md § Agent interface): the second skin over src/bridge-ops.js, so the
 // orchestrator calls typed tools instead of shelling `bounce publish` and reading its own journal with
 // `tail | jq`. It holds no policy: every call goes to a verb, every result is that verb's answer.
 // Researched first (2026-09-22): no client we serve consumes MCP resource subscriptions — Codex pulls

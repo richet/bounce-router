@@ -1,4 +1,4 @@
-// The persisted shape of `operation` and profile tables (docs/local-orchestration.md,
+// The persisted shape of `operation` and profile tables (docs/ARCHITECTURE.md § Core,
 // "Operation modes", D2): validated once, opt-in, and legacy configs untouched by construction.
 // Phase 8 §4: the role vocabulary is free-form (any non-empty label); `orchestrator` stays
 // reserved (derived from `settings.orchestrator`, never declared). READ_ONLY_ROLES is now only
@@ -24,7 +24,7 @@ function resolveStrategy(spec) {
   throw new Error('strategy must be default, no-review, or quorum:<n>');
 }
 
-// Phase 7 execution-policy ladder (docs/local-orchestration.md "Permissions", CONTRACT.md §1):
+// Phase 7 execution-policy ladder (docs/ARCHITECTURE.md § Core, CONTRACT.md §1):
 // least to most privileged. `write` exists for adapters to declare and future profiles to
 // request; no current bounce profile produces it.
 export const POLICY_RANK = {'read-only': 0, plan: 1, write: 2, yolo: 3};
@@ -213,7 +213,7 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
 // What a local backend adds for its job: the output it needs room for (src/local-resolve.js) and how
 // it samples (src/local-opencode-config.js). Only local backends carry it, so a cloud model never does.
 // `settings` are what the backend samples with: from bindings, its alias's own (none: nothing is sent, the model's
-// settings in LM Studio decide — docs/plans/agent-bindings.md option D); from a profile's legacy models:, the profile's.
+// settings in LM Studio decide — docs/ARCHITECTURE.md § Agents, bindings and models option D); from a profile's legacy models:, the profile's.
 const localOptions = (agent, settings) => ({maxOutputTokens: settings?.maxTokens ?? 2048, ...(settings ? {sampling: settings} : {})});
 // The settings of a surviving backend: chainSettings is aligned with the chain bindings resolved (src/bindings.js),
 // and each backend keeps its place in that chain (`at`) through the filters above — two aliases may name one model.

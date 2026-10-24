@@ -1,4 +1,4 @@
-// docs/plans/standing-workers.md step 2 (2026-10-01): a task that continues an earlier one resumes
+// docs/ARCHITECTURE.md § Standing workers (2026-10-01): a task that continues an earlier one resumes
 // that task's worker session into the new task's own copy instead of launching a stranger. Measured on session
 // e3bd01d5: 21 of 54 local builder sessions were continuations, each re-reading 13 files and 1.4 minutes
 // before its first edit. Probed 2026-10-01 with the real CLIs: OpenCode, Claude and Codex all edit the new
@@ -90,7 +90,7 @@ test('a continuation launches fresh, and says why, when the earlier task ran on 
   assert.throws(() => g.submit({continues: 'no-such-task'}), /continues/);
 });
 
-// docs/plans/standing-workers.md step 3: a worker is a standing session per agent. A new task for the agent
+// docs/ARCHITECTURE.md § Standing workers: a worker is a standing session per agent. A new task for the agent
 // goes to its idle standing worker by itself (a continuation of that worker's last task); a busy standing
 // worker means a second one is started, so parallel work stays parallel (deviation from the plan's "waits",
 // 2026-10-01); `worker.retire` ends one, with an optional handoff that opens the next.
@@ -152,7 +152,7 @@ test('a retired worker is not continued: the next task starts a fresh worker, op
   assert.deepEqual([f.rows('task.launch.requested', fresh.task)[0].worker, f.adapters.worker.calls.resume], ['builder#3', 0]);
 });
 
-// docs/plans/standing-workers.md §3, step 4 (2026-10-01: "introduce the handoff too and check on
+// docs/ARCHITECTURE.md § Standing workers (2026-10-01: "introduce the handoff too and check on
 // compact"). Probed with the real Claude CLI: `/compact` on a resumed session cut the next turn's context from
 // ~173k to ~38k tokens and the worker still knew what it had done. A retiring worker can be asked for its own
 // handoff: one more turn on its session, read-only, and its answer opens the next worker of that job.

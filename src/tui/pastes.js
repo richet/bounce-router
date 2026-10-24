@@ -1,4 +1,4 @@
-// A large paste is shown in the draft as one placeholder and sent in full (docs/plans/interactive-polish.md step 4):
+// A large paste is shown in the draft as one placeholder and sent in full (docs/ARCHITECTURE.md § TUI):
 // three hundred pasted lines would otherwise push the conversation off the screen while you type around them.
 const LINES = 20;
 const CHARS = 2000;

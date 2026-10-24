@@ -21,7 +21,7 @@ export const clean = text => stripAnsi(String(text ?? ''))
 // `role(row)` (optional) names who a row belongs to — the orchestrator profile, a worker's
 // profile — and is shown before the provider: `main · claude · Tool`. Only the orchestrator's views pass it.
 // `foldAnswers` (default: with `compact`) cuts an answer's code blocks to 4 lines and tables to 3 rows, for a worker
-// pane's few rows; the conversation shows answers whole (docs/plans/interactive-polish.md step 1).
+// pane's few rows; the conversation shows answers whole (docs/ARCHITECTURE.md § TUI).
 export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in process.env) && process.env.TERM !== 'dumb', compact = false, foldAnswers = compact, role = null} = {}) {
   const c = new Chalk({level: color ? 1 : 0});
   const style = {
@@ -125,7 +125,7 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     try { return hangAll(parser.parse(source).trimEnd(), width); }
     catch { return hangAll(source, width); } // Partial/unknown Markdown must never hide a response.
   }
-  // An answer still streaming (docs/plans/interactive-polish.md step 11): the paragraphs it has finished are
+  // An answer still streaming (docs/ARCHITECTURE.md § Classic mode): the paragraphs it has finished are
   // rendered once and kept; only the one being written is rendered again on each delta. A paragraph ends at a blank
   // line outside a code fence. A 2 000-word answer took 24 ms to render whole, more than a frame.
   let stream = {prefix: '', width: 0, rows: []}, reused = 0;
@@ -705,7 +705,7 @@ export function parseCommand(text) {
 // takes the orchestration profile table and the requested name, nothing shaped like a
 // session event — so nothing that folds session.events (a subscriber) could call it even by
 // accident. Only the keyboard's /continue handler in src/cli.js calls it, after the user
-// presses Enter; see CONTRACT.md A2/U5 and docs/local-orchestration.md "Reducers and policies".
+// presses Enter; see CONTRACT.md A2/U5 and docs/ARCHITECTURE.md § Core.
 export function continueMain(profiles, name) {
   if (!name || !Object.prototype.hasOwnProperty.call(profiles || {}, name) || profiles[name].policy === 'read-only') {
     return {ok: false, error: 'no such profile'};

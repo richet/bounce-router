@@ -8,7 +8,7 @@ import YAML from 'yaml';
 import {runLocalSetup} from '../src/local-wizard.js';
 import {agentMetadata, rolesFor} from '../src/agents.js';
 
-// Setup writes what a machine needs to play its team (docs/plans/agent-bindings.md): models.yaml, this machine's models
+// Setup writes what a machine needs to play its team (docs/ARCHITECTURE.md § Agents, bindings and models): models.yaml, this machine's models
 // by alias, and bindings.yml, who plays each agent; it moves the old agent files' models: and sampling into them. The
 // bridge check runs a real turn through a real `opencode`; here it is doubled (test/local-wizard-cli.test.js runs it).
 const okBridge = async () => ({binary: '/fake/opencode', config: {ready: true}, worker: {ready: true}});

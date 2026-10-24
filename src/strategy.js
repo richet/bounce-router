@@ -1,4 +1,4 @@
-// Phase 8 — pluggable orchestration strategy (CONTRACT.md, docs/local-orchestration.md
+// Phase 8 — pluggable orchestration strategy (CONTRACT.md, docs/ARCHITECTURE.md § Core
 // "Phase 8"). A strategy is a plain object of pure, synchronous decision functions the
 // scheduler (CORE) calls at fixed points; each hook returns a declared intent the CORE
 // executes. Strategies never journal, launch, or touch budgets directly — see CONTRACT §0.

@@ -8,7 +8,7 @@ import {createOpencodeLive, toolsFor, mapUsage, scrubCredentials, nativeConfig} 
 
 // The OpenCode adapter is the claude adapter's twin: one `opencode run` per turn, prompt on stdin,
 // JSON lines out, exit = turn end. The fake prints the event shapes observed from the real binary
-// (docs/plans/local-design-v2.md §1) and exits; it does not simulate a server.
+// (docs/ARCHITECTURE.md § Local workers) and exits; it does not simulate a server.
 const helper = fileURLToPath(new URL('../helpers/fake-opencode.js', import.meta.url));
 
 const setup = (t, env = {}) => {

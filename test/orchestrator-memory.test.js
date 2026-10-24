@@ -1,4 +1,4 @@
-// The orchestrator's working memory (docs/plans/orchestrator-memory.md). Found live: five sessions in one
+// The orchestrator's working memory (docs/ARCHITECTURE.md § Agent interface). Found live: five sessions in one
 // workspace were a single piece of work, each starting from an empty journal, and inside a session the
 // orchestrator re-derived the situation every wake — which is how ten identical reviewer tasks happened
 // without anyone noticing. Its own state note is judgement it rewrites each turn; the view of the work beside

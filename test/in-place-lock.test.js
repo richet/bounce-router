@@ -1,4 +1,4 @@
-// Phase 3 (docs/plans/in-place-tasks.md §5/§6): the integration lock. While an in-place task is
+// Phase 3 (docs/ARCHITECTURE.md § In-place tasks): the integration lock. While an in-place task is
 // `running`, an `integrate` action stays pending (never started) and runs — in order — once the
 // task leaves `running`. A copy worker running in parallel is never paused for it. A second
 // in-place task queues (`in_place_busy`) until the first ends. Restart replay: an orphaned

@@ -1,4 +1,4 @@
-// The turn footer's context and thinking (docs/plans/interactive-polish.md step 6), and the token counting under it:
+// The turn footer's context and thinking (docs/ARCHITECTURE.md § TUI), and the token counting under it:
 // each vendor's numbers mean different things, and the footer, /stats and the sidebar must read them the same way.
 import './helpers/env.js';
 import test from 'node:test';

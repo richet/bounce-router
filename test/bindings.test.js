@@ -1,4 +1,4 @@
-// Agent profiles and model bindings (docs/plans/agent-bindings.md): one team and one bindings file in use, the most
+// Agent profiles and model bindings (docs/ARCHITECTURE.md § Agents, bindings and models): one team and one bindings file in use, the most
 // specific that exists, whole; aliases resolved through the machine's models.yaml; an alias's settings travel with its
 // backend and nothing else is sent.
 import './helpers/env.js';

@@ -1,4 +1,4 @@
-// What the machine can run (docs/plans/resource-aware.md). Every fixture here is real output from the
+// What the machine can run (docs/ARCHITECTURE.md § Local slots). Every fixture here is real output from the
 // machine this was built on (2026-09-22): 128 GiB, 8.5 GB of swap already used with no pressure, a 92 GB
 // GPU wiring cap, a 20 GB model resident and a 73 GB one on disk. Nothing in these tests reads the
 // machine: the reads are injected, so the numbers cannot drift under the assertions.

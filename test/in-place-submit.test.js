@@ -1,4 +1,4 @@
-// Phase 2 (docs/plans/in-place-tasks.md §1/§3): task.submitted may carry `inPlace:
+// Phase 2 (docs/ARCHITECTURE.md § In-place tasks): task.submitted may carry `inPlace:
 // {authorizedBy: <seq>}`. Structural check (the cited row exists and is a `user` row), the
 // eligibility rule (a write-policy profile whose mode is not plan), and the workspace choice
 // (no attempt workspace, cwd = session.cwd, no writeFence) — all through the real scheduler and

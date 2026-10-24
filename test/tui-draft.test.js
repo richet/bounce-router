@@ -1,5 +1,5 @@
 // The prompt editor behaves the way fingers trained on a shell and on Claude Code expect
-// (docs/plans/interactive-polish.md step 4): kill and yank, undo, a history that outlives the session and can be
+// (docs/ARCHITECTURE.md § TUI): kill and yank, undo, a history that outlives the session and can be
 // searched, and a large paste that does not flood the draft.
 import test from 'node:test';
 import assert from 'node:assert/strict';

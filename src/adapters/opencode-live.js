@@ -11,7 +11,7 @@ import {serveForTurn} from '../opencode-server.js';
 // Bounce's only local-specific work is configuration: which model, and how OpenCode reaches it
 // (`profile.opencodeConfig`, built by src/local-opencode-config.js).
 //
-// Measured against opencode 1.18.31 (docs/plans/local-design-v2.md §1): `run --format json` exits by
+// Measured against opencode 1.18.31 (docs/ARCHITECTURE.md § Local workers): `run --format json` exits by
 // itself; every line carries `sessionID`; `step_finish` carries the tokens; and with nobody to
 // answer, a permission ask (e.g. a path outside --dir) is REJECTED by opencode itself — so there is
 // no server, port, password, SSE stream, permission responder, poll, deadline or reap here.
@@ -44,7 +44,7 @@ const COMMAND_MAX = 1000;
 // session with every tool off and a two-step cap: state your conclusion from what you have. An
 // answer is the task's result (still reviewed like any other); silence leaves the failure as it was.
 const CONCLUDE_STEPS = 2;
-// Why a turn ended with nothing from the worker. One path, one prompt (docs/plans/answer-contract.md).
+// Why a turn ended with nothing from the worker. One path, one prompt (docs/ARCHITECTURE.md § Local workers).
 const CAP_PROMPT = concludeAsk('your step budget is spent');
 const CONCLUDE_PROMPT = concludeAsk('you repeated the same call with nothing new');
 const SILENT_PROMPT = concludeAsk('your turn ended without an answer');

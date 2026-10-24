@@ -1,4 +1,4 @@
-// Completion the way a modern prompt does it (docs/plans/interactive-polish.md step 5): slash commands match
+// Completion the way a modern prompt does it (docs/ARCHITECTURE.md § TUI): slash commands match
 // fuzzily, and `@` completes a path in the workspace.
 import test from 'node:test';
 import assert from 'node:assert/strict';

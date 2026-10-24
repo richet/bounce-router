@@ -1,7 +1,7 @@
 import {createHash} from 'node:crypto';
 
 const cache = new Map();
-// Phase 2 (docs/plans/opencode-adapter.md): local workers now run a full `opencode serve` per
+// Phase 2 (docs/ARCHITECTURE.md § Local workers): local workers now run a full `opencode serve` per
 // worker instead of a single in-process loop, so the concurrency that was safe before has not been
 // measured for the new shape. Default to one until it is.
 // on-demand by default: LM Studio unloads idle models on its own, and its server loads a requested

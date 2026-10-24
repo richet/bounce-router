@@ -1,4 +1,4 @@
-// Jev completion verdicts over a LOCAL worker (docs/plans/jev-agents-routing.md, Phase 0): the two
+// Jev completion verdicts over a LOCAL worker (docs/ARCHITECTURE.md § Jev): the two
 // were connected only by construction — a local worker's answer is synthesized into
 // task.completed.summary, and Jev judges `review.summary` when there is no structured report — and
 // had never been run together. Real scheduler, real OpenCode adapter on the one-shot fake, the

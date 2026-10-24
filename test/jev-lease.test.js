@@ -1,4 +1,4 @@
-// Jev as the lease judge (docs/plans/task-leases.md §4): one Choice over the worker's recent work
+// Jev as the lease judge (docs/ARCHITECTURE.md § Tasks): one Choice over the worker's recent work
 // against its orders, asked at a lease end. It may only add to bounce's own progress rule, never be
 // required by it: off, failing or unsure, it answers `verdict: null` and the rule decides.
 import test from 'node:test';

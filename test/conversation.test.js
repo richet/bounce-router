@@ -1,4 +1,4 @@
-// One vendor process per conversation instead of one per turn (docs/plans/interactive-polish.md step 10, behind
+// One vendor process per conversation instead of one per turn (docs/ARCHITECTURE.md § Classic mode, behind
 // keepProcess): the process stays alive between turns, and is replaced (resuming the same thread) when what it was
 // launched with changes.
 import './helpers/env.js';

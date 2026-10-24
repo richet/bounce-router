@@ -1,4 +1,4 @@
-// MCP over stdio: the second transport for the agent-facing interface (docs/plans/bridge-interface.md).
+// MCP over stdio: the second transport for the agent-facing interface (docs/ARCHITECTURE.md § Agent interface).
 // Every tool here is a verb of src/bridge-ops.js or a view of src/task-view.js; this file decides nothing.
 //
 // Tools only, deliberately: researched 2026-09-22 — Codex pulls MCP resources through callable tools and

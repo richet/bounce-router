@@ -2,7 +2,7 @@ import sliceAnsi from 'slice-ansi';
 import stringWidth from 'string-width';
 import stripAnsi from 'strip-ansi';
 
-// Text selection the way a modern terminal app does it (docs/plans/interactive-polish.md step 0). The workspace
+// Text selection the way a modern terminal app does it (docs/ARCHITECTURE.md § TUI). The workspace
 // reports the regions it drew — the conversation, each pane's text, the sidebar — as rectangles on the screen with
 // the rows shown in them (Workspace.js); a drag stays in the region it started in, so a selection never runs across
 // a neighbouring pane or the sidebar the way the terminal's own selection would. Rows and columns are 0-based inside

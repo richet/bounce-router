@@ -302,7 +302,7 @@ test('a settings row renders as a block with one line per setting', () => {
   assert.deepEqual(rows, ['Bounce · Settings', '  Settings (x/config.json; what the file does not set is a default):', '    order = ["codex"] · provider order · applies now', '    sweepMinutes = 20 (default) · quiet minutes · applies next session', '']);
 });
 
-// docs/plans/interactive-polish.md step 1: the conversation shows an answer whole; folding is for worker panes.
+// docs/ARCHITECTURE.md § TUI: the conversation shows an answer whole; folding is for worker panes.
 test('the conversation formatter shows a long code block and a table whole; the pane formatter still folds them', () => {
   const code = Array.from({length: 40}, (_, n) => `line${n} = ${n}`).join('\n');
   const table = ['| name | qty | price |', '|---|---|---|', ...Array.from({length: 10}, (_, n) => `| item${n} | ${n} | ${n * 100} |`)].join('\n');

@@ -199,7 +199,7 @@ export function createWorkspace(React, Ink) {
         React.createElement(Text, {bold: true, color: working ? 'yellow' : 'cyan', wrap: 'truncate-end'}, statusText)),
     ];
   }
-  // Inline (docs/plans/interactive-polish.md step 7): finished rows are printed once into the terminal's own
+  // Inline (docs/ARCHITECTURE.md § TUI): finished rows are printed once into the terminal's own
   // scrollback through <Static>; below them only the turn in flight and the prompt area are redrawn, sized to their
   // content, so scrolling, search and selection are the terminal's. No sidebar.
   function InlineWorkspace({inline, view}) {

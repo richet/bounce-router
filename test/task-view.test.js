@@ -1,4 +1,4 @@
-// The read the orchestrator never had (docs/plans/bridge-interface.md). Found live: with
+// The read the orchestrator never had (docs/ARCHITECTURE.md § Agent interface). Found live: with
 // no way to ask "what did this task produce", it ran `tail -n 20 journal.jsonl` and 143 KB of raw JSON went
 // into the chat. These views answer the same question in a screenful, and hand back a POINTER to the journal
 // instead of its contents. Pure: events in, view out — the same fold the TUI renders from.

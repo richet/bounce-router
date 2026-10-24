@@ -1,4 +1,4 @@
-// The probing reviewer (docs/plans/probing-reviewer.md). Found live: a read-only reviewer was
+// The probing reviewer (docs/ARCHITECTURE.md § Reviews). Found live: a read-only reviewer was
 // told to run probes it had no tool for, reasoned through the whole tree for 60 minutes instead, and was
 // killed while writing its conclusion, taking every finding with it. A reviewer runs commands like any
 // write worker (its orders, not a sandbox, keep it from changing the tree); it states each finding as it
