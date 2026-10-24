@@ -229,7 +229,7 @@ export function quotaReport(store, order, now = Date.now()) {
     if (!entry?.windows?.length) return `${provider} · ${entry?.error ?? quotaUnavailable(provider)}`;
     const windows = entry.windows.map(w => expired(w, now) ? `${windowTitle(w.label)} ended since this reading (was ${w.percent}% used)`
       : `${windowTitle(w.label)} ${w.percent}% used${w.resetsAt ? ` (resets in ${duration(w.resetsAt - now)})` : ''}`);
-    return [provider, entry.plan, ...windows, `reported ${since(entry.time, now)}`, entry.error].filter(Boolean).join(' · ');
+    return [provider, entry.plan, ...windows, `reported ${since(entry.time, now)}`, entry.error && `latest check: ${entry.error}`].filter(Boolean).join(' · ');
   }).join('\n') + '\nThese are the plan\'s own windows, used by every session and app on the account, not this session alone.';
 }
 
@@ -336,10 +336,10 @@ const modelBar = (fraction, width, p) => {
 // Ranked by reducers.modelUsage, so entries[0] is already the top spender: its bar is always
 // full and every other bar reads as a share of it. No usage yet means nothing to rank — hidden,
 // not a placeholder. Same bars -> lines -> compact degradation as quotaPanel, for the same reason.
-// In and out apart (2026-10-02): what a model read (input, cache reads included) and what it wrote
+// In and out apart (2026-10-02): what a model read (input, cache reads and writes included, as the turn footer counts it) and what it wrote
 // are two quantities — output is a fraction of a percent of input — so each gets its own bar, scaled against
 // the model that read or wrote the most, and the label row carries both counts.
-const inOf = e => (e.usage?.input ?? 0) + (e.usage?.cache_read ?? 0) || (e.tokens ?? 0);
+const inOf = e => (e.usage?.input ?? 0) + (e.usage?.cache_read ?? 0) + (e.usage?.cache_write ?? 0) || (e.tokens ?? 0);
 const outOf = e => e.usage?.output ?? 0;
 const taggedBar = (fraction, width, tag, p) => { const cells = Math.max(4, width - tag.length - 1); const fill = Math.min(cells, Math.round(Math.max(0, Math.min(1, fraction)) * cells)); return `${p.ok(BAR.used.repeat(fill))}${p.muted(BAR.free.repeat(cells - fill))} ${p.muted(tag)}`; };
 export function modelPanel(entries, {width = 28, rows = Infinity, paint} = {}) {

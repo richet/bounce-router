@@ -17,6 +17,8 @@ export const SETTINGS = {
   'models.claude': {what: 'Claude model for the orchestrator and classic turns', applies: 'now', type: 'string', help: "The Claude model name used when a turn runs on Claude (for example sonnet or opus). Empty means the CLI's own default."},
   'models.codex': {what: 'Codex model for the orchestrator and classic turns', applies: 'now', type: 'string', help: "The Codex model name used when a turn runs on Codex (for example gpt-5.6-sol). Empty means the CLI's own default."},
   sidebar: {what: 'show the status sidebar (also /sidebar)', applies: 'now', type: 'boolean', help: 'Whether the right-hand status rail (workers, models, quota) is shown next to the transcript.'},
+  inline: {what: 'classic draws in the terminal\'s own scrollback', applies: 'next session', fallback: true, type: 'boolean', help: 'On: a classic session prints the conversation into your terminal, so its own scrollback, search and selection work, and only the turn in flight and the prompt are redrawn. Off: the full-screen view with the sidebar. The orchestrator always uses the full screen.'},
+  keepProcess: {what: 'keep one claude process for the whole conversation', applies: 'now', fallback: false, type: 'boolean', help: 'On: a classic conversation on claude keeps one claude process between turns instead of starting one per turn and resuming the thread. Off by default: measured, it gained nothing provable after the first turn and made the first turn about 2 s slower.'},
   cooldownMinutes: {what: 'how long a provider that hit its quota is skipped', applies: 'now', type: 'number', help: 'After a provider reports its quota is exhausted, how many minutes bounce skips it before trying it again. 0 retries at once.'},
   taskMinutes: {what: 'a task\'s lease, renewed while its worker makes progress (1–240)', applies: 'next session', fallback: 15, type: 'number', help: "How long a worker may run before bounce checks on it: the lease. It is renewed while the worker makes progress, so long work is normal; a worker that stops progressing is asked to conclude at the lease's end. 1 to 240."},
   taskCeilingMinutes: {what: 'the most a task runs from its own start (at least taskMinutes, up to 240)', applies: 'next session', fallback: 60, type: 'number', help: 'The most one task runs, counted from its own start, renewals included; past it the worker is asked for its conclusion. At least taskMinutes, up to 240.'},
@@ -34,6 +36,7 @@ export const SETTINGS = {
   'local.endpoints.lmstudio.maxConcurrent': {what: 'local workers at once on this endpoint', applies: 'next session', fallback: 1, type: 'number', help: 'How many local workers run on this LM Studio at once, across every bounce session on the machine. 1 on a single-GPU Mac: more does not make it faster.'},
   'local.endpoints.lmstudio.contextTokens': {what: 'context OpenCode is told a local model has', applies: 'next session', type: 'number', help: "The context size OpenCode is told a local model has; a worker's conversation is compacted at this size instead of growing to whatever LM Studio loaded the model with."},
   'local.endpoints.lmstudio.slotsPerModel': {what: 'parallel slots per loaded local model', applies: 'next session', type: 'number', help: "How many turns one loaded local model runs at once (LM Studio's parallel slots). Two builders on one model no longer hold back a reviewer on another."},
+  'local.endpoints.lmstudio.queueSeconds': {what: 'seconds a task waits for a busy local slot before its next AI', applies: 'next session', fallback: 60, type: 'number', help: 'When every local slot is in use, a task whose agent also lists a cloud AI waits this long, then runs on the next AI of its chain. 0 moves it at once. An agent with only local AIs waits as long as it takes.'},
 };
 const HIDDEN = new Set(['profiles', 'executables', 'operation', 'orchestrator', 'secrets']);
 
@@ -116,6 +119,8 @@ export function configCommand(words, {root, settings}) {
   const meta = SETTINGS[key];
   if (!key) throw new Error('Use /config unset <key>');
   if (HIDDEN.has(key.split('.')[0])) throw new Error(`${key} is managed elsewhere: profiles and agents by /local setup and bounce agents, the operation by /operation`);
+  // A dotted key under a known object (models.opencode, local.endpoints.<name>) reaches what the list does not show.
+  if (!meta && !(key.split('.')[0] in defaults())) throw new Error(`Unknown setting ${key} · /config lists them`);
   const value = unset ? undefined : parseValue(rest.join(' '));
   if (!unset && value === undefined) throw new Error(`Use /config ${key} <value>, or /config unset ${key}`);
   const next = structuredClone(stored);

@@ -116,3 +116,20 @@ test('one line per task names what ate its time', () => {
   assert.match(lines[0], /^a · builder · local:qwen3\.6-35b-a3b-mlx · 2 attempts · 7\.0 min · 111k tokens · checks fail\/pass · accepted · 2 attempts$/);
   assert.match(lines[3], /^d · builder · local:qwen3\.6-35b-a3b-mlx · 1 attempt · 1\.0 min · 0 tokens · checks pass · blocked$/);
 });
+
+// Found in the real-console pass 2026-10-21: a classic session's claude turns counted no tokens (its usage rows carry
+// claude's own field names) and no turns (classic journals user → turn, not main.started → main.terminal).
+test('a classic conversation counts its claude and codex tokens and its turns', () => {
+  const events = [
+    {kind: 'session', time: '2026-10-21T00:00:00Z'},
+    {kind: 'user', text: 'a', time: '2026-10-21T00:00:01Z'},
+    {kind: 'usage', provider: 'claude', usage: {input_tokens: 2, cache_read_input_tokens: 37500, cache_creation_input_tokens: 16200, output_tokens: 142}, time: '2026-10-21T00:00:05Z'},
+    {kind: 'turn', text: 'completed', time: '2026-10-21T00:00:05.400Z'},
+    {kind: 'user', text: 'b', time: '2026-10-21T00:01:00Z'},
+    {kind: 'usage', provider: 'codex', usage: {input: 2400, cache_read: 12300, output: 38}, time: '2026-10-21T00:01:03Z'},
+    {kind: 'turn', text: 'completed', time: '2026-10-21T00:01:03.800Z'},
+  ];
+  const s = sessionStats(events);
+  assert.deepEqual(s.tokens.byAI.orchestrator, {input: 2402, output: 180, cacheRead: 49800, reasoning: 0});
+  assert.deepEqual(s.time.orchestrator, {turns: 2, totalMs: 8200, medianMs: 4100});
+});

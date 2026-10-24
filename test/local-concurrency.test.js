@@ -181,3 +181,66 @@ test('a task sent back and waiting for the local model is not cancelled as silen
   await waitFor(() => scheduler.tasks()[task]?.state === 'accepted');
   assert.deepEqual(session.events.filter(e => e.kind === 'task.check' && e.task === task).map(e => e.passed), [false, true]);
 });
+
+// Found by the integration run 2026-10-22 (concurrency): three analysts on one LM Studio slot queued 96 + 27 + 31 s while
+// claude and codex sat idle. A task that waits `queueSeconds` for a local slot falls to the next AI of its own chain.
+test('a task kept waiting for a local slot past queueSeconds falls to the cloud backend of its chain', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-conc-wait-')));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const session = new Session(root, {root});
+  const launched = [];
+  const first = orders => orders.split('\n')[0];
+  const opencode = fakeAdapter(({orders}) => { launched.push(`local:${first(orders)}`); return new Promise(() => {}); });
+  // A derived (agent) profile's orders lead with the agent's prompt: name the job by the line after it.
+  const claude = fakeAdapter(({orders}) => { launched.push(`cloud:${orders.split('\n---\n\n')[1]?.split('\n')[0]}`); return [{kind: 'result', status: 'completed', text: 'cloud done'}]; });
+  const localResolver = {resolve: async ({profile}) => ({...profile, providerID: 'lmstudio', opencodeConfig: {}}), configure() {}};
+  const cloud = role => ({adapter: 'claude', model: 'sonnet', mode: 'yolo', policy: 'write', fallback: [], role, derived: true, agent: {name: role, description: 'x', policy: 'write', prompt: 'x'}});
+  const profiles = {a: {...local('analyst'), fallback: ['a~2']}, 'a~2': cloud('analyst'), b: {...local('analyst'), fallback: ['b~2']}, 'b~2': cloud('analyst')};
+  const scheduler = createScheduler({...hostless, session, adapters: {opencode, claude}, profiles, localResolver, gitHead: () => null,
+    localSettings: {endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234', maxConcurrent: 1, queueSeconds: 1}}}});
+  t.after(() => scheduler.close());
+  scheduler.submit({parent: null, profile: 'a', orders: 'one', deadline: null});
+  const two = scheduler.submit({parent: null, profile: 'b', orders: 'two', deadline: null});
+  await waitFor(() => launched.includes('cloud:two'));
+  assert.deepEqual(launched, ['local:one', 'cloud:two']);
+  const failed = session.events.find(e => e.kind === 'task.failed' && e.task === two.task);
+  assert.equal(failed.reason, 'local_busy');
+  assert.match(failed.text, /^Waited [12] s for a local slot on lmstudio \(1 of 1 in use\); moving to the next AI in its chain$/);
+  assert.equal(session.events.find(e => e.kind === 'policy.fallback' && e.task === two.task)?.to_profile, 'b~2');
+});
+
+test('a task with no other backend keeps waiting for its local slot however long it takes', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-conc-wait2-')));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const session = new Session(root, {root});
+  const opencode = fakeAdapter(() => new Promise(() => {}));
+  const localResolver = {resolve: async ({profile}) => ({...profile, providerID: 'lmstudio', opencodeConfig: {}}), configure() {}};
+  const scheduler = createScheduler({...hostless, session, adapters: {opencode}, profiles: {a: local('a'), b: local('b')}, localResolver, gitHead: () => null,
+    localSettings: {endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234', maxConcurrent: 1, queueSeconds: 1}}}});
+  t.after(() => scheduler.close());
+  scheduler.submit({parent: null, profile: 'a', orders: 'one', deadline: null});
+  const two = scheduler.submit({parent: null, profile: 'b', orders: 'two', deadline: null});
+  await new Promise(r => setTimeout(r, 1800));
+  assert.equal(scheduler.tasks()[two.task].state, 'queued');
+});
+
+// Found by the verification run 2026-10-22: a Jev-routed task (`analyst@lmstudio/…`) falls first to the agent's own
+// head, which is local too, so a check of the first link saw no other AI and the task waited for the slot anyway.
+test('the wait is capped when another AI is anywhere down the chain, not only in its first link', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-conc-chain-')));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const session = new Session(root, {root});
+  const launched = [];
+  const opencode = fakeAdapter(({orders}) => { launched.push(`local:${orders.split('\n---\n\n')[1]?.split('\n')[0] ?? orders.split('\n')[0]}`); return new Promise(() => {}); });
+  const claude = fakeAdapter(({orders}) => { launched.push(`cloud:${orders.split('\n---\n\n')[1]?.split('\n')[0]}`); return [{kind: 'result', status: 'completed', text: 'cloud done'}]; });
+  const localResolver = {resolve: async ({profile}) => ({...profile, providerID: 'lmstudio', opencodeConfig: {}}), configure() {}};
+  const cloud = {adapter: 'claude', model: 'sonnet', mode: 'yolo', policy: 'write', fallback: [], role: 'analyst', derived: true, agent: {name: 'analyst', description: 'x', policy: 'write', prompt: 'x'}};
+  const profiles = {a: {...local('analyst'), fallback: []}, b: {...local('analyst'), fallback: ['b~1']}, 'b~1': {...local('analyst'), fallback: ['b~2']}, 'b~2': cloud};
+  const scheduler = createScheduler({...hostless, session, adapters: {opencode, claude}, profiles, localResolver, gitHead: () => null,
+    localSettings: {endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234', maxConcurrent: 1, queueSeconds: 1}}}});
+  t.after(() => scheduler.close());
+  scheduler.submit({parent: null, profile: 'a', orders: 'one', deadline: null});
+  scheduler.submit({parent: null, profile: 'b', orders: 'two', deadline: null});
+  await waitFor(() => launched.includes('cloud:two'));
+  assert.deepEqual(launched.filter(l => l.endsWith('two')), ['cloud:two'], 'never queued again on the busy endpoint');
+});

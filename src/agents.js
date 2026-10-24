@@ -4,6 +4,7 @@ import {fileURLToPath} from 'node:url';
 import {createHash, randomUUID} from 'node:crypto';
 import {validateOrchestration, LOCAL_ADAPTERS} from './profiles.js';
 import {normalizeLocalSettings} from './local-models.js';
+import {applyBindings, bindingsFile, MODELS_FILE} from './bindings.js';
 
 // An agent is the job: one markdown file, frontmatter for what bounce routes on, body as the worker's
 // system prompt. The only thing that varies between the AIs that may play it is the AI — `models:`
@@ -20,6 +21,8 @@ import {normalizeLocalSettings} from './local-models.js';
 export const SKILL = 'agent-orchestrator';
 export const agentStore = root => path.join(root, 'agents');
 export const projectAgentStore = cwd => path.join(cwd, '.bounce', 'agents');
+// From the home directory, a project's .bounce is the user's own ~/.bounce: that is the user's layer, not a project.
+export const isOwnHome = (root, cwd) => Boolean(cwd) && path.resolve(cwd, '.bounce') === path.resolve(root);
 export const installedSkillAgents = root => path.join(root, 'skills', SKILL, 'team');
 const SHIPPED = fileURLToPath(new URL(`../skills/${SKILL}/team/`, import.meta.url));
 const LISTS = ['models', 'readPaths', 'writePaths', 'commands'];
@@ -152,12 +155,22 @@ function readStore(dir, source) {
 // Three layers, later ones shadowing by name: the shipped defaults (always present, even before
 // anything is seeded — so a read path never has to write), the user's store, then the project's.
 // A file that fails to parse is reported, not hidden, so a broken role never silently falls back.
+// The team is the most specific layer that has agents, whole — the project's, else the user's, else the shipped one —
+// never a sum (2026-10-24: "los agentes no son una suma de sets si no reemplazos"; an agent from outside a
+// project joining its team unasked is "una receta para el desastre"). The installed skill's copy is the shipped team.
 export function loadAgents(root, {cwd} = {}) {
+  const project = cwd && !isOwnHome(root, cwd) ? readStore(projectAgentStore(cwd), 'project') : [];
+  const user = project.length ? [] : readStore(agentStore(root), 'user');
+  const team = project.length ? project : user.length ? user : null;
   const roles = new Map();
+  if (team) { for (const agent of team) roles.set(agent.name, agent); return roles; }
+  return shippedAgents(root, roles);
+}
+
+// The team bounce ships (the installed skill's copy shadowing it by name): the default team, and what setup offers.
+export function shippedAgents(root, roles = new Map()) {
   for (const agent of readStore(SHIPPED, 'skill')) roles.set(agent.name, agent);
   for (const agent of readStore(installedSkillAgents(root), 'installed-skill')) roles.set(agent.name, agent);
-  for (const agent of readStore(agentStore(root), 'user')) roles.set(agent.name, agent);
-  if (cwd) for (const agent of readStore(projectAgentStore(cwd), 'project')) roles.set(agent.name, agent);
   return roles;
 }
 
@@ -181,28 +194,44 @@ export const readOnlyRoles = roles => new Set([...roles.values()].filter(role =>
 
 // What every entry point calls. It never writes: the shipped agents are layered in from the skill.
 export function rolesFor(root, {cwd} = {}) {
-  return loadAgents(root, {cwd});
+  return applyBindings(loadAgents(root, {cwd}), {root, cwd, sampling: SAMPLING});
 }
 
 // One row per agent: who may play it here (the derived chain, in fallback order) and which
 // backends were skipped and why. The same table backs `bounce agents`, `bounce local` and the TUI.
 export function agentTable(roles, settings) {
+  // Derived as the orchestrator would, whatever the operation: who can play an agent does not depend on whether this
+  // session dispatches it, and a classic session saying "nobody" read as a broken team.
   let view = null;
-  if (settings.operation === 'orchestrator') { try { view = validateOrchestration(settings, undefined, {roles}); } catch {} }
+  try { view = validateOrchestration({...settings, operation: 'orchestrator', orchestrator: settings.orchestrator ?? 'main'}, undefined, {roles}); } catch {}
   const ref = p => LOCAL_ADAPTERS.has(p.adapter) ? `${p.endpoint ?? 'lmstudio'}/${p.model || 'auto'} (via opencode)` : [p.adapter, p.model].filter(Boolean).join('/');
   return [...roles.values()].map(role => {
     if (role.error) return {name: role.name, error: role.error, backends: [], skipped: []};
     const chain = []; let current = view?.profiles[role.name];
     if (current?.auto) chain.push('auto (Jev)');
     while (current) { chain.push(ref(current)); current = current.fallback[0] ? view.profiles[current.fallback[0]] : null; }
-    return {name: role.name, policy: role.policy, description: role.description, source: role.source, backends: chain,
-      skipped: (view?.skipped ?? []).filter(item => item.agent === role.name).map(item => `${item.ref}: ${item.reason}`)};
+    return {name: role.name, policy: role.policy, description: role.description, source: role.source, backends: chain, ...(role.binding ? {binding: role.binding} : {}),
+      skipped: [...(role.binding?.skipped ?? []).map(item => item.reason), ...(view?.skipped ?? []).filter(item => item.agent === role.name).map(item => `${item.ref}: ${item.reason}`)]};
   });
 }
 
+// Where an agent's chain came from: an entry of the bindings in use, or the profile's own models: (legacy).
+const chainSource = binding => !binding ? ''
+  : binding.source === 'profile' ? ' · models: in the profile (bounce local setup moves it)'
+  : ` · bindings: ${binding.from}`;
 export const formatAgentTable = rows => rows.map(row => row.error
   ? `  ${row.name} · INVALID: ${row.error}`
-  : [`  ${row.name} · ${row.policy} · ${row.source} · ${row.backends.length ? row.backends.join(', ') : 'nobody can play it here'}`, ...row.skipped.map(why => `      skipped ${why}`)].join('\n'));
+  : [`  ${row.name} · ${row.policy} · ${row.source} · ${row.backends.length ? row.backends.join(', ') : 'nobody can play it here'}${chainSource(row.binding)}`, ...row.skipped.map(why => `      skipped ${why}`)].join('\n'));
+
+// Which team, bindings and models files are in use: one of each, the most specific that exists (docs/plans/agent-bindings.md).
+export function teamHeader(roles, {root, cwd} = {}) {
+  const layer = [...roles.values()][0]?.source;
+  const team = layer === 'project' ? `this project's (${projectAgentStore(cwd)})` : layer === 'user' ? `yours (${agentStore(root)})` : 'the one bounce ships';
+  const inUse = bindingsFile(root, cwd);
+  const bindings = !inUse ? 'none: each agent\'s own models:, else the default chain' : `${inUse.source === 'project' ? 'this project\'s' : 'yours'} (${inUse.file})`;
+  const models = path.join(root, MODELS_FILE);
+  return [`Team: ${team}`, `Bindings: ${bindings}`, `Models: ${fs.existsSync(models) ? models : `none yet (${models}; bounce local setup writes it)`}`];
+}
 
 // `bounce agents`: how an agent file gets defined without anyone learning the format by hand.
 // The orchestrator (or the user) pipes markdown in; it lands only if it parses, names a provider
@@ -213,8 +242,9 @@ export function agentsCommand(words, {root, cwd, settings, scope = 'user', input
   const roles = loadAgents(root, {cwd});
   const dir = scope === 'project' ? projectAgentStore(cwd) : agentStore(root);
   if (action === 'list') {
-    const rows = agentTable(roles, settings);
-    return {text: ['Agents (skill agent-orchestrator, then ~/.bounce/agents, then .bounce/agents):', ...formatAgentTable(rows)].join('\n'), report: rows};
+    const team = rolesFor(root, {cwd});
+    const rows = agentTable(team, settings);
+    return {text: [...teamHeader(team, {root, cwd}), ...formatAgentTable(rows)].join('\n'), report: rows};
   }
   if (!['show', 'remove', 'set'].includes(action)) throw new Error('Use agents list, agents show NAME, agents set NAME [--scope user|project] [--force] (markdown on stdin), or agents remove NAME');
   if (!name) throw new Error(`Use agents ${action} NAME`);

@@ -88,7 +88,9 @@ const TOOL_CALL = /^([A-Za-z_][\w.-]*): (\{[\s\S]*\})$/;
 const WAIT_TASK = /bounce\s+wait\b[^]*?"task"\s*:\s*"([0-9a-f-]{8,})"/;
 // One row at a time (so a projection can keep it incrementally); `tasks` only matters for a wait.
 export function doingStep(state = {what: 'idle', since: null}, e, {tasks = {}} = {}) {
-  if (e.kind === 'main.started' || e.kind === 'task.started') return {what: 'thinking', since: e.time};
+  // A classic turn has no main.started: its prompt starts it and its `turn` row ends it.
+  if (e.kind === 'main.started' || e.kind === 'task.started' || e.kind === 'user') return {what: 'thinking', since: e.time};
+  if (e.kind === 'turn') return {what: 'idle', since: e.time};
   if (['main.terminal', 'main.blocked', 'task.completed', 'task.failed', 'task.cancelled', 'task.accepted'].includes(e.kind)) return {what: 'idle', since: e.time};
   if (e.kind === 'progress') return state.what === 'command' || state.what === 'waiting' ? state : {what: 'thinking', since: state.what === 'thinking' ? state.since : e.time};
   if (e.kind === 'assistant') return {what: 'thinking', since: e.time};
@@ -119,7 +121,7 @@ export function doingStep(state = {what: 'idle', since: null}, e, {tasks = {}} =
 
 export function doingNow(events, {tasks = {}, now = Date.now(), task = null} = {}) {
   const mine = events.filter(e => task ? e.task === task && ['task.started', 'task.activity', 'task.observed', 'task.completed', 'task.failed', 'task.cancelled', 'task.accepted'].includes(e.kind)
-    : (e.from === 'main' || e.kind.startsWith('main.')) && ['main.started', 'main.terminal', 'main.blocked', 'tool', 'assistant', 'progress'].includes(e.kind));
+    : e.kind === 'user' || e.kind === 'turn' || ((e.from === 'main' || e.kind.startsWith('main.')) && ['main.started', 'main.terminal', 'main.blocked', 'tool', 'assistant', 'progress'].includes(e.kind)));
   return mine.reduce((state, e) => doingStep(state, e, {tasks}), {what: 'idle', since: null});
 }
 

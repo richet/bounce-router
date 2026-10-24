@@ -229,3 +229,15 @@ test('malformed worker output remains durable and is available only through the 
   assert.match(formatTaskView(full), /unvalidated raw output \(malformed_json: Expected , or \]\):/);
   assert.match(formatTaskView(full), /evidence 1099/);
 });
+
+// Found in the real-console pass 2026-10-21: /stop and /msg passed the 8-character id the view shows straight to the
+// scheduler, which knows tasks by their full id, so the cancel and the message reached no one while the view said
+// they had been requested.
+test('a task reference is a full id or a unique prefix of one; anything else is refused with the reason', async () => {
+  const {taskByRef} = await import('../src/task-view.js');
+  const tasks = {'1e940e8b-aaaa': {state: 'running'}, '165aacdf-bbbb': {state: 'running'}, '165aaxxx-cccc': {state: 'completed'}};
+  assert.equal(taskByRef(tasks, '1e940e8b'), '1e940e8b-aaaa');
+  assert.equal(taskByRef(tasks, '165aacdf-bbbb'), '165aacdf-bbbb');
+  assert.throws(() => taskByRef(tasks, 'zzzz9999'), {message: 'No task zzzz9999 in this session'});
+  assert.throws(() => taskByRef(tasks, '165aa'), {message: 'Task 165aa is ambiguous: 165aacdf, 165aaxxx'});
+});

@@ -372,3 +372,20 @@ test('usageOrder: the fallback order first, then every profile adapter, deduped,
   assert.deepEqual(usageOrder(['muse'], profiles, ['claude', 'codex', 'muse']), ['muse', 'claude', 'codex']);
   assert.deepEqual(usageOrder([], {}, ['claude']), []);
 });
+
+// Found in the real-console pass 2026-10-21: a kept reading beside a failed re-check read as a contradiction
+// ("5-hour window 1% used … · claude reported no quota").
+test('a kept reading says the latest check found nothing, rather than contradicting itself', async () => {
+  const {quotaReport} = await import('../src/quota.js');
+  const now = Date.parse('2026-10-21T04:00:00Z');
+  const store = {claude: {provider: 'claude', windows: [{label: '5h', percent: 1}], plan: null, time: '2026-10-21T03:59:00Z', error: 'claude reported no quota'}};
+  assert.equal(quotaReport(store, ['claude'], now).split('\n')[0], 'claude · 5-hour window 1% used · reported 1m ago · latest check: claude reported no quota');
+});
+
+// Found in the real-console pass 2026-10-21: the sidebar read 67.4k in while the turn's footer read 91.7k: the
+// sidebar left out cache writes, which are input the model read too (the prompt being cached).
+test('the sidebar counts a model\'s input as the footer does: uncached, cache reads and cache writes', async () => {
+  const {modelPanel} = await import('../src/quota.js');
+  const rows = modelPanel([{model: 'claude-sonnet', usage: {input: 4, cache_read: 67400, cache_write: 24300, output: 800}, tokens: 92504}], {width: 40});
+  assert.match(rows[1], /91\.7k in · 800 out/);
+});

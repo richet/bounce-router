@@ -8,11 +8,14 @@ export const limitPattern = /rate[_ -]?limit|usage[_ -]?limit|quota[_ -]?(?:exce
 // `resume`: the vendor's own id for the thread this turn continues (a `peer.native` row), for an adapter
 // that declares `resumes: true`; the others start fresh and ignore it.
 // `stream`: the caller renders text as it is generated (the classic TUI); adapters without partial output ignore it.
-export function invocation(provider, {model, mode, images = [], ephemeral = false, resume = null, stream = false, cwd}, promptFile) {
+// `executable`: the CLI this turn runs (resolveExecutable), for an adapter whose flags depend on its version.
+export function invocation(provider, {model, mode, images = [], ephemeral = false, resume = null, stream = false, cwd, executable}, promptFile) {
   if (!adapters[provider]) throw new Error(`Unknown provider: ${provider}`);
-  return adapters[provider].invocation({model, mode, images, ephemeral, stream, cwd, resume: adapters[provider].resumes ? resume : null}, promptFile);
+  return adapters[provider].invocation({model, mode, images, ephemeral, stream, cwd, executable, resume: adapters[provider].resumes ? resume : null}, promptFile);
 }
 export const canResume = provider => adapters[provider]?.resumes === true;
+// What a provider sets up around a classic turn before its process starts (opencode 2.x: a server to stream from).
+export const prepareTurn = (provider, options) => adapters[provider]?.prepareTurn ? adapters[provider].prepareTurn(options) : null;
 // A provider that cannot run without a chosen model (opencode: no model, nothing to run) says so.
 export const requiresModel = provider => adapters[provider]?.requiresModel === true;
 // Environment an adapter needs its CLI to see (opencode's config travels in OPENCODE_CONFIG_CONTENT);
@@ -26,22 +29,27 @@ export function normalize(provider, raw) {
   return adapters[provider].normalize(raw);
 }
 
+// The environment a vendor CLI runs with, the adapter's additions laid over it. A vendor CLI must never see the bus,
+// a grant, or the role/profile that would make a nested bounce believe it is the orchestrator: it acts through its own
+// adapter, not as a peer. The single exception (T3b): the orchestrator profile's own CLI *is* a peer — it holds the
+// orchestrator grant and talks to the bridge — so only that one child keeps BOUNCE_BUS*. The supervisor's own flags
+// go too (same set as live-common's DAEMON_FLAGS): a nested `bounce` in the vendor's shell must not think it is the
+// supervised child or a daemon.
+export function vendorChildEnv({executable, keepBus = false, extraEnv = {}}) {
+  const {BOUNCE_BUS, BOUNCE_BUS_TOKEN_FILE, BOUNCE_REMOTE_SESSION, BOUNCE_ROLE, BOUNCE_ORCHESTRATOR_PROFILE,
+    BOUNCE_SUPERVISED, BOUNCE_DETACHED, BOUNCE_VIEW_DAEMON, BOUNCE_PERSISTENT_VIEW, BOUNCE_RESTART, ...env} = process.env;
+  if (keepBus && BOUNCE_BUS !== undefined) { env.BOUNCE_BUS = BOUNCE_BUS; env.BOUNCE_BUS_TOKEN_FILE = BOUNCE_BUS_TOKEN_FILE; }
+  Object.assign(env, extraEnv);
+  prepareCodexHome(executable, env);
+  return env;
+}
+
 // Only error channels are classified as exhaustion. Assistant/tool text can quote errors.
 // `env`: the adapter's additions (providerEnv), laid over the stripped process environment.
 export function runProcess({provider, executable = provider, args, prompt, cwd, signal, emit, keepBus = false, env: extraEnv = {}}) {
   return new Promise(resolve => {
     let failed = false, limited = false, terminal = false, stderr = '', closed = false, lastText = '';
-    // A vendor CLI must never see the bus, a grant, or the role/profile that would make a nested
-    // bounce believe it is the orchestrator: it acts through its own adapter, not as a peer.
-    // The single exception (T3b): the orchestrator profile's own CLI *is* a peer — it holds the
-    // orchestrator grant and talks to the bridge — so only that one child keeps BOUNCE_BUS*.
-    // The supervisor's own flags go too (same set as live-common's DAEMON_FLAGS): a nested
-    // `bounce` in the vendor's shell must not think it is the supervised child or a daemon.
-    const {BOUNCE_BUS, BOUNCE_BUS_TOKEN_FILE, BOUNCE_REMOTE_SESSION, BOUNCE_ROLE, BOUNCE_ORCHESTRATOR_PROFILE,
-      BOUNCE_SUPERVISED, BOUNCE_DETACHED, BOUNCE_VIEW_DAEMON, BOUNCE_PERSISTENT_VIEW, BOUNCE_RESTART, ...env} = process.env;
-    if (keepBus && BOUNCE_BUS !== undefined) { env.BOUNCE_BUS = BOUNCE_BUS; env.BOUNCE_BUS_TOKEN_FILE = BOUNCE_BUS_TOKEN_FILE; }
-    Object.assign(env, extraEnv);
-    prepareCodexHome(executable, env);
+    const env = vendorChildEnv({executable, keepBus, extraEnv});
     const child = spawn(executable, args, {cwd, env, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe']});
     const finish = result => { if (!closed) { closed = true; clearTimeout(killTimer); signal?.removeEventListener('abort', cancel); resolve(result); } };
     let killTimer;

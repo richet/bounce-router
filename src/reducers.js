@@ -343,6 +343,9 @@ export function normalizeUsage(raw) {
     const value = raw[key];
     if (Number.isFinite(value)) usage[canon] = (usage[canon] || 0) + value;
   }
+  // codex counts its cached input inside input_tokens (measured on 0.162: 15 085 input, 12 288 of them cached);
+  // claude reports input_tokens without the cache. Canonical `input` is the uncached part for both.
+  if (Number.isFinite(raw.input_tokens) && Number.isFinite(raw.cached_input_tokens)) usage.input = Math.max(0, raw.input_tokens - raw.cached_input_tokens);
   return usage;
 }
 const TOKEN_KEYS = ['input', 'cache_read', 'cache_write', 'output'];

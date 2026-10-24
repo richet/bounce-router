@@ -4,7 +4,7 @@ import {createCodexLive} from './adapters/codex-live.js';
 import {createMuseLive} from './adapters/muse-live.js';
 import {createOpencodeLive} from './adapters/opencode-live.js';
 import {createTypesafeLive} from './adapters/typesafe-live.js';
-import {JEV_REVIEWER, createJevActivation, createJevDecisions, jevReviewerProfile, readJevSettings, routingFallback} from './jev.js';
+import {JEV_REVIEWER, JEV_SAMPLES, createJevActivation, createJevDecisions, jevReviewerProfile, readJevSettings, routingFallback} from './jev.js';
 import {createRosterSetup, effectiveNotes, readRosterNotes, setupAgent} from './roster-notes.js';
 import {modelCatalog} from './models.js';
 import os from 'node:os';
@@ -366,7 +366,7 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     'steps (the verification steps, as text) — required when the completion reviewer is a verifier profile, refused with reason `steps` without it.',
     'check (one shell command that proves the work is done, optional but give one to every task that changes files; it must run the work — its tests, its script — and fail when the result is wrong, because a check that only looks for a file or a phrase passes on a false report; bounce tells you when you submit one, and passing it does not count as verification): bounce runs it in the worker\'s copy when the worker finishes, in a plain shell with its own environment (give a tool that is not on the path its full path), and only work that passes (exit 0) reaches the checkout by itself. A failure goes back to the worker once with what the check printed. Work that changed files and that no such check has verified (the check still fails, could not run, only looks, or was not given) is kept in the worker\'s copy and comes to you as task.blocked (reason `check_failed`, `check_unrunnable` or `unverified`) with the folder it is in and what the review said: that is not a failure, it is work waiting for you. Read or run it there, then accept it (task.accepted with what you checked, which puts it in the checkout), send it back, or retry it on another AI.',
     'A verifier is handed steps alone as its orders, so they must stand on their own. A strict session requires both review stages as well.',
-    'The publish reply shows the task id as `task=<id>` (add --json for the whole row). Always match on kind AND task: a match on the task alone returns the task.submitted row at once.',
+    'The publish reply shows the task id as `task=<id>`, and a submission also its `profile=` and the start of its `orders=` (add --json for the whole row). Replies to publishes run in parallel arrive in any order: pair each id with its task by profile and orders, never by reply order. Always match on kind AND task: a match on the task alone returns the task.submitted row at once.',
     'The publish reply carries the task id. `wait` on a task outcome follows replacements and waits for completion review when configured. Read the',
     'returned row\'s `kind`: task.completed or task.accepted is done. task.deadline (and the task.cancelled with reason `deadline` that',
     'follows it) means the worker ran out of time with the work unfinished: use its partial progress to submit a smaller continuation with retryOf; it is not a reason to stop the run.',
@@ -452,7 +452,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   const settings = config(root);
   // The live adapters are orchestrator mode's workers; a test may replace any of them by name.
   // Classic mode never dispatches, so registering them costs it nothing.
-  const adapters = {claude: createClaudeLive(), codex: createCodexLive(), muse: createMuseLive(), opencode: createOpencodeLive(), typesafe: createTypesafeLive(), ...extraAdapters};
+  const adapters = {claude: createClaudeLive(), codex: createCodexLive(), muse: createMuseLive(), opencode: createOpencodeLive(), typesafe: createTypesafeLive({samples: JEV_SAMPLES, memoFile: path.join(root, 'jev-memo.json')}), ...extraAdapters};
   // Validated once, before anything is created: an invalid orchestration config throws out of
   // supervise() (cli.js prints it and exits 1) with no session, daemon.json or socket behind it.
   // A profile whose vendor binary is absent fails at dispatch as task.failed{reason:'missing'}.
@@ -549,9 +549,9 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   const orders = () => writeOrders({session, root, bus, grant: orchestratorGrant, profiles, orchestrator: orchestration.orchestrator, jev: jevBlock() ? readJevSettings(root) : null,
     notes: effectiveNotes(profiles, readRosterNotes(root)), roles: readRoles(), settings, adapterNames});
   if (orchestrating) orders();
-  // Routing on: describe the roster's models now so the first `auto` need not wait; the outcome
-  // is journaled either way.
-  if (orchestrating) { const jevNow = readJevSettings(root); if (jevNow.enabled && jevNow.routing.enabled) rosterSetup.ensure().catch(() => {}); }
+  // No agent is asked to describe the roster's models at start: what it wrote changed between askings and routing
+  // flipped with it (integration runs 2026-10-22). Routing reads the catalog, pins and LM Studio's own numbers
+  // (src/roster-notes.js routingNote); /jev roster refresh still asks, for reading only.
   if (homeSessionWarning(session.cwd)) session.append({kind: 'status', text: homeSessionWarning(session.cwd)});
   if (orchestrating) session.append({kind: 'operation', operation: 'orchestrator', orchestrator: orchestration.orchestrator, shape: orchestration.shape, text: `Operation: orchestrator on ${orchestration.orchestrator} (${orchestration.shape})`});
   const bridgeEnv = orchestrating ? orchestratorBridgeEnv({session, bus, grant: orchestratorGrant, profile: orchestratorProfile}) : null;

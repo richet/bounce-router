@@ -152,3 +152,12 @@ export function taskList(events, {now = Date.now(), all = false} = {}) {
         findings: rowsOf(events, task, 'task.finding').length};
     });
 }
+
+// A task as a person names it: its full id or a unique prefix (the view shows eight characters).
+export function taskByRef(tasks, ref) {
+  if (tasks[ref]) return ref;
+  const matches = Object.keys(tasks).filter(id => id.startsWith(ref));
+  if (matches.length === 1) return matches[0];
+  if (!matches.length) throw new Error(`No task ${ref} in this session`);
+  throw new Error(`Task ${ref} is ambiguous: ${matches.map(id => id.slice(0, 8)).join(', ')}`);
+}

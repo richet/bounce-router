@@ -1,12 +1,15 @@
 import {serializeAgent, agentStore} from './agents.js';
 import {imagePaths, saveImages, providerInput} from './images.js';
+import {createConversations, PERSISTENT} from './conversation.js';
+import {runLiveTurn} from './live-turn.js';
+import {createCodexLive} from './adapters/codex-live.js';
 import {resolveExecutable} from './executable.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {execFileSync} from 'node:child_process';
-import {providers, invocation, runProcess, canResume, requiresModel, providerEnv} from './providers.js';
+import {providers, invocation, runProcess, canResume, requiresModel, providerEnv, prepareTurn, vendorChildEnv} from './providers.js';
 
 // The tool was renamed from localrouter, so a pre-rename data directory is moved across
 // once: config, journals and quota readings survive the rename instead of being orphaned.
@@ -19,7 +22,8 @@ export function dataRoot() {
 }
 export const defaults = () => ({order: ['claude', 'codex', 'muse'], mode: 'yolo', models: {}, cooldownMinutes: 30, contextChars: 48000, executables: {}, skills: {scope: 'user', autoSync: true}, sidebar: true, maxConcurrentCloud: 3});
 // Kinds folded in memory only: never journaled, delivered straight to onEvent.
-export const LIVE_KINDS = new Set(['progress', 'task.activity', 'tool.started', 'tool.finished']);
+// `delta` is a streamed fragment: shown as it arrives, journaled once assembled as an `assistant` row (Router.run).
+export const LIVE_KINDS = new Set(['progress', 'task.activity', 'tool.started', 'tool.finished', 'delta']);
 // A vendor's raw stream row whose content bounce already stores as its own normalized row (the
 // assistant text, the tool result, the thinking-token tick that becomes `progress`). Found live (session
 // d1bc0206): these were 75% of a 21 MB journal. They are delivered live, never journaled; raw rows
@@ -138,6 +142,8 @@ export function validateSettings(value) {
   if (!Array.isArray(value.order) || !value.order.length || value.order.some(p => !providers[p]) || new Set(value.order).size !== value.order.length) throw new Error('config.order must be a unique, nonempty list of claude, codex, muse, opencode');
   if (!['yolo', 'plan'].includes(value.mode)) throw new Error('config.mode must be yolo or plan');
   if (typeof value.sidebar !== 'boolean') throw new Error('config.sidebar must be true or false');
+  if (value.keepProcess !== undefined && typeof value.keepProcess !== 'boolean') throw new Error('config.keepProcess must be true or false');
+  if (value.inline !== undefined && typeof value.inline !== 'boolean') throw new Error('config.inline must be true or false');
   if (value.taskMinutes !== undefined && (!Number.isInteger(value.taskMinutes) || value.taskMinutes < 1 || value.taskMinutes > 240)) throw new Error('taskMinutes must be a whole number of minutes from 1 to 240');
   if (value.taskCeilingMinutes !== undefined && (!Number.isInteger(value.taskCeilingMinutes) || value.taskCeilingMinutes < 1 || value.taskCeilingMinutes > 240 || value.taskCeilingMinutes < (value.taskMinutes ?? 15))) throw new Error('taskCeilingMinutes must be a whole number of minutes from 1 to 240, and at least taskMinutes');
   if (value.reports !== undefined && !['plain', 'structured'].includes(value.reports)) throw new Error('reports must be "plain" or "structured"');
@@ -391,8 +397,15 @@ export class Router {
   // `onFirstUserPrompt(session, settings)` fires once, fire-and-forget, right after a NEW
   // session's first `user` row lands (src/session-title.js); a no-op by default so tests never
   // title a session unless they inject one — see cli.js for the live wiring.
-  constructor(session, settings, {runner = runProcess, extraArgs = () => [], onFirstUserPrompt = () => {}} = {}) {
-    this.session = session; this.settings = settings; this.runner = runner; this.extraArgs = extraArgs;
+  // `conversations` (src/conversation.js) keeps one process per conversation for the providers that allow it; a
+  // custom `runner` (tests, the one-shot asks) opts out of it unless one is passed too.
+  // `live` names the providers whose classic turns run on their live adapter so the answer streams (codex's
+  // app-server; docs/plans/interactive-polish.md step 3). Like `conversations`, a custom runner opts out.
+  constructor(session, settings, {runner, extraArgs = () => [], onFirstUserPrompt = () => {}, conversations, live, prepare} = {}) {
+    this.session = session; this.settings = settings; this.runner = runner ?? runProcess; this.extraArgs = extraArgs;
+    this.conversations = conversations ?? (runner ? null : createConversations());
+    this.live = live ?? (runner ? {} : {codex: createCodexLive()});
+    this.prepare = prepare ?? (runner ? null : prepareTurn);
     this.onFirstUserPrompt = onFirstUserPrompt;
     this.cooldowns = {}; this.selectionVersion = 0;
     for (const e of session.events) if (e.kind === 'cooldown') this.cooldowns[e.provider] = e.until;
@@ -401,6 +414,8 @@ export class Router {
   // that turn's fallback may finish without overwriting the provider chosen for the next turn.
   select(provider) { this.selectionVersion++; this.session.active = provider; }
   cancel() { this.controller?.abort(); }
+  // The kept processes end with the session (quit, /new, a switch).
+  close() { this.conversations?.closeAll(); }
   // `typed` is the slash line a prompt was expanded from (vendor-commands.js); the journal
   // keeps the expansion as the request — that is what a fallback agent and later turns must
   // read — and the typed line only for the transcript.
@@ -440,12 +455,61 @@ export class Router {
           const promptFile = path.join(s.dir, 'handoff.txt');
           fs.writeFileSync(promptFile, packet, {mode: 0o600});
           const said = [];
-          result = await this.runner({provider, executable: resolveExecutable(provider, cfg.executables[provider]),
-            args: [...invocation(provider, {model: cfg.models[provider], mode: cfg.mode, images, resume, stream: true, cwd: s.cwd}, promptFile), ...(this.extraArgs(provider) ?? [])],
-            env: providerEnv(provider, {model: cfg.models[provider], mode: cfg.mode, settings: cfg, cwd: s.cwd}),
+          // Streamed text is shown live and journaled as one `assistant` row per text block, written when the
+          // block ends: at the next tool call, answer, result or error, or when the turn does
+          // (docs/plans/interactive-polish.md step 11; one row instead of an fsync per fragment).
+          let streamed = '';
+          const flushStream = () => { if (streamed) s.append({kind: 'assistant', provider, text: streamed, streamed: true}); streamed = ''; };
+          const executable = resolveExecutable(provider, cfg.executables[provider]);
+          // One process for the whole conversation where the provider allows it and keepProcess is on; a fresh one
+          // per turn otherwise. Off by default: measured 2026-10-21 against real claude (docs/PROGRESS.md), a kept
+          // process gained nothing provable after the first turn and its first turn was ~2 s slower.
+          const keep = this.conversations && PERSISTENT.has(provider) && cfg.keepProcess === true;
+          const emit = e => {
+            if (['error', 'diagnostic', 'assistant', 'delta', 'result'].includes(e.kind)) said.push(e);
+            if (e.kind === 'delta') streamed += e.text ?? '';
+            // An adapter that streams and then sends the finished message too (codex's app-server): that message is
+            // the journal's one copy of the block.
+            else if (e.kind === 'assistant' && streamed && e.text?.trim() === streamed.trim()) { streamed = ''; s.publish({...e, provider, streamed: true}); return; }
+            else if (['tool', 'assistant', 'result', 'error'].includes(e.kind)) flushStream();
+            s.publish({...e, provider});
+          };
+          const turn = {provider, executable,
+            args: [...invocation(provider, {model: cfg.models[provider], mode: cfg.mode, images, resume, stream: true, cwd: s.cwd, executable}, promptFile), ...(this.extraArgs(provider) ?? [])],
+            env: providerEnv(provider, {model: cfg.models[provider], mode: cfg.mode, settings: cfg, cwd: s.cwd, executable}),
             cwd: s.cwd, prompt: providerInput(provider, packet, images), signal,
             // Live kinds (progress, etc.) are shown while the turn runs and never journaled; see Session.publish.
-            emit: e => { if (['error', 'diagnostic', 'assistant', 'delta', 'result'].includes(e.kind)) said.push(e); s.publish({...e, provider}); }});
+            emit,
+          };
+          // A live adapter answers on its app-server and streams; any other turn is a vendor process.
+          const live = this.live?.[provider];
+          result = live
+            ? await runLiveTurn({adapter: live, provider, prompt: packet, model: cfg.models[provider], mode: cfg.mode, resume, cwd: s.cwd,
+              dir: path.join(s.dir, 'classic', provider), images, executables: cfg.executables, signal, emit})
+            : null;
+          // A peer that would not start (an older codex without the app-server) leaves this session on the vendor
+          // process, once and said.
+          if (result?.status === 'unavailable') {
+            this.live[provider] = null;
+            s.append({kind: 'status', provider, text: `${provider} app-server did not start (${result.reason}); this session uses ${provider} exec, whose answers arrive whole`});
+            result = null;
+          }
+          // A provider that streams from a side channel (opencode 2.x's server) owns the answer's text there: the
+          // process's own copy is dropped, and its result is held until the side channel has settled.
+          let prepared = null;
+          if (!result && !keep && this.prepare) {
+            try { prepared = await this.prepare(provider, {args: turn.args, env: vendorChildEnv({executable, extraEnv: turn.env}), cwd: s.cwd, executable, emit}); }
+            catch (error) { s.append({kind: 'status', provider, text: `${error.message}; this turn's answer arrives whole`}); }
+          }
+          if (prepared) {
+            const held = [];
+            result ??= await this.runner({...turn, args: prepared.args, env: {...turn.env, ...prepared.env},
+              emit: e => { if (prepared.ownsText && e.kind === 'assistant') return; if (prepared.ownsText && e.kind === 'result') { held.push(e); return; } emit(e); }});
+            await prepared.close();
+            for (const e of held) emit(e);
+          }
+          result ??= await (keep ? this.conversations.turn.bind(this.conversations) : this.runner)(turn);
+          flushStream();
           // The thread bounce asked for is gone (the vendor says so, or the turn died before a word): once,
           // start this provider fresh from the packet — the same recovery the orchestrator has (main-service.js).
           const lost = resume && result.status === 'failed' && !signal.aborted

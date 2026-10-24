@@ -23,14 +23,15 @@ import {hostless} from './helpers/local-fakes.js';
 const model = (id, extra = {}) => ({id, ref: `lmstudio/${id}`, type: 'llm', tools: true, ready: true, instances: [{id: `${id}@live`, context: 65536}], context: 65536, ...extra});
 const catalogs = models => [{provider: 'local', backend: 'lmstudio', endpoint: 'lmstudio', models}];
 const onDisk = {ready: false, instances: [], context: 131072};
-const cache = {'lmstudio/dense-27b': {tier: 'strongest', capabilities: 'Careful reviewer; slow.'}};
+// Pinned by hand: since 2026-10-22 the only way a local model's tier is not the default (an agent's guess is not read).
+const cache = {'lmstudio/dense-27b': {tier: 'strongest', capabilities: 'Careful reviewer; slow.', by: 'you'}};
 
-test('candidates: every tool-capable model, loaded or not, described by its note or conservatively', () => {
+test('candidates: every tool-capable model, loaded or not, described by its pinned note or by what LM Studio reports', () => {
   const mixed = catalogs([model('coder-30b'), model('dense-27b', {instances: [{id: 'dense', context: 32768}]}), model('big-disk', onDisk), model('no-tools', {tools: false}), {id: 'embed', type: 'embedding', ready: true, instances: []}]);
   assert.deepEqual(localCandidates(mixed, cache), [
-    {name: 'lmstudio/coder-30b', endpoint: 'lmstudio', model: 'coder-30b', loaded: true, size: null, context: 65536, tier: 'cheapest', capabilities: 'unknown local model: single-file reading only'},
+    {name: 'lmstudio/coder-30b', endpoint: 'lmstudio', model: 'coder-30b', loaded: true, size: null, context: 65536, tier: 'cheapest', capabilities: 'local model on lmstudio · context 64k · runs on this machine at no cost, one turn at a time, slower than a cloud model'},
     {name: 'lmstudio/dense-27b', endpoint: 'lmstudio', model: 'dense-27b', loaded: true, size: null, context: 32768, tier: 'strongest', capabilities: 'Careful reviewer; slow.'},
-    {name: 'lmstudio/big-disk', endpoint: 'lmstudio', model: 'big-disk', loaded: false, size: null, context: 131072, tier: 'cheapest', capabilities: 'unknown local model: single-file reading only'}]);
+    {name: 'lmstudio/big-disk', endpoint: 'lmstudio', model: 'big-disk', loaded: false, size: null, context: 131072, tier: 'cheapest', capabilities: 'local model on lmstudio · context 128k · runs on this machine at no cost, one turn at a time, slower than a cloud model'}]);
   assert.deepEqual(localCandidates(catalogs([model('big-disk', onDisk), model('no-tools', {tools: false})]), cache).map(item => [item.name, item.loaded]), [['lmstudio/big-disk', false]]);
   assert.deepEqual(localCandidates([], cache), []);
 });
@@ -45,7 +46,7 @@ const tier = (choice, confidence) => ({tier: {choice, confidence, probabilities:
 test('the AI question offers the local models beside the profiles; a plain `auto` task never sees them', () => {
   const profiles = table();
   const questions = aiQuestions(profiles, {}, profiles.reviewer, locals);
-  assert.equal(questions.profile.criteria['lmstudio/dense-27b'], 'local model lmstudio/dense-27b · runs on this machine at no cost · context 64k · tier strongest: independent review, ambiguous or cross-cutting debugging, security-sensitive work · capabilities: Careful reviewer; slow.');
+  assert.equal(questions.profile.criteria['lmstudio/dense-27b'], 'local model lmstudio/dense-27b · runs on this machine at no cost · context 64k · tier strongest: reviewing a security-sensitive or cross-cutting change, ambiguous or cross-cutting debugging, security-sensitive work · capabilities: Careful reviewer; slow.');
   const cold = localCandidates(catalogs([model('big-disk', onDisk)]), {});
   assert.equal(aiQuestions(profiles, {}, profiles.reviewer, cold).profile.criteria['lmstudio/big-disk'], undefined, 'this reviewer does not name it and it is not loaded: not offered');
   const {main, haiku} = profiles;
@@ -133,4 +134,18 @@ test('an unloaded local model is offered when the agent names it, and never when
   // what choosing it costs is part of what Jev is told: its memory, and the load
   assert.match(aiQuestions(profiles, {}, profiles.reviewer, cold).profile.criteria['lmstudio/dense-27b'],
     /^local model lmstudio\/dense-27b · runs on this machine at no cost · 16\.0 GB of memory · not loaded: choosing it costs a model load first · /);
+});
+
+// 2026-10-22: "incertidumbre/no determinismo es un nono". Found by the integration runs: a cloud agent wrote the
+// local model's tier from its name, "cheapest" in eight runs and "mid" in two, and Jev's routing flipped from all-cloud
+// to all-local with the same setup. What routing reads about a local model is now fixed: the tier pinned by hand, else
+// cheapest, and capabilities from what LM Studio reports — never an agent's description.
+test('what routing reads about a local model is the same whatever an agent wrote about it', () => {
+  const fleet = catalogs([model('dense-27b', {instances: [{id: 'dense', context: 32768}]})]);
+  const described = tier => ({'lmstudio/dense-27b': {tier, capabilities: `An agent's guess: ${tier}.`, by: 'claude/opus'}});
+  const one = localCandidates(fleet, described('cheapest')), two = localCandidates(fleet, described('mid'));
+  assert.deepEqual(one, two);
+  assert.deepEqual(one.map(item => [item.tier, item.capabilities]), [['cheapest', 'local model on lmstudio · context 32k · runs on this machine at no cost, one turn at a time, slower than a cloud model']]);
+  const pinned = localCandidates(fleet, {'lmstudio/dense-27b': {tier: 'mid', capabilities: 'Careful reader.', by: 'you'}});
+  assert.deepEqual(pinned.map(item => [item.tier, item.capabilities]), [['mid', 'Careful reader.']], 'a tier pinned by hand stands');
 });

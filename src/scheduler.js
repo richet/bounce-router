@@ -29,7 +29,9 @@ import {execFileSync} from 'node:child_process';
 import {parseVerdict} from './verdict.js';
 const processAlive = pid => { try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } };
 
-const FALLBACK_REASONS = new Set(['limited', 'missing', 'backend_unavailable', 'watchdog', 'local_unavailable', 'worker_runtime', 'incomplete_report']);
+const FALLBACK_REASONS = new Set(['limited', 'missing', 'backend_unavailable', 'watchdog', 'local_unavailable', 'local_busy', 'worker_runtime', 'incomplete_report']);
+// How long a task waits for a busy local slot before falling to the next AI of its chain (local.endpoints.<name>.queueSeconds).
+const LOCAL_QUEUE_SECONDS = 60;
 const RISKS = new Set(['boundary', 'process-model', 'logic', 'extraction']);
 const SIZE_FIELDS = ['lines', 'probes', 'minutes'];
 // Silence is five minutes, not two: at two the alarm fired on every test run and corrected itself
@@ -163,6 +165,15 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   const contractFor = profile => (plainAnswers ? plainContract(profile) : reportContract(profile));
   const endingLine = plainAnswers ? PLAIN_ENDING : LOCAL_REPORT_LINE;
   const slotWaiters = new Set();
+  const localQueuedAt = new Map(); // task -> when it first waited for a local slot
+  const onEndpoint = (p, endpoint) => Boolean(p) && LOCAL_ADAPTERS.has(p.adapter) && (p.endpoint ?? 'lmstudio') === endpoint;
+  // Every profile down a profile's fallback links, in order, each once.
+  const chainAfter = profile => {
+    const out = [], seen = new Set();
+    const walk = names => { for (const name of names ?? []) { if (seen.has(name) || !profiles[name]) continue; seen.add(name); out.push(name); walk(profiles[name].fallback); } };
+    walk(profile?.fallback);
+    return out;
+  };
   const OBSERVED_RUNS = 8;
   const observedRuns = new Map(); // task -> what bounce saw its current attempt run
   // In-place tasks (docs/plans/in-place-tasks.md): at most one running, and never alongside a
@@ -474,14 +485,13 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
 
   // Progress in that turn: the same repeat check leaseDecision uses for a lease renewal (new tool
   // calls, not just the same ones already made before this turn started), scoped here to the calls
-  // made since the attempt's own task.started rather than a lease boundary.
+  // made since the attempt's own task.started (by journal order) rather than a lease boundary.
   function stepTurnProgressed(task, attempt) {
     const started = session.events.findLast(e => e.kind === 'task.started' && e.task === task && e.attempt === attempt);
     if (!started) return false;
-    const sinceAt = Date.parse(started.time);
     const calls = toolCalls.get(task) ?? [];
-    const inTurn = calls.filter(c => c.at > sinceAt);
-    const before = calls.filter(c => c.at <= sinceAt);
+    const inTurn = calls.filter(c => c.seq >= started.seq);
+    const before = calls.filter(c => c.seq < started.seq);
     if (!inTurn.length) return false;
     return before.length === 0 || inTurn.some(c => c.change) || !inTurn.every(c => before.some(b => b.call === c.call));
   }
@@ -983,7 +993,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       return;
     }
     const maximumPolicy = POLICY_RANK[effectivePolicy(profiles[view[lineageRoot].profile])];
-    const next = (profile.fallback ?? []).find(name => !tried.has(name) && profiles[name]
+    // A busy local slot: the next AI down the whole chain that is not on that endpoint (a Jev-routed job's first link
+    // is the agent's own head, often the same local model).
+    const busyEndpoint = row.reason === 'local_busy' ? (profile.endpoint ?? 'lmstudio') : null;
+    const next = (busyEndpoint ? chainAfter(profile) : profile.fallback ?? []).find(name => !tried.has(name) && profiles[name]
+      && !(busyEndpoint && onEndpoint(profiles[name], busyEndpoint))
       && profiles[name].role !== 'orchestrator'
       && POLICY_RANK[effectivePolicy(profiles[name])] <= maximumPolicy && !policyRefusal(profiles[name])
       && !missingCapabilities(profiles[name], submittedRow(row.task)?.requires).length);
@@ -1854,13 +1868,15 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return check?.passed ? [...(Array.isArray(evidence) ? evidence : []), checkPassed(check)] : evidence;
   };
 
-  async function runReviewers({task, stage, round, reviewers, row, context, root, reserveFirst, note = null}) {
+  async function runReviewers({task, stage, round, reviewers, row, context, root, reserveFirst, note = null, slot = null}) {
     const verdicts = [];
     for (let i = 0; i < reviewers.length; i++) {
       const profileName = reviewers[i];
       const reviewProfile = profiles[profileName];
       const candidate = candidateResult(session.events, task);
-      const peer = reviewers.length === 1 ? reviewFrom(task) : `${reviewFrom(task)}:${i}`;
+      // `slot` names a second review of the same candidate (an unsure Jev handing over), so the first one's finished
+      // verdict is not found again and reused for it.
+      const peer = `${reviewers.length === 1 ? reviewFrom(task) : `${reviewFrom(task)}:${i}`}${slot ? `:${slot}` : ''}`;
       const retryBoundary = session.events.findLast(e => e.task === task && e.kind === 'review.reasked'
         && e.stage === stage && e.candidateSeq === candidate?.seq)?.seq ?? 0;
       // A completed review is durable work too. Reuse only this candidate's current review
@@ -1997,12 +2013,28 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     }
 
     const candidate = candidateResult(session.events, task);
-    const verdicts = await runReviewers({task, stage: 'completion', round, reviewers, row, context, root, reserveFirst: true, note});
+    let verdicts = await runReviewers({task, stage: 'completion', round, reviewers, row, context, root, reserveFirst: true, note});
     if (!verdicts) return;
     // Same guard as the prelaunch path: a review that finishes after the task left `reviewing`
     // for an unrelated reason journals its verdict but drives no accept/reject/rework (A3).
-    if (closed || reducers.tasks(session.events)[task]?.state !== 'reviewing') return;
-    if (candidate && (candidateResult(session.events, task)?.digest !== candidate.digest || candidateResult(session.events, task)?.seq !== candidate.seq)) return;
+    const stale = () => closed || reducers.tasks(session.events)[task]?.state !== 'reviewing'
+      || (candidate && (candidateResult(session.events, task)?.digest !== candidate.digest || candidateResult(session.events, task)?.seq !== candidate.seq));
+    if (stale()) return;
+    // An unsure Jev (a lean below its bar) does not decide on its own when the team has a reviewer agent: the agent
+    // reviews, told what Jev leaned, and its verdict decides. Found by the integration runs 2026-10-21/22: 4 of 5
+    // Jev reviews were below the bar and the work was accepted unread.
+    const lean = verdicts[0];
+    let changes = null;
+    try { changes = artifactFor(task)?.artifact?.changes ?? null; } catch {}
+    const agentReviewer = escalationReviewer({lean, reviewers, profiles, changes});
+    if (agentReviewer) {
+      const leaned = `Jev leaned ${lean.choice} below its bar (confidence ${Number(lean.confidence ?? 0).toFixed(2)} of ${lean.threshold})`;
+      append({kind: 'review.escalated', task, to: agentReviewer, from: 'bounce', text: `${leaned}: the ${profiles[agentReviewer].role ?? agentReviewer} agent reviews it`, context});
+      const agentVerdicts = await runReviewers({task, stage: 'completion', round, reviewers: [agentReviewer], row, context, root, reserveFirst: false, slot: 'escalated',
+        note: [note, `${leaned}${lean.findings?.length ? `, flagging: ${lean.findings.join('; ')}` : ''}. Review the change yourself; that lean is not a verdict.`].filter(Boolean).join('\n\n')});
+      if (!agentVerdicts || stale()) return;
+      verdicts = agentVerdicts;
+    }
 
     const hook = invokeHook(() => strategy.onReviewVerdict(task, verdicts, reducers.tasks(session.events), api), task, context);
     if (!hook.ok) return;
@@ -2150,11 +2182,24 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       const full = running >= slots ? `Waiting for a local slot on ${endpoint}: ${running} of ${slots} in use`
         : onModel >= perModel ? `Waiting for a local slot on ${endpoint} for ${profile.model}: ${onModel} of ${perModel} in use` : null;
       if (full) {
-        if (!slotWaiters.has(task)) append({kind: 'task.milestone', task, phase: 'queued', text: full, next: 'dispatch when a local turn ends', context});
+        // Another AI in the chain that is not this busy endpoint: the wait is capped, then the task moves to it.
+        const elsewhere = chainAfter(profile).some(name => !onEndpoint(profiles[name], endpoint));
+        const capMs = (localEndpoint(endpoint).queueSeconds ?? LOCAL_QUEUE_SECONDS) * 1000;
+        if (!localQueuedAt.has(task)) localQueuedAt.set(task, clock());
+        const waited = clock() - localQueuedAt.get(task);
+        if (elsewhere && waited >= capMs) {
+          slotWaiters.delete(task); localQueuedAt.delete(task);
+          append({kind: 'task.failed', task, reason: 'local_busy', text: `Waited ${Math.round(waited / 1000)} s for a local slot on ${endpoint} (${running} of ${slots} in use); moving to the next AI in its chain`, context});
+          return;
+        }
+        if (!slotWaiters.has(task)) {
+          append({kind: 'task.milestone', task, phase: 'queued', text: full, next: elsewhere ? `dispatch when a local turn ends, or on the next AI after ${Math.round(capMs / 1000)} s` : 'dispatch when a local turn ends', context});
+          if (elsewhere) setTimeout(() => { const again = submittedRow(task); if (again && slotWaiters.has(task)) requestDispatch(again, `local-wait:${task}`); }, capMs + 50).unref?.();
+        }
         slotWaiters.add(task);
         return;
       }
-      slotWaiters.delete(task);
+      slotWaiters.delete(task); localQueuedAt.delete(task);
     }
     if (CLOUD_ADAPTERS.has(profile.adapter)) {
       const running = cloudRunning();
@@ -2680,7 +2725,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       activity.set(row.task, {at, expectUntil});
       if (typeof row.call === 'string') {
         const calls = toolCalls.get(row.task) ?? [];
-        calls.push({at, call: row.call, change: row.change === true});
+        // `seq`: the last journaled row when the call came in, so a turn's calls are told from earlier
+        // ones by order rather than by a millisecond clock its first call can share with task.started.
+        calls.push({at, seq: session.events.at(-1)?.seq ?? 0, call: row.call, change: row.change === true});
         toolCalls.set(row.task, calls.slice(-CALL_MEMORY));
       }
     }
@@ -2887,4 +2934,16 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     _activitySize: () => activity.size,
     close: () => { closed = true; for (const entry of [...launchingAttempts.values(), ...reviews.values()]) entry.localController?.abort(); machineSlots.releaseAll(); effects.close(); unsubscribe(); if (watchdogInterval) clearInterval(watchdogInterval); },
   };
+}
+
+// Who reviews when Jev is unsure (a lean below its bar): the team's reviewer agent, for work that changed files (or
+// whose changes are not known). A report that changed nothing is not a reviewer's to grade (verification run
+// 2026-10-22: it graded the repository's known bug as the analyst's blocker), and a sure Jev, or a review that was
+// already an agent's, decides as before.
+export function escalationReviewer({lean, reviewers, profiles, changes}) {
+  const unsure = lean?.verdict === 'unavailable' && ['accept', 'rework'].includes(lean.choice) && Number.isFinite(Number(lean.threshold));
+  if (!unsure || !reviewers.length || !reviewers.every(name => profiles[name]?.adapter === 'typesafe')) return null;
+  if (Array.isArray(changes) && !changes.length) return null;
+  const agent = profiles.reviewer;
+  return agent && agent.role !== 'orchestrator' && agent.adapter !== 'typesafe' ? 'reviewer' : null;
 }

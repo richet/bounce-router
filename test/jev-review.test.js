@@ -491,3 +491,60 @@ test('Jev on: an in-place task is not given the automatic completion reviewer; a
   const inPlace = scheduler.submit({parent: null, profile: 'A', orders: 'git commit -am done', deadline: null, requires: ['read', 'exec', 'write'], inPlace: true});
   assert.equal(inPlace.review?.completion, undefined);
 });
+
+// Found by the integration runs 2026-10-21/22: 4 of 5 Jev reviews were below the bar ("unavailable · chose accept
+// below threshold") and the work was accepted unread. When the team has a reviewer agent, an unsure Jev hands it the
+// review instead; with none, the lean is accepted with advice as before (the test above).
+test('an unsure Jev review falls to the reviewer agent, whose verdict decides', async t => {
+  const {root, session} = setup(t);
+  // A repository, so the work is an isolated artifact with a digest: the case where the first review's verdict was
+  // found again and reused for the reviewer (integration run 2026-10-22: escalated, then accepted in the same second).
+  const {spawnSync} = await import('node:child_process');
+  for (const args of [['init', '-q'], ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'init']]) spawnSync('git', args, {cwd: root});
+  // The work changes a file: an unsure Jev hands such work to the reviewer agent.
+  const worker = fakeAdapter(({cwd}) => { if (cwd) fs.writeFileSync(path.join(cwd, 'truncate.js'), 'export const truncate = s => s;\n'); return [{kind: 'result', status: 'completed', text: 'done'}]; });
+  const reviews = [];
+  const rev = fakeAdapter(({orders}) => { reviews.push(orders); return [{kind: 'result', status: 'completed', text: 'Verdict: FAIL\nFINDING: {"file": "src/truncate.js", "line": 4, "severity": "major", "title": "a space is left before the ellipsis", "repro": "node -e x", "observed": "ab  c …"}'}]; });
+  const reviewer = {adapter: 'rev', model: 'r', mode: 'yolo', fallback: [], role: 'reviewer', policy: 'read-only', derived: true, agent: {name: 'reviewer', description: 'Grades a change cold', policy: 'read-only', prompt: 'You are the reviewer.'}};
+  const {profiles, typesafe, jev} = jevScheduler(session, {settings: {enabled: true}, profiles: {reviewer}, respond: () => ({answers: answers('accept', 0.55)})});
+  const scheduler = createScheduler({session, adapters: {worker, typesafe, rev}, profiles, jev, gitHead: () => null});
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'write truncate', deadline: null});
+  await waitFor(() => session.events.some(e => e.kind === 'task.rework' && e.task === row.task));
+  const escalated = session.events.find(e => e.kind === 'review.escalated' && e.task === row.task);
+  assert.equal(escalated.to, 'reviewer');
+  assert.match(escalated.text, /^Jev leaned accept below its bar \(confidence 0\.\d+ of 0\.8\): the reviewer agent reviews it$/);
+  assert.match(reviews[0], /Jev leaned accept/, 'the reviewer is told what Jev leaned');
+  assert.match(JSON.stringify(session.events.find(e => e.kind === 'task.rework' && e.task === row.task).findings), /a space is left before the ellipsis/);
+  const finished = session.events.filter(e => e.kind === 'review.finished' && e.task === row.task).slice(0, 2).map(e => e.from);
+  assert.equal(new Set(finished).size, 2, `the reviewer's review is its own, not Jev's found again: ${finished}`);
+});
+
+test('an unsure Jev review that the reviewer agent passes is accepted, with no rework', async t => {
+  const {session} = setup(t);
+  // The work changes a file: an unsure Jev hands such work to the reviewer agent.
+  const worker = fakeAdapter(({cwd}) => { if (cwd) fs.writeFileSync(path.join(cwd, 'truncate.js'), 'export const truncate = s => s;\n'); return [{kind: 'result', status: 'completed', text: 'done'}]; });
+  const rev = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'Verdict: PASS'}]);
+  const reviewer = {adapter: 'rev', model: 'r', mode: 'yolo', fallback: [], role: 'reviewer', policy: 'read-only', derived: true, agent: {name: 'reviewer', description: 'Grades a change cold', policy: 'read-only', prompt: 'You are the reviewer.'}};
+  const {profiles, typesafe, jev} = jevScheduler(session, {settings: {enabled: true}, profiles: {reviewer}, respond: () => ({answers: answers('accept', 0.55)})});
+  const scheduler = createScheduler({session, adapters: {worker, typesafe, rev}, profiles, jev, gitHead: () => null});
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'write truncate', deadline: null});
+  // A pass, not a send-back. (Changed files with no check are then held for the orchestrator: verified-work policy.)
+  await waitFor(() => session.events.some(e => e.kind === 'review.finished' && e.task === row.task && /:escalated$/.test(e.from)));
+  await waitFor(() => ['accepted', 'blocked'].includes(scheduler.tasks()[row.task]?.state));
+  assert.equal(session.events.some(e => e.kind === 'task.rework'), false);
+  assert.equal(session.events.filter(e => e.kind === 'review.escalated').length, 1);
+});
+
+// Found by the verification run 2026-10-22: the reviewer agent was handed an analyst's report (no file changed) and
+// graded the repository's known bug as the analyst's blocker. Escalation is for work that changed something.
+test('an unsure Jev hands over only work that changed files, or whose changes are not known', async () => {
+  const {escalationReviewer} = await import('../src/scheduler.js');
+  const lean = {verdict: 'unavailable', choice: 'rework', confidence: 0.14, threshold: 0.9};
+  const profiles = {jev: {adapter: 'typesafe'}, reviewer: {adapter: 'opencode', role: 'reviewer'}};
+  assert.equal(escalationReviewer({lean, reviewers: ['jev'], profiles, changes: [{path: 'src/index.js'}]}), 'reviewer');
+  assert.equal(escalationReviewer({lean, reviewers: ['jev'], profiles, changes: null}), 'reviewer', 'unknown changes: the agent reviews');
+  assert.equal(escalationReviewer({lean, reviewers: ['jev'], profiles, changes: []}), null, 'a report with no change is not a reviewer\'s');
+  assert.equal(escalationReviewer({lean: {verdict: 'accept'}, reviewers: ['jev'], profiles, changes: [{}]}), null, 'a sure Jev decides');
+  assert.equal(escalationReviewer({lean, reviewers: ['jev'], profiles: {jev: profiles.jev}, changes: [{}]}), null, 'no reviewer agent');
+  assert.equal(escalationReviewer({lean, reviewers: ['reviewer'], profiles, changes: [{}]}), null, 'the review was already an agent\'s');
+});

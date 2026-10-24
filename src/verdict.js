@@ -31,7 +31,10 @@ function jsonObjects(text) {
 }
 
 const LABELLED = /^[\s>*#_-]*(?:final\s+)?(?:verdict|decision|review\s+verdict)\s*[:：=-]\s*[*_`"]*\s*([A-Za-z][A-Za-z ]{0,24}?)\s*[*_`".!]*\s*$/i;
-const FINDING = /^\s*[-*]?\s*FINDING\s*[:：]\s*(.+)$/i;
+const FINDING = /^\s*[-*>]*\s*[*_`]*FINDING[*_`]*\s*[:：]\s*(.+?)[*_`]*\s*$/i;
+// A line that is nothing but a verdict word ("PASS", "**FAIL**"): what reviewer agents are told to write.
+const BARE = /^[\s>*#_`-]*([A-Za-z][A-Za-z ]{0,24}?)[\s*_`.!]*(?:[(—–:-].*)?$/;
+const BLOCKING = /"severity"\s*:\s*"(blocker|major)"/i;
 
 export function parseVerdict(status, text) {
   const raw = typeof text === 'string' ? text.replace(/<think>[\s\S]*?(<\/think>|$)/gi, '').trim() : '';
@@ -44,14 +47,19 @@ export function parseVerdict(status, text) {
       if (verdict) return {...value, verdict};
     }
     const lines = raw.split('\n');
+    const findings = lines.map(line => FINDING.exec(line)?.[1]?.trim()).filter(Boolean);
+    const withFindings = verdict => ({verdict, ...(findings.length ? {findings} : {}), source: 'text'});
     for (let i = lines.length - 1; i >= 0; i--) {
       const match = LABELLED.exec(lines[i]);
       const verdict = match && normalize(match[1]);
-      if (verdict) {
-        const findings = lines.map(line => FINDING.exec(line)?.[1]?.trim()).filter(Boolean);
-        return {verdict, ...(findings.length ? {findings} : {}), source: 'text'};
-      }
+      if (verdict) return withFindings(verdict);
     }
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const verdict = normalize(BARE.exec(lines[i])?.[1]);
+      if (verdict) return withFindings(verdict);
+    }
+    // FINDING lines and no verdict: a blocker or major one sends the work back; minor ones alone do not.
+    if (findings.length) return withFindings(findings.some(finding => BLOCKING.test(finding)) ? 'rework' : 'accept');
   }
   return {verdict: 'unreadable', status: status ?? null, excerpt: raw.slice(-1200)};
 }

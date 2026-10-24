@@ -520,7 +520,9 @@ export function connectBus({path, token}) {
         }
       });
       socket.on('close', () => failAll(Object.assign(new Error('bus connection closed'), {code: 'closed'})));
-      socket.on('error', error => failAll(error));
+      // Once authenticated, a socket error is the connection going away by another name: Linux
+      // reports a revoke's teardown as ECONNRESET before 'close', where macOS just closes.
+      socket.on('error', error => failAll(authSettled ? Object.assign(new Error('bus connection closed'), {code: 'closed', cause: error}) : error));
       send({jsonrpc: '2.0', id: 0, method: 'auth', params: {token}});
     }, reject);
   });

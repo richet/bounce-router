@@ -15,10 +15,35 @@ export const commands = [
 ];
 // `extra` supplies the agents' own commands for this workspace (vendor-commands.js); it is a
 // function so the directories are only read once the input looks like a slash command.
+// Matching (docs/plans/interactive-polish.md step 5): names that start with what was typed; when none does, names
+// containing it, then names with its letters in order (`/cfg` finds config). Bounce's own before the agents' at a tie.
+export function fuzzyScore(name, query) {
+  const text = name.toLowerCase(), needle = query.toLowerCase();
+  if (!needle) return 3;
+  if (text.startsWith(needle)) return 3;
+  if (text.includes(needle)) return 2;
+  let at = 0;
+  for (const char of text) if (char === needle[at]) at++;
+  return at === needle.length ? 1 : 0;
+}
 export function completions(input, extra = () => []) {
   if (!/^\/\S*$/.test(input)) return [];
-  const own = commands.filter(([name]) => name.startsWith(input.slice(1)));
-  return [...own, ...extra().filter(([name]) => name.startsWith(input.slice(1)) && !commands.some(([mine]) => mine === name))];
+  const query = input.slice(1);
+  const all = [...commands, ...extra().filter(([name]) => !commands.some(([mine]) => mine === name))];
+  const scored = all.map((row, index) => ({row, index, score: fuzzyScore(row[0], query)})).filter(entry => entry.score > 0);
+  // Prefix matches alone when there are any: a fuzzy tail after two letters is noise, not help.
+  const best = scored.some(entry => entry.score === 3) ? scored.filter(entry => entry.score === 3) : scored;
+  return best.sort((a, b) => b.score - a.score || a.index - b.index).map(entry => entry.row);
+}
+// The `@mention` the caret is in: an @ at the start of the draft or after whitespace, up to the caret, with no
+// space in between. Returns where it is and what was typed after the @.
+export function mentionAt(input, cursor) {
+  const before = input.slice(0, cursor);
+  const match = /(^|\s)@([^\s@]*)$/.exec(before);
+  if (!match) return null;
+  const start = cursor - match[2].length - 1;
+  if (input[cursor] && !/\s/.test(input[cursor])) return null;
+  return {start, end: cursor, query: match[2]};
 }
 // A command typed out in full is not a completion waiting to be accepted. Enter on it must
 // run the command, so /skills lists the skills on the first press rather than quietly
@@ -47,7 +72,8 @@ const releaseMouse = '\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l';
 // prompt history instead of the transcript. Turn it off whenever bounce owns the screen and
 // read the wheel from mouse reports instead; restore it before handing a child CLI the terminal.
 const alternateScroll = enabled => enabled ? '\x1b[?1007h' : '\x1b[?1007l';
-export const mouseTracking = enabled => releaseMouse + alternateScroll(false) + (enabled ? '\x1b[?1000h\x1b[?1006h' : '');
+// 1002 (button-event tracking) adds motion while a button is held, which a drag selection needs; 1006 is SGR coordinates.
+export const mouseTracking = enabled => releaseMouse + alternateScroll(false) + (enabled ? '\x1b[?1002h\x1b[?1006h' : '');
 
 // Handing the terminal to a vendor CLI means handing over the keyboard too. Node keeps
 // reading fd 0 while stdin is flowing, so an inherited child never sees the keystrokes
@@ -57,16 +83,17 @@ export function suspendTerminal(stdin = process.stdin, stdout = process.stdout) 
   stdin.pause();
   stdout.write(keyboardProtocol(false) + releaseMouse + alternateScroll(true) + '\x1b[?2004l\x1b[0 q\x1b[?25h\x1b[?1049l');
 }
-export function resumeTerminal(stdin = process.stdin, stdout = process.stdout, {mouse = false} = {}) {
+// `inline` (classic, docs/plans/interactive-polish.md step 7) stays on the main screen with the mouse left to the
+// terminal: its scrollback, search and selection are the point.
+export function resumeTerminal(stdin = process.stdin, stdout = process.stdout, {mouse = false, inline = false} = {}) {
   stdin.setRawMode?.(true);
   stdin.resume();
-  stdout.write('\x1b[?1049h\x1b[?25l\x1b[?2004h' + keyboardProtocol(true) + mouseTracking(mouse));
+  stdout.write((inline ? '' : '\x1b[?1049h') + '\x1b[?25l\x1b[?2004h' + keyboardProtocol(true) + mouseTracking(mouse && !inline));
 }
-// Tracking the wheel means the terminal reports the whole mouse, so a plain click-drag no
-// longer reaches its own selection. onPress fires on a left button press so the caller can
-// say how to get selection back, at the moment the click is swallowed rather than in a
-// startup line nobody rereads.
-export function createMouseInput(onText, onScroll, onPress = () => {}) {
+// Tracking the mouse means the terminal reports all of it, so bounce selects text itself (src/tui/selection.js):
+// the wheel goes to onScroll with where the pointer is, and the left button's press, drag and release go to
+// onPointer with their 1-based cells. Other buttons are consumed.
+export function createMouseInput(onText, onScroll, onPointer = () => {}) {
   let pending = '';
   const consume = chunk => {
     pending += chunk;
@@ -86,14 +113,16 @@ export function createMouseInput(onText, onScroll, onPress = () => {}) {
         onText(pending.slice(0, 3)); pending = pending.slice(3); continue;
       }
       const button = Number(match[1]);
-      const wheel = button & 64;
-      if (match[4] === 'M' && wheel && !(button & 2)) onScroll(button & 1 ? -3 : 3);
-      // Press only: a click reports press then release, and one hint per click is enough.
-      else if (match[4] === 'M' && !wheel && (button & 3) === 0) onPress();
+      const at = {x: Number(match[2]), y: Number(match[3])};
+      const wheel = button & 64, motion = button & 32, left = (button & 3) === 0;
+      if (match[4] === 'M' && wheel && !(button & 2)) onScroll(button & 1 ? -3 : 3, at);
+      else if (!wheel && left) onPointer({kind: match[4] === 'm' ? 'release' : motion ? 'drag' : 'press', ...at});
       pending = pending.slice(match[0].length);
     }
   };
-  consume.flush = () => { if (pending) onText(pending); pending = ''; };
+  // The flush timer hands a lone ESC to the keyboard, but never the start of a mouse report: the terminal can split
+  // one across reads (seen in a pty: `…M\x1b[<` then `0;37;3m`), and nobody types `ESC [ <`.
+  consume.flush = () => { if (pending && !/^\x1b\[<[\d;]*$/.test(pending)) { onText(pending); pending = ''; } };
   return consume;
 }
 
@@ -130,6 +159,7 @@ export function createKeyInput(onText, onNewline, onControl = () => {}) {
         const key = {shift: !!(bits & 1), meta: !!(bits & 2), ctrl: !!(bits & 4)};
         // Enter with any modifier — Shift, Ctrl, Alt or Cmd — opens a line instead of sending.
         if (code === 13 || code === 10) { if (bits) onNewline(); else onText('\r'); continue; }
+        if (code === 106 && bits === 4) { onNewline(); continue; } // Ctrl+J: a line feed, as in a raw terminal
         const named = NAMED[code];
         const text = named ? named[1] : String.fromCodePoint(code);
         // Only Ctrl and Alt need a synthesized event; anything else readline can read as text.
@@ -215,4 +245,9 @@ export function modelRows(entries, index, width) {
   return entries.map((entry, i) => fit(
     `${i === index ? '›' : ' '} ${String(i + 1).padStart(2)}. ${fit(labels[i], labelWidth)} ${entry.current ? '✓' : ' '} ${String(entry.description ?? '').replace(/\s+/g, ' ')}`,
     Math.max(1, width)).trimEnd());
+}
+
+// Prose (help, a wizard's questions) wraps at word boundaries; the prompt draft above wraps at the column.
+export function wordRows(text, width) {
+  return wrapAnsi(String(text), Math.max(2, width), {hard: true}).split('\n');
 }

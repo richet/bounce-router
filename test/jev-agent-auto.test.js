@@ -48,7 +48,7 @@ test('the AI question leaves the job out of it: what each AI runs on and is good
   const view = validateOrchestration(settings, undefined, {roles: rolesOf('auto, claude/sonnet')});
   const questions = aiQuestions(view.profiles, {build: {tier: 'strongest'}}, view.profiles.reviewer);
   assert.deepEqual(Object.keys(questions), ['tier', 'profile']);
-  assert.equal(questions.profile.criteria.build, 'codex/gpt-6-astra · tier mid: research, routine implementation, test triage · capabilities: routine implementation');
+  assert.equal(questions.profile.criteria.build, 'codex/gpt-6-astra · tier mid: research, routine implementation, test triage, reviewing a scoped change · capabilities: routine implementation');
   // the shipped roster is in the table too; whatever is offered is an AI, never a job or the orchestrator
   assert.deepEqual(Object.keys(questions.profile.criteria).filter(name => ['main', 'reviewer'].includes(name)), []);
   assert.deepEqual(Object.values(questions.profile.criteria).filter(text => /role |policy /.test(text)), []);
@@ -170,4 +170,12 @@ test('scheduler: a job on Jev\'s AI survives a daemon restart and follows the ag
   await live.settled(live.scheduler.submit({parent: null, profile: 'reviewer', orders: ORDERS, deadline: null}).task);
   assert.deepEqual(live.launched.map(([name]) => name), ['codex', 'claude', 'codex']);
   assert.deepEqual(live.prompts, ['You are the reviewer.', 'You are the STRICT reviewer.', 'You are the STRICT reviewer.']);
+});
+
+// Found by the integration run 2026-10-21: with the operation on classic, `bounce agents` and `bounce local` said
+// "nobody can play it here" and "No agent has a local model yet" for a team whose files name local and cloud models.
+test('the agent table shows who may play each agent whatever the operation', () => {
+  const classic = {...settings, operation: 'classic'};
+  delete classic.orchestrator;
+  assert.deepEqual(agentTable(rolesOf('auto, claude/sonnet'), classic)[0].backends, ['auto (Jev)', 'claude/sonnet']);
 });

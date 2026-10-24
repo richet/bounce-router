@@ -209,3 +209,20 @@ test('bounce agents set on a config with no profiles block leaves the config alo
   assert.deepEqual([orchestration.profiles.researcher.adapter, orchestration.profiles['researcher~2'].adapter], ['opencode', 'claude']);
   assert.equal(orchestration.profiles.build.adapter, 'codex');
 });
+
+// Found in the real-console pass 2026-10-21: `bounce tasks` lists eight-character ids and `bounce task <that id>` said
+// "Unknown task".
+test('bounce task takes the short id bounce tasks prints, and names a missing one', async t => {
+  const root = tmpRoot('bounce-cli-'), cwd = tmpRoot('bounce-cli-cwd-');
+  t.after(() => { fs.rmSync(root, {recursive: true, force: true}); fs.rmSync(cwd, {recursive: true, force: true}); });
+  writeConfig(root);
+  const session = new Session(cwd, {root});
+  session.append({kind: 'task.submitted', task: '1e940e8b-46d0-4677-a5db-d36acb0933b1', parent: null, orders: 'write slow.txt', profile: 'builder'});
+  session.append({kind: 'task.started', task: '1e940e8b-46d0-4677-a5db-d36acb0933b1', attempt: 1});
+  const found = await run(['task', '1e940e8b', '--json', '--session', session.id], bounceEnv(root));
+  assert.equal(found.code, 0, found.stderr);
+  assert.equal(JSON.parse(found.stdout).task, '1e940e8b-46d0-4677-a5db-d36acb0933b1');
+  const missing = await run(['task', 'zzzz9999', '--session', session.id], bounceEnv(root));
+  assert.equal(missing.code, 1);
+  assert.match(missing.stderr, /No task zzzz9999 in this session/);
+});

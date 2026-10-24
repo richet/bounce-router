@@ -29,3 +29,18 @@ test('only text with no verdict in it is unreadable, and it keeps what the revie
   assert.equal(parseVerdict('completed', '').verdict, 'unreadable');
   assert.equal(parseVerdict('completed', 'The verdict is out on this one.').verdict, 'unreadable', 'the word alone is not a verdict');
 });
+
+// Found by the verification run 2026-10-22: a local reviewer answered with a bold "**FINDING: {…}**" line and no verdict
+// line, and the review was unreadable; the team's reviewer.md also asks for a bare "PASS or FAIL" line.
+test('a bare PASS/FAIL line is a verdict, emphasis around FINDING is read, and blocking findings alone are a rework', () => {
+  assert.equal(parseVerdict('completed', 'Checked the diff and reran npm test.\n\nPASS').verdict, 'accept');
+  assert.equal(parseVerdict('completed', '**FAIL**\n- FINDING: {"severity": "major", "title": "x"}').verdict, 'rework');
+  const finding = '{"file": "src/slugify.js", "line": 4, "severity": "blocker", "title": "no dash-run collapse"}';
+  const bold = parseVerdict('completed', `**FINDING: ${finding}**\n\nThe tests still fail.`);
+  assert.equal(bold.verdict, 'rework');
+  assert.deepEqual(bold.findings, [finding]);
+  assert.equal(parseVerdict('completed', 'FINDING: {"severity": "minor", "title": "a typo"}').verdict, 'accept', 'only minor findings do not send work back');
+  assert.equal(parseVerdict('completed', 'All checks done. Verdict:\n## PASS\nℹ tests 9 / pass 9').verdict, 'accept', 'the verdict on the line after its label');
+  assert.equal(parseVerdict('completed', `**FINDING: ${finding}**\n## PASS (goal complete: root cause found, no fix applied)`).verdict, 'accept', 'a stated verdict with its reason wins over findings');
+  assert.equal(parseVerdict('completed', 'I looked around and it seems fine overall.').verdict, 'unreadable');
+});

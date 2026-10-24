@@ -42,7 +42,10 @@ test('streamed deltas read as one answer block and the result that repeats them 
     {id: 'r', kind: 'result', success: true, text: 'Hi — picked up'},
   ]);
   assert.deepEqual(rows.map(row => [row.kind, row.id, row.text]), [['delta', 'd1+3', 'Hi — picked up']]);
-  assert.equal(conversationEvents([{id: 'd1', kind: 'delta', provider: 'muse', text: 'Hi'}, {id: 'd2', kind: 'delta', provider: 'muse', text: '!'}], {details: true}).length, 2);
+  // /details reads them as one block too (real-console pass 2026-10-21): deltas are live-only since
+  // interactive-polish step 11, so one row per delta was never the record, only "codex · Response / the" noise.
+  assert.deepEqual(conversationEvents([{id: 'd1', kind: 'delta', provider: 'muse', text: 'Hi'}, {id: 'd2', kind: 'delta', provider: 'muse', text: '!'}], {details: true}).map(row => row.text), ['Hi!']);
+  assert.deepEqual(conversationEvents([{id: 'd1', kind: 'delta', provider: 'muse', text: 'Hi'}, {id: 'a', kind: 'assistant', provider: 'muse', text: 'Hi', streamed: true}], {details: true}).map(row => row.id), ['a']);
   // Rows bounce journals while the answer streams (seen live: the session title, a native id, a status)
   // do not cut the answer in two, and the result that repeats the whole of it is still dropped.
   const interleaved = conversationEvents([
@@ -195,4 +198,99 @@ test('a settings row is shown, and a repeated listing folds to the latest', () =
     {id: 's2', kind: 'settings', text: 'Settings (a):\n  order = ["codex"]\n  sweepMinutes = 25'},
   ]);
   assert.deepEqual(rows.map(row => row.id), ['u', 's2']);
+});
+
+test('the route row shows when the provider, model or mode changes, not at every turn (interactive-polish step 1)', async () => {
+  const {conversationEvents} = await import('../src/tui/transcript.js');
+  const route = (id, provider, model = 'sonnet', mode = 'yolo') => ({kind: 'route', id, provider, model, mode, text: `Using ${provider} / ${model} / ${mode}`});
+  const events = [route('r1', 'claude'), {kind: 'user', id: 'u1', text: 'one'}, route('r2', 'claude'), {kind: 'user', id: 'u2', text: 'two'},
+    route('r3', 'claude', 'opus'), route('r4', 'codex'), route('r5', 'codex', 'sonnet', 'plan')];
+  assert.deepEqual(conversationEvents(events).filter(e => e.kind === 'route').map(e => e.id), ['r1', 'r3', 'r4', 'r5']);
+  assert.equal(conversationEvents(events, {details: true}).filter(e => e.kind === 'route').length, 5, '/details keeps every one');
+});
+
+test('each finished turn ends with a footer: how long it took and the tokens it read and wrote (interactive-polish step 6)', async () => {
+  const {conversationEvents} = await import('../src/tui/transcript.js');
+  const {createFormatter} = await import('../src/format.js');
+  const events = [
+    {kind: 'user', id: 'u1', text: 'hi', time: '2026-10-21T10:00:00.000Z'},
+    {kind: 'assistant', id: 'a1', text: 'Hello.', provider: 'claude'},
+    {kind: 'usage', id: 'g1', provider: 'claude', usage: {input_tokens: 1200, cache_read_input_tokens: 30000, cache_creation_input_tokens: 0, output_tokens: 214}},
+    {kind: 'turn', id: 't1', text: 'completed', time: '2026-10-21T10:00:12.400Z'},
+    {kind: 'user', id: 'u2', text: 'again', time: '2026-10-21T10:01:00.000Z'},
+    {kind: 'usage', id: 'g2', provider: 'opencode', usage: {input: 500, output: 20}},
+    {kind: 'usage', id: 'g3', provider: 'opencode', usage: {input: 700, output: 30}},
+    {kind: 'turn', id: 't2', text: 'cancelled', time: '2026-10-21T10:01:03.200Z'},
+  ];
+  const footers = conversationEvents(events).filter(e => e.kind === 'turn.footer');
+  assert.deepEqual(footers.map(e => e.text), ['12.4 s · in 31.2k (30.0k cached) · out 214', 'cancelled after 3.2 s · in 1.2k · out 50']);
+  const plain = createFormatter({color: false, compact: true});
+  assert.equal(plain.event(footers[0], 80)[0].trim(), '12.4 s · in 31.2k (30.0k cached) · out 214');
+  assert.equal(conversationEvents(events, {details: true}).filter(e => e.kind === 'turn.footer').length, 0, '/details shows the raw rows instead');
+});
+
+test('a finished turn leaves no live progress rows or bare vendor status behind; a running one still shows them', async () => {
+  const {conversationEvents} = await import('../src/tui/transcript.js');
+  const running = [
+    {kind: 'user', id: 'u1', text: 'hi', time: '2026-10-21T10:00:00.000Z'},
+    {kind: 'progress', id: 'p1', provider: 'claude', text: 'Ready · 88 tools'},
+    {kind: 'status', id: 's1', provider: 'claude', text: 'status'},
+    {kind: 'progress', id: 'p2', provider: 'claude', text: 'Thinking · ~218 tokens'},
+  ];
+  assert.deepEqual(conversationEvents(running).map(e => e.kind), ['user', 'progress', 'progress']);
+  const finished = [...running, {kind: 'assistant', id: 'a1', provider: 'claude', text: 'Hello.'}, {kind: 'turn', id: 't1', text: 'completed', time: '2026-10-21T10:00:05.000Z'}];
+  assert.deepEqual(conversationEvents(finished).map(e => e.kind), ['user', 'assistant', 'turn.footer']);
+});
+
+test('the journaled assistant row of a streamed block takes the place of its live deltas, not a second copy', async () => {
+  const {conversationEvents} = await import('../src/tui/transcript.js');
+  const events = [
+    {kind: 'user', id: 'u1', text: 'hi'},
+    {kind: 'delta', id: 'd1', provider: 'claude', text: 'Hel'},
+    {kind: 'delta', id: 'd2', provider: 'claude', text: 'lo.'},
+    {kind: 'assistant', id: 'a1', provider: 'claude', text: 'Hello.', streamed: true},
+  ];
+  assert.deepEqual(conversationEvents(events).map(e => [e.kind, e.text]), [['user', 'hi'], ['assistant', 'Hello.']]);
+  assert.deepEqual(conversationEvents(events.filter(e => e.kind !== 'delta')).map(e => [e.kind, e.text]), [['user', 'hi'], ['assistant', 'Hello.']], 'a replay from the journal alone shows it once too');
+  const titled = [...events.slice(0, 3), {kind: 'session.titled', id: 's1', text: 'Greeting'}, events[3]];
+  assert.deepEqual(conversationEvents(titled).filter(e => ['delta', 'assistant'].includes(e.kind)).map(e => e.text), ['Hello.'], 'a row journaled mid-stream does not cause a second copy');
+});
+
+// Found live 2026-10-21: a worker's second lifecycle row in the same turn left a hole where its first was, and the
+// end of the turn crashed on it; removing progress also shifted the row a worker's next update replaces.
+test('the end of a turn with a worker that updated twice keeps one block for it, and the footer', () => {
+  const rows = conversationEvents([
+    {id: 'u', kind: 'user', text: 'go', time: '2026-10-21T00:00:00Z'},
+    {id: 'p', kind: 'progress', text: 'Thinking', time: '2026-10-21T00:00:00.500Z'},
+    {id: 's', kind: 'task.submitted', task: 'task-one', profile: 'builder', time: '2026-10-21T00:00:01Z'},
+    {id: 'r', kind: 'task.started', task: 'task-one', profile: 'builder', time: '2026-10-21T00:00:01Z'},
+    {id: 't', kind: 'turn', text: 'Turn completed', time: '2026-10-21T00:00:02Z'},
+    {id: 'c', kind: 'task.completed', task: 'task-one', summary: 'done', time: '2026-10-21T00:00:05Z'},
+  ]);
+  assert.deepEqual(rows.map(row => row.kind), ['user', 'turn.footer', 'task.fold']);
+  assert.equal(rows[2].state, 'completed');
+});
+
+test('a streamed answer after a worker updated twice still replaces its own deltas', () => {
+  const rows = conversationEvents([
+    {id: 'u', kind: 'user', text: 'go', time: '2026-10-21T00:00:00Z'},
+    {id: 'd', kind: 'delta', provider: 'claude', text: 'Sending', time: '2026-10-21T00:00:00.200Z'},
+    {id: 's', kind: 'task.submitted', task: 'task-one', profile: 'builder', time: '2026-10-21T00:00:01Z'},
+    {id: 'r', kind: 'task.started', task: 'task-one', profile: 'builder', time: '2026-10-21T00:00:01Z'},
+    {id: 'a', kind: 'assistant', provider: 'claude', text: 'Sending a builder.', streamed: true, time: '2026-10-21T00:00:02Z'},
+  ]);
+  assert.deepEqual(rows.map(row => `${row.kind}:${row.id}`), ['user:u', 'assistant:a', 'task.fold:r']);
+});
+
+test('a turn the orchestrator starts on worker outcomes, with no typed prompt, ends with its own footer', () => {
+  const rows = conversationEvents([
+    {id: 'u', kind: 'user', text: 'go', time: '2026-10-21T00:00:00Z'},
+    {id: 't1', kind: 'turn', text: 'Turn completed', time: '2026-10-21T00:00:02Z'},
+    {id: 'w', kind: 'main.requested', wake: true, time: '2026-10-21T00:01:00Z'},
+    {id: 'g', kind: 'usage', provider: 'claude', usage: {input_tokens: 1200, output_tokens: 40}, time: '2026-10-21T00:01:03Z'},
+    {id: 'a', kind: 'assistant', provider: 'claude', text: 'Builder done.', time: '2026-10-21T00:01:04Z'},
+    {id: 't2', kind: 'turn', text: 'Turn completed', time: '2026-10-21T00:01:04.500Z'},
+  ]);
+  const footers = rows.filter(row => row.kind === 'turn.footer').map(row => row.text);
+  assert.deepEqual(footers, ['Turn completed after 2.0 s', 'Turn completed after 4.5 s · in 1.2k · out 40']);
 });

@@ -154,7 +154,7 @@ Headless usage: `bounce run "Explain this screenshot" --image "/path/Screen shot
 - `/mode yolo` (default) bypasses native approvals and sandboxing.
 - `/mode plan` requests Claude plan mode, Codex read-only sandbox, or Muse disabled write/shell. It is not an interactive approval bridge, and provider-native tools/configuration determine exact restrictions.
 - `/quota` refreshes and prints the usage each agent reports. On terminals at least 100 columns wide, a right sidebar topped by the BOUNCE wordmark shows the provider, mode, model, operation mode and state, queued prompts, workspace, session id, each agent's short quota reading, and an AGENTS list of the main agent and every worker with its state. It is on by default; `/sidebar` toggles it (`/sidebar on|off` sets it) and the choice is saved in `config.json` as `sidebar`. Narrower terminals keep the header. Use `/review` to print the full text of every completed turn's result in chronological order.
-- `/local` shows local models, the OpenCode bridge and the agents a local model may play; `/local verify` runs one real turn; `/local setup [loaded]` picks which model plays each agent and applies it to this session; `/local activate [AGENT]` re-reads agent files into the running session.
+- `/local` shows local models, the OpenCode bridge and the agents a local model may play; `/local verify` runs one real turn; `/local setup [loaded]` writes this machine's models and the bindings and applies them to this session; `/local activate [AGENT]` re-reads agent files into the running session.
 - `/skills` lists bounce's skills and where each agent has them; `/skills sync`, `/skills new NAME`, `/skills add PATH`, `/skills remove NAME`, `/skills import [provider]`, `/skills clear`, `/skills reset` and `/skills seed --force` manage them. See [Skills](#skills).
 - `/steer TEXT` steers the focused agent while it works — the message is delivered into the running turn (or to the selected worker when the AGENTS pane is open). The agent reads it when its current tool call returns, so if the orchestrator is inside a `bounce wait`, bounce ends that wait at once with a `wait.interrupted` row telling it to read the message first; the notice says exactly that. When nothing is running it is saved as an aside for the next turn.
 - `/btw QUESTION` asks a quick side question about this session — a one-shot, read-only call to the same model the session runs on, answered from the recent conversation (and, in orchestrator mode, the orchestrator's state note and task list). It never joins, delays or steers the running turn, works busy or idle, and its answer never feeds back into the orchestrator's own context.
@@ -304,10 +304,29 @@ The only local-specific step is setup: install the `opencode` CLI (1.x or 2.x: b
 ```sh
 bounce local            # what is loaded, whether OpenCode is installed, which agents a local model may play
 bounce local --verify   # additionally run one real one-line turn through OpenCode
-bounce local setup      # pick which model plays each agent — Enter accepts the suggestion
+bounce local setup      # write this machine's models and who plays each agent; shows the files, then asks
 ```
 
-or `/local`, `/local verify`, `/local setup` inside the TUI (setup applies to the running session). `bounce local on|off` (`/local on|off`) is the switch, in the same words as `bounce jev on|off`: off makes every agent skip its local AIs and run on the rest of its list, and inside the TUI it applies to the running session. With routing on, `bounce jev` also lists the jobs `auto` can route to, which agents hand their AI to Jev, and whether local models are candidates. Loaded models are listed first; downloaded ones load on first use. Setup writes `lmstudio/<model>` first in the agent's `models:` and keeps your cloud providers behind it as fallbacks.
+or `/local`, `/local verify`, `/local setup` inside the TUI (setup applies to the running session). `bounce local on|off` (`/local on|off`) is the switch, in the same words as `bounce jev on|off`: off makes every agent skip its local AIs and run on the rest of its list, and inside the TUI it applies to the running session. With routing on, `bounce jev` also lists the jobs `auto` can route to, which agents hand their AI to Jev, and whether local models are candidates. Loaded models are listed first; downloaded ones load on first use.
+
+**Who plays each agent: profiles, bindings, models.** An agent file says who the agent is (prompt, policy, `maxSteps`) and travels with the project. Which AI plays it is in two YAML files beside it:
+
+```yaml
+# <project>/.bounce/bindings.yml (committed), else ~/.bounce/bindings.yml — one file in use, whole
+agents:
+  builder: [auto, qwen_coder, claude/sonnet]   # auto = Jev picks; the rest is the fallback chain
+  "*": [auto, qwen, codex]                     # every agent not named above
+```
+
+```yaml
+# ~/.bounce/models.yaml — this machine's meaning of each alias
+qwen: lmstudio/qwen3.8-27b-gsq-rco
+qwen_coder:
+  model: lmstudio/qwen3-coder-30b
+  thinking: off           # optional settings: temperature, topP, topK, minP, presencePenalty, repeatPenalty, maxTokens
+```
+
+So a project's bindings run unchanged on another machine: that machine points the same alias at a model it has. The team is likewise one layer, whole: the project's `.bounce/agents/`, else `~/.bounce/agents/`, else the one bounce ships — never a mix. bounce sends no sampling of its own to a local model; only an alias's settings are sent, and a model's own settings live in LM Studio. `bounce agents list` names the team, the bindings and models files in use, where each chain came from, and an alias this machine does not define. `bounce local setup` writes both files by discovery, moves an old agent file's `models:` and sampling into them, and offers the shipped agents a team lacks.
 
 `local.endpoints.<name>.contextTokens` (optional, at least 4096) is the context OpenCode is told each local model has: a worker's conversation is compacted at that size instead of growing to whatever LM Studio loaded the model with (these MLX builds load at 262k whatever the CLI asks). Verified live: with a 32k limit a worker reading a 60k-token file compacted twice and still answered correctly; without it the prompt grew to 82k. `local.endpoints.<name>.maxConcurrent` (default 1) is how many local workers run on that endpoint at once; it is the ceiling for the endpoint as a whole. `slotsPerModel` (optional) is the limit per model within it, set to the parallel slots LM Studio gives each loaded model: two builders on one model no longer hold back a reviewer on the other, idle one (observed: a reviewer queued seven minutes behind two builders on a different model). A task past either limit stays queued, says which limit and how many are in use, and starts when a local turn ends. Cloud workers are never held by either — they share one machine-wide `maxConcurrentCloud` (config.json, default 3) instead, since a cloud vendor and a local endpoint have nothing in common to size against.
 

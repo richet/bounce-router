@@ -2,7 +2,7 @@
 // the journal alone. Every figure names what it counts, over which span, in which unit; a figure that cannot
 // be known from the journal says so instead of guessing. The numbers that drove this week's decisions came
 // from scratch scripts over the same rows; this is those scripts, kept.
-import {tasks as taskStates, TERMINAL} from './reducers.js';
+import {tasks as taskStates, TERMINAL, normalizeUsage} from './reducers.js';
 
 const T = e => Date.parse(e.time);
 const minutes = ms => Math.round(ms / 60000);
@@ -47,10 +47,13 @@ export function sessionStats(events, {now = Date.now()} = {}) {
   for (const a of attempts) { const w = workerByAI[a.ai] ??= {attempts: 0, totalMs: 0, durations: []}; w.attempts += 1; w.totalMs += a.ms; w.durations.push(a.ms); }
   for (const w of Object.values(workerByAI)) { w.medianMs = median(w.durations); delete w.durations; }
   // Orchestrator turns.
+  // A classic conversation has no main.* rows: its turns run from the prompt to the `turn` row.
+  const classic = !rows.some(e => e.kind === 'main.started');
+  const [opens, closes] = classic ? ['user', 'turn'] : ['main.started', 'main.terminal'];
   let turnStart = null; const turns = [];
   for (const e of rows) {
-    if (e.kind === 'main.started') turnStart = T(e);
-    if (e.kind === 'main.terminal' && turnStart !== null) { turns.push({ms: T(e) - turnStart, start: turnStart, end: T(e)}); turnStart = null; }
+    if (e.kind === opens) turnStart = T(e);
+    if (e.kind === closes && turnStart !== null) { turns.push({ms: T(e) - turnStart, start: turnStart, end: T(e)}); turnStart = null; }
   }
   // Busy: any worker attempt or orchestrator turn in flight; quiet gaps: no row of anyone's for 20 min.
   const spans = [...attempts.map(a => [a.start, a.end]), ...turns.map(t => [t.start, t.end])].sort((a, b) => a[0] - b[0]);
@@ -62,7 +65,8 @@ export function sessionStats(events, {now = Date.now()} = {}) {
 
   // Tokens from usage rows, by the AI that spent them; the orchestrator's own usage under 'orchestrator'.
   const tokensByAI = {};
-  const add = (ai, usage = {}) => { const t = tokensByAI[ai] ??= {input: 0, output: 0, cacheRead: 0, reasoning: 0}; t.input += usage.input ?? 0; t.output += usage.output ?? 0; t.cacheRead += usage.cache_read ?? 0; t.reasoning += usage.reasoning ?? 0; };
+  // Usage rows carry each vendor's own field names (claude's input_tokens…): read through the one normalizer.
+  const add = (ai, raw = {}) => { const usage = {...normalizeUsage(raw), reasoning: raw.reasoning}; const t = tokensByAI[ai] ??= {input: 0, output: 0, cacheRead: 0, reasoning: 0}; t.input += usage.input ?? 0; t.output += usage.output ?? 0; t.cacheRead += usage.cache_read ?? 0; t.reasoning += usage.reasoning ?? 0; };
   for (const e of rows) {
     if (e.kind === 'task.usage' && e.usage) add(aiOf(events, e.task, submitted.get(e.task)?.profile), e.usage);
     if (e.kind === 'usage' && e.usage) add('orchestrator', e.usage);

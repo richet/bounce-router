@@ -10,6 +10,7 @@
 // probability distribution plus a confidence; a Noul is a yes/no probability. It emits no
 // text, so every decision below is combined in code, and the sanctioned pattern of gating
 // on confidence (below the threshold → today's behaviour) is applied everywhere.
+import {createHash} from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import {dataRoot, saveJSON} from './core.js';
@@ -126,7 +127,7 @@ export function retryAfterMs(header, {now = Date.now(), max = 15_000, fallback =
   return fallback;
 }
 
-export function createJevClient({fetchImpl = (...args) => globalThis.fetch(...args), readKey = () => readJevKey(), endpoint = JEV_ENDPOINT, timeoutMs = JEV_TIMEOUT_MS, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), clock = Date.now} = {}) {
+export function createJevClient({fetchImpl = (...args) => globalThis.fetch(...args), readKey = () => readJevKey(), endpoint = JEV_ENDPOINT, timeoutMs = JEV_TIMEOUT_MS, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), clock = Date.now, samples = 1, memoFile = null} = {}) {
   async function once(body, key, signal) {
     const controller = new AbortController();
     const abort = () => controller.abort(jevError('aborted', 'TypeSafe request cancelled'));
@@ -146,7 +147,24 @@ export function createJevClient({fetchImpl = (...args) => globalThis.fetch(...ar
   // Resolves {answers, model, usage, latencyMs}; rejects with error.code in
   // missing_key | timeout | aborted | network | http_<status> | protocol. The key is read
   // here and only ever placed on the request header — never on the error, never returned.
+  // Jev is not deterministic: the same request, byte for byte, answered 0.76–0.80 and once picked another model
+  // (measured 2026-10-22), and TypeSafe refuses temperature and seed. So a request is asked `samples` times at once,
+  // the majority answer is kept (median confidence), and that answer is remembered for that exact request — in the
+  // process, and in `memoFile` when given — so the same inputs always get the same decision.
+  // The daemon turns both on (src/reload.js: samples JEV_SAMPLES, memoFile); a bare client asks once and remembers nothing.
+  const memo = memoFile ? loadMemo(memoFile) : null;
   async function ask({state, questions, model = JEV_DEFAULT_MODEL, signal} = {}) {
+    if (samples === 1 && !memo) return askOnce({state, questions, model, signal});
+    const key = createHash('sha256').update(JSON.stringify({model, state, questions})).digest('hex');
+    if (memo?.has(key)) return {...memo.get(key), latencyMs: 0, remembered: true};
+    const settled = await Promise.allSettled(Array.from({length: Math.max(1, samples)}, () => askOnce({state, questions, model, signal})));
+    const answered = settled.filter(result => result.status === 'fulfilled').map(result => result.value);
+    if (!answered.length) throw settled[0].reason;
+    const result = {answers: majority(answered.map(reply => reply.answers)), model: answered[0].model, usage: answered[0].usage, latencyMs: Math.max(...answered.map(reply => reply.latencyMs ?? 0))};
+    if (memo) { memo.set(key, {answers: result.answers, model: result.model, usage: result.usage}); saveMemo(memoFile, memo); }
+    return result;
+  }
+  async function askOnce({state, questions, model = JEV_DEFAULT_MODEL, signal} = {}) {
     const found = readKey();
     if (!found?.key) throw jevError('missing_key', `No TypeSafe API key: set ${JEV_KEY_ENV} or run /jev key`);
     const body = {state, model, questions};
@@ -172,6 +190,40 @@ export function createJevClient({fetchImpl = (...args) => globalThis.fetch(...ar
   }
 
   return {ask};
+}
+
+export const JEV_SAMPLES = 3;
+const MEMO_MAX = 2000;
+const median = values => { const sorted = [...values].sort((a, b) => a - b); const mid = Math.floor(sorted.length / 2); return sorted.length % 2 ? sorted[mid] : Math.round(((sorted[mid - 1] + sorted[mid]) / 2) * 1000) / 1000; };
+// Per question: a choice is the one most samples picked (ties: the higher mean confidence), with the median confidence
+// of the samples that picked it and the mean probabilities; a yes/no (noul) is the median; anything else, the first.
+export function majority(sets) {
+  const names = [...new Set(sets.flatMap(answers => Object.keys(answers ?? {})))];
+  return Object.fromEntries(names.map(name => {
+    const all = sets.map(answers => answers?.[name]).filter(isObject);
+    if (all.some(answer => typeof answer.choice === 'string')) {
+      const picked = all.filter(answer => typeof answer.choice === 'string');
+      const groups = Map.groupBy(picked, answer => answer.choice);
+      const mean = list => list.reduce((sum, answer) => sum + Number(answer.confidence ?? 0), 0) / list.length;
+      const [choice, chosen] = [...groups].sort((a, b) => b[1].length - a[1].length || mean(b[1]) - mean(a[1]))[0];
+      const keys = [...new Set(picked.flatMap(answer => Object.keys(answer.probabilities ?? {})))];
+      const probabilities = Object.fromEntries(keys.map(k => [k, Math.round(picked.reduce((sum, answer) => sum + Number(answer.probabilities?.[k] ?? 0), 0) / picked.length * 1000) / 1000]));
+      return [name, {...chosen[0], choice, confidence: median(chosen.map(answer => Number(answer.confidence ?? 0))), probabilities}];
+    }
+    if (all.some(answer => Number.isFinite(Number(answer.noul)))) return [name, {...all[0], noul: median(all.filter(answer => Number.isFinite(Number(answer.noul))).map(answer => Number(answer.noul)))}];
+    return [name, all[0]];
+  }));
+}
+function loadMemo(file) {
+  const memo = new Map();
+  if (!file) return memo;
+  try { for (const [key, value] of Object.entries(JSON.parse(fs.readFileSync(file, 'utf8')))) memo.set(key, value); } catch {}
+  return memo;
+}
+function saveMemo(file, memo) {
+  if (!file) return;
+  while (memo.size > MEMO_MAX) memo.delete(memo.keys().next().value);
+  try { fs.mkdirSync(path.dirname(file), {recursive: true}); fs.writeFileSync(file, JSON.stringify(Object.fromEntries(memo)), {mode: 0o600}); } catch {}
 }
 
 // ---- completion verdict: one Choice {accept, rework} plus narrow Nouls over {orders, report, diff} ----
@@ -395,7 +447,9 @@ export function routingFallback(profiles = {}, preferred = null) {
     ?? null;
 }
 
-export const TIER_HINT = {cheapest: 'cheapest: locating files, symbols and call sites; extracting structured facts', mid: 'mid: research, routine implementation, test triage', strongest: 'strongest: independent review, ambiguous or cross-cutting debugging, security-sensitive work'};
+// Review is mid unless the change is security-sensitive or cross-cutting (integration runs 2026-10-22: every confident
+// review went to opus[1m], the dearest profile, for a 20-line change).
+export const TIER_HINT = {cheapest: 'cheapest: locating files, symbols and call sites; extracting structured facts', mid: 'mid: research, routine implementation, test triage, reviewing a scoped change', strongest: 'strongest: reviewing a security-sensitive or cross-cutting change, ambiguous or cross-cutting debugging, security-sensitive work'};
 
 // One criterion per routable profile: what it runs on, what it may do, and — from the profile's
 // own `tier`/`capabilities` or the roster notes bounce wrote for its model (src/roster-notes.js)
@@ -489,7 +543,7 @@ export function routingQuestions(profiles = {}, notes = {}) {
       type: 'choice',
       instructions: {
         question: 'Which worker profile should carry out these orders?',
-        guidance: 'Weigh each profile\'s capabilities against what the orders demand, then prefer the cheapest tier whose contract fits: cheapest for locating files and extracting facts, mid for research and routine implementation, strongest for independent review, ambiguous or cross-cutting debugging and security-sensitive work. A read-only profile cannot edit files or run commands.',
+        guidance: 'Weigh each profile\'s capabilities against what the orders demand, then prefer the cheapest tier whose contract fits: cheapest for locating files and extracting facts, mid for research, routine implementation and reviewing a scoped change, strongest for reviewing a security-sensitive or cross-cutting change, ambiguous or cross-cutting debugging and security-sensitive work. A read-only profile cannot edit files or run commands.',
       },
       criteria,
     },
@@ -547,7 +601,7 @@ export function aiQuestions(profiles = {}, notes = {}, head = null, locals = [])
     type: 'choice',
     instructions: {
       question: `Which AI should do this job?${head?.agent ? ` The job: ${head.agent.description} (policy ${head.policy})` : ''}`,
-      guidance: 'Weigh each AI\'s capabilities against what the orders demand, then prefer the cheapest tier that fits: cheapest for locating files and extracting facts, mid for research and routine implementation, strongest for independent review, ambiguous or cross-cutting debugging and security-sensitive work.',
+      guidance: 'Weigh each AI\'s capabilities against what the orders demand, then prefer the cheapest tier that fits: cheapest for locating files and extracting facts, mid for research, routine implementation and reviewing a scoped change, strongest for reviewing a security-sensitive or cross-cutting change, ambiguous or cross-cutting debugging and security-sensitive work.',
     },
     criteria: {...profileCriteria(profiles, notes, {job: true}), ...Object.fromEntries(locals.map(item => [item.name, [
       `local model ${item.name}`, 'runs on this machine at no cost', ...(item.size ? [`${(item.size / 1024 ** 3).toFixed(1)} GB of memory`] : []), ...(item.loaded ? [] : ['not loaded: choosing it costs a model load first']),

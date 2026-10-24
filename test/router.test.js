@@ -445,3 +445,36 @@ test('claude text streams as deltas and the whole block that follows is not show
   assert.deepEqual(normalize('claude', {type: 'assistant', session_id: 'other', message: {content: [{type: 'text', text: 'plain'}]}}), [{kind: 'assistant', text: 'plain'}]);
   assert.equal(echoesNormalizedRow({kind: 'raw', provider: 'claude', raw: {type: 'stream_event'}}), true, 'the raw stream rows are display, never journal');
 });
+
+// docs/plans/interactive-polish.md step 11: streamed text is shown live, journaled once.
+test('streamed deltas reach the view live but the journal keeps one assistant row per text block, in order', async t => {
+  const {session} = setup(t);
+  const seen = [];
+  session.onEvent = event => seen.push(event.kind);
+  const router = new Router(session, defaults(), {runner: async options => {
+    for (const piece of ['Hel', 'lo, ', 'world.']) options.emit({kind: 'delta', text: piece});
+    options.emit({kind: 'tool', text: 'Read: {"file_path":"a.js"}'});
+    for (const piece of ['Done', '.']) options.emit({kind: 'delta', text: piece});
+    return {status: 'completed'};
+  }});
+  assert.equal(await router.run('hi'), 'completed');
+  const journal = fs.readFileSync(path.join(session.dir, 'journal.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(journal.filter(e => e.kind === 'delta').length, 0, 'no delta row is written to disk');
+  const said = journal.filter(e => ['assistant', 'tool'].includes(e.kind)).map(e => [e.kind, e.text, e.streamed ?? false]);
+  assert.deepEqual(said, [['assistant', 'Hello, world.', true], ['tool', 'Read: {"file_path":"a.js"}', false], ['assistant', 'Done.', true]]);
+  assert.equal(seen.filter(kind => kind === 'delta').length, 5, 'every delta was delivered live');
+});
+
+test('keepProcess sends a claude turn to the kept conversation; off (the default) it runs a process per turn', async t => {
+  const {session} = setup(t);
+  const used = [];
+  const conversations = {turn: async options => { used.push(['kept', options.provider]); options.emit({kind: 'assistant', text: 'kept'}); return {status: 'completed'}; }, closeAll() { used.push(['closed']); }};
+  const runner = async options => { used.push(['spawned', options.provider]); options.emit({kind: 'assistant', text: 'fresh'}); return {status: 'completed'}; };
+  const settings = {...defaults(), order: ['claude']};
+  const router = new Router(session, settings, {runner, conversations});
+  await router.run('one');
+  settings.keepProcess = true;
+  await router.run('two');
+  router.close();
+  assert.deepEqual(used, [['spawned', 'claude'], ['kept', 'claude'], ['closed']]);
+});

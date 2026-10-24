@@ -272,8 +272,9 @@ test('U13: withAsides folds /steer notes in front of the next turn; /steer never
   assert.equal(withAsides('fix the parser', ['tests live in test/', 'skip docs']),
     'By the way — notes from the user while you were working:\n- tests live in test/\n- skip docs\n\nfix the parser');
   const runs = [...cliSource.matchAll(/router\.run\([^\n]+/g)].map(m => m[0]);
-  assert.equal(runs.length, 3);
-  assert.equal(runs.filter(r => r.includes('withAsides(')).length, 2, 'both TUI turns fold idle asides; only the one-shot run does not');
+  // Four: the two TUI turns, the one-shot run, and that run's handoff turns (carryJob, integration run 2026-10-21).
+  assert.equal(runs.length, 4);
+  assert.equal(runs.filter(r => r.includes('withAsides(')).length, 2, 'both TUI turns fold idle asides; the one-shot run and its handoff turns do not');
   const steer = cliSource.indexOf("command === 'steer'");
   assert.notEqual(steer, -1);
   const block = cliSource.slice(steer, cliSource.indexOf('} else if', steer + 1));

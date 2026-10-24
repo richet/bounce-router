@@ -412,6 +412,9 @@ export function createMainService({session, adapters, profile, settings, profile
         if (event.kind === 'error' && event.code === 'missing') result = {status: 'missing', text: event.text};
         if (['assistant', 'tool', 'delta', 'progress', 'activity'].includes(event.kind)) run.spoke = true;
         const row = {...event, provider: run.provider, from: 'main', context: session.id};
+        // The finished message of a block that streamed (codex's app-server) takes the deltas' place on screen.
+        if (event.kind === 'delta') run.streaming = true;
+        if (event.kind === 'assistant' && run.streaming) { row.streamed = true; run.streaming = false; }
         if (['delta', 'progress', 'activity'].includes(event.kind)) session.publish(row);
         else session.append(row);
       }

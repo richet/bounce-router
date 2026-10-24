@@ -84,13 +84,14 @@ for (const [name, {make, executable, env}] of Object.entries(adapters)) {
 const usageEnv = {
   claude: {FAKE_SESSION: 'sess-conf-usage', FAKE_USAGE: JSON.stringify({
     input_tokens: 11, cache_read_input_tokens: 3, cache_creation_input_tokens: 2, output_tokens: 7})},
-  codex: {FAKE_USAGE: JSON.stringify({inputTokens: 11, cachedInputTokens: 3, outputTokens: 7, reasoningOutputTokens: 0, totalTokens: 21})},
+  // codex counts the cache inside inputTokens (measured 2026-10-21 on 0.162: totalTokens = inputTokens + outputTokens).
+  codex: {FAKE_USAGE: JSON.stringify({inputTokens: 11, cachedInputTokens: 3, outputTokens: 7, reasoningOutputTokens: 0, totalTokens: 18})},
   muse: {},
   opencode: {FAKE_OC_USAGE: JSON.stringify({total: 21, input: 11, output: 7, reasoning: 4, cache: {read: 3, write: 2}})},
 };
 const expectedUsage = {
   claude: {input: 11, cache_read: 3, cache_write: 2, output: 7},
-  codex: {input: 11, cache_read: 3, output: 7},
+  codex: {input: 8, cache_read: 3, output: 7},
   opencode: {input: 11, cache_read: 3, cache_write: 2, output: 7},
 };
 for (const [name, {make, executable}] of Object.entries(adapters)) {

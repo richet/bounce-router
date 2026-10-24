@@ -81,3 +81,16 @@ test('every setting has an explanation, and typing filters the rows by key or by
   assert.equal(filterEntries(entries, '').length, entries.length);
   assert.deepEqual(filterEntries(entries, 'zzz'), []);
 });
+
+// Found in the real-console pass 2026-10-21: `/config nosuch 1` wrote "nosuch": 1 to config.json. A dotted key under a
+// known object (models.opencode, local.endpoints.<name>) is still accepted: that is how unlisted ones are reached.
+test('/config refuses a key bounce does not have, and keeps the file as it was', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-config-'));
+  fs.writeFileSync(path.join(root, 'config.json'), '{}');
+  const settings = config(root);
+  assert.throws(() => configCommand(['nosuch', '1'], {root, settings}), {message: 'Unknown setting nosuch · /config lists them'});
+  assert.throws(() => configCommand(['unset', 'nosuch'], {root, settings}), {message: 'Unknown setting nosuch · /config lists them'});
+  assert.equal(fs.readFileSync(path.join(root, 'config.json'), 'utf8'), '{}');
+  assert.match(configCommand(['models.opencode', 'lmstudio/qwen'], {root, settings}).text, /^models\.opencode = "lmstudio\/qwen" · saved/);
+  fs.rmSync(root, {recursive: true, force: true});
+});

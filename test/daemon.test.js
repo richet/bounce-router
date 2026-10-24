@@ -1011,3 +1011,20 @@ test('a resume stops this session\'s stuck daemon that holds the lock, and leave
   assert.equal(await releaseStuckDaemon(dir, 'sess-1', {inspect: own, sleep}), stuck.pid);
   await waitFor(() => !pidAlive(stuck.pid));
 });
+
+// Found by the integration run 2026-10-21 (docs/bench/integration-2026-10-21-multi.md): an orchestrated `bounce run`
+// was its first turn only, so an orchestrator that dispatched and ended its turn — as real ones do — never heard back
+// and the job stopped there. The run now hands the outcome over in one more turn, then ends.
+test('O11 an orchestrated run that dispatches without waiting is handed its worker\'s outcome in one more turn', async t => {
+  const root = tmpRoot('bounce-o11-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  writeOrchestratorConfig(root, {profiles: {main: {adapter: 'codex'}, build: {adapter: 'codex'}}});
+  const session = await runOrchestratorSession(root, {adapters: {codex: completingAdapter()}, env: {FAKE_ORCH_NOWAIT: '1'}});
+  const submitted = session.events.find(e => e.kind === 'task.submitted');
+  assert.equal(session.events.some(e => e.kind === 'task.completed' && e.task === submitted.task), true);
+  const users = session.events.filter(e => e.kind === 'user');
+  assert.equal(users.length, 2, 'the prompt, then one handoff turn');
+  assert.match(users[1].text, /Worker outcomes not yet handed to you/);
+  assert.equal(session.events.some(e => e.kind === 'assistant' && e.text === `handed: - task ${submitted.task} · profile build · task.completed`), true);
+  assert.deepEqual(session.events.filter(e => e.kind === 'main.disposition').map(e => e.task), [submitted.task]);
+});

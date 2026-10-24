@@ -1,6 +1,7 @@
 import {doingStep} from './status.js';
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'timed_out', 'rejected', 'accepted']);
-const HIDDEN_TRANSCRIPT_KINDS = new Set(['raw', 'usage', 'checkpoint', 'task.activity']);
+// `usage` is kept: the conversation view sums it into each turn's footer (src/tui/transcript.js) and shows no row.
+const HIDDEN_TRANSCRIPT_KINDS = new Set(['raw', 'checkpoint', 'task.activity']);
 // `task.observed` is a throttled journal copy of the same live `task.activity` rows (src/scheduler.js
 // consumeWorkerEvents): a row seen live moments earlier lands again on restart replay. Only the
 // text is compared — a recent window, not the whole history, so a genuinely repeated line still shows.

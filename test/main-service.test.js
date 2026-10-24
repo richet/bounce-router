@@ -1159,3 +1159,26 @@ test('a turn that had already said something when it failed is not run again', a
 
   assert.deepEqual([terminal.status, f.calls.length], ['failed', 1]);
 });
+
+test('an orchestrator answer that streamed is journaled once, marked so its live deltas give way to it', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-main-stream-'));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const session = new Session(root, {root});
+  const adapter = {
+    async launch() { return {}; },
+    async *events() {
+      yield {kind: 'delta', text: 'Plan'}; yield {kind: 'delta', text: 'ned.'};
+      yield {kind: 'assistant', text: 'Planned.'};
+      yield {kind: 'assistant', text: 'A second block, not streamed.'};
+      yield {kind: 'result', status: 'completed'};
+    },
+    async cancel() { return {verified: true}; },
+  };
+  const main = createMainService({session, adapters: {codex: adapter}, profile: {adapter: 'codex', mode: 'plan'}, settings: {executables: {}}, brief: 'Orders'});
+  t.after(() => main.close());
+  const ended = nextEvent(main, 'main.terminal');
+  await main.run({id: 'r1', text: 'go'});
+  await ended;
+  assert.deepEqual(session.events.filter(e => e.kind === 'assistant').map(e => [e.text, e.streamed ?? false]), [['Planned.', true], ['A second block, not streamed.', false]]);
+  assert.equal(session.events.filter(e => e.kind === 'delta').length, 0);
+});

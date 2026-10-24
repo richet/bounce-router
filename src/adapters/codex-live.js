@@ -162,14 +162,26 @@ async function startTurn(handle, text, userImages = []) {
 
 // The vendor's own rows, with two substitutions: a thread id is the peer's native id, and a
 // turn's end is a milestone for this worker, not a result — the worker is still there.
+// One model call's tokens: input without the cached part (codex counts the cache inside its input), the thinking,
+// and the context the call filled against the model's window, for the turn footer.
+export function tokenUsageRow(params) {
+  const raw = params?.tokenUsage?.last;
+  const usage = {};
+  for (const [from, to] of [['inputTokens', 'input'], ['cachedInputTokens', 'cache_read'], ['cacheWriteInputTokens', 'cache_write'], ['outputTokens', 'output']]) {
+    if (Number.isInteger(raw?.[from])) usage[to] = raw[from];
+  }
+  if (Number.isInteger(usage.input) && Number.isInteger(usage.cache_read)) usage.input = Math.max(0, usage.input - usage.cache_read);
+  if (!Object.keys(usage).length) return null;
+  const window = params?.tokenUsage?.modelContextWindow;
+  // `usage` keeps the four counts the scheduler sums (CONTRACT §5); thinking and context travel beside it.
+  return {kind: 'usage', usage, ...(raw?.reasoningOutputTokens > 0 ? {thinking: raw.reasoningOutputTokens} : {}),
+    ...(Number.isInteger(raw?.totalTokens) && Number.isInteger(window) ? {context: {used: raw.totalTokens, window}} : {})};
+}
+
 function rows(handle, message) {
   if (message.method === 'thread/tokenUsage/updated') {
-    const raw = message.params?.tokenUsage?.last;
-    const usage = {};
-    for (const [from, to] of [['inputTokens', 'input'], ['cachedInputTokens', 'cache_read'], ['cacheWriteInputTokens', 'cache_write'], ['outputTokens', 'output']]) {
-      if (Number.isInteger(raw?.[from])) usage[to] = raw[from];
-    }
-    if (Object.keys(usage).length) handle.stream.push({kind: 'usage', usage});
+    const row = tokenUsageRow(message.params);
+    if (row) handle.stream.push(row);
     return;
   }
   for (const event of codex.normalize(message)) {

@@ -1,11 +1,9 @@
 import {fileURLToPath} from 'node:url';
-import {spawn as spawnProcess} from 'node:child_process';
-import {createInterface} from 'node:readline';
-import {randomUUID} from 'node:crypto';
 import {resolveExecutable} from '../executable.js';
 import {spawnLive, vendorEnv, verifiedCancel, appendPending, readPending, takePending, TEXT_MAX, SPEAKER, classifyText, createAnswer, concludeAsk, reportGrant, peerTask} from './live-common.js';
 import {outputTail} from '../command-output.js';
 import {opencodeVersion, VERIFIED} from '../opencode-version.js';
+import {serveForTurn} from '../opencode-server.js';
 
 // The OpenCode peer, driven the way claude and codex are: one `opencode run` process per turn, in
 // the user's own tree. The prompt goes in on stdin, JSON event lines come out on stdout, the
@@ -23,7 +21,7 @@ import {opencodeVersion, VERIFIED} from '../opencode-version.js';
 // `--standalone` makes it a private one that inherits this env and ends with the turn (without it,
 // `run` attaches to the user's shared background service, which never sees our config). There is no
 // --dir (the directory is $PWD, which wins over the spawn cwd) and no --pure. Its config has its own
-// shape (nativeConfig below) and its tools other names: bash is shell, task is subagent.
+// shape (nativeConfig, opencode-common.js) and its tools other names: bash is shell, task is subagent.
 const RUN_ARGS = ['run', '--pure', '--format', 'json'];
 const RUN_ARGS_V2 = ['run', '--standalone', '--format', 'json'];
 // 2.x lists an MCP server's tools only once it has connected ("reads report what is connected now",
@@ -32,7 +30,6 @@ const RUN_ARGS_V2 = ['run', '--standalone', '--format', 'json'];
 // step one wrote its own client for the report socket. So a worker with a report grant gets a server
 // bounce starts itself (`serve --stdio`, what --standalone runs), and its turn starts only once the
 // server says bounce is no longer pending — or after MCP_READY_MS, when it runs without the tool.
-const SERVER_READY_MS = 30_000;
 const MCP_READY_MS = 20_000;
 const DEFAULT_AGENT = 'bounce-worker';
 const DEFAULT_STEPS = 30;
@@ -73,9 +70,9 @@ const STEP_BEAT_CAP_MS = 15 * 60_000;
 const CONCLUDE_TIMEOUT_MS = 90_000;
 const BEAT = Symbol('beat');
 
-// toolsFor and mapUsage live in opencode-common.js (shared with the classic adapter) and are re-exported.
-export {toolsFor, mapUsage} from './opencode-common.js';
-import {toolsFor, mapUsage, READ_TOOLS, WRITE_TOOLS, NEVER_TOOLS} from './opencode-common.js';
+// toolsFor, mapUsage and nativeConfig live in opencode-common.js (shared with the classic adapter) and are re-exported.
+export {toolsFor, mapUsage, nativeConfig} from './opencode-common.js';
+import {toolsFor, mapUsage, nativeConfig, READ_TOOLS, WRITE_TOOLS, NEVER_TOOLS} from './opencode-common.js';
 
 // Everything this adapter takes on faith from the opencode binary, in one place and per major, so a
 // test can hold the installed binary to it (test/opencode-contract.test.js). Verified against the
@@ -96,59 +93,6 @@ export const CONTRACT = {
   },
 };
 
-// opencode 2.x reads the 1.x config through a migration, but three things only its own shape says
-// (2.0.29 source): its LM Studio plugin rediscovers a provider named lmstudio and replaces the models
-// we declare (tools off unless the model says so), so it is removed; an MCP server defaults to code
-// mode, which hides bounce_report inside a generic `execute` tool; and the output cap goes out as
-// max_completion_tokens beside our max_tokens unless the provider names max_tokens as its field. So
-// bounce builds one config (1.x shape, src/local-opencode-config.js and start() below) and this turns
-// it into 2.x's: providers/settings/body, agents/system/steps/permissions, mcp.servers.
-const NATIVE_PROVIDER = '@opencode/ai/providers/openai-compatible';
-// 1.x tool → the 2.x permission it is governed by; a tool with no 2.x counterpart has no entry.
-const ACTION = {read: 'read', grep: 'grep', glob: 'glob', write: 'edit', edit: 'edit', apply_patch: 'edit', bash: 'shell',
-  task: 'subagent', websearch: 'websearch', webfetch: 'webfetch', skill: 'skill', question: 'question'};
-// The 2.x tools each action hides, so a denied action leaves no tool of that kind (write and patch
-// are checked as edit, and denying the names too keeps that true if a release splits them).
-const ACTION_TOOLS = {edit: ['edit', 'write', 'patch']};
-const rule = (action, effect) => ({action, resource: '*', effect});
-
-export function nativeConfig(config = {}) {
-  const native = {...(config.$schema ? {$schema: config.$schema} : {}),
-    // Not the user's Claude Code setup (~/.claude, ~/.agents skills): 1.x was told so by env vars 2.x
-    // no longer reads. Not the LM Studio discovery that would replace the models declared here.
-    plugins: ['-opencode.provider.lmstudio', '-opencode.config.compatibility']};
-  native.providers = Object.fromEntries(Object.entries(config.provider ?? {}).map(([id, provider]) => [id, {
-    name: provider.name ?? id, package: NATIVE_PROVIDER, settings: {...(provider.options ?? {})},
-    compatibility: {maxTokensField: 'max_tokens'},
-    models: Object.fromEntries(Object.entries(provider.models ?? {}).map(([modelID, model]) => {
-      // Every option is a field of the request body, verbatim, except the SDK's reasoningEffort,
-      // which the body names reasoning_effort (src/local-opencode-config.js samplingOptions).
-      const {reasoningEffort, ...fields} = model.options ?? {};
-      const body = {...fields, ...(reasoningEffort !== undefined ? {reasoning_effort: reasoningEffort} : {})};
-      return [modelID, {name: model.name ?? modelID, capabilities: {tools: true}, ...(model.limit ? {limit: model.limit} : {}),
-        ...(Object.keys(body).length ? {body} : {})}];
-    })),
-  }]));
-  native.permissions = Object.entries(config.permission ?? {}).map(([action, effect]) => rule(action, effect));
-  native.mcp = {servers: Object.fromEntries(Object.entries(config.mcp ?? {}).map(([id, server]) => [id, {
-    type: server.type, command: server.command, environment: server.environment ?? {}, disabled: server.enabled === false, codemode: false}]))};
-  native.agents = Object.fromEntries(Object.entries(config.agent ?? {}).map(([id, agent]) => {
-    const allowed = new Map();
-    for (const [tool, on] of Object.entries(agent.tools ?? {})) {
-      const action = ACTION[tool] ?? (tool.startsWith('bounce_') ? tool : null);
-      if (action) allowed.set(action, (allowed.get(action) ?? false) || on);
-    }
-    // Only denials: everything is allowed by default, and an explicit allow would also override
-    // opencode's own ask before a .env edit. Code mode (`execute`) is a second way into every tool;
-    // a 1.x worker never had it.
-    const permissions = [rule('execute', 'deny'), ...[...allowed].filter(([, on]) => !on)
-      .flatMap(([action]) => (ACTION_TOOLS[action] ?? [action]).map(name => rule(name, 'deny')))];
-    return [id, {description: agent.description, mode: agent.mode, ...(agent.prompt ? {system: agent.prompt} : {}),
-      ...(agent.maxSteps ? {steps: agent.maxSteps} : {}), permissions}];
-  }));
-  return native;
-}
-
 const effectiveTier = (profile = {}) =>
   profile.policy === 'read-only' ? 'read-only' : profile.mode === 'plan' ? 'plan' : profile.policy === 'write' ? 'write' : 'yolo';
 
@@ -158,44 +102,6 @@ const effectiveTier = (profile = {}) =>
 const CREDENTIAL = /(_API_KEY|_AUTH_TOKEN|_ACCESS_TOKEN|_SECRET|_SECRET_KEY)$|^(ANTHROPIC|OPENAI|GEMINI|GOOGLE|AWS|AZURE|GROQ|MISTRAL|OPENROUTER|XAI|DEEPSEEK)_/;
 export const scrubCredentials = (env, keep = []) =>
   Object.fromEntries(Object.entries(env).filter(([key]) => keep.includes(key) || !CREDENTIAL.test(key)));
-
-async function serveForTurn({executable, cwd, env, spawn = spawnProcess, fetchImpl = fetch, readyMs = SERVER_READY_MS, mcpMs = MCP_READY_MS}) {
-  const password = randomUUID();
-  const server = spawn(executable, ['serve', '--stdio', '--port', '0'], {cwd, env: {...env, OPENCODE_PASSWORD: password}, stdio: ['pipe', 'pipe', 'pipe']});
-  server.stderr?.resume();
-  server.stdin?.on('error', () => {});
-  // The server lives until its stdin closes (and so dies with bounce); a server that ignores that is killed.
-  const stop = () => {
-    try { server.stdin?.end(); } catch {}
-    const timer = setTimeout(() => { try { server.kill('SIGKILL'); } catch {} }, 3000);
-    timer.unref?.(); server.once('exit', () => clearTimeout(timer));
-  };
-  try {
-    const url = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`opencode serve gave no address within ${readyMs} ms`)), readyMs);
-      server.once('error', error => { clearTimeout(timer); reject(error); });
-      server.once('exit', code => { clearTimeout(timer); reject(new Error(`opencode serve exited ${code} before it was ready`)); });
-      createInterface({input: server.stdout}).once('line', line => {
-        clearTimeout(timer);
-        try { resolve(JSON.parse(line).url); } catch { reject(new Error(`opencode serve printed ${line.slice(0, 200)} instead of its address`)); }
-      });
-    });
-    // The first request boots this directory's location, which starts its MCP servers.
-    const headers = {authorization: `Basic ${Buffer.from(`opencode:${password}`).toString('base64')}`};
-    const started = Date.now();
-    let state = 'pending';
-    while (state === 'pending' && Date.now() - started < mcpMs) {
-      const listed = await fetchImpl(`${url}/api/mcp?location[directory]=${encodeURIComponent(cwd)}`, {headers}).then(res => res.ok ? res.json() : null).catch(() => null);
-      state = listed?.data?.find(item => item.name === 'bounce')?.status?.status ?? 'pending';
-      if (state === 'pending') await new Promise(resolve => setTimeout(resolve, 100));
-    }
-    const notice = state === 'connected' ? null : `bounce_report was ${state} after ${Date.now() - started} ms: the turn runs without it`;
-    return {url, password, stop, notice};
-  } catch (error) {
-    stop();
-    throw Object.assign(new Error(`opencode server did not start: ${error.message}`), {code: 'backend_unavailable'});
-  }
-}
 
 export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HEARTBEAT_MS, stepBeatCapMs = STEP_BEAT_CAP_MS, concludeTimeoutMs = CONCLUDE_TIMEOUT_MS, versionOf = opencodeVersion, fetchImpl = fetch, mcpReadyMs = MCP_READY_MS} = {}) {
   const pendingPath = dir => `${dir}/pending.jsonl`;

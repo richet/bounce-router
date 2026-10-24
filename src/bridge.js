@@ -8,13 +8,16 @@ import {parseArgs} from 'node:util';
 import {createOps, DEFAULT_WAIT_MS, WAIT_CHUNK_MS} from './bridge-ops.js';
 
 
-function formatRow(row, json) {
+export function formatRow(row, json) {
   if (row == null) return 'null';
   if (json) return JSON.stringify(row);
   // A task row leads with its id: the orchestrator needs it for the very next `wait`, and the plain
   // form used to hide it (observed: an orchestrator digging the id out of the tasks/ directory).
+  // A submission also names what was submitted: replies to parallel publishes arrive in any order.
   const notes = Array.isArray(row.notes) ? row.notes.map(note => `\n  note: ${note}`).join('') : '';
-  return `[${row.from}:${row.kind}]${typeof row.task === 'string' ? ` task=${row.task}` : ''} ${row.text ?? ''}${notes}`;
+  const orders = String(row.orders ?? '').replace(/\s+/g, ' ').trim();
+  const what = row.kind === 'task.submitted' ? `${row.profile ? ` profile=${row.profile}` : ''}${orders ? ` orders="${orders.length > 60 ? `${orders.slice(0, 60)}…` : orders}"` : ''}` : '';
+  return `[${row.from}:${row.kind}]${typeof row.task === 'string' ? ` task=${row.task}` : ''}${what} ${row.text ?? ''}${notes}`;
 }
 
 function parseJsonArg(value, label) {

@@ -147,8 +147,10 @@ async function askVerdict({stream, client, state, profile, settings, controller}
     threshold: decision.threshold, choice: decision.choice, probabilities: decision.probabilities, fired: decision.fired, leanFindings: decision.leanFindings, source: 'jev'})});
 }
 
-export function createTypesafeLive({fetchImpl, readKey, readSettings = () => readJevSettings(), git = defaultGit, clock = Date.now, timeoutMs} = {}) {
-  const client = createJevClient({...(fetchImpl ? {fetchImpl} : {}), ...(readKey ? {readKey} : {}), ...(timeoutMs ? {timeoutMs} : {}), clock});
+// `memoFile`: where Jev's answers are remembered by exact request, so the same inputs decide the same way across
+// sessions (src/jev.js createJevClient). The daemon passes <data>/jev-memo.json; tests pass nothing (memory only).
+export function createTypesafeLive({fetchImpl, readKey, readSettings = () => readJevSettings(), git = defaultGit, clock = Date.now, timeoutMs, samples, memoFile = null} = {}) {
+  const client = createJevClient({...(fetchImpl ? {fetchImpl} : {}), ...(readKey ? {readKey} : {}), ...(timeoutMs ? {timeoutMs} : {}), ...(samples ? {samples} : {}), clock, memoFile});
 
   const skipped = (stream, reason, text) => {
     stream.push({kind: 'jev', name: 'skipped', data: {reason}, text: `Jev verdict unavailable · ${text ?? reason}`});

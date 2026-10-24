@@ -177,7 +177,7 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
         ...(local.enabled && adapterNames.includes('opencode') ? Object.keys(local.endpoints).map(endpoint => `${endpoint}/auto`) : [])];
     // `provider/default` is the provider's own default model — the written form of what an agent with
     // no `models:` gets, so setup can pin a local model first and still keep the cloud fallbacks.
-    const backends = wanted.map(ref => { const cut = ref.indexOf('/'); const model = ref.slice(cut + 1); return {provider: ref.slice(0, cut), model: model === 'default' ? '' : model, ref}; })
+    const backends = wanted.map((ref, at) => { const cut = ref.indexOf('/'); const model = ref.slice(cut + 1); return {provider: ref.slice(0, cut), model: model === 'default' ? '' : model, ref, at}; })
       .filter(({provider, ref}) => {
         // A plan session is read-only end to end: a write agent is not offered rather than refused,
         // so a fresh install (whose shipped team has write agents) still plans.
@@ -194,11 +194,11 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
       const policy = agent.policy ?? 'write';
       const base = {derived: true, adapter: isLocal(provider) ? 'opencode' : provider, model, mode, policy,
         fallback: chain.slice(index + 1, index + 2), role: agent.name, executables: {...(settings.executables ?? {})},
-        agent: {name: agent.name, description: agent.description, policy, prompt: agent.prompt, ...(agent.maxSteps ? {maxSteps: agent.maxSteps} : {}), ...(agent.sampling ? {sampling: agent.sampling} : {})}};
+        agent: {name: agent.name, description: agent.description, policy, prompt: agent.prompt, ...(agent.maxSteps ? {maxSteps: agent.maxSteps} : {}), ...(agent.sampling && profileSamples(agent) ? {sampling: agent.sampling} : {})}};
       if (auto && index === 0) base.auto = true;
       if (isLocal(provider)) {
         // All a local backend adds is where its model lives and how the job samples; src/local-resolve.js does the rest at dispatch.
-        Object.assign(base, {backend: 'lmstudio', endpoint: provider, localOptions: localOptions(agent)});
+        Object.assign(base, {backend: 'lmstudio', endpoint: provider, localOptions: localOptions(agent, backendSettings(agent, backends, index))});
       }
       profiles[name] = base;
     });
@@ -212,7 +212,17 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
 
 // What a local backend adds for its job: the output it needs room for (src/local-resolve.js) and how
 // it samples (src/local-opencode-config.js). Only local backends carry it, so a cloud model never does.
-const localOptions = agent => ({maxOutputTokens: agent?.sampling?.maxTokens ?? 2048, ...(agent?.sampling ? {sampling: agent.sampling} : {})});
+// `settings` are what the backend samples with: from bindings, its alias's own (none: nothing is sent, the model's
+// settings in LM Studio decide — docs/plans/agent-bindings.md option D); from a profile's legacy models:, the profile's.
+const localOptions = (agent, settings) => ({maxOutputTokens: settings?.maxTokens ?? 2048, ...(settings ? {sampling: settings} : {})});
+// The settings of a surviving backend: chainSettings is aligned with the chain bindings resolved (src/bindings.js),
+// and each backend keeps its place in that chain (`at`) through the filters above — two aliases may name one model.
+// A profile's own sampling is played only while its chain is the profile's (legacy models:, or no bindings at all).
+const profileSamples = agent => agent.binding?.source === 'profile' || !agent.binding;
+function backendSettings(agent, backends, index) {
+  if (profileSamples(agent)) return agent.sampling ?? null;
+  return agent.chainSettings?.[backends[index].at] ?? null;
+}
 
 // A job played by an AI that is not on its own list — Jev's pick for an agent whose `models:` opens
 // with `auto`. The AI brings only what it runs on; mode, policy, role and prompt stay the job's, and
@@ -221,7 +231,7 @@ const localOptions = agent => ({maxOutputTokens: agent?.sampling?.maxTokens ?? 2
 export function playedBy(head, aiName, ai, local = null) {
   return {derived: true, ai: aiName, adapter: local ? 'opencode' : ai.adapter, model: local ? local.model : ai.model ?? '', mode: head.mode, policy: head.policy,
     fallback: [head.agent.name], role: head.role, executables: head.executables, agent: head.agent,
-    ...(local ? {backend: 'lmstudio', endpoint: local.endpoint, localOptions: localOptions(head.agent)} : {})};
+    ...(local ? {backend: 'lmstudio', endpoint: local.endpoint, localOptions: localOptions(head.agent, head.agent?.sampling ?? null)} : {})};
 }
 
 export function profileFor(view, name) {

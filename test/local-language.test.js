@@ -81,13 +81,15 @@ test('/local on hands every pinned agent\'s AI to Jev: auto goes first, the mode
   fs.writeFileSync(path.join(root, 'agents', 'reviewer.md'), agentFile('reviewer', 'read-only', 'auto, claude/sonnet'));
   fs.writeFileSync(path.join(cwd, '.bounce', 'agents', 'porter.md'), agentFile('porter', 'write', 'codex/gpt-5.6-terra'));
   fs.writeFileSync(path.join(root, 'agents', 'main.md'), agentFile('main', 'write', 'claude/opus'));
-  assert.deepEqual(handAIsToJev(rolesFor(root, {cwd}), {orchestrator: 'main'}), ['analyst', 'porter']);
-  const after = rolesFor(root, {cwd});
+  // The team in use is the one handed over (2026-10-24: a project's team replaces the user's whole).
+  assert.deepEqual(handAIsToJev(rolesFor(root, {cwd}), {orchestrator: 'main'}), ['porter']);
+  assert.deepEqual(rolesFor(root, {cwd}).get('porter').models, ['auto', 'codex/gpt-5.6-terra']);
+  assert.deepEqual(handAIsToJev(rolesFor(root), {orchestrator: 'main'}), ['analyst'], 'outside the project, the user\'s team');
+  const after = rolesFor(root);
   assert.deepEqual(after.get('analyst').models, ['auto', 'lmstudio/coder-30b', 'claude/default']);
-  assert.deepEqual(after.get('porter').models, ['auto', 'codex/gpt-5.6-terra']);
   assert.deepEqual([after.get('analyst').prompt, after.get('analyst').policy, after.get('analyst').description], ['You are the analyst.', 'read-only', 'The analyst.']);
   assert.deepEqual(after.get('reviewer').models, ['auto', 'claude/sonnet'], 'already handed over: untouched');
   assert.deepEqual(after.get('main').models, ['claude/opus'], 'the orchestrator is configured, never routed');
-  assert.deepEqual(after.get('builder').source, 'skill', 'a shipped agent is never written to');
+  assert.equal(after.has('builder'), false, 'no shipped agent joins a user team');
   assert.deepEqual(handAIsToJev(after, {orchestrator: 'main'}), [], 'a second /local on changes nothing');
 });

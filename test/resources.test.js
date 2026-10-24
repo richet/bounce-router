@@ -112,3 +112,9 @@ test('R6 the report: what is free, what is resident, and what each model would c
   ].join('\n'));
   assert.equal(resourceReport({machine: {known: false, reason: 'vm_stat unreadable'}, fleet}), 'Machine: unknown (vm_stat unreadable) · bounce will not hold a local task back');
 });
+
+// Found in the real-console pass 2026-10-21: on Linux `bounce resources` printed "spawnSync vm_stat ENOENT". The
+// numbers are macOS's (unified memory); off it, bounce says it does not measure rather than fail at a macOS tool.
+test('off macOS the machine is not measured, and says so in words', () => {
+  assert.deepEqual(readMachine({platform: 'linux'}), {known: false, reason: 'bounce measures memory on macOS only'});
+});

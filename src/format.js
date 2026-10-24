@@ -5,6 +5,7 @@ import {Chalk} from 'chalk';
 import wrapAnsi from 'wrap-ansi';
 import sliceAnsi from 'slice-ansi';
 import stripAnsi from 'strip-ansi';
+import stringWidth from 'string-width';
 import {tasks, budgets, TERMINAL} from './reducers.js';
 import {helpRows} from './help.js';
 
@@ -18,8 +19,10 @@ export const clean = text => stripAnsi(String(text ?? ''))
   .replace(/\t/g, '    ');
 
 // `role(row)` (optional) names who a row belongs to — the orchestrator profile, a worker's
-// profile — and is shown before the provider: `main · claude · Tool`. Classic never passes it.
-export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in process.env) && process.env.TERM !== 'dumb', compact = false, role = null} = {}) {
+// profile — and is shown before the provider: `main · claude · Tool`. Only the orchestrator's views pass it.
+// `foldAnswers` (default: with `compact`) cuts an answer's code blocks to 4 lines and tables to 3 rows, for a worker
+// pane's few rows; the conversation shows answers whole (docs/plans/interactive-polish.md step 1).
+export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in process.env) && process.env.TERM !== 'dumb', compact = false, foldAnswers = compact, role = null} = {}) {
   const c = new Chalk({level: color ? 1 : 0});
   const style = {
     title: c.bold.cyan, muted: c.gray, user: c.bold.cyan, assistant: c.bold.green,
@@ -44,6 +47,8 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
       });
     } catch { return text; }
   }
+  // The width the Markdown being parsed is laid out in: a table chooses columns or label lines by it.
+  let layoutWidth = 80;
   const parser = new Marked(markedTerminal({
     heading: c.bold.cyan, firstHeading: c.bold.cyan, strong: c.bold, em: c.italic,
     codespan: c.yellow, code: c.yellow, blockquote: c.gray.italic,
@@ -56,7 +61,7 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     code({text, lang}) {
       const language = lang?.trim().split(/\s+/)[0].toLowerCase();
       const lines = text.split('\n');
-      const visible = compact ? lines.slice(0, 4) : lines;
+      const visible = foldAnswers ? lines.slice(0, 4) : lines;
       const code = codeColors(visible.join('\n'), language);
       const folded = lines.length - visible.length;
       const more = folded ? '\n' + c.gray(`  … +${folded} lines · /details to expand`) : '';
@@ -81,10 +86,20 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
       codespan({text}) { return c.yellow(text); },
       table({header, rows}) {
         const labels = header.map(cell => this.parser.parseInline(cell.tokens));
-        const preview = rows.slice(0, 3).map(row => row.map((cell, index) =>
-          `${c.gray(labels[index] + ':')} ${this.parser.parseInline(cell.tokens)}`).join(' · '));
-        const more = rows.length > 3 ? `\n${c.gray(`  … +${rows.length - 3} rows · /details to expand`)}` : '';
-        return preview.join('\n') + more + '\n\n';
+        const cells = rows.map(row => row.map(cell => this.parser.parseInline(cell.tokens)));
+        const labelled = row => row.map((cell, index) => `${c.gray(labels[index] + ':')} ${cell}`).join(' · ');
+        if (foldAnswers) {
+          const more = rows.length > 3 ? `\n${c.gray(`  … +${rows.length - 3} rows · /details to expand`)}` : '';
+          return cells.slice(0, 3).map(labelled).join('\n') + more + '\n\n';
+        }
+        // Whole: aligned columns when they fit the width, else each row as its label: value pairs.
+        const widths = labels.map((label, index) => Math.max(stringWidth(stripAnsi(label)), ...cells.map(row => stringWidth(stripAnsi(row[index] ?? '')))));
+        const pad = (text, index) => text + ' '.repeat(Math.max(0, widths[index] - stringWidth(stripAnsi(text))));
+        const line = row => row.map((cell, index) => pad(cell ?? '', index)).join('  ').trimEnd();
+        if (widths.reduce((sum, width) => sum + width, 0) + 2 * (widths.length - 1) > layoutWidth) {
+          return cells.map(row => row.map((cell, index) => `${c.gray(labels[index] + ':')} ${cell}`).join('\n')).join('\n\n') + '\n\n';
+        }
+        return [c.bold(line(labels)), c.gray(widths.map(width => '─'.repeat(width)).join('  ')), ...cells.map(line)].join('\n') + '\n\n';
       },
     } : {}),
     link({href, tokens}) { return c.blue(this.parser.parseInline(tokens)) + c.underline(` (${clean(href)})`); },
@@ -106,8 +121,36 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
   const hangAll = (text, width) => text.split('\n').flatMap(line => hang(line, width));
   function markdown(text, width) {
     const source = clean(text);
+    layoutWidth = width;
     try { return hangAll(parser.parse(source).trimEnd(), width); }
     catch { return hangAll(source, width); } // Partial/unknown Markdown must never hide a response.
+  }
+  // An answer still streaming (docs/plans/interactive-polish.md step 11): the paragraphs it has finished are
+  // rendered once and kept; only the one being written is rendered again on each delta. A paragraph ends at a blank
+  // line outside a code fence. A 2 000-word answer took 24 ms to render whole, more than a frame.
+  let stream = {prefix: '', width: 0, rows: []}, reused = 0;
+  function stableCut(text) {
+    let cut = 0, fenced = false, at = 0;
+    for (const line of text.split('\n')) {
+      const next = at + line.length + 1;
+      if (/^\s*(```|~~~)/.test(line)) fenced = !fenced;
+      else if (!fenced && line.trim() === '' && next <= text.length) cut = next;
+      at = next;
+    }
+    return cut;
+  }
+  function streamingMarkdown(text, width) {
+    const cut = stableCut(text);
+    const prefix = text.slice(0, cut), tail = text.slice(cut);
+    if (stream.prefix !== prefix || stream.width !== width) {
+      const grows = stream.width === width && stream.prefix && prefix.startsWith(stream.prefix);
+      const added = grows ? markdown(prefix.slice(stream.prefix.length), width) : [];
+      const rows = !grows ? (prefix.trim() ? markdown(prefix, width) : [])
+        : added.length ? [...stream.rows, ...(stream.rows.length ? [''] : []), ...added] : stream.rows;
+      stream = {prefix, width, rows};
+    } else reused++;
+    const rest = tail.trim() ? markdown(tail, width) : [];
+    return stream.rows.length && rest.length ? [...stream.rows, '', ...rest] : [...stream.rows, ...rest];
   }
   // Claude sends tool calls as `Name: {json}`. Escaped newlines and quotes are unreadable,
   // so display the fields as lines. The journal keeps the original text for handoffs.
@@ -158,7 +201,7 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     }
     // Compact mode (the orchestrator transcript): a coordinator's tool mechanics and pasted file
     // output are noise — fold each tool row to one summary line, and render foldedThread's delegation
-    // rows as one line each. Classic transcript never sets compact, so it is unchanged.
+    // rows as one line each. The TUI's conversation and panes are compact; /details and `bounce attach` are not.
     if (compact && e.kind === 'tool') {
       // A tool CALL (`Name: {json}`) is one "● Name(what for)" line; a tool RESULT is a ⎿ block
       // with its first few lines and "… +N lines" for the rest — the shape Claude Code uses, so
@@ -191,6 +234,7 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     }
     // How a finished turn ends: what it came to, and who is still working or waiting on you. Labelled
     // TLDR, not Next: found live, "Next · <the answer's own question>" read as a proposed prompt.
+    if (compact && e.kind === 'turn.footer') return [oneLine(`  ${clean(e.text)}`, width, style.muted), ''];
     if (compact && e.kind === 'next') {
       const said = e.tldr ? wrap(`▸ TLDR · ${clean(e.tldr)}`, width - 2).slice(0, 4).map((row, index) => index ? `  ${row.trimStart()}` : style.title(row)) : [];
       const workers = [e.running ? `${e.running} worker${e.running === 1 ? '' : 's'} running` : '',
@@ -220,8 +264,10 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     // /config's listing and help: a block, one setting per line, not a status line that folds to its first.
     if (e.kind === 'settings' || e.kind === 'stats') {
       const [head, ...body] = clean(e.text ?? '').split('\n');
-      return [clip(style.title(`${who(e)} · ${e.kind === 'stats' ? 'Stats' : 'Settings'}`), width), ...(head ? [clip(`  ${style.muted(head)}`, width)] : []), ...body.flatMap(line => wrap(line, width - 2).map(row => '  ' + row)), ''];
+      return [clip(style.title(`${who(e)} · ${e.kind === 'stats' ? 'Stats' : 'Settings'}`), width), ...(head ? wrap(head, width - 2).map(row => `  ${style.muted(row)}`) : []), ...body.flatMap(line => wrap(line, width - 2).map(row => '  ' + row)), ''];
     }
+    // /sessions: a table, so its rows keep their columns and are cut at the edge rather than wrapped.
+    if (e.kind === 'sessions') return [clip(style.title(`${who(e)} · Sessions`), width), ...clean(e.text ?? '').split('\n').map(row => clip(`  ${row}`, width)), ''];
     if (e.kind === 'help') {
       const paint = {title: style.title, name: style.prompt, hint: style.muted, muted: style.muted, key: c.yellow};
       const body = helpRows({width: width - 2, paint, vendor: Array.isArray(e.vendor) ? e.vendor : [], tui: true});
@@ -235,7 +281,7 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     if (compact && e.kind === 'user' && e.local) return [...block(style.user('>'), wrap(clean(e.text), width - 2).map(line => style.user(line))), clip(`  ${style.muted('⎿')}  ${style.muted('queued · runs when the current turn ends · ↑ to edit')}`, width), ''];
     if (compact && e.kind === 'user') return [...block(style.user('>'), wrap(clean(withoutBrief(e.text)), width - 2).map(line => style.user(line))), ''];
     if (compact && e.kind === 'assistant' && e.narration) return [...block(style.muted('∴'), wrap(clean(e.text), width - 2).map(line => style.muted(line))), ''];
-    if (compact && ['assistant', 'delta', 'result'].includes(e.kind)) return [...block(style.result('●'), markdown(e.text, width - 2).map(line => line ? style.answer(line) : line)), ''];
+    if (compact && ['assistant', 'delta', 'result'].includes(e.kind)) return [...block(style.result('●'), (e.kind === 'delta' ? streamingMarkdown : markdown)(e.text, width - 2).map(line => line ? style.answer(line) : line)), ''];
     const names = {user: 'You', assistant: 'Response', delta: 'Response', result: 'Result',
       status: 'Activity', route: 'Agent selected', tool: 'Tool output', error: 'Error',
       diagnostic: 'Diagnostics', note: 'Saved note', cooldown: 'Retry delay', attempt: 'Agent finished',
@@ -251,7 +297,7 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
       ? markdown(e.text, width) : wrap(e.kind === 'tool' ? codeColors(source) : source, width);
     return [clip(paint(clean(label)), width), ...content, ''];
   }
-  return {style, wrap, clip, markdown, event};
+  return {style, wrap, clip, markdown, event, streamStats: () => ({reused})};
 }
 
 // A provider may split a fence or even a word between adjacent output deltas.

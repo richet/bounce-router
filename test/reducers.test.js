@@ -265,7 +265,8 @@ test('modelUsage: raw codex usage keys normalize, and repeat turns on the same m
     {kind: 'usage', from: 'main', provider: 'codex', usage: {input_tokens: 2000, cached_input_tokens: 0, output_tokens: 700}},
   ];
   const [row] = modelUsage(events);
-  assert.deepEqual(row, {model: 'gpt-5-codex', provider: 'codex', usage: {input: 3000, cache_read: 200, cache_write: 0, output: 1000}, tokens: 4200, turns: 2});
+  // codex's input_tokens include its cached_input_tokens: 1000 of which 200 cached is 800 uncached plus 200 cached.
+  assert.deepEqual(row, {model: 'gpt-5-codex', provider: 'codex', usage: {input: 2800, cache_read: 200, cache_write: 0, output: 1000}, tokens: 4000, turns: 2});
 });
 
 test('modelUsage: a worker task.usage row (already-normalized) attributes via its own model row, keyed by task, never crossing tasks', () => {
@@ -309,8 +310,9 @@ test('modelUsage: real codex main-session usage carries cache_write_input_tokens
     {kind: 'usage', from: 'main', provider: 'codex', usage: {input_tokens: 102543, cached_input_tokens: 85760, cache_write_input_tokens: 5000, output_tokens: 567, reasoning_output_tokens: 22}},
   ];
   const [row] = modelUsage(events);
-  assert.deepEqual(row.usage, {input: 102543, cache_read: 85760, cache_write: 5000, output: 567});
-  assert.equal(row.tokens, 102543 + 85760 + 5000 + 567);
+  // input_tokens include the cached_input_tokens (codex 0.162, measured 2026-10-21): 102543 − 85760 uncached.
+  assert.deepEqual(row.usage, {input: 16783, cache_read: 85760, cache_write: 5000, output: 567});
+  assert.equal(row.tokens, 16783 + 85760 + 5000 + 567);
 });
 
 test('modelUsage: a route.model of "default" is not a pinned model, so usage lands on "<provider> default"', () => {

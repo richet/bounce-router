@@ -126,7 +126,8 @@ test('the shipped agents come from the orchestration skill and are present with 
   assert.equal(roles.get('builder').policy, 'write');
 });
 
-test('later layers shadow by name: adopted skill, then user, then project; a broken file is reported, not hidden', t => {
+// 2026-10-24: layers replace, they do not add up — the team is the most specific layer that has agents, whole.
+test('the team is one layer, whole: the project\'s, else the user\'s, else the shipped one; a broken file is reported, not hidden', t => {
   const dir = root(t);
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-agents-cwd-'));
   t.after(() => fs.rmSync(cwd, {recursive: true, force: true}));
@@ -138,13 +139,14 @@ test('later layers shadow by name: adopted skill, then user, then project; a bro
   fs.writeFileSync(path.join(projectAgentStore(cwd), 'reviewer.md'), '---\nname: reviewer\ndescription: Project reviewer.\npolicy: write\n---\nP.\n');
   fs.writeFileSync(path.join(projectAgentStore(cwd), 'pentester.md'), '---\nname: pentester\ndescription: Probes.\n---\nProbe.\n');
   fs.writeFileSync(path.join(projectAgentStore(cwd), 'broken.md'), 'no frontmatter\n');
-  assert.equal(loadAgents(dir).get('reviewer').description, 'My reviewer.', 'user beats adopted skill');
+  assert.deepEqual([...loadAgents(dir).keys()], ['reviewer'], 'the user\'s team, without the adopted skill\'s or the shipped agents');
+  assert.equal(loadAgents(dir).get('reviewer').description, 'My reviewer.');
   const roles = rolesFor(dir, {cwd});
+  assert.deepEqual([...roles.keys()].sort(), ['broken', 'pentester', 'reviewer'], 'the project\'s team alone');
   assert.equal(roles.get('reviewer').source, 'project');
-  assert.equal(roles.get('reviewer').policy, 'write', 'the project file wins outright, attributes included');
+  assert.equal(roles.get('reviewer').policy, 'write');
   assert.equal(roles.get('pentester').policy, 'write');
   assert.match(roles.get('broken').error, /frontmatter block/);
-  assert.equal(roles.size, 6);
 });
 
 // ---------------------------------------------------------------- the derived profile table
@@ -218,10 +220,11 @@ test('the orchestrator profile is never derived from an agent, and a plan sessio
   const planned = root(t);
   fs.mkdirSync(agentStore(planned), {recursive: true});
   fs.writeFileSync(path.join(agentStore(planned), 'scout.md'), serializeAgent({name: 'scout', description: 'Finds.', policy: 'read-only', models: ['claude/sonnet'], prompt: 'Scout.'}));
+  fs.writeFileSync(path.join(agentStore(planned), 'builder.md'), serializeAgent({name: 'builder', description: 'Builds.', policy: 'write', models: ['claude/sonnet', 'codex/default'], prompt: 'Build.'}));
   const plan = validateOrchestration(orchestration({}, {mode: 'plan'}), undefined, {roles: loadAgents(planned)});
-  assert.deepEqual([...new Set(Object.values(plan.profiles).filter(p => p.derived).map(p => p.role))], ['scout'], 'only a read-only agent is offered: every shipped agent writes');
-  for (const agent of ['analyst', 'builder', 'debugger', 'reviewer']) assert.equal(plan.skipped.filter(item => item.agent === agent).length, 4, `${agent}: one skip per backend it would have had`);
-  assert.equal(plan.skipped.find(item => item.agent === 'reviewer').reason, 'a plan session runs read-only agents only');
+  assert.deepEqual([...new Set(Object.values(plan.profiles).filter(p => p.derived).map(p => p.role))], ['scout'], 'only a read-only agent is offered');
+  assert.equal(plan.skipped.filter(item => item.agent === 'builder').length, 2, 'builder: one skip per backend it would have had');
+  assert.equal(plan.skipped.find(item => item.agent === 'builder').reason, 'a plan session runs read-only agents only');
 });
 
 // ---------------------------------------------------------------- the bridge command: bounce agents
@@ -274,13 +277,13 @@ test('agents set validates the file against this machine, writes it in the chose
   fs.appendFileSync(set.report.file, '\nMine.\n');
   assert.throws(() => agentsCommand(['set', 'coder'], {...options(), input: coder}), {code: 'AGENT_EDITED'});
   assert.match(agentsCommand(['set', 'coder'], {...options(), input: coder, force: true}).text, /Defined coder/);
-  // list and show read the layered set; remove takes only a file in a writable store.
+  // list and show read the team in use — the project's, whole: no shipped agent joins it.
   const list = agentsCommand(['list'], options());
-  assert.match(list.text, /^  coder · write · project · claude\/sonnet, lmstudio\/auto \(via opencode\)$/m);
-  assert.match(list.text, /^  reviewer · write · skill · auto \(Jev\), claude\/sonnet, codex\/gpt-5.6-terra, muse, lmstudio\/auto \(via opencode\)$/m);
+  assert.match(list.text, /^  coder · write · project · claude\/sonnet, lmstudio\/auto \(via opencode\) · models: in the profile \(bounce local setup moves it\)$/m);
+  assert.doesNotMatch(list.text, /reviewer/);
   assert.equal(agentsCommand(['show', 'coder'], options()).text, fs.readFileSync(set.report.file, 'utf8'));
   assert.throws(() => agentsCommand(['show', 'nope'], options()), /no agent named nope/);
-  assert.throws(() => agentsCommand(['remove', 'reviewer'], options()), /shipped with skill agent-orchestrator/);
+  assert.throws(() => agentsCommand(['remove', 'reviewer'], options()), /no agent named reviewer/, 'not in the project\'s team');
   assert.match(agentsCommand(['remove', 'coder'], options()).text, /Removed coder/);
   assert.equal(fs.existsSync(set.report.file), false);
   assert.throws(() => agentsCommand(['bogus'], options()), /Use agents list/);
@@ -317,4 +320,11 @@ test('real CLI: agents set reads the file from stdin and, run by an orchestrator
   assert.match(bad.stderr, /frontmatter block/);
   const list = await run(['agents']);
   assert.match(list.stdout, /^  coder · write · project · claude\/sonnet, codex\/gpt-5.6-terra, muse, lmstudio\/auto \(via opencode\)$/m);
+});
+
+test('with no team of its own, the shipped team is in use, and a shipped agent cannot be removed', t => {
+  const dir = root(t);
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-agents-cwd-'));
+  t.after(() => fs.rmSync(cwd, {recursive: true, force: true}));
+  assert.throws(() => agentsCommand(['remove', 'reviewer'], {root: dir, cwd, settings: orchestration(), scope: 'user'}), /shipped with skill agent-orchestrator/);
 });
