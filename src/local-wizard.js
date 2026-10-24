@@ -13,7 +13,7 @@ const isObject = value => value !== null && typeof value === 'object' && !Array.
 const PROVIDERS = new Set(['claude', 'codex', 'muse']);
 const isRef = entry => /^[a-z0-9][a-z0-9_-]*\/\S+$/.test(entry) || PROVIDERS.has(entry);
 
-// What a machine needs to play its team (docs/ARCHITECTURE.md § Agents, bindings and models): `models.yaml` naming this machine's models by
+// What a machine needs to play its team: `models.yaml` naming this machine's models by
 // alias, and a `bindings.yml` saying which alias plays each agent. Setup writes them from what it discovers, and folds
 // in the move from the old agent files (a profile's `models:` and sampling). Nothing is written before consent.
 export async function runLocalSetup({settings, ask, write, save, discover = discoverLocalModels,

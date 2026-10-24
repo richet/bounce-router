@@ -12,7 +12,7 @@ import {createCodexLive} from '../../src/adapters/codex-live.js';
 import {createMuseLive} from '../../src/adapters/muse-live.js';
 import {createOpencodeLive} from '../../src/adapters/opencode-live.js';
 
-// The adapter interface (docs/ARCHITECTURE.md § Core) as an executable contract: every live
+// The adapter interface as an executable contract: every live
 // adapter is driven through the REAL scheduler with its fake CLI. Phase 3's wide critic found three blockers that
 // only a composed test can catch — launch's return shape, the task dir, and the native session id reaching the log.
 const helper = name => fileURLToPath(new URL(`../helpers/${name}`, import.meta.url));
@@ -51,7 +51,7 @@ for (const [name, {make, executable, env}] of Object.entries(adapters)) {
     assert.deepEqual(await adapter.cancel(handle), {verified: true});
   });
 
-  // Phase 4: resume is scheduler-driven exactly like launch (docs/ARCHITECTURE.md § Core) —
+  // Phase 4: resume is scheduler-driven exactly like launch —
   // src/scheduler.js's resumeWorker() is the real caller now; this test stands
   // in for it here, creating the task dir before calling resume the same way the scheduler does;
   // the adapter must never create it itself, and must resolve to the bare handle with events
@@ -75,7 +75,7 @@ for (const [name, {make, executable, env}] of Object.entries(adapters)) {
   });
 }
 
-// Phase 5 (CONTRACT.md #5, #6): live adapters map the vendor usage shape onto
+// Phase 5: live adapters map the vendor usage shape onto
 // {input, cache_read, cache_write, output} (integer values only, absent keys stay absent)
 // before yielding, so reducers.spend never sees a vendor field name. muse yields no usage
 // at all. The fakes' default usage lines carry no real fields (claude: '{}', codex:
@@ -123,7 +123,7 @@ for (const [name, {make, executable}] of Object.entries(adapters)) {
 // so that workaround must be gone: resume must fail rather than silently paper over a missing dir.
 //
 // The `local` adapter's bespoke cases lived here because it owned an in-house tool loop with no
-// executable. It was removed in Phase 4 (docs/ARCHITECTURE.md § Local workers); `opencode` is an ordinary
+// executable. It was removed in Phase 4; `opencode` is an ordinary
 // executable-driven adapter and is covered by the table above like every other live adapter.
 test('muse: resume never creates the task dir itself — a missing dir is the caller\'s bug, not papered over', async t => {
   const {root} = setup(t);

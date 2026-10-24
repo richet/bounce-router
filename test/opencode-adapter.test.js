@@ -1,4 +1,4 @@
-// OpenCode as a classic provider (docs/ARCHITECTURE.md § Classic mode): the one-shot adapter that lets a
+// OpenCode as a classic provider: the one-shot adapter that lets a
 // local LM Studio model be the agent answering the conversation, ordered and picked like claude or codex.
 import './helpers/env.js';
 import test from 'node:test';

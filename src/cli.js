@@ -222,7 +222,7 @@ async function main() {
     const {text, report} = skillsCommand([...positionals.slice(1), ...(values.force ? ['--force'] : []), ...(values.list ? ['--list'] : [])], options);
     return console.log(values.json ? JSON.stringify(report ?? inspectSkills(options), null, 2) : text);
   }
-  // CONTRACT.md #5 bullet 4: the built-in A/B, legacy CLI path, no daemon. Unknown session/task
+  // The built-in A/B, legacy CLI path, no daemon. Unknown session/task
   // is a thrown Error, which the top-level .catch prints to stderr and exits 1 (same convention
   // as every other legacy command's error here, e.g. Session's own "Session not found").
   // Registering that server with the agents, so nobody edits a config by hand (the user: "let bounce do it").
@@ -248,7 +248,7 @@ async function main() {
     said.push(`claude: ${claude.error ? `not installed here (${claude.error.code})` : claude.status === 0 ? (installing ? 'registered' : 'removed') : (claude.stderr || claude.stdout || 'refused').trim().split('\n')[0]}`);
     return console.log(said.join('\n'));
   }
-  // The agent-facing interface over MCP (docs/ARCHITECTURE.md § Agent interface): the same verbs and views the
+  // The agent-facing interface over MCP: the same verbs and views the
   // bridge and these commands use, as typed tools, so an orchestrator stops shelling and parsing.
   if (positionals[0] === 'mcp-serve') {
     const {createOps, sessionBinding} = await import('./bridge-ops.js');
@@ -290,7 +290,7 @@ async function main() {
     const rows = taskList(target.events, {all: Boolean(values.all)});
     return console.log(values.json ? JSON.stringify(rows, null, 2) : formatTaskList(rows));
   }
-  // bounce stats [--session REF] [--json] [--tasks] [--against REF] (docs/ARCHITECTURE.md § Agent interface): what a session
+  // bounce stats [--session REF] [--json] [--tasks] [--against REF]: what a session
   // cost and what it got, from its journal alone.
   if (positionals[0] === 'stats') {
     const ref = values.session || positionals[1] || listSessions(root).find(row => row.live)?.id || listSessions(root)[0]?.id;
@@ -378,7 +378,7 @@ async function main() {
   // The main profile selects the initial provider/model/mode. Keep legacy order available
   // for daemon failover when the profile has no explicit fallback list.
   const orchestrating = process.env.BOUNCE_ROLE === 'orchestrator' && !!process.env.BOUNCE_ORCHESTRATOR_PROFILE;
-  // Classic draws inline (docs/ARCHITECTURE.md § TUI) unless `inline` is off; the orchestrator never does.
+  // Classic draws inline unless `inline` is off; the orchestrator never does.
   const inlineView = !orchestrating && settings.inline !== false;
   if (orchestrating) {
     const profile = JSON.parse(process.env.BOUNCE_ORCHESTRATOR_PROFILE);
@@ -1493,7 +1493,7 @@ async function main() {
   });
   for (const event of session.events) terminal.ingest(event);
   // Classic draws inline: history in the terminal's own scrollback, only the turn in flight and the prompt redrawn
-  // (docs/ARCHITECTURE.md § TUI). The orchestrator keeps the full screen for its panes.
+  //. The orchestrator keeps the full screen for its panes.
   // Inline, the terminal's own scrollback is what scrolls: bounce's PgUp/PgDn has nothing to move.
   function pageHint(what = '') { return inlineView ? '' : ` · PgUp/PgDn scroll${what}`; }
   if (inlineView) notice = notice.replace('Drag to select and copy · the wheel scrolls what is under it', 'Your terminal scrolls, searches and selects the conversation');

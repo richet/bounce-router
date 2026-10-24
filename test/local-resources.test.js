@@ -1,4 +1,4 @@
-// The resource gate (docs/ARCHITECTURE.md § Local slots). Slots count turns, not memory: bounce would happily
+// The resource gate. Slots count turns, not memory: bounce would happily
 // ask LM Studio to load a 73 GB model beside a resident one, or keep working while the machine pages.
 // Decided 2026-09-22: greedy on what is actually free, unload an IDLE model to make room (with a
 // warning), wait with a warning when nothing fits, and never start local work under memory pressure —

@@ -387,7 +387,7 @@ test('worker scrollback stays put during activity and returns to live output at 
   } finally { terminal.unmount(); }
 });
 
-// Step 0 of docs/ARCHITECTURE.md § TUI: drag selects inside the region it started in, release copies.
+// Drag selects inside the region it started in, release copies.
 async function mountedForSelection(t, initial, options = {}) {
   const stdin = new PassThrough(), stdout = new PassThrough();
   stdin.setRawMode = () => {};

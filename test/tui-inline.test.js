@@ -1,4 +1,4 @@
-// Inline rendering for classic (docs/ARCHITECTURE.md § TUI): what is finished goes to the terminal's own
+// Inline rendering for classic: what is finished goes to the terminal's own
 // scrollback once, through Ink's <Static>; only the turn in flight, the prompt and the status line are redrawn.
 import test from 'node:test';
 import assert from 'node:assert/strict';

@@ -1,4 +1,4 @@
-// Classic turns on a live adapter (docs/ARCHITECTURE.md § Classic mode): codex runs on its app-server, as the
+// Classic turns on a live adapter: codex runs on its app-server, as the
 // orchestrator does, so its answer streams instead of landing whole after `codex exec` is done.
 import './helpers/env.js';
 import test from 'node:test';

@@ -1,4 +1,4 @@
-// What a task is doing and what it has produced, in a screenful (docs/ARCHITECTURE.md § Agent interface).
+// What a task is doing and what it has produced, in a screenful.
 // Found live: with no read verb, the orchestrator ran `tail -n 20` on its own journal and
 // 143 KB of raw JSON went into the chat, the journal and its own next context packet. These views are the
 // answer to that question, bounded by construction: capped lists with a count of the rest, cut text, and a
@@ -80,7 +80,7 @@ export function taskView(events, task, {now = Date.now(), journal = null, report
     : mine.find(event => event.kind === 'task.output' && event.seq === invalid.outputSeq) ?? lastOf(events, task, 'task.output');
   const reviewGate = gateView(events, task, result);
   const seqs = mine.map(e => e.seq).filter(Number.isFinite);
-  // (docs/ARCHITECTURE.md § In-place tasks): the task ran in the real checkout, so the view names
+  //: the task ran in the real checkout, so the view names
   // what consent authorized that — the cited user message (first 80 chars) and Jev's verdict
   // when there was one, exactly as bounce shows any other decision.
   const inPlaceRow = submitted?.inPlace ? submitted : null;

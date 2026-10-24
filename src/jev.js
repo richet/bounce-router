@@ -670,7 +670,7 @@ export async function routeTask({orders, profiles, settings, ask, notes = {}, or
 
 // ---- the lease judge: is a running task still getting somewhere, at the end of its lease? --------
 
-// One Choice over the worker's recent text and tool calls against its orders (docs/ARCHITECTURE.md § Tasks).
+// One Choice over the worker's recent text and tool calls against its orders.
 // Jev only adds to bounce's own progress rule: `stuck` concludes the task, `drifting` renews it and
 // tells whoever submitted it. Off, failing or unsure, the verdict is null and the rule alone decides —
 // bounce never depends on Jev being installed.

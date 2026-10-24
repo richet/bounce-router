@@ -1,4 +1,4 @@
-// Local models as candidates for an `auto` agent's AI (docs/ARCHITECTURE.md § Jev).
+// Local models as candidates for an `auto` agent's AI.
 // A local model only ever exists as an agent's backend, so it is a candidate for the AI of a JOB —
 // never for a plain `auto` task. Loaded models are preferred; a model that is not loaded is offered
 // only when the agent's own `models:` list names it (found live 2026-09-22: the 27B reviewer model had

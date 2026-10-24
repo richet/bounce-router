@@ -1,4 +1,4 @@
-// Which models play the team's agents (docs/ARCHITECTURE.md § Agents, bindings and models). A project's profiles say who an agent is; its
+// Which models play the team's agents. A project's profiles say who an agent is; its
 // bindings.yml says which alias plays each one; each machine's models.yaml says what an alias is here. One bindings
 // file is in use — the project's, else the user's, else none (today's default chains) — taken whole, never merged.
 import fs from 'node:fs';

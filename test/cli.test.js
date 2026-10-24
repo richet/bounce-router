@@ -1,4 +1,4 @@
-// Phase 5 (CONTRACT.md #5 bullets 3-4, #6 last paragraph): `bounce sessions` rows gain a
+// Phase 5: `bounce sessions` rows gain a
 // `spend` field recomputed from the journal via reducers.spend, and `bounce task compare
 // <session> <a> <b>` is the built-in A/B, both driven through the real `src/cli.js` as a
 // user would run it (spawned, BOUNCE_HOME in a tmp root — same pattern as test/e2e.test.js).
@@ -41,8 +41,8 @@ function writeConfig(root) {
   }));
 }
 
-// Two root tasks under one orchestrator session, each with its own usage rows — mirrors
-// CONTRACT.md #5's W11-style fold, but through the journal a real `bounce sessions`/`task
+// Two root tasks under one orchestrator session, each with its own usage rows — the usage
+// fold, but through the journal a real `bounce sessions`/`task
 // compare` call reads, not the reducer called directly.
 function seedSession(root, cwd) {
   const session = new Session(cwd, {root});

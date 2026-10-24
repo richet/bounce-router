@@ -1,4 +1,4 @@
-// A classic turn on a provider's live adapter (docs/ARCHITECTURE.md § Classic mode): the same app-server peer the
+// A classic turn on a provider's live adapter: the same app-server peer the
 // orchestrator drives (main-service.js), one per turn, so the answer streams. Launched fresh, or resuming the thread
 // Router.run hands over; the peer is stopped when the turn ends. Resolves like runProcess: {status}.
 export async function runLiveTurn({adapter, provider, prompt, model, mode, resume = null, cwd, dir, images = [], executables = {}, signal, emit}) {

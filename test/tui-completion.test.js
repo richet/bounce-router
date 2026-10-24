@@ -1,4 +1,4 @@
-// Completion the way a modern prompt does it (docs/ARCHITECTURE.md § TUI): slash commands match
+// Completion the way a modern prompt does it: slash commands match
 // fuzzily, and `@` completes a path in the workspace.
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -25,8 +25,8 @@ test('mentionAt finds the @word the caret is in, only at a word start', () => {
 });
 
 test('matchFiles ranks a file-name start over a path match over scattered letters, shorter first', () => {
-  const files = ['src/tui/selection.js', 'test/tui-selection.test.js', 'src/scheduler.js', 'docs/plans/selection-notes.md', 'src/core.js'];
-  assert.deepEqual(matchFiles(files, 'sel').slice(0, 3), ['src/tui/selection.js', 'docs/plans/selection-notes.md', 'test/tui-selection.test.js']);
+  const files = ['src/tui/selection.js', 'test/tui-selection.test.js', 'src/scheduler.js', 'notes/selection-notes.md', 'src/core.js'];
+  assert.deepEqual(matchFiles(files, 'sel').slice(0, 3), ['src/tui/selection.js', 'notes/selection-notes.md', 'test/tui-selection.test.js']);
   assert.equal(matchFiles(files, 'tui/sel')[0], 'src/tui/selection.js');
   assert.equal(matchFiles(files, 'schjs')[0], 'src/scheduler.js', 'letters in order');
   assert.equal(matchFiles(files, '').length, 5);

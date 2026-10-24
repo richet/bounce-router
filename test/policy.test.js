@@ -1,4 +1,4 @@
-// CONTRACT.md §5: contract tests for Phase 4 review-as-policy — prelaunch/completion review,
+// Contract tests for Phase 4 review-as-policy — prelaunch/completion review,
 // rework via resume bounded by rounds, depends_on holds and the verdict protocol. Composed
 // real scheduler + reducers + fake adapters, exactly like test/scheduler.test.js.
 import test from 'node:test';

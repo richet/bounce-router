@@ -1,7 +1,7 @@
 // Remote session over IPC (Phase 2 process model): the supervisor stays the single
 // writer of a session's journal; a child (the TUI/run process) gets a synchronous
 // proxy that looks like Session. hostSession runs in the parent; createRemoteSession
-// runs in the child. See docs/ARCHITECTURE.md § Core.
+// runs in the child.
 import {randomUUID} from 'node:crypto';
 import {LIVE_KINDS, echoesNormalizedRow} from './core.js';
 

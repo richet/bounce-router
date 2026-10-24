@@ -21,7 +21,7 @@ const T = '02a9a23d-8722-4f50-b4f5-6204afd58a78';
 
 test('a run of the orchestrator\'s own tool calls is one line naming how many and the last one; details still shows them all', () => {
   const events = [ev(1, 'user', {text: 'continue'}),
-    call(2, 'Read', {file_path: '/repo/docs/PROGRESS.md'}), output(3, '1  # Notes\n2\n3  Design\n4  more\n5  more'),
+    call(2, 'Read', {file_path: '/repo/NOTES.md'}), output(3, '1  # Notes\n2\n3  Design\n4  more\n5  more'),
     ev(4, 'status', {provider: 'claude', from: 'main', text: 'hook_started'}),
     call(5, 'Bash', {command: 'ls', description: 'List the tree'}), output(6, 'a\nb'),
     ev(7, 'assistant', {provider: 'claude', text: 'Here is the plan.'}),

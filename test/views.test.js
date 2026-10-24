@@ -89,7 +89,7 @@ test('U4: fifty activity rows plus a blocker still fold to exactly one row', () 
 // submit(...) or router.run(...), and the only two call sites of submit(...) in src/cli.js are
 // inside handleKey's Enter branch and inside submit's own pending-turn continuation (itself
 // only ever reached from that same handleKey-originated call). A real terminal/keyboard is
-// needed to drive handleKey end-to-end, so per CONTRACT.md A4/U5 this is proven by (a) reading
+// needed to drive handleKey end-to-end, so this is proven by (a) reading
 // the source structurally, the way a grep-driven regression test does, and (b) exercising the
 // pure decision unit (continueMain) that the keyboard's /continue handler calls, which nothing
 // else in the file references.

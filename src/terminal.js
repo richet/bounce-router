@@ -15,7 +15,7 @@ export const commands = [
 ];
 // `extra` supplies the agents' own commands for this workspace (vendor-commands.js); it is a
 // function so the directories are only read once the input looks like a slash command.
-// Matching (docs/ARCHITECTURE.md § TUI): names that start with what was typed; when none does, names
+// Matching: names that start with what was typed; when none does, names
 // containing it, then names with its letters in order (`/cfg` finds config). Bounce's own before the agents' at a tie.
 export function fuzzyScore(name, query) {
   const text = name.toLowerCase(), needle = query.toLowerCase();
@@ -83,7 +83,7 @@ export function suspendTerminal(stdin = process.stdin, stdout = process.stdout) 
   stdin.pause();
   stdout.write(keyboardProtocol(false) + releaseMouse + alternateScroll(true) + '\x1b[?2004l\x1b[0 q\x1b[?25h\x1b[?1049l');
 }
-// `inline` (classic, docs/ARCHITECTURE.md § TUI) stays on the main screen with the mouse left to the
+// `inline` (classic) stays on the main screen with the mouse left to the
 // terminal: its scrollback, search and selection are the point.
 export function resumeTerminal(stdin = process.stdin, stdout = process.stdout, {mouse = false, inline = false} = {}) {
   stdin.setRawMode?.(true);

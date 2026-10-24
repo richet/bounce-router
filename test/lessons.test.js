@@ -1,4 +1,4 @@
-// docs/ARCHITECTURE.md § Standing workers (2026-10-01): a correction the orchestrator makes becomes
+// 2026-10-01: a correction the orchestrator makes becomes
 // one line in the project's .bounce/LESSONS.md, and every later worker of that job reads it. Every
 // lesson of the week before (evidence inside the copy, checks that run the work, no thinking for the
 // builder) reached the agent files only through a person reading journals.

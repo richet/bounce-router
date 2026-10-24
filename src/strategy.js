@@ -1,5 +1,4 @@
-// Phase 8 — pluggable orchestration strategy (CONTRACT.md, docs/ARCHITECTURE.md § Core
-// "Phase 8"). A strategy is a plain object of pure, synchronous decision functions the
+// Phase 8 — pluggable orchestration strategy. A strategy is a plain object of pure, synchronous decision functions the
 // scheduler (CORE) calls at fixed points; each hook returns a declared intent the CORE
 // executes. Strategies never journal, launch, or touch budgets directly — see CONTRACT §0.
 //
@@ -52,7 +51,7 @@ function failedCheckIntent(task, api) {
   return {action: 'rework', findings: [checkFinding(check)]};
 }
 
-// CONTRACT.md §2. Single reviewer, quorum 1, prelaunch never reworks (any non-accept/non-unreadable
+// Single reviewer, quorum 1, prelaunch never reworks (any non-accept/non-unreadable
 // verdict rejects); completion sends the work back at most once and otherwise accepts it with advice.
 const afterReworkAdvice = (findings = [], checks = null) => `Accepted after its one rework round; the review still ${findings.length ? `found: ${findings.join('; ')}` : 'did not accept it'}${checks?.length ? ` (${checks.join(', ')})` : ''}. Decide whether a follow-up task is needed.`;
 
@@ -113,7 +112,7 @@ export const defaultStrategy = {
   onTerminal() { return {submit: []}; },
 };
 
-// CONTRACT.md §3 — a completion (or prelaunch) review in the row's config is never launched;
+// A completion (or prelaunch) review in the row's config is never launched;
 // every completed task is accepted by the strategy itself, with no reviewer in the loop.
 export const noReviewStrategy = {
   onSubmitted(task, view, api) {
@@ -127,7 +126,7 @@ export const noReviewStrategy = {
   onTerminal() { return {submit: []}; },
 };
 
-// CONTRACT.md §3 — n reviewers must accept before task.accepted; any reject routes to
+// N reviewers must accept before task.accepted; any reject routes to
 // reject/rework as today, a reject taking precedence over a rework among the reported verdicts.
 export function quorumStrategy(n) {
   return {

@@ -8,7 +8,7 @@ import {createOpencodeLive, toolsFor, mapUsage, scrubCredentials, nativeConfig} 
 
 // The OpenCode adapter is the claude adapter's twin: one `opencode run` per turn, prompt on stdin,
 // JSON lines out, exit = turn end. The fake prints the event shapes observed from the real binary
-// (docs/ARCHITECTURE.md § Local workers) and exits; it does not simulate a server.
+// and exits; it does not simulate a server.
 const helper = fileURLToPath(new URL('../helpers/fake-opencode.js', import.meta.url));
 
 const setup = (t, env = {}) => {
@@ -294,7 +294,7 @@ test('cancel is killing our own child: verified within bounds even when it ignor
   }
 });
 
-// Observed live twice (qwen3-4b re-reading PROGRESS.md; qwen3.8-27b alternating read/todowrite for 42
+// Observed live twice (qwen3-4b re-reading one notes file; qwen3.8-27b alternating read/todowrite for 42
 // steps when asked to use a tool it did not have): a stuck model repeats itself until the step cap.
 test('a worker repeating the same call with nothing changed is stopped as no progress, recoverably, and the process is gone', async t => {
   const {cwd, dir} = setup(t, {FAKE_OC_SCENARIO: 'loop', FAKE_OC_CONCLUDE: 'silent'});

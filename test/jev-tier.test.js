@@ -1,4 +1,4 @@
-// Tier first (docs/ARCHITECTURE.md § Jev). Measured live: over eleven look-alike
+// Tier first. Measured live: over eleven look-alike
 // profiles Jev's choice never reached 0.8 (0.15–0.66), while the three-way tier question was right
 // 5/5 at 0.60–1.00. So Jev picks the TIER, and bounce takes the first fitting profile of that tier
 // in the provider order — inside a tier the AIs are near-equal, which is not a decision for a model.

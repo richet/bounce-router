@@ -29,7 +29,7 @@ const waitFor = async (fn, {timeout = 2000, interval = 5} = {}) => {
   }
 };
 
-// E1: effectivePolicy unit — exact strings, per CONTRACT.md §1.
+// E1: effectivePolicy unit — exact strings.
 test('E1 effectivePolicy: read-only absolute, otherwise mode narrows write/unset', () => {
   assert.equal(effectivePolicy({policy: 'read-only'}), 'read-only');
   assert.equal(effectivePolicy({policy: 'write', mode: 'plan'}), 'plan');

@@ -1,4 +1,4 @@
-// One vendor process per conversation instead of one per turn (docs/ARCHITECTURE.md § Classic mode, behind
+// One vendor process per conversation instead of one per turn (behind
 // keepProcess): the process stays alive between turns, and is replaced (resuming the same thread) when what it was
 // launched with changes.
 import './helpers/env.js';

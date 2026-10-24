@@ -265,13 +265,13 @@ test('what a review is sent leaves out evidence and logs, and names them', () =>
   write(workspace.cwd, 'evidence/p6/final-gate/test-1.log', `${'ok line\n'.repeat(500)}`);
   write(workspace.cwd, 'evidence/p6/final-gate/report.md', 'VERDICT: PASS\n');
   write(workspace.cwd, 'build/logs/run.txt', 'started\n');
-  write(workspace.cwd, 'docs/changelog.md', 'one line about logs and evidence\n');
+  write(workspace.cwd, 'notes/changelog.md', 'one line about logs and evidence\n');
 
   const artifact = captureArtifact(workspace);
   const shown = reviewDiff(artifact);
 
   assert.deepEqual(shown.split('\n').filter(line => /^(---|\+\+\+) /.test(line)), [
-    '--- /dev/null', '+++ b/docs/changelog.md',
+    '--- /dev/null', '+++ b/notes/changelog.md',
     '--- a/src/a.js', '+++ b/src/a.js',
   ]);
   assert.equal(shown.endsWith([

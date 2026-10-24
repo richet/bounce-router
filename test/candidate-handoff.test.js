@@ -47,7 +47,7 @@ test('a completed task\'s remaining work reaches the orchestrator as a follow-up
   assert.equal(text.match(/remaining \(reported/g).length, 1);
 });
 
-// docs/ARCHITECTURE.md § Standing workers: the moment a lesson is in hand is when accepted work is redone, or a
+// The moment a lesson is in hand is when accepted work is redone, or a
 // check has failed twice. The handoff asks then, and only then.
 test('the handoff asks for a lesson after a correction of accepted work or a check that failed twice, and otherwise does not', () => {
   const session = {events: [
@@ -76,7 +76,7 @@ test('the handoff asks for a lesson after a correction of accepted work or a che
   assert.equal(handoffBlock(session, [session.events[14]]).includes('lesson'), false, 'an ordinary acceptance asks nothing');
 });
 
-// docs/ARCHITECTURE.md § Standing workers: the handoff lists the standing workers — what each has done, who is
+// The handoff lists the standing workers — what each has done, who is
 // busy, idle or held, and how heavy its last context was — so the overseer can assign, continue or retire.
 test('the handoff carries the roster of standing workers', () => {
   const t0 = Date.parse('2026-10-01T10:00:00Z');

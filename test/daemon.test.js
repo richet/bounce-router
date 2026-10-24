@@ -699,7 +699,7 @@ test('O2 orchestrator single-provider: the orchestrator submits over the bridge,
   // says to pick the lightest AI that fits.
   // Decided on 2026-09-30: a failed local attempt is retried on the agent's own next AI first (a
   // second local model, then Sonnet); the chain lines name those profiles so the retry can submit them.
-  // docs/ARCHITECTURE.md § Standing workers: the orders say when and how a lesson is recorded.
+  // The orders say when and how a lesson is recorded.
   assert.equal(orders.includes('Lessons: when a task redid work that had been accepted, or a check failed twice, the handoff asks whether there is a lesson.'), true);
   assert.equal(orders.includes('Retry first on the agent\'s own next AI: submit the name after the arrow in its chain above (builder~2, then builder~3) with retryOf; it is the lightest AI that has not tried the task. Name a cloud AI yourself only when the cause needs a stronger tier: a mid-tier model (e.g. Sonnet) for routine implementation a local worker could not finish'), true);
   assert.match(orders, /Worker profiles \(one AI each\): .*build_claude \(opus\[1m\]\)/);
@@ -1012,7 +1012,7 @@ test('a resume stops this session\'s stuck daemon that holds the lock, and leave
   await waitFor(() => !pidAlive(stuck.pid));
 });
 
-// Found by the integration run 2026-10-21 (docs/bench/integration-2026-10-21-multi.md): an orchestrated `bounce run`
+// Found by the integration run 2026-10-21: an orchestrated `bounce run`
 // was its first turn only, so an orchestrator that dispatched and ended its turn — as real ones do — never heard back
 // and the job stopped there. The run now hands the outcome over in one more turn, then ends.
 test('O11 an orchestrated run that dispatches without waiting is handed its worker\'s outcome in one more turn', async t => {

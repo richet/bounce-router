@@ -1,6 +1,6 @@
-// docs/ARCHITECTURE.md § Agent interface (2026-10-01): what a session cost and what it got, folded from the journal.
+// 2026-10-01: what a session cost and what it got, folded from the journal.
 // The fold is checked on a journal written here with known counts; the same fold run on the real journals
-// was checked by hand against the figures in docs/PROGRESS.md (now in its git history).
+// was checked by hand against a real session.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {sessionStats, formatStats, compareStats, taskLines} from '../src/stats.js';

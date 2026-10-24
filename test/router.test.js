@@ -360,7 +360,7 @@ test('a tool row carries the command and a bounded head of its output, never the
   assert.equal(small.text, 'echo hi\nhi');
 });
 
-// Classic mode is a conversation (docs/ARCHITECTURE.md § Classic mode): the provider that answered last turn
+// Classic mode is a conversation: the provider that answered last turn
 // continues its own thread with the bare prompt; the packet is for a first turn or a change of provider.
 const threadRunner = (attempts, {native = {claude: 'claude-sid-1', codex: 'codex-tid-1'}, lost = () => false} = {}) => async options => {
   attempts.push(options);
@@ -446,7 +446,7 @@ test('claude text streams as deltas and the whole block that follows is not show
   assert.equal(echoesNormalizedRow({kind: 'raw', provider: 'claude', raw: {type: 'stream_event'}}), true, 'the raw stream rows are display, never journal');
 });
 
-// docs/ARCHITECTURE.md § Classic mode: streamed text is shown live, journaled once.
+// Streamed text is shown live, journaled once.
 test('streamed deltas reach the view live but the journal keeps one assistant row per text block, in order', async t => {
   const {session} = setup(t);
   const seen = [];

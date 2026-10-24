@@ -2,7 +2,7 @@ import {spawn} from 'node:child_process';
 import {createInterface} from 'node:readline';
 import {limitPattern, normalize, vendorChildEnv} from './providers.js';
 
-// One vendor process per conversation instead of one per turn (docs/ARCHITECTURE.md § Classic mode). claude
+// One vendor process per conversation instead of one per turn. claude
 // started as `-p --input-format stream-json` keeps reading user messages on stdin and answers each with a result
 // line, so the second turn skips the CLI's start (~1 s measured) and the thread stays warm. A process is reused
 // while what it was launched with is the same (provider, executable, arguments other than --resume, environment,

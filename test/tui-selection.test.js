@@ -1,4 +1,4 @@
-// Selecting and copying text the way a modern terminal app does (docs/ARCHITECTURE.md § TUI): a drag
+// Selecting and copying text the way a modern terminal app does: a drag
 // stays inside the region it started in (the conversation, one pane, the sidebar), the release copies what was
 // selected, and the wheel scrolls the region under the pointer.
 import test from 'node:test';

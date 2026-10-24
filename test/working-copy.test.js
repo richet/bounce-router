@@ -28,20 +28,20 @@ test('analysts write by default, like every role but critic, and an explicitly r
 // empty diff. A write worker's orders point into its working copy, and it is fenced off the checkout.
 test('an isolated write worker is sent into its working copy, unfenced like any Claude or Codex worker', {timeout: 4000}, async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-write-fence-'));
-  const cwd = path.join(root, 'project'); fs.mkdirSync(path.join(cwd, 'docs'), {recursive: true}); fs.writeFileSync(path.join(cwd, 'docs', 'PROGRESS.md'), 'original');
+  const cwd = path.join(root, 'project'); fs.mkdirSync(path.join(cwd, 'notes'), {recursive: true}); fs.writeFileSync(path.join(cwd, 'notes', 'LOG.md'), 'original');
   const session = new Session(cwd, {root}); const real = fs.realpathSync(cwd); const seen = [];
   const adapter = fakeAdapter(({cwd: work, profile, orders}) => { seen.push({work, profile, orders}); return [{kind: 'result', status: 'completed', text: 'done'}]; });
   const scheduler = createScheduler({session, adapters: {worker: adapter}, profiles: {builder: {adapter: 'worker', policy: 'write'}}, watchdog: {interval: null}});
   t.after(() => { scheduler.close(); fs.rmSync(root, {recursive: true, force: true}); });
-  scheduler.submit({task: 'edit', profile: 'builder', owns: ['docs/PROGRESS.md'], requires: ['read', 'exec', 'write'],
-    orders: `Append a section to ${real}/docs/PROGRESS.md and show the tail of ${cwd}/docs/PROGRESS.md.`});
+  scheduler.submit({task: 'edit', profile: 'builder', owns: ['notes/LOG.md'], requires: ['read', 'exec', 'write'],
+    orders: `Append a section to ${real}/notes/LOG.md and show the tail of ${cwd}/notes/LOG.md.`});
   await waitFor(() => seen.length === 1);
   const [{work, profile, orders}] = seen;
   assert.notEqual(work, cwd);
   // User, 2026-09-27: local write workers get the same freedom as Claude and Codex ones — no OS fence.
   assert.equal(profile.writeFence, undefined);
-  assert.match(orders, new RegExp(`^Append a section to ${work.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/docs/PROGRESS\\.md and show the tail of ${work.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/docs/PROGRESS\\.md\\.`));
-  assert.equal(orders.includes(`${real}/docs`), false);
+  assert.match(orders, new RegExp(`^Append a section to ${work.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/notes/LOG\\.md and show the tail of ${work.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/notes/LOG\\.md\\.`));
+  assert.equal(orders.includes(`${real}/notes`), false);
   assert.match(orders, /Your working copy is .+: it is a copy of the project, and only changes made there are your work: bounce integrates them into the original checkout .+ after review, so edit the copy, never the original\./);
 });
 

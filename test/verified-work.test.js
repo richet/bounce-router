@@ -463,7 +463,7 @@ test('strategy: every way of accepting finished work holds it when it changed fi
   assert.equal(defaultStrategy.onReviewVerdict('t', objection, view, held()).action, 'rework');
 });
 
-// docs/ARCHITECTURE.md § Standing workers: a worker reads the project's lessons for its job after its agent prompt —
+// A worker reads the project's lessons for its job after its agent prompt —
 // in the orders for a cloud worker, in the agent definition for a local one — and not another job's.
 test('a worker is handed the project\'s lessons for its job with its agent prompt, and not another job\'s', async t => {
   let launched = null;

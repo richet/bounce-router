@@ -1,4 +1,4 @@
-// The answer contract (docs/ARCHITECTURE.md § Local workers). Six separate fixes in two days all came from one
+// The answer contract. Six separate fixes in two days all came from one
 // gap: an answer was "the last text on the stream", and three speakers share that stream — the worker, its
 // thinking, and the runtime itself. Every shape below was taken from a real session.
 import test from 'node:test';

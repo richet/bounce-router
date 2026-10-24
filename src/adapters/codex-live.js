@@ -34,7 +34,7 @@ const REQUESTS = {
   turnInterrupt: ({threadId, turnId}) => ({method: 'turn/interrupt', params: {threadId, turnId}}),
 };
 
-// CONTRACT.md #5: same usage-mapping obligation as claude-live.js, codex's own vendor field
+// Same usage-mapping obligation as claude-live.js, codex's own vendor field
 // names — input_tokens→input, cached_input_tokens→cache_read, output_tokens→output (codex
 // reports no cache_write). The classic normalizer (src/adapters/codex.js) is unchanged.
 const USAGE_FIELDS = [['input_tokens', 'input'], ['cached_input_tokens', 'cache_read'], ['output_tokens', 'output']];

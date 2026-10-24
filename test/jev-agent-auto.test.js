@@ -1,4 +1,4 @@
-// `auto` inside an agent's `models:` (docs/ARCHITECTURE.md § Jev): the agent is still
+// `auto` inside an agent's `models:`: the agent is still
 // the job, but WHICH AI plays it is Jev's pick at dispatch; the entries after `auto` are the chain
 // the job runs on when Jev is off, unavailable or unconfident. Real scheduler, fake adapters, a
 // scripted Jev answer (never the network).

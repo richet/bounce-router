@@ -51,7 +51,7 @@ const CALL_MEMORY = 200; // tool calls remembered per running task, to tell new 
 // A worker's own step cap (e.g. OpenCode's per-turn maxSteps) ending a turn is not the task ending:
 // while it is still producing new, non-repeated tool calls, bounce resumes the same worker instead
 // of treating a synthesized "steps reached" report as the final answer. Bounded the same way a
-// lease ceiling is, so a genuinely stuck local worker still stops (docs/ARCHITECTURE.md § Tasks).
+// lease ceiling is, so a genuinely stuck local worker still stops.
 const STEP_RENEWAL_LIMIT = 3;
 const TIERS = new Set(['live', 'next-turn', 'queued']);
 // The depends_on hold/fail decision (which dependency states fail a dependent outright vs.
@@ -176,7 +176,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   };
   const OBSERVED_RUNS = 8;
   const observedRuns = new Map(); // task -> what bounce saw its current attempt run
-  // In-place tasks (docs/ARCHITECTURE.md § In-place tasks): at most one running, and never alongside a
+  // In-place tasks: at most one running, and never alongside a
   // mid-flight integration of any task's — `inPlaceWaiters` holds tasks parked on that lock,
   // exactly like `slotWaiters` parks tasks on a full local endpoint.
   const inPlaceWaiters = new Set();
@@ -496,7 +496,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return before.length === 0 || inTurn.some(c => c.change) || !inTurn.every(c => before.some(b => b.call === c.call));
   }
 
-  // The step-budget renewal (docs/ARCHITECTURE.md § Tasks): a worker whose turn ended only because it
+  // The step-budget renewal: a worker whose turn ended only because it
   // hit its own step cap, and was still making progress, is resumed on the SAME native session with
   // a short "keep going" message instead of having its cap-truncated answer treated as final. Bounded
   // exactly like a lease: at most STEP_RENEWAL_LIMIT times, and never past the task's own deadline —
@@ -536,10 +536,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   }
 
   // Session effective policy: the user session is write-privileged; only its mode narrows it
-  // (docs/ARCHITECTURE.md § Core, CONTRACT.md §1).
+  //.
   const sessionEffective = sessionMode === 'plan' ? 'plan' : 'yolo';
 
-  // The pre-launch policy check (CONTRACT.md §3), shared by every path that launches a profile
+  // The pre-launch policy check, shared by every path that launches a profile
   // (the worker's own launch and a prelaunch review's launch): ratchet-down first (never more
   // privileged than the session), then per-provider support (`unsupported` over downgrade — an
   // adapter that declares no executionPolicies is unconstrained, so bare test fakes keep
@@ -617,7 +617,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     }
     if (spec.profile === AUTO_PROFILE ? !routingFallback(profiles) : !profiles[spec.profile]) return `profile: ${JSON.stringify(spec.profile ?? null)} is not a profile or agent here; send one of ${JSON.stringify(Object.keys(profiles).filter(name => profiles[name].role !== 'orchestrator' && profiles[name].adapter !== 'typesafe'))}`;
     if (spec.inPlace !== undefined) {
-      // Structural check (docs/ARCHITECTURE.md § In-place tasks, always): the cited row must exist and
+      // Structural check (always): the cited row must exist and
       // be a `user` row — only the keyboard path writes those, and bus.js already refuses `user`
       // from a peer, so a row that IS one was typed by the person, not asserted by any AI.
       const cited = inPlaceCitation(spec.inPlace);
@@ -800,7 +800,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (typeof adapters[profile.adapter]?.resume !== 'function') return {reason: `${profile.adapter} cannot resume a session`};
     return {native: {provider: nativeRow.provider, sessionId: nativeRow.sessionId}, worker: session.events.findLast(e => e.kind === 'task.launch.requested' && e.task === row.continues && e.worker)?.worker ?? null};
   };
-  // Standing workers (docs/ARCHITECTURE.md § Standing workers): a task with no `continues` goes to its agent's idle
+  // Standing workers: a task with no `continues` goes to its agent's idle
   // standing worker by itself; a named `worker` goes to that one if it is idle. A busy or retired one is not
   // continued — the task starts a fresh worker and the row says so — so parallel work stays parallel.
   const assignWorker = spec => {
@@ -820,7 +820,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const idle = idleWorkerOf(session.events, spec.profile);
     return idle ? {...spec, continues: idle.lastTask, worker: idle.name} : spec;
   };
-  // One turn on a standing worker's own session that is not a task (docs/ARCHITECTURE.md § Standing workers):
+  // One turn on a standing worker's own session that is not a task:
   // read-only, in the checkout, its answer returned. Used to compact a worker and to ask it for a handoff.
   const HANDOFF_ASK = 'You are being retired; a new worker takes over your job in this project. Write the handoff it should read first: what you did and where it is, what you learned about this project that is not written down, what is unfinished, and what to watch out for. Plain text, under 300 words. Change nothing.';
   async function workerSideTurn(found, message, {cap = 180_000} = {}) {
@@ -1068,7 +1068,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     }
   }
 
-  // STRATEGY (CONTRACT.md §2 onCompleted): fires on every task.completed row (even a second/
+  // STRATEGY: fires on every task.completed row (even a second/
   // later one on the same task). `defaultStrategy` reproduces the exact pre-Phase-8 condition
   // (only a row whose review.completion is set ever entered a completion review) via its own
   // onCompleted hook — the CORE here just executes whatever intent comes back.
@@ -1138,7 +1138,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     append({kind: 'task.failed', task, reason: 'strategy', text: 'malformed onCompleted intent', context});
   }
 
-  // STRATEGY (CONTRACT.md §1 onTerminal): fires after a task actually leaves the tree for good
+  // STRATEGY: fires after a task actually leaves the tree for good
   // (accepted/failed/cancelled/timed_out/rejected — NOT a bare `completed`, which may still be
   // heading into review). Held-task re-evaluation is CORE and always runs regardless of what
   // the strategy decides; the strategy only adds an optional next-wave fan-out.
@@ -1428,7 +1428,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // OpenCode runs the worker AS its role agent (system prompt, step cap); every other adapter
       // gets the role's prompt ahead of the orders instead, so the role means the same thing whoever
       // answers the dispatch.
-      // The project's lessons for this job ride with the agent prompt (docs/ARCHITECTURE.md § Standing workers).
+      // The project's lessons for this job ride with the agent prompt.
       profile = withLessons(profile);
       const roleLead = profile.agent?.prompt && profile.adapter !== 'opencode' ? `${profile.agent.prompt}\n\n---\n\n` : '';
       // Prefer the acknowledged report endpoint, including OpenCode's dedicated MCP tool.
@@ -1437,14 +1437,14 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       let workerOrders = canReport ? `${roleLead}${row.orders}\n\n${contractFor(profile)}`
         : LOCAL_ADAPTERS.has(profile.adapter) ? `${roleLead}${row.orders}\n\n${endingLine}` : `${roleLead}${row.orders}`;
       // An in-place task's worker runs directly in session.cwd: no attempt workspace
-      // (docs/ARCHITECTURE.md § In-place tasks) — `owned` stays null, so the ordinary
+      // — `owned` stays null, so the ordinary
       // cwd/orders fallbacks below already do the right thing with no further branching.
       owned = row.inPlace ? null : workspaceFor(task, profile, attempt);
       // OpenCode takes the agent text as its system prompt, apart from the orders (found live: an agent
       // file naming the checkout sent a local worker to write there); it points into the copy too.
       if (owned && profile.agent?.prompt) profile = {...profile, agent: {...profile.agent, prompt: toWorkingCopy(profile.agent.prompt, owned)}};
       const orders = owned ? inWorkingCopy(workerOrders, owned) : workerOrders;
-      // A continuation (docs/ARCHITECTURE.md § Standing workers): the earlier task's worker is resumed into
+      // A continuation: the earlier task's worker is resumed into
       // this task's own copy and told where it is, instead of a stranger being launched. Probed with the
       // real CLIs (2026-10-01): OpenCode, Claude and Codex all edit the new copy once told.
       const continuation = row.continues ? continuationOf(row, profile) : null;
@@ -1545,7 +1545,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         ({profile, adapter} = admission);
       }
       // An in-place task's worker runs directly in session.cwd: no attempt workspace
-      // (docs/ARCHITECTURE.md § In-place tasks) — `owned` stays null, so the ordinary
+      // — `owned` stays null, so the ordinary
       // cwd/orders fallbacks below already do the right thing with no further branching.
       owned = row.inPlace ? null : workspaceFor(task, profile, attempt);
       // OpenCode takes the agent text as its system prompt, apart from the orders (found live: an agent
@@ -1764,7 +1764,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     append({kind: 'task.blocked', task, text: 'root budget exhausted', context});
   }
 
-  // CONTRACT.md §1: the read-only helper set every strategy hook receives as its third
+  // The read-only helper set every strategy hook receives as its third
   // argument. `roundsCap` is a small addition beyond the literal list in CONTRACT §1 — it is
   // what lets defaultStrategy's onReviewVerdict reproduce today's per-root `budget.rounds`
   // override (P4/policy.test.js) rather than only the scheduler's own `limits.rounds` default;
@@ -1889,7 +1889,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         verdicts.push(verdict.verdict === recovered.verdict ? verdict : {verdict: recovered.verdict});
         continue;
       }
-      // A review profile is a profile too (CONTRACT.md §3): the same shared check runs before
+      // A review profile is a profile too: the same shared check runs before
       // its launch. The first reviewer's refusal handling differs by stage (matches pre-Phase-8
       // behavior exactly): prelaunch (`reserveFirst: false`) releases its already-made shared
       // reservation and fails the task outright; completion (`reserveFirst: true`) has reserved
@@ -2071,7 +2071,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       return;
     }
     // The ceiling is the only limit on how long ONE task may be given: the deadline is a lease,
-    // renewed while the worker makes progress (docs/ARCHITECTURE.md § Tasks). Found live: a 15-minute cap
+    // renewed while the worker makes progress. Found live: a 15-minute cap
     // killed every local reviewer mid-review, and the orchestrator answered by shrinking the next one.
     if ((limits.minutes !== undefined || limits.ceiling !== undefined) && Number.isFinite(row.deadline) && row.deadline > ceilingMs) {
       append({kind: 'task.failed', task, reason: 'size', text: `a ${Math.ceil(row.deadline / 60000)}-minute task exceeds the ${ceilingMs / 60000}-minute ceiling: give it at most ${ceilingMs / 60000} minutes; bounce renews its lease while it makes progress`, context});
@@ -2239,7 +2239,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
           text: `Jev in-place risk check unavailable (${judged.reason ?? 'unconfident'}); the structural check alone authorized this task`, context});
       }
     }
-    // STRATEGY (CONTRACT.md §0/§1): the depends_on hold/fail decision and the prelaunch-review
+    // STRATEGY: the depends_on hold/fail decision and the prelaunch-review
     // decision both come from onSubmitted now — the CORE only executes the returned intent, it
     // never re-derives the decision itself. `defaultStrategy.onSubmitted` reproduces exactly
     // the depends_on/review logic that lived here before Phase 8.
@@ -2411,7 +2411,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     append({kind: 'policy.escalated', task: r.task, reason: 'blocked', text: blocker, to, context: row?.context});
   }
 
-  // A lease end (docs/ARCHITECTURE.md § Tasks). The deadline is not a kill: a worker that made progress
+  // A lease end. The deadline is not a kill: a worker that made progress
   // in this lease, is not repeating itself and that Jev (when present) does not judge stuck gets
   // another lease; otherwise, or at the ceiling, it is asked for its conclusion, and only a worker
   // that gives none within concludeGrace is cancelled. Nothing here needs Jev.
@@ -2693,7 +2693,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       requestDispatch(row);
     }
     if (row.kind === 'task.completed') {
-      // STRATEGY (CONTRACT.md §2 onCompleted): a second (and later) task.completed on the same
+      // STRATEGY: a second (and later) task.completed on the same
       // task re-enters review exactly the same way — the hook and runCompletionReview both
       // read state fresh off the log every time.
       requestAction(session, {actionId: `completion:${row.task}:${reducers.tasks(session.events)[row.task]?.attempt ?? 0}`, type: 'completion', task: row.task});

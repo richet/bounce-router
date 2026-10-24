@@ -6,7 +6,7 @@ import {opencodeVersion} from '../opencode-version.js';
 import {listenToServer, serveForTurn} from '../opencode-server.js';
 
 // OpenCode as a classic provider: a local model (LM Studio) is the one agent answering the conversation,
-// picked and ordered like claude or codex (docs/ARCHITECTURE.md § Classic mode). Same command the worker
+// picked and ordered like claude or codex. Same command the worker
 // runtime uses (opencode-live.js: `opencode run --pure --format json`, prompt on stdin, JSON lines out,
 // `-s` continues the session), same containment: OpenCode's config travels in OPENCODE_CONFIG_CONTENT and
 // the user's Claude Code prompt and skills are kept out of a local model. What differs is the shape — this

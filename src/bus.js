@@ -213,7 +213,7 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         const problem = validate(e);
         if (problem) return refuse(id, -32602, `invalid event: ${problem}`);
         if (e.retryOf !== undefined && (!authenticated.tasks.includes(e.retryOf) || typeof e.retryOf !== 'string')) return refuse(id, -32001, 'unauthorized retry');
-        // A continuation resumes another task's worker (docs/ARCHITECTURE.md § Standing workers): only a task of one's own.
+        // A continuation resumes another task's worker: only a task of one's own.
         if (e.continues !== undefined && (!authenticated.tasks.includes(e.continues) || typeof e.continues !== 'string')) return refuse(id, -32001, 'unauthorized continuation');
       } else if (e.kind === 'plan.submitted') {
         // Plans are no longer reviewed (2026-09-29): a refusal here cost the orchestrator a whole turn
@@ -257,7 +257,7 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
           if (TERMINAL.has(tasks(session.events)[e.task]?.state)) return refuse(id, -32602, 'invalid event: task is already terminal, nothing to cancel');
         }
       } else if (e.kind === 'worker.retire') {
-        // The orchestrator ends a standing worker (docs/ARCHITECTURE.md § Standing workers); the scheduler says why not.
+        // The orchestrator ends a standing worker; the scheduler says why not.
         if (peer !== 'orchestrator' && peer !== 'user') return refuse(id, -32001, 'unauthorized');
         if (typeof retireWorker !== 'function') return refuse(id, -32601, 'workers are not kept in this session');
         if (typeof e.worker !== 'string' || !e.worker) return refuse(id, -32602, 'invalid event: worker.retire needs the worker name, e.g. builder#1');
@@ -276,7 +276,7 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         send({jsonrpc: '2.0', id, result: compacted});
         return;
       } else if (e.kind === 'lesson.learned') {
-        // A lesson is the orchestrator's (docs/ARCHITECTURE.md § Standing workers): one line for a job in this
+        // A lesson is the orchestrator's: one line for a job in this
         // project, kept in .bounce/LESSONS.md by the hook, which says in plain words why one is refused.
         if (peer !== 'orchestrator' && peer !== 'user') return refuse(id, -32001, 'unauthorized');
         if (typeof receiveLesson !== 'function') return refuse(id, -32601, 'lessons are not kept in this session');

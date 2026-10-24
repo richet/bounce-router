@@ -223,7 +223,7 @@ export const formatAgentTable = rows => rows.map(row => row.error
   ? `  ${row.name} · INVALID: ${row.error}`
   : [`  ${row.name} · ${row.policy} · ${row.source} · ${row.backends.length ? row.backends.join(', ') : 'nobody can play it here'}${chainSource(row.binding)}`, ...row.skipped.map(why => `      skipped ${why}`)].join('\n'));
 
-// Which team, bindings and models files are in use: one of each, the most specific that exists (docs/ARCHITECTURE.md § Agents, bindings and models).
+// Which team, bindings and models files are in use: one of each, the most specific that exists.
 export function teamHeader(roles, {root, cwd} = {}) {
   const layer = [...roles.values()][0]?.source;
   const team = layer === 'project' ? `this project's (${projectAgentStore(cwd)})` : layer === 'user' ? `yours (${agentStore(root)})` : 'the one bounce ships';

@@ -12,7 +12,7 @@ import {createWorkspace} from '../src/tui/Workspace.js';
 test('a suggestion is the answer\'s stated next step, as a prompt the user could send', () => {
   const answer = `Completed through Bounce agents:\n\n- Fixed subprocess-helper formatting.\n\nP2 remains unaccepted. Next agent: finish the acceptance audit in smaller chunks, complete outstanding real CLI/Docker and allocation checks, then obtain independent review before P3–P6.\n\nStopped because the analyst exceeded its ten-minute deadline.`;
   assert.equal(suggestionFrom(answer), 'Finish the acceptance audit in smaller chunks, complete outstanding real CLI/Docker and allocation checks, then obtain independent review before P3–P6.');
-  assert.equal(suggestionFrom('All done.\n\n**Next:** run the live Docker acceptance and record the result in PROGRESS.md.'), 'Run the live Docker acceptance and record the result in PROGRESS.md.');
+  assert.equal(suggestionFrom('All done.\n\n**Next:** run the live Docker acceptance and record the result in NOTES.md.'), 'Run the live Docker acceptance and record the result in NOTES.md.');
   assert.equal(suggestionFrom('Done. Next step: rebase onto main and rerun the gate'), 'Rebase onto main and rerun the gate');
   assert.equal(suggestionFrom('Should I dispatch a re-review of the fix round?'), 'Dispatch a re-review of the fix round');
   assert.equal(suggestionFrom('Do you want me to split P3 into two chunks?'), 'Split P3 into two chunks');

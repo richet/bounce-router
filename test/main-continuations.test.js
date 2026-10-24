@@ -274,7 +274,7 @@ test('startup timeout without process identity blocks with a typed termination-u
   assert.equal((await main.close()).verified, false);
 });
 
-// docs/ARCHITECTURE.md § Standing workers (2026-10-01). Found live (session e3bd01d5, 2026-09-30): two held
+// 2026-10-01. Found live (session e3bd01d5, 2026-09-30): two held
 // tasks waited 91 minutes with nothing running and nothing waking the orchestrator. After sweepMinutes
 // with nothing in flight and held work waiting, one turn asks what is waiting; answered, it is not
 // repeated until something else happens; a running task or a pending outcome means no sweep.

@@ -103,7 +103,7 @@ export function appendPending(file, text) {
 }
 export function takePending(file) { const texts = readPending(file); try { fs.truncateSync(file, 0); } catch {} return texts; }
 // Peer-supplied text that lands inside a prompt template must not be able to forge the template's line structure.
-// ---- who is speaking, and what the worker's answer is (docs/ARCHITECTURE.md § Local workers) -------------
+// ---- who is speaking, and what the worker's answer is -------------
 // One stream carries three voices: the worker, its own thinking, and the runtime (the CLI's notices and
 // refusals). Found live: opencode's "MAXIMUM STEPS REACHED" notice became a review's verdict and blocked
 // the task; a stray `</think>` reached another answer. Every adapter classifies here, once, and the

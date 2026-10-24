@@ -1,4 +1,4 @@
-// Phase 4 (docs/ARCHITECTURE.md § In-place tasks): the task view, its text skin, the TUI pane and the
+// Phase 4: the task view, its text skin, the TUI pane and the
 // standing orders all name an in-place task as "in place", the user message that authorized it
 // (first 80 chars), and Jev's verdict when there was one.
 import test from 'node:test';

@@ -3,7 +3,7 @@ import path from 'node:path';
 import {execFileSync} from 'node:child_process';
 import {fuzzyScore} from '../terminal.js';
 
-// The files an `@mention` completes from (docs/ARCHITECTURE.md § TUI). In a git repository: what git
+// The files an `@mention` completes from. In a git repository: what git
 // tracks plus untracked files it does not ignore. Elsewhere: a bounded walk that skips dependency and VCS folders.
 // Read at most every ten seconds per workspace, so typing stays instant.
 const LIMIT = 20_000;
