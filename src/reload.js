@@ -17,7 +17,7 @@ import {spawn, execFileSync} from 'node:child_process';
 import {parseArgs} from 'node:util';
 import {Session, config, dataRoot, pidAlive} from './core.js';
 import {loadQuota, recordQuota, quotaSnapshot} from './quota.js';
-import {seedSkills, seedSummary} from './skills.js';
+import {seedSkills, seedSummary, skillsInUse, skillsBlock} from './skills.js';
 const SEED_NOTABLE = ['invalid', 'unmanaged', 'modified', 'withdrawn', 'failed'];
 import {resolveSessionRef} from './sessions.js';
 import {titleSession, createAsk} from './session-title.js';
@@ -256,6 +256,13 @@ export function orchestratorBridgeEnv({session, bus, grant, profile}) {
 
 // The orchestrator profile's standing brief, written once per daemon start: where its skill
 // lives and how to reach the bridge. The prompt line cli.js prepends points at this file.
+// The orchestrator's view of the skills in use: each by its real path, and what its workers get.
+export function ordersSkills(root, cwd) {
+  const {skills} = skillsInUse(root, cwd);
+  const block = skillsBlock(skills, skill => path.join(skill.dir, 'SKILL.md'));
+  return block ? ['', block, 'Every worker gets the same list in its prompt, with the files in its own copy: name a skill in the orders only when the task needs one it might not pick.', ''] : [];
+}
+
 function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, jev = null, notes = {}, roles = null, settings = {}, adapterNames = []}) {
   const dir = path.join(session.dir, 'orchestrator');
   const autoFallback = routingFallback(profiles, jev?.routing?.default);
@@ -325,6 +332,7 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     })(),
     // The project's lessons: every line, with its job, and how one is recorded.
     ...(() => { const block = lessonsBlock(session.cwd, 'orchestrator'); return block ? ['', block, ''] : []; })(),
+    ...ordersSkills(root, session.cwd),
     'Lessons: when a task redid work that had been accepted, or a check failed twice, the handoff asks whether there is a lesson. If there is, record it with the lesson tool (or publish lesson.learned): agent (the job it is for, or all) and text (one sentence, imperative, no task ids). It lands in .bounce/LESSONS.md in the project and in every later worker\'s prompt for that job; a person deletes a line to withdraw it. Record what a worker should do differently here, not what happened.', '',
     `Worker profiles (one AI each): ${Object.entries(profiles).filter(([name, p]) => name !== orchestrator && name !== JEV_REVIEWER && !p.derived).map(([name, p]) => p.model ? `${name} (${p.model})` : name).join(', ') || 'none configured'} — name one only when the user asks for that AI, or for a retry (see above).`,
     ...(jev && autoFallback ? [`    auto → ${routingOn ? 'Jev (TypeSafe) routes each task: to the agent above whose job the orders clearly describe (that agent\'s own models then decide the AI), otherwise by the tier the orders need — the first fitting worker profile of that tier in the provider order; unconfident picks go to' : 'Jev routing is off (/jev routing on): resolves to'} ${autoFallback}`] : []),

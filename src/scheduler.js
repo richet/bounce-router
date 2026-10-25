@@ -12,6 +12,7 @@ import {defaultStrategy} from './strategy.js';
 import {reportEvent, validateReport, remainingWork} from './reporting.js';
 import {inspectFinalReport, synthesizeReport, synthesizeReportFromChanges, FINAL_REPORT_INSTRUCTION} from './final-report.js';
 import {lessonsBlock} from './lessons.js';
+import {skillsInUse, skillsBlock} from './skills.js';
 import {workersView, idleWorkerOf, nextWorkerName, pendingHandoffFor} from './workers.js';
 import {actionState, createActionRunner, requestAction} from './orchestration.js';
 import {normalizeLocalSettings} from './local-models.js';
@@ -865,12 +866,16 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     }
     return append({kind: 'worker.retired', worker, profile: found.profile, by, ...(text ? {handoff: text} : {}), ...(ask ? {asked: true} : {}), ...(context ? {context} : {})});
   }
-  // The agent prompt plus the project's lessons for its job, when there are any and the profile has a job.
-  const withLessons = profile => {
+  // The agent prompt plus the project's lessons for its job and the index of the skills in use, when there are any and
+  // the profile has a job. A skill is named by its path in the checkout, which the copy rewrites to its own (the copy
+  // carries the skills); an in-place worker reads the user's skills where they are.
+  const withLessons = (profile, row = {}) => {
     if (!profile.agent?.prompt || !profile.role) return profile;
-    const block = lessonsBlock(session.cwd, profile.role);
-    if (!block || profile.agent.prompt.includes(block)) return profile;
-    return {...profile, agent: {...profile.agent, prompt: `${profile.agent.prompt}\n\n${block}`}};
+    const inUse = skillsInUse(session.root, session.cwd);
+    const fileOf = skill => row.inPlace && inUse.source !== 'project' ? path.join(skill.dir, 'SKILL.md') : path.join(session.cwd, '.bounce', 'skills', skill.name, 'SKILL.md');
+    const blocks = [lessonsBlock(session.cwd, profile.role), skillsBlock(inUse.skills, fileOf)].filter(block => block && !profile.agent.prompt.includes(block));
+    if (!blocks.length) return profile;
+    return {...profile, agent: {...profile.agent, prompt: [profile.agent.prompt, ...blocks].join('\n\n')}};
   };
   const toWorkingCopy = (text, workspace) => {
     const source = fs.realpathSync(session.cwd);
@@ -910,7 +915,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // owns is a hint for the worker and the orchestrator, not a fence any more (2026-09-29): every
     // working copy owns everything, so any change the worker makes is part of its artifact; what
     // actually protects the checkout is integrateArtifact's conflict check against the real file.
-    const workspace = createAttemptWorkspace({cwd: session.cwd, dir, owns: ['**'], attemptId: `${task}-${attempt}`,
+    const workspace = createAttemptWorkspace({cwd: session.cwd, dir, owns: ['**'], attemptId: `${task}-${attempt}`, skills: skillsInUse(session.root, session.cwd).skills,
       ...(nested ? {} : {copyRoot: path.join(session.root, 'w')})});
     workspaces.set(task, workspace);
     append({kind: 'task.workspace', task, attempt, purpose: 'publish', cwd: workspace.cwd, metadata: path.join(workspace.cwd, '.attempt-workspace.json'), baselineHash: workspace.baselineHash});
@@ -1429,7 +1434,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // gets the role's prompt ahead of the orders instead, so the role means the same thing whoever
       // answers the dispatch.
       // The project's lessons for this job ride with the agent prompt.
-      profile = withLessons(profile);
+      profile = withLessons(profile, row);
       const roleLead = profile.agent?.prompt && profile.adapter !== 'opencode' ? `${profile.agent.prompt}\n\n---\n\n` : '';
       // Prefer the acknowledged report endpoint, including OpenCode's dedicated MCP tool.
       // Final-answer parsing remains a compatibility path for workers without a grant.
@@ -1551,7 +1556,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // OpenCode takes the agent text as its system prompt, apart from the orders (found live: an agent
       // file naming the checkout sent a local worker to write there); it points into the copy too.
       if (owned && profile.agent?.prompt) profile = {...profile, agent: {...profile.agent, prompt: toWorkingCopy(profile.agent.prompt, owned)}};
-      profile = withLessons(profile);
+      profile = withLessons(profile, row);
       if (owned && profile.agent?.prompt) profile = {...profile, agent: {...profile.agent, prompt: toWorkingCopy(profile.agent.prompt, owned)}};
       append({kind: 'task.launch.requested', task, attempt, executionKey: `${task}:${attempt}`, resumed: true, context});
       if (owned) message = inWorkingCopy(message, owned);

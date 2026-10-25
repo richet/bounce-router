@@ -8,6 +8,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
+import {skillsInUse, skillsBlock} from './skills.js';
 import {execFileSync} from 'node:child_process';
 import {providers, invocation, runProcess, canResume, requiresModel, providerEnv, prepareTurn, vendorChildEnv} from './providers.js';
 
@@ -351,7 +352,10 @@ export function handoff(session, prompt, budget = 48000, {orchestrator = false} 
   // Router journals the current prompt before building the packet; it is the request, not history.
   const lastUser = relevant.findLast(e => e.kind === 'user');
   const prior = relevant.filter(e => !(e === lastUser && e.text === prompt));
-  const workspace = `Workspace: ${session.cwd}`;
+  // A classic vendor runs in the real tree: the skills in use are named by their real path (the orchestrator has them
+  // in its orders). The vendor thread keeps them after this one packet.
+  const skills = orchestrator || !session.root ? '' : skillsBlock(skillsInUse(session.root, session.cwd).skills, skill => path.join(skill.dir, 'SKILL.md'));
+  const workspace = `Workspace: ${session.cwd}${skills ? `\n\n${skills}` : ''}`;
   if (!prior.length && !orchestrator) return `${prompt}\n\n${workspace}`;
   const worked = prior.some(e => e.kind === 'tool');
   const memory = orchestrator ? orchestratorMemory(session) : '';

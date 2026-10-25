@@ -37,9 +37,13 @@ function assertNoSymlink(root, rel) {
     if (fs.existsSync(cursor) && fs.lstatSync(cursor).isSymbolicLink()) throw new Error(`symlink denied: ${rel}`);
   }
 }
+// A skill bounce wrote into a copy carries this file; the manifest never sees it, so it is never integrated back.
+const GENERATED = '.bounce-generated';
+const NATIVE_SKILLS = ['.claude/skills', '.codex/skills', '.agents/skills'];
 function manifest(root) {
   const files = {};
   const visit = (dir, prefix = '') => {
+    if (fs.existsSync(path.join(dir, GENERATED))) return;
     for (const entry of fs.readdirSync(dir, {withFileTypes: true})) {
       if (EXCLUDED.has(entry.name)) continue;
       const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
@@ -93,7 +97,7 @@ function realAncestor(dir) {
 // on the source's branch, with a baseline commit of the checkout as copied (see below). It has no remote, so nothing a worker does in git can reach the source, and
 // .git is outside every manifest, so only file changes are ever integrated. A source that is not a git
 // checkout, or a clone that fails, leaves the copy without git as before.
-function giveGit(source, copy) {
+function giveGit(source, copy, generated = []) {
   if (!fs.existsSync(path.join(source, '.git'))) return;
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
   const git = (cwd, ...args) => execFileSync('git', args, {cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']}).trim();
@@ -112,7 +116,7 @@ function giveGit(source, copy) {
     const omitted = execFileSync('git', ['ls-files', '-z', '--', '.bounce', ':(glob)**/.bounce/**'], {cwd: copy, env, stdio: ['ignore', 'pipe', 'ignore']});
     if (omitted.length) execFileSync('git', ['update-index', '--skip-worktree', '-z', '--stdin'], {cwd: copy, env, input: omitted, stdio: ['pipe', 'ignore', 'ignore']});
     fs.mkdirSync(path.join(copy, '.git', 'info'), {recursive: true});
-    fs.appendFileSync(path.join(copy, '.git', 'info', 'exclude'), '\n/.attempt-workspace.json\n');
+    fs.appendFileSync(path.join(copy, '.git', 'info', 'exclude'), `\n/.attempt-workspace.json\n${generated.map(rel => `/${rel}/\n`).join('')}`);
     // The checkout as the copy got it — the user's uncommitted edits included — becomes a baseline
     // commit, so `git status` starts clean and `git diff` is only the worker's own work. Found live (session
     // 36ecaacd, task 7bafef8e): a worker read the user's uncommitted edits as its own out-of-scope
@@ -138,7 +142,24 @@ function shortCopyDir(root) {
 // `copyRoot` puts the working copy at a short path of its own (<copyRoot>/<8 hex>) instead of under
 // `dir`. Found live (session d1bc0206): a local model typing the default ~200-character path, three
 // UUIDs deep, garbled it (`de83` for `dee3`, a doubled segment) and spent its steps on "File not found".
-export function createAttemptWorkspace({cwd, dir, owns, attemptId, copyRoot}) {
+// The skills in use go into the copy (they live in .bounce, which the copy leaves out): at .bounce/skills, where the
+// prompt's index points, and in each vendor's own project folder so claude, codex and muse also load them natively.
+// A vendor folder the project already has for a skill is left as the project keeps it.
+function giveSkills(copy, skills) {
+  const generated = [];
+  for (const skill of skills) {
+    for (const area of ['.bounce/skills', ...NATIVE_SKILLS]) {
+      const rel = `${area}/${skill.name}`, target = path.join(copy, rel);
+      if (fs.existsSync(target)) continue;
+      fs.cpSync(skill.dir, target, {recursive: true, dereference: false, filter: from => !fs.lstatSync(from).isSymbolicLink() && path.basename(from) !== '.bounce-skill.json'});
+      fs.writeFileSync(path.join(target, GENERATED), '');
+      generated.push(rel);
+    }
+  }
+  return generated;
+}
+
+export function createAttemptWorkspace({cwd, dir, owns, attemptId, copyRoot, skills = []}) {
   const source = fs.realpathSync(cwd);
   const allowed = ownList(owns);
   const resolvedDir = fs.existsSync(dir) ? fs.realpathSync(dir) : path.resolve(dir);
@@ -148,7 +169,7 @@ export function createAttemptWorkspace({cwd, dir, owns, attemptId, copyRoot}) {
   if (copyRoot && !path.relative(source, realAncestor(copyRoot)).startsWith('..')) throw new Error('workspace dir must be outside source');
   const workspace = copyRoot ? shortCopyDir(copyRoot) : path.join(dir, 'workspaces', `${attemptId}-${crypto.randomUUID()}`);
   copyTree(source, workspace);
-  giveGit(source, workspace);
+  giveGit(source, workspace, giveSkills(workspace, skills));
   const baseline = manifest(workspace);
   const baselineHash = manifestHash(baseline);
   const result = {id: path.basename(workspace), attemptId, cwd: workspace, source, dir, owns: allowed, baseline, baselineHash};
