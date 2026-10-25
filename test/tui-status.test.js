@@ -102,3 +102,12 @@ test('a blocked worker keeps its state word, is not coloured as a failure, and s
   projection.ingest({seq: 3, kind: 'task.started', task: 't1', attempt: 2, time: '2026-09-25T06:30:00Z'});
   assert.equal(projection.snapshot().panes.find(p => p.task === 't1').reason, undefined);
 });
+
+// Found live 2026-10-24 : a review ran on the local model for minutes and nothing on screen moved, because
+// `reviewing` was not a working state — the pane showed a still ● beside LM Studio busy with the reviewer.
+test('a task under review is working: it spins, shows its quiet time and turns red when silent like any running task', () => {
+  assert.deepEqual([0, 120].map(now => glyph('reviewing', now)), [SPINNER[0], SPINNER[1]]);
+  const since = '2026-10-24T22:40:00.000Z', at = Date.parse(since);
+  assert.equal(rowColor({state: 'reviewing', updatedAt: since}, at + 10_000), 'yellow');
+  assert.equal(rowColor({state: 'reviewing', updatedAt: since}, at + 10 * 60_000), 'red');
+});

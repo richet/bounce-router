@@ -34,6 +34,7 @@ const LABELLED = /^[\s>*#_-]*(?:final\s+)?(?:verdict|decision|review\s+verdict)\
 const FINDING = /^\s*[-*>]*\s*[*_`]*FINDING[*_`]*\s*[:：]\s*(.+?)[*_`]*\s*$/i;
 // A line that is nothing but a verdict word ("PASS", "**FAIL**"): what reviewer agents are told to write.
 const BARE = /^[\s>*#_`-]*([A-Za-z][A-Za-z ]{0,24}?)[\s*_`.!]*(?:[(—–:-].*)?$/;
+const REASON_MAX = 6000;
 const BLOCKING = /"severity"\s*:\s*"(blocker|major)"/i;
 
 export function parseVerdict(status, text) {
@@ -48,7 +49,11 @@ export function parseVerdict(status, text) {
     }
     const lines = raw.split('\n');
     const findings = lines.map(line => FINDING.exec(line)?.[1]?.trim()).filter(Boolean);
-    const withFindings = verdict => ({verdict, ...(findings.length ? {findings} : {}), source: 'text'});
+    // A verdict that sends the work back with no FINDING lines still says why, in prose: that text is its finding, so
+    // the worker is told what to change (found live: a FAIL with two majors in prose reached the builder as an empty
+    // "Rework round 1:", and it blocked itself).
+    const sendsBack = verdict => verdict === 'rework' || verdict === 'reject';
+    const withFindings = verdict => ({verdict, ...(findings.length ? {findings} : sendsBack(verdict) ? {findings: [raw.slice(-REASON_MAX)]} : {}), source: 'text'});
     for (let i = lines.length - 1; i >= 0; i--) {
       const match = LABELLED.exec(lines[i]);
       const verdict = match && normalize(match[1]);

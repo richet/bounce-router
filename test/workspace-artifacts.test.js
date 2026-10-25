@@ -292,3 +292,27 @@ test('what a review is sent is the whole diff when nothing in it is evidence or 
   const artifact = captureArtifact(workspace);
   assert.equal(reviewDiff(artifact), artifact.diff);
 });
+
+// Found live (session fb6036ee, 2026-10-24): a builder compiled its binaries into the ignored dist/ and an analyst's
+// script left a __pycache__ .pyc, and the whole artifact was refused for those files alone. A binary or large file
+// the project's .gitignore ignores is left out and named; the rest integrates. One the project tracks still refuses.
+test('an ignored binary or large file is left out and named; the rest of the work integrates', t => {
+  const {source, dir} = setup(t);
+  const git = (...args) => execFileSync('git', args, {cwd: source, stdio: 'ignore'});
+  write(source, '.gitignore', 'dist/\n');
+  write(source, 'src/x.js', 'old\n');
+  git('init', '-q'); git('add', '.'); git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'base');
+  const ws = createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'ignored'});
+  write(ws.cwd, 'dist/kb', Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0, 1]));
+  write(ws.cwd, 'src/x.js', 'new\n');
+  const artifact = captureArtifact(ws);
+  assert.deepEqual(artifact.unsupported, []);
+  assert.deepEqual(artifact.leftOut, [{path: 'dist/kb', reason: 'binary'}]);
+  assert.deepEqual(artifact.changes.map(change => change.path), ['src/x.js']);
+  assert.equal(integrateArtifact({cwd: source, artifact, dir}).status, 'integrated');
+  assert.equal(fs.readFileSync(path.join(source, 'src/x.js'), 'utf8'), 'new\n');
+  assert.equal(fs.existsSync(path.join(source, 'dist')), false);
+
+  write(ws.cwd, 'tracked.bin', Buffer.from([0, 1, 2]));
+  assert.deepEqual(captureArtifact(ws).unsupported, [{path: 'tracked.bin', reason: 'binary'}], 'a binary the project would track still refuses');
+});

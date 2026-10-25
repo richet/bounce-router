@@ -128,7 +128,7 @@ export function taskView(events, task, {now = Date.now(), journal = null, report
     } : null,
     reason: terminal?.reason ?? null,
     blocker: blocked ? cut(blocked.text, TEXT_MAX) : null,
-    artifact: lastOf(events, task, 'artifact.captured')?.artifact ?? (artifact ? {id: artifact.artifactId, digest: artifact.digest, resultHash: artifact.resultHash} : null),
+    artifact: lastOf(events, task, 'artifact.captured')?.artifact ?? (artifact ? {id: artifact.artifactId, digest: artifact.digest, resultHash: artifact.resultHash, ...(artifact.leftOut ? {leftOut: artifact.leftOut} : {})} : null),
     integration: lastOf(events, task, 'artifact.integrated')?.status ?? (integrated ? 'integrated' : null),
     // The raw material, named — never carried. Whoever wants it reads it themselves.
     journal: journal ? {path: journal, task, fromSeq: seqs.length ? Math.min(...seqs) : null, toSeq: seqs.length ? Math.max(...seqs) : null} : null,

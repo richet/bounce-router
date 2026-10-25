@@ -253,6 +253,9 @@ export function watchdog(events, now, {activity = new Map(), watchdog: cfg} = {}
     }
     // A completion review is a worker turn too, with its own lease from `review.started` — the worker's
     // own elapsed time is not the reviewer's budget. Found live: a 24-minute review nothing was watching.
+    // A task that has ended is never watched, even when its review never finished: found live (session fb6036ee), two
+    // tasks cancelled while their review waited for the local model were escalated every tick for four hours.
+    if (t.state !== 'completed' && TERMINAL.has(t.state)) continue;
     const activeReview = events.findLast(e => e.task === t.id && ['review.started', 'review.finished'].includes(e.kind));
     const reviewing = t.state === 'reviewing' || activeReview?.kind === 'review.started';
     if (t.state !== 'running' && !reviewing) continue;

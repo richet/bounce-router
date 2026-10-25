@@ -1227,7 +1227,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
               artifact = captureArtifact(owned);
               append({kind: 'task.artifact', task, attempt: reducers.tasks(session.events)[task]?.attempt,
                 artifactId: artifact.id, digest: artifact.digest, resultHash: artifact.resultHash,
-                file: path.join(owned.dir, 'artifacts', `${artifact.id}.json`), dir: owned.dir, cwd: owned.cwd, from, context});
+                file: path.join(owned.dir, 'artifacts', `${artifact.id}.json`), dir: owned.dir, cwd: owned.cwd,
+                ...(artifact.leftOut?.length ? {leftOut: artifact.leftOut, text: `Left out, ignored by the project: ${artifact.leftOut.map(entry => `${entry.path} (${entry.reason})`).join(', ')}`} : {}), from, context});
               if (artifact.unsupported.length) {
                 append({kind: 'task.blocked', task, reason: 'artifact_unsupported',
                   text: `Isolated artifact cannot be integrated: ${JSON.stringify(artifact.unsupported)}`, from, context});
@@ -2569,7 +2570,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // A task waiting for its turn (the local model, memory) has no worker to be silent: found live
       // (session e3bd01d5), two tasks sent back by their check were cancelled as silent while they waited
       // for the local model, and redone on a cloud fallback.
-      if (launchingAttempts.get(r.task)?.phase === 'admission') continue;
+      // Its review waits the same way (session fb6036ee, 39e4fed3): a finished builder was cancelled as silent while its
+      // review waited for the local model, and redone on a fallback.
+      if (launchingAttempts.get(r.task)?.phase === 'admission' || [...reviews.values()].some(entry => entry.task === r.task && entry.pending && entry.phase === 'admission')) continue;
       for (const reason of ['silent', 'stalled']) if (r.verdicts.includes(reason)) await handleSignature(r, reason, now);
     }
   }

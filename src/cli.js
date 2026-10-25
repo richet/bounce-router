@@ -4,7 +4,7 @@ import {resolveExecutable} from './executable.js';
 import {createMainClient} from './main-client.js';
 import {createInkTerminal} from './tui/ink-terminal.js';
 import {workspaceColumns} from './tui/Workspace.js';
-import {doingNow} from './tui/status.js';
+import {doingNow, isWorking} from './tui/status.js';
 import {suggestionFrom, lastAnswer} from './tui/suggestion.js';
 import {headerProvider, chooseModel, chooseOrder} from './cli-view.js';
 import {backspace, clampCursor, createUndo, deleteForward, deleteWordBackward, deleteWordForward, insertText, killLineEnd, killWordBackward, moveCursor, moveLineEnd, moveLineStart, moveVertical, moveWord} from './tui/editor.js';
@@ -1517,7 +1517,7 @@ async function main() {
   // unref'd so it never keeps the process alive, and render() is a no-op while suspended.
   if (orchestration.operation === 'orchestrator') {
     let beat = 0;
-    const t = setInterval(() => { const working = !daemonLostAt && (busy || (terminal?.snapshot().panes ?? []).some(pane => pane.state === 'running')); if (working || ++beat % 4 === 0) render(); }, 250);
+    const t = setInterval(() => { const working = !daemonLostAt && (busy || (terminal?.snapshot().panes ?? []).some(pane => isWorking(pane.state))); if (working || ++beat % 4 === 0) render(); }, 250);
     t.unref?.();
   }
   void refreshQuota(settings, {root, store: quotas, cwd: session.cwd}).then(render, () => {});

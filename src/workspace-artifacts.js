@@ -285,17 +285,32 @@ export function reviewDiff(artifact) {
   return [...parts.filter(part => !isEvidence(part.path)).map(part => part.text), ...note].join('\n');
 }
 
+// The paths git ignores in the copy; none when it has no git or git fails, so nothing is left out unasked.
+function ignoredPaths(cwd, paths) {
+  if (!paths.length || !fs.existsSync(path.join(cwd, '.git'))) return new Set();
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+  try {
+    const out = execFileSync('git', ['check-ignore', '-z', '--stdin'], {cwd, env, input: paths.join('\0'), stdio: ['pipe', 'pipe', 'ignore']});
+    return new Set(out.toString('utf8').split('\0').filter(Boolean));
+  } catch { return new Set(); } // exit 1: none is ignored
+}
+
 export function captureArtifact(workspace) {
   const result = manifest(workspace.cwd);
   const paths = [...new Set([...Object.keys(workspace.baseline), ...Object.keys(result)])].sort();
-  const changes = [], unsupported = [];
+  const changes = [], refused = [];
   for (const file of paths) {
     const before = workspace.baseline[file] ?? null, after = result[file] ?? null;
     if (JSON.stringify(before) === JSON.stringify(after)) continue;
-    if (before?.unsupported || after?.unsupported || before?.binary || after?.binary) { unsupported.push({path: file, reason: before?.unsupported ?? after?.unsupported ?? 'binary'}); continue; }
+    if (before?.unsupported || after?.unsupported || before?.binary || after?.binary) { refused.push({path: file, reason: before?.unsupported ?? after?.unsupported ?? 'binary'}); continue; }
     if (!after) changes.push({path: file, kind: 'delete', before});
     else changes.push({path: file, kind: 'write', before, after, data: fs.readFileSync(safeJoin(workspace.cwd, file)).toString('base64'), mode: after.mode});
   }
+  // A binary or large file the project's .gitignore ignores (a build's output, a .pyc) is left out and named, so it
+  // does not refuse the rest of the work (found live: compiled binaries in dist/ refused a whole CLI step).
+  const ignored = ignoredPaths(workspace.cwd, refused.map(entry => entry.path));
+  const unsupported = refused.filter(entry => !ignored.has(entry.path));
+  const leftOut = refused.filter(entry => ignored.has(entry.path));
   const resultHash = manifestHash(result);
   // owns is a hint, not a fence (2026-09-29): every workspace owns everything, so nothing here is
   // ever a violation. `owns` and `violations` stay in the digest binding, in this exact order, so an
@@ -304,7 +319,7 @@ export function captureArtifact(workspace) {
   const binding = {target: workspace.source, attemptId: workspace.attemptId, baselineHash: workspace.baselineHash, resultHash, owns: workspace.owns, changes, violations: [], unsupported};
   const digest = hash(json(binding));
   const id = digest.slice(0, 32);
-  const artifact = {id, digest, ...binding, files: Object.keys(result).sort(), ...describeChanges(workspace.source, changes)};
+  const artifact = {id, digest, ...binding, leftOut, files: Object.keys(result).sort(), ...describeChanges(workspace.source, changes)};
   atomicJSON(path.join(workspace.dir, 'artifacts', `${id}.json`), artifact);
   return artifact;
 }

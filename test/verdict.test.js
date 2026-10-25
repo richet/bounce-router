@@ -44,3 +44,16 @@ test('a bare PASS/FAIL line is a verdict, emphasis around FINDING is read, and b
   assert.equal(parseVerdict('completed', `**FINDING: ${finding}**\n## PASS (goal complete: root cause found, no fix applied)`).verdict, 'accept', 'a stated verdict with its reason wins over findings');
   assert.equal(parseVerdict('completed', 'I looked around and it seems fine overall.').verdict, 'unreadable');
 });
+
+// Found live 2026-10-24 (task 01660bb6): a reviewer wrote "**FAIL** — two majors" with each major in prose and
+// no FINDING lines; the verdict was read as rework but carried no findings, so the builder got "Rework round 1:" and
+// nothing else, and blocked itself ("the rework message has no review findings in it").
+test('a verdict that sends the work back with no FINDING lines carries the reviewer\'s own text as its finding', () => {
+  const text = 'Verification is complete.\n\n**FAIL** — no blockers; two majors.\n\n**Major 1 — Proof not run against the running app.**\n- Repro: `app open --print`, then curl it.';
+  const verdict = parseVerdict('completed', text);
+  assert.equal(verdict.verdict, 'rework');
+  assert.deepEqual(verdict.findings, [text]);
+  assert.equal(parseVerdict('completed', 'All good.\n\n**PASS**').findings, undefined, 'an accept needs none');
+  const long = parseVerdict('completed', `**FAIL**\n\n${'x'.repeat(9000)}`);
+  assert.equal(long.findings[0].length <= 6000, true, 'bounded');
+});

@@ -182,6 +182,72 @@ test('a task sent back and waiting for the local model is not cancelled as silen
   assert.deepEqual(session.events.filter(e => e.kind === 'task.check' && e.task === task).map(e => e.passed), [false, true]);
 });
 
+// Found live (session fb6036ee, 2026-10-24, task 39e4fed3): a builder finished green and its review waited for the
+// local model another review held. Five minutes into the wait the watchdog called the task silent, cancelled it
+// and fell back to another builder for work that was already done. A review waiting for its turn is not silent.
+test('a review waiting for the local model is not cancelled as silent', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-review-wait-')));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const session = new Session(root, {root: path.join(root, 'home')});
+  const builder = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'built'}]);
+  const opencode = fakeAdapter(() => [{kind: 'result', status: 'completed', text: JSON.stringify({verdict: 'accept', findings: []})}]);
+  const localResolver = {resolve: async ({profile}) => ({...profile, providerID: 'lmstudio', opencodeConfig: {}}), configure() {}};
+  let free = false, claims = 0;
+  const machineSlots = {
+    acquire: () => { claims += 1; return free ? {ok: true, token: `claim-${claims}`} : {ok: false, holders: [{pid: 1, session: 'other-session', task: 'other-task', since: '2026-10-24T23:18:00.000Z'}]}; },
+    release: () => true,
+    releaseAll() {},
+  };
+  let now = Date.parse('2026-10-24T23:20:00Z');
+  const profiles = {b: {adapter: 'builder', model: 's', mode: 'yolo', policy: 'read-only', fallback: ['b~2'], role: 'builder'}, 'b~2': {adapter: 'builder', model: 's2', mode: 'yolo', policy: 'read-only', fallback: [], role: 'builder'},
+    critic: {...local('reviewer'), policy: 'read-only'}};
+  const scheduler = createScheduler({...hostless, session, adapters: {builder, opencode}, profiles, localResolver, gitHead: () => null, machineSlots,
+    clock: () => now, watchdog: {interval: null},
+    localSettings: {endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234', maxConcurrent: 1, pollMs: 20}}}});
+  t.after(() => scheduler.close());
+
+  const {task} = scheduler.submit({parent: null, profile: 'b', orders: 'build it', deadline: null, review: {completion: 'critic'}});
+  await waitFor(() => session.events.find(e => e.kind === 'task.milestone' && e.task === task && /another bounce is using it/.test(e.text)));
+  now += 310_000;
+  await scheduler.tick();
+  now += 310_000;
+  await scheduler.tick();
+
+  assert.deepEqual(session.events.filter(e => e.kind === 'policy.escalated' && e.task === task).map(e => e.reason), []);
+  assert.equal(session.events.some(e => e.kind === 'policy.fallback' && e.task === task), false, 'no second builder for finished work');
+
+  free = true;
+  await waitFor(() => scheduler.tasks()[task]?.state === 'accepted');
+});
+
+// Found live (session fb6036ee, 2026-10-24): two tasks cancelled while their review waited for the local model kept a
+// review.started with no review.finished, so the watchdog went on watching them. For four hours, every tick wrote one
+// more deadline escalation for one and one more Jev lease check for the other (5,600 rows), and a resume reads the same journal.
+test('a task cancelled while its review waits for the local model is no longer watched', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-review-cancel-')));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const session = new Session(root, {root: path.join(root, 'home')});
+  const builder = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'built'}]);
+  const opencode = fakeAdapter(() => [{kind: 'result', status: 'completed', text: JSON.stringify({verdict: 'accept', findings: []})}]);
+  const localResolver = {resolve: async ({profile}) => ({...profile, providerID: 'lmstudio', opencodeConfig: {}}), configure() {}};
+  const machineSlots = {acquire: () => ({ok: false, holders: [{pid: 1, session: 'other-session', task: 'other-task', since: '2026-10-24T23:18:00.000Z'}]}), release: () => true, releaseAll() {}};
+  let now = Date.parse('2026-10-24T23:20:00Z');
+  const profiles = {b: {adapter: 'builder', model: 's', mode: 'yolo', policy: 'read-only', fallback: [], role: 'builder'}, critic: {...local('reviewer'), policy: 'read-only'}};
+  const scheduler = createScheduler({...hostless, session, adapters: {builder, opencode}, profiles, localResolver, gitHead: () => null, machineSlots,
+    clock: () => now, watchdog: {interval: null},
+    localSettings: {endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234', maxConcurrent: 1, pollMs: 20}}}});
+  t.after(() => scheduler.close());
+
+  const {task} = scheduler.submit({parent: null, profile: 'b', orders: 'build it', deadline: null, review: {completion: 'critic'}});
+  await waitFor(() => session.events.find(e => e.kind === 'task.milestone' && e.task === task && /another bounce is using it/.test(e.text)));
+  await scheduler.cancel(task);
+  await waitFor(() => scheduler.tasks()[task]?.state === 'cancelled');
+  const before = session.events.length;
+  for (const step of [310_000, 310_000, 3_600_000, 5_000, 5_000]) { now += step; await scheduler.tick(); }
+
+  assert.deepEqual(session.events.slice(before).filter(e => e.task === task).map(e => `${e.kind} ${e.reason ?? ''}`.trim()), []);
+});
+
 // Found by the integration run 2026-10-22 (concurrency): three analysts on one LM Studio slot queued 96 + 27 + 31 s while
 // claude and codex sat idle. A task that waits `queueSeconds` for a local slot falls to the next AI of its own chain.
 test('a task kept waiting for a local slot past queueSeconds falls to the cloud backend of its chain', async t => {

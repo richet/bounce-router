@@ -3,7 +3,8 @@
 // titles say the same thing and a frame is a function of the clock.
 export const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const FRAME_MS = 120;
-const WORKING = new Set(['running', 'working', 'starting']);
+// A review is a worker still working (found live: a local review ran for minutes beside a still ●).
+const WORKING = new Set(['running', 'working', 'starting', 'reviewing']);
 const FIXED = {queued: '◌', completed: '✓', accepted: '✓', failed: '✗', cancelled: '✗', timed_out: '✗', rejected: '✗', blocked: '!', input_required: '?'};
 
 export const isWorking = state => WORKING.has(state);
