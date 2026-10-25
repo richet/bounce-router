@@ -548,3 +548,32 @@ test('an unsure Jev hands over only work that changed files, or whose changes ar
   assert.equal(escalationReviewer({lean, reviewers: ['jev'], profiles: {jev: profiles.jev}, changes: [{}]}), null, 'no reviewer agent');
   assert.equal(escalationReviewer({lean, reviewers: ['reviewer'], profiles, changes: [{}]}), null, 'the review was already an agent\'s');
 });
+
+// 2026-10-25: in a live session Jev's first pass was unsure on every task, so every one went to the reviewer agent
+// anyway. With `/jev review off` the work goes straight to that agent, with no Jev call; a team with no reviewer
+// agent gets no automatic review, as before.
+test('Jev review off: changed work goes straight to the reviewer agent, without asking Jev', async t => {
+  const {session} = setup(t);
+  const worker = fakeAdapter(({cwd}) => { if (cwd) fs.writeFileSync(path.join(cwd, 'truncate.js'), 'export const truncate = s => s;\n'); return [{kind: 'result', status: 'completed', text: 'done'}]; });
+  const reviews = [];
+  const rev = fakeAdapter(({orders}) => { reviews.push(orders); return [{kind: 'result', status: 'completed', text: 'Verdict: PASS'}]; });
+  const reviewer = {adapter: 'rev', model: 'r', mode: 'yolo', fallback: [], role: 'reviewer', policy: 'read-only', derived: true, agent: {name: 'reviewer', description: 'Grades a change cold', policy: 'read-only', prompt: 'You are the reviewer.'}};
+  const fetchCalls = [];
+  const {profiles, typesafe, jev} = jevScheduler(session, {settings: {enabled: true, review: false}, profiles: {reviewer}, fetchCalls, respond: () => ({answers: answers('accept', 0.95)})});
+  const scheduler = createScheduler({session, adapters: {worker, typesafe, rev}, profiles, jev, gitHead: () => null});
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'write truncate', deadline: null});
+  await waitFor(() => session.events.some(e => e.kind === 'review.finished' && e.task === row.task && /:escalated$/.test(e.from)));
+  const escalated = session.events.find(e => e.kind === 'review.escalated' && e.task === row.task);
+  assert.equal(escalated.to, 'reviewer');
+  assert.equal(escalated.text, "Jev's first-pass review is off: the reviewer agent reviews it");
+  assert.equal(reviews.length, 1);
+  assert.doesNotMatch(reviews[0], /Jev leaned/);
+  assert.equal(fetchCalls.length, 0, 'Jev is never asked');
+});
+
+test('Jev review off and no reviewer agent: no automatic review, as before', async t => {
+  const {session} = setup(t);
+  const {profiles, typesafe, jev} = jevScheduler(session, {settings: {enabled: true, review: false}, respond: () => ({answers: answers('accept', 0.95)})});
+  const scheduler = createScheduler({session, adapters: {typesafe}, profiles, jev, gitHead: () => null});
+  assert.equal(scheduler.submit({parent: null, profile: 'A', orders: 'go', deadline: null}).review?.completion, undefined);
+});

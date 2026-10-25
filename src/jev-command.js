@@ -19,7 +19,7 @@ export const JEV_HELP = [
   '/jev key [KEY]       Store the TypeSafe API key (0600 file under ~/.bounce; TYPESAFE_API_KEY overrides it); no KEY opens a masked prompt',
   '/jev key clear       Remove the stored key',
   '/jev on | off        Enable or disable everything Jev does (off by default; on means verdicts and routing)',
-  '/jev review on|off   Completion verdicts: a fast accept/rework check on each root task without its own reviewer (default on)',
+  '/jev review on|off   Completion verdicts: a fast accept/rework check on each root task without its own reviewer (default on); off sends changed work straight to the reviewer agent',
   '/jev routing on|off  Model routing for tasks submitted with "profile":"auto" (default on)',
   '/jev routing default PROFILE|none   Where auto falls back when routing is off or unconfident',
   '/jev roster          What routing knows about each worker profile\'s model: its tier and capabilities, and who described it',

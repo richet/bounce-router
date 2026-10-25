@@ -708,7 +708,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (spec.inPlace !== undefined) return spec;
     let settings;
     try { settings = jev.settings(); } catch { return spec; }
-    if (!settings?.enabled || !settings.review) return spec;
+    if (!settings?.enabled) return spec;
+    // Review off keeps the slot when the team has a reviewer agent: changed work goes to that agent without a Jev
+    // call, and a report that changed nothing is not reviewed (handleCompleted, 2026-10-25).
+    if (!settings.review && !escalationReviewer({lean: REVIEW_OFF, reviewers: [jev.reviewer], profiles, changes: null})) return spec;
     return {...spec, review: {...(spec.review ?? {}), completion: jev.reviewer}};
   }
 
@@ -921,6 +924,15 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     append({kind: 'task.workspace', task, attempt, purpose: 'publish', cwd: workspace.cwd, metadata: path.join(workspace.cwd, '.attempt-workspace.json'), baselineHash: workspace.baselineHash});
     return workspace;
   }
+  // The files a task's artifact changed; null when unknown (no artifact, or it cannot be read).
+  function changesOf(task) {
+    try { return artifactFor(task)?.artifact?.changes ?? null; } catch { return null; }
+  }
+  // Jev's first-pass review is off and these reviewers are only Jev: nothing asks Jev (2026-10-25).
+  function jevReviewOff(reviewers) {
+    if (!reviewers?.length || !reviewers.every(name => profiles[name]?.adapter === 'typesafe')) return false;
+    try { const settings = jev?.settings(); return Boolean(settings?.enabled && !settings.review); } catch { return false; }
+  }
   function artifactFor(task) {
     const row = session.events.findLast(e => e.kind === 'task.artifact' && e.task === task);
     return row ? {row, artifact: JSON.parse(fs.readFileSync(row.file, 'utf8'))} : null;
@@ -1113,8 +1125,13 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const view = reducers.tasks(session.events);
     const hook = invokeHook(() => strategy.onCompleted(task, view, api), task, context);
     if (!hook.ok) return;
-    const intent = hook.intent;
+    let intent = hook.intent;
     if (intent === 'none') return;
+    // Only work known to have changed files goes to the reviewer agent; anything else (a read-only task has no
+    // artifact) is accepted, as an unsure Jev accepts a report that changed nothing. Unverified changes still
+    // take the review path, whose verdict strategy holds them for the orchestrator.
+    if (intent?.action === 'review' && jevReviewOff(intent.reviewers) && !api.unverifiedChanges(task)
+      && !(changesOf(task)?.length && escalationReviewer({lean: REVIEW_OFF, reviewers: intent.reviewers, profiles, changes: changesOf(task)}))) intent = {action: 'accept'};
     // A check that failed: the work goes back once, or is held for the orchestrator.
     if (intent && typeof intent === 'object' && (intent.action === 'rework' || intent.action === 'escalate')) {
       if (!['completed', 'reviewing'].includes(view[task]?.state)) return;
@@ -2019,7 +2036,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     }
 
     const candidate = candidateResult(session.events, task);
-    let verdicts = await runReviewers({task, stage: 'completion', round, reviewers, row, context, root, reserveFirst: true, note});
+    let verdicts = jevReviewOff(reviewers) ? [REVIEW_OFF] : await runReviewers({task, stage: 'completion', round, reviewers, row, context, root, reserveFirst: true, note});
     if (!verdicts) return;
     // Same guard as the prelaunch path: a review that finishes after the task left `reviewing`
     // for an unrelated reason journals its verdict but drives no accept/reject/rework (A3).
@@ -2030,14 +2047,13 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // reviews, told what Jev leaned, and its verdict decides. Found by the integration runs 2026-10-21/22: 4 of 5
     // Jev reviews were below the bar and the work was accepted unread.
     const lean = verdicts[0];
-    let changes = null;
-    try { changes = artifactFor(task)?.artifact?.changes ?? null; } catch {}
-    const agentReviewer = escalationReviewer({lean, reviewers, profiles, changes});
+    const agentReviewer = escalationReviewer({lean, reviewers, profiles, changes: changesOf(task)});
     if (agentReviewer) {
-      const leaned = `Jev leaned ${lean.choice} below its bar (confidence ${Number(lean.confidence ?? 0).toFixed(2)} of ${lean.threshold})`;
+      const off = lean.reason === REVIEW_OFF.reason;
+      const leaned = off ? "Jev's first-pass review is off" : `Jev leaned ${lean.choice} below its bar (confidence ${Number(lean.confidence ?? 0).toFixed(2)} of ${lean.threshold})`;
       append({kind: 'review.escalated', task, to: agentReviewer, from: 'bounce', text: `${leaned}: the ${profiles[agentReviewer].role ?? agentReviewer} agent reviews it`, context});
       const agentVerdicts = await runReviewers({task, stage: 'completion', round, reviewers: [agentReviewer], row, context, root, reserveFirst: false, slot: 'escalated',
-        note: [note, `${leaned}${lean.findings?.length ? `, flagging: ${lean.findings.join('; ')}` : ''}. Review the change yourself; that lean is not a verdict.`].filter(Boolean).join('\n\n')});
+        note: off ? note : [note, `${leaned}${lean.findings?.length ? `, flagging: ${lean.findings.join('; ')}` : ''}. Review the change yourself; that lean is not a verdict.`].filter(Boolean).join('\n\n')});
       if (!agentVerdicts || stale()) return;
       verdicts = agentVerdicts;
     }
@@ -2944,12 +2960,15 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   };
 }
 
+// The verdict Jev's slot gives when its first-pass review is off (src/adapters/typesafe-live.js `review_off`).
+const REVIEW_OFF = {verdict: 'unavailable', reason: 'review_off'};
+
 // Who reviews when Jev is unsure (a lean below its bar): the team's reviewer agent, for work that changed files (or
 // whose changes are not known). A report that changed nothing is not a reviewer's to grade (verification run
 // 2026-10-22: it graded the repository's known bug as the analyst's blocker), and a sure Jev, or a review that was
 // already an agent's, decides as before.
 export function escalationReviewer({lean, reviewers, profiles, changes}) {
-  const unsure = lean?.verdict === 'unavailable' && ['accept', 'rework'].includes(lean.choice) && Number.isFinite(Number(lean.threshold));
+  const unsure = lean?.verdict === 'unavailable' && (lean.reason === REVIEW_OFF.reason || ['accept', 'rework'].includes(lean.choice) && Number.isFinite(Number(lean.threshold)));
   if (!unsure || !reviewers.length || !reviewers.every(name => profiles[name]?.adapter === 'typesafe')) return null;
   if (Array.isArray(changes) && !changes.length) return null;
   const agent = profiles.reviewer;

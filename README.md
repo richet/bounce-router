@@ -343,7 +343,7 @@ Optional, off by default. [Jev](https://docs.typesafe.ai) is TypeSafe's decision
     /jev                  status: enabled?, key (last 4 chars), model, review/routing flags
     /jev key [KEY|clear]  store the key in ~/.bounce/secrets.json (0600); no KEY opens a masked prompt
     /jev on | off         enable or disable everything Jev does: verdicts and routing
-    /jev review on|off    completion verdicts (default on when enabled)
+    /jev review on|off    completion verdicts (default on when enabled); off sends changed work straight to the reviewer agent
     /jev routing on|off   model routing for "profile":"auto" (default on when enabled)
     /jev roster [refresh] what routing knows about each worker model (tier, capabilities, who described it); refresh describes them again
     /jev model ID         default jev-1.13.0 — pinned, because an alias like jev-latest moves between releases and shifts the calibrated thresholds
