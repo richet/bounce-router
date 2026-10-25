@@ -183,3 +183,32 @@ test('a worker compacts on request through its own session, and a retiring worke
   assert.equal(seen.at(-1).orders.includes('From the worker before you, who was retired: Handoff: state lives in src/x.js'), true);
   await assert.rejects(f.scheduler.compactWorker({worker: 'builder#1'}), /retired/);
 });
+
+// Found live (fb6036ee, 2026-10-25): the roster told the orchestrator builder@claude_sonnet#1 had 481k of context;
+// its transcript's largest call was 43k. Claude's result usage sums every call of the turn; the context is the last
+// call's size, which the adapter reports as `context.used`.
+test('a worker\'s last context is the size of its last call, not the turn\'s summed usage', async t => {
+  const {rosterLines} = await import('../src/workers.js');
+  const f = setup(t, {worker: args => { write(args.cwd, 'new'); return [{kind: 'usage', usage: {input: 30, cache_read: 480684, cache_write: 32654, output: 3727}, context: {used: 43394, window: 200000}}, {kind: 'result', status: 'completed', text: ownReport('state is now new')}]; }});
+  const first = f.submit();
+  assert.equal(await f.settled(first.task), 'accepted');
+  assert.equal(f.rows('task.usage', first.task)[0].contextUsed, 43394);
+  assert.match(rosterLines(f.session.events).join('\n'), /builder#1 · 1 task · idle \d+ min · last context 43k tokens$/);
+});
+
+// 2026-10-25: builder@claude_sonnet#2 was continued across 7 tasks and grew 34k → 224k, every call
+// re-reading the earlier tasks. Past the cap a new task starts a fresh worker; naming the worker still continues it.
+test('an idle worker past the context cap is not continued by itself; naming it still does', async t => {
+  const {rosterLines} = await import('../src/workers.js');
+  const f = setup(t, {worker: args => { write(args.cwd, 'new'); return [{kind: 'usage', usage: {input: 10}, context: {used: 160000, window: 200000}}, {kind: 'result', status: 'completed', text: ownReport('state is now new')}]; }});
+  const first = f.submit();
+  assert.equal(await f.settled(first.task), 'accepted');
+  assert.match(rosterLines(f.session.events).join('\n'), /builder#1 · .* · last context 160k tokens, over the 150k cap: a new task starts a fresh worker$/);
+  const second = f.submit({orders: 'a follow-up'});
+  assert.equal(await f.settled(second.task), 'accepted');
+  assert.deepEqual([f.adapters.worker.calls.launch, f.adapters.worker.calls.resume], [2, 0]);
+  assert.equal(f.rows('task.launch.requested', second.task)[0].worker, 'builder#2');
+  const third = f.submit({orders: 'on builder#1 anyway', worker: 'builder#1'});
+  assert.equal(await f.settled(third.task), 'accepted');
+  assert.equal(f.adapters.worker.calls.resume, 1);
+});

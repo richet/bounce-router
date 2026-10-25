@@ -804,6 +804,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (typeof adapters[profile.adapter]?.resume !== 'function') return {reason: `${profile.adapter} cannot resume a session`};
     return {native: {provider: nativeRow.provider, sessionId: nativeRow.sessionId}, worker: session.events.findLast(e => e.kind === 'task.launch.requested' && e.task === row.continues && e.worker)?.worker ?? null};
   };
+  // The size of the worker's context after its last call, as the adapter measured it: a turn's usage sums every
+  // call (session fb6036ee: 481k of usage for a 43k context). The row's own `context` is the session's id.
+  const contextUsedOf = event => (Number.isInteger(event.context?.used) ? {contextUsed: event.context.used} : {});
   // Standing workers: a task with no `continues` goes to its agent's idle
   // standing worker by itself; a named `worker` goes to that one if it is idle. A busy or retired one is not
   // continued — the task starts a fresh worker and the row says so — so parallel work stays parallel.
@@ -1214,7 +1217,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
           case 'milestone': append({kind: 'task.milestone', task, text: event.text, evidence: event.evidence, from, context}); break;
           case 'blocked': append({kind: 'task.blocked', task, reason: 'worker_blocked', text: event.text, from, context}); break;
           case 'diagnostic': append({kind: 'task.diagnostic', task, text: String(event.text ?? '').slice(0, 2000), ...(event.reason ? {reason: event.reason} : {}), ...(event.phase ? {phase: event.phase} : {}), ...(event.toolsDisabled ? {toolsDisabled: true} : {}), from, context}); break;
-          case 'usage': append({kind: 'task.usage', task, usage: event.usage, from, context}); break;
+          case 'usage': append({kind: 'task.usage', task, usage: event.usage, ...contextUsedOf(event), from, context}); break;
           case 'native': append({kind: 'peer.native', from, provider: event.provider, sessionId: event.sessionId, ...(event.cwd ? {cwd: event.cwd} : {}), context}); break;
           case 'jev': append({kind: `jev.${event.name}`, ...(event.data ?? {}), text: event.text, task, from, context}); break;
           case 'result':
@@ -1748,7 +1751,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         if (closed) return {verdict: 'unreadable', cancelled: true};
         switch (event.kind) {
           case 'milestone': append({kind: 'task.milestone', task, text: event.text, evidence: event.evidence, from: peer, context}); break;
-          case 'usage': append({kind: 'task.usage', task, usage: event.usage, from: peer, context}); break;
+          case 'usage': append({kind: 'task.usage', task, usage: event.usage, ...contextUsedOf(event), from: peer, context}); break;
           case 'raw': append({kind: 'raw', raw: event.raw ?? null, provider: profile.adapter, task, from: peer, context}); break;
           case 'model': append({kind: 'model', model: String(event.model), provider: profile.adapter, task, from: peer, context}); break;
           case 'native': append({kind: 'peer.native', from: peer, provider: event.provider, sessionId: event.sessionId, ...(event.cwd ? {cwd: event.cwd} : {}), context}); break;
