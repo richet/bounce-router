@@ -105,6 +105,13 @@ export function createWorkspaceProjection({activityLimit = 400, transcriptLimit 
       if (submitted) { addTask(submitted); task = tasks.get(event.task); }
     }
     if (!task) return true;
+    // A parked task messaged live is resumed by the message (the worker process is still there): its next row of
+    // work or milestone means it runs again. Without a delivery a later row stays a late copy, and the block stands.
+    const parked = task.state === 'blocked' || task.state === 'input_required';
+    if (parked && event.kind === 'task.delivered' && event.tier === 'live') task.resuming = true;
+    if (parked && task.resuming && ['task.activity', 'task.observed', 'task.milestone'].includes(event.kind)) {
+      task.state = 'running'; delete task.resuming; delete task.reason; delete task.blocked;
+    }
     if (event.kind === 'task.activity' || event.kind === 'task.observed') {
       if (event.text) {
         const text = String(event.text).slice(0, 16000);
@@ -130,7 +137,7 @@ export function createWorkspaceProjection({activityLimit = 400, transcriptLimit 
       task.model = event.requested ?? task.model;
       if (event.attempt != null) task.attempt = event.attempt;
     }
-    if (event.kind === 'task.blocked' || event.kind === 'task.input_required') task.reason = event.reason ?? null;
+    if (event.kind === 'task.blocked' || event.kind === 'task.input_required') { task.reason = event.reason ?? null; delete task.resuming; }
     if (event.kind === 'task.started') { delete task.reason; delete task.blocked; }
     if (event.kind === 'task.milestone' || event.kind === 'task.reported' || event.kind === 'task.blocked' || event.kind === 'task.input_required') {
       task.phase = event.phase ?? task.phase;
