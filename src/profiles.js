@@ -46,6 +46,8 @@ export function starterProfiles(settings = {}) {
     build_claude: {adapter: 'claude', model: 'opus[1m]', fallback: ['build', 'claude_fable']},
     claude_fable: {adapter: 'claude', model: 'claude-fable-5-1[1m]', fallback: ['build_claude', 'build']},
     // mid
+    codex_61_sol: {adapter: 'codex', model: 'gpt-6.1-sol', fallback: ['claude_sonnet', 'codex_6_sol']},
+    codex_6_sol: {adapter: 'codex', model: 'gpt-6-sol', fallback: ['claude_sonnet', 'codex_61_sol']},
     codex_sol: {adapter: 'codex', model: 'gpt-5.6-sol', fallback: ['claude_sonnet', 'codex_terra']},
     codex_terra: {adapter: 'codex', model: 'gpt-5.6-terra', fallback: ['claude_sonnet', 'codex_sol']},
     claude_sonnet: {adapter: 'claude', model: 'sonnet', fallback: ['codex_terra', 'codex_sol']},
@@ -53,6 +55,7 @@ export function starterProfiles(settings = {}) {
     muse_spark: {adapter: 'muse', model: 'muse-spark-1.3', fallback: ['muse_spark_12', 'codex_terra', 'claude_sonnet']},
     muse_spark_12: {adapter: 'muse', model: 'muse-spark-1.2', fallback: ['muse_spark', 'codex_terra']},
     // cheapest
+    codex_6_luna: {adapter: 'codex', model: 'gpt-6-luna', fallback: ['claude_haiku', 'codex_luna']},
     codex_luna: {adapter: 'codex', model: 'gpt-5.6-luna', fallback: ['claude_haiku']},
     claude_haiku: {adapter: 'claude', model: 'haiku', fallback: ['codex_luna']},
   };
@@ -203,6 +206,15 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
       }
       profiles[name] = base;
     });
+  }
+
+  // A cloud model an agent's list names that no roster profile runs joins the roster under its own name, so an
+  // `auto` agent can be given it (src/jev.js ownProfiles) and roster notes describe it. 2026-10-25: the shipped
+  // roster lags the vendors' pickers — a project named codex/gpt-6.1-sol, which no shipped profile ran.
+  for (const link of Object.values(profiles).filter(p => p.derived && !p.backend && p.model)) {
+    if (Object.values(profiles).some(p => !p.derived && p.adapter === link.adapter && p.model === link.model)) continue;
+    const name = `${link.adapter}_${link.model}`.replace(/[^A-Za-z0-9_.~-]/g, '_');
+    if (!profiles[name]) profiles[name] = {adapter: link.adapter, model: link.model, mode: settings.mode, policy: 'write', fallback: [], role: 'builder', executables: {...(settings.executables ?? {})}};
   }
 
   const orchestratorAdapter = profiles[orchestrator].adapter;

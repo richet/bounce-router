@@ -11,7 +11,7 @@ import {CAPABILITIES_MAX, effectiveNotes, undescribedModels, modelKey} from '../
 // and deliberately not shipped).
 const PICKER = {
   claude: ['default', 'opus[1m]', 'claude-fable-5-1[1m]', 'sonnet', 'haiku'],
-  codex: ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5'],
+  codex: ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5'],
   muse: ['muse-spark-1.3', 'muse-spark-1.3-contributor', 'muse-spark-1.2', 'muse-spark-1.2-contributor'],
 };
 

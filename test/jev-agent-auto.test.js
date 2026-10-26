@@ -209,3 +209,23 @@ test('an `auto` agent with no list after it is still offered the whole roster', 
   const offered = Object.keys(aiQuestions(view.profiles, {}, view.profiles.builder).profile.criteria);
   assert.equal(offered.includes('build_claude') && offered.includes('claude_sonnet'), true, offered.join(', '));
 });
+
+// 2026-10-25: the shipped roster lags the vendors' pickers. a project named codex/gpt-6.1-sol, which no shipped
+// profile ran, so its `auto` agents could never be given it. A cloud model a list names joins the roster under its own
+// name; the current codex models ship with notes.
+test('a cloud model an agent list names joins the roster, so its `auto` agent can be given it', () => {
+  const builder = `---\nname: builder\ndescription: Writes the change.\npolicy: write\nmodels: [auto, claude/sonnet, codex/gpt-9-nova]\n---\nYou are the builder.\n`;
+  const roles = new Map([['builder', {...agentMetadata(builder), source: 'user', file: '/x/builder.md'}]]);
+  const view = validateOrchestration({...settings, profiles: {main: {adapter: 'claude', model: 'opus'}}}, undefined, {roles});
+  assert.deepEqual([view.profiles['codex_gpt-9-nova']?.adapter, view.profiles['codex_gpt-9-nova']?.model, view.profiles['codex_gpt-9-nova']?.derived], ['codex', 'gpt-9-nova', undefined]);
+  assert.equal(Object.keys(view.profiles).filter(name => view.profiles[name].model === 'sonnet' && !view.profiles[name].derived).length, 1, 'a model the roster already runs is not added twice');
+  assert.deepEqual(Object.keys(aiQuestions(view.profiles, {}, view.profiles.builder).profile.criteria), ['claude_sonnet', 'codex_gpt-9-nova']);
+});
+
+test('the current codex models ship in the roster with their tiers', async () => {
+  const {starterProfiles} = await import('../src/profiles.js');
+  const {catalogNote} = await import('../src/model-catalog.js');
+  const shipped = Object.values(starterProfiles()).filter(p => p.adapter === 'codex').map(p => p.model);
+  for (const model of ['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna']) assert.equal(shipped.includes(model), true, model);
+  assert.deepEqual(['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'].map(model => catalogNote(`codex/${model}`)?.tier), ['mid', 'mid', 'cheapest']);
+});

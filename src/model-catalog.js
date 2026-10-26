@@ -52,6 +52,23 @@ const CODEX_LUNA = {
   capabilities: 'GPT-5.6 Luna: fast and affordable agentic coding model — good at locating files, symbols and call sites, extracting structured facts, small mechanical edits and quick checks; limited on long multi-step autonomy and ambiguous debugging, so risky for open-ended implementation or anything that needs independent judgment or review.',
 };
 
+// GPT-6.1 Sol, GPT-6 Sol and GPT-6 Luna: in the codex picker since the 5.6 models became "older" (2026-10-25); the
+// notes start from the vendor's own one-line descriptions there.
+const CODEX_61_SOL = {
+  tier: 'mid',
+  capabilities: 'GPT-6.1 Sol: OpenAI\'s latest workhorse for coding and everyday work (the vendor\'s description) — the default pick for routine implementation, refactors, test triage and research with dependable Codex tool use; for ambiguous cross-cutting debugging or security review prefer Astra.',
+};
+
+const CODEX_6_SOL = {
+  tier: 'mid',
+  capabilities: 'GPT-6 Sol: the previous-generation Codex workhorse (the vendor\'s description) — fine for routine implementation, test triage and research, a fallback when 6.1 Sol is limited; for ambiguous cross-cutting debugging or security review prefer Astra.',
+};
+
+const CODEX_6_LUNA = {
+  tier: 'cheapest',
+  capabilities: 'GPT-6 Luna: fast and affordable Codex model for easier tasks (the vendor\'s description) — locating files, symbols and call sites, extracting facts, small mechanical edits and quick checks; risky for open-ended implementation or anything that needs independent judgment.',
+};
+
 const CODEX_55 = {
   tier: 'mid',
   capabilities: 'GPT-5.5: proven previous-generation model for coding and general work — dependable on routine implementation, research and test triage with familiar Codex tool use; a safe fallback when the 5.6 models are limited, but behind Sol and Terra on agentic reliability and behind Astra on hard reasoning, so not the pick for ambiguous, cross-cutting or security-sensitive work.',
@@ -91,6 +108,9 @@ export const MODEL_CATALOG = Object.freeze({
   'claude/haiku': CLAUDE_HAIKU,
   // codex
   'codex/gpt-6-astra': CODEX_ASTRA,
+  'codex/gpt-6.1-sol': CODEX_61_SOL,
+  'codex/gpt-6-sol': CODEX_6_SOL,
+  'codex/gpt-6-luna': CODEX_6_LUNA,
   'codex/gpt-5.6-sol': CODEX_SOL,
   'codex/gpt-5.6-terra': CODEX_TERRA,
   'codex/gpt-5.6-luna': CODEX_LUNA,
