@@ -115,6 +115,30 @@ test('a blocker survives a later milestone and clears only when the task starts 
   assert.equal(pane.blocked, undefined);
 });
 
+// Found live (session eb37afa3, 2026-10-26): a builder reported blocked (its copy's db/init lost its modes), the
+// orchestrator's fix was delivered live 14 s later, and the worker went on for 11 minutes and four milestones, while
+// its pane still said "needs a decision". A live delivery to a parked task resumes it: its next row is work again.
+test('a blocked task that is messaged live runs again at its next row; without a delivery it stays blocked', () => {
+  const projection = createWorkspaceProjection();
+  projection.replay([
+    {kind: 'task.submitted', id: '1', seq: 1, task: 'build', profile: 'worker'},
+    {kind: 'task.started', id: '2', seq: 2, task: 'build', attempt: 1},
+    {kind: 'task.blocked', id: '3', seq: 3, task: 'build', reason: 'worker_blocked', text: 'db/init is mode 700'},
+    {kind: 'task.activity', id: '4', seq: 4, task: 'build', text: 'late row from before the block was read'},
+  ]);
+  const pane = () => projection.snapshot().panes.find(p => p.task === 'build');
+  assert.equal(pane().state, 'blocked', 'activity alone does not resume it');
+  projection.ingest({kind: 'task.delivered', id: '5', seq: 5, task: 'build', tier: 'live'});
+  assert.equal(pane().state, 'blocked', 'delivered, not yet acted on');
+  projection.ingest({kind: 'task.observed', id: '6', seq: 6, task: 'build', text: 'Running · chmod 755 db/init'});
+  assert.equal(pane().state, 'running');
+  assert.equal(pane().blocked, undefined);
+  assert.equal(pane().reason, undefined);
+  projection.ingest({kind: 'task.blocked', id: '7', seq: 7, task: 'build', reason: 'worker_blocked', text: 'still no db'});
+  projection.ingest({kind: 'task.milestone', id: '8', seq: 8, task: 'build', text: 'unrelated'});
+  assert.equal(pane().state, 'blocked', 'a second block needs its own delivery');
+});
+
 test('verified replacement keeps the logical pane identity and exposes recovery state', () => {
   const projection = createWorkspaceProjection();
   projection.replay([
