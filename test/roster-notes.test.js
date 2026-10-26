@@ -222,7 +222,7 @@ test('the shipped catalog beats the cache and the agent, and config beats the ca
   assert.deepEqual(notes.tiered, {model: 'codex/gpt-5.6-luna', tier: 'mid', capabilities: MODEL_CATALOG['codex/gpt-5.6-luna'].capabilities, source: 'catalog'}, 'the profile\'s own tier, the catalog\'s sentence');
   assert.deepEqual(notes.unknown, {model: 'codex/gpt-7-nova', tier: null, capabilities: null, source: null});
   assert.deepEqual(undescribedModels(profiles, stale).map(m => m.key), ['codex/gpt-7-nova'], 'only the model bounce does not know is pending');
-  assert.match(rosterLines(profiles)[0], /^build → codex\/gpt-6-astra · tier strongest · GPT-6 Astra: .* \(catalog\)$/);
+  assert.match(rosterLines(profiles)[0], /^build → codex\/gpt-6-astra · tier advisor · GPT-6 Astra: .* \(catalog\)$/);
   assert.match(routingQuestions(profiles, notes).profile.criteria.scout, /tier cheapest: .* · capabilities: Haiku 4\.5: /);
   // a roster of catalog models only never spends an agent turn
   const calls = [];

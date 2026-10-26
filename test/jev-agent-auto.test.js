@@ -70,7 +70,10 @@ test('the AI question leaves the job out of it: what each AI runs on and is good
   assert.equal(Object.hasOwn(decideRoute({...both, profile: {choice: 'build', confidence: 0.4}}, {...options, fallback: 'build'}), 'ai'), false, 'an unconfident AI answer leaves the job on its own chain');
 });
 
-function rig(t, {answer, enabled = true, codexScript = null}) {
+// Jev describes the task; the load picks between the tier's peers. Here codex's week resets first, so codex plays it.
+const DESCRIBED = {hardest: {noul: 0.2}, small_fix: {noul: 0.1}, long_context: {noul: 0.2}};
+const CODEX_FIRST = {codex: {windows: [{label: '7d', percent: 1, resetsAt: Date.now() + 86400000}]}, claude: {windows: [{label: '7d', percent: 14, resetsAt: Date.now() + 4 * 86400000}]}};
+function rig(t, {answer, enabled = true, codexScript = null, quotas = CODEX_FIRST}) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-agent-auto-')));
   t.after(() => fs.rmSync(root, {recursive: true, force: true}));
   const session = new Session(root, {root});
@@ -78,7 +81,7 @@ function rig(t, {answer, enabled = true, codexScript = null}) {
   const done = name => [{kind: 'result', status: 'completed', text: `done by ${name}`}];
   const worker = (name, script = () => done(name)) => { const inner = fakeAdapter(script); return {...inner, launch: async args => { launched.push([name, args.profile.model, args.profile.role, args.profile.policy, args.profile.agent?.name ?? null]); prompts.push(args.profile.agent?.prompt ?? null); return inner.launch(args); }}; };
   const jevSettings = {enabled, model: 'jev-1.13.0', review: false, routing: {enabled: true, default: null}, confidence: 0.8};
-  const jev = createJevDecisions({readSettings: () => jevSettings, adapter: {ask: async request => { asked.push(request); return {answers: answer, model: 'jev-1.13.0', latencyMs: 9}; }}});
+  const jev = createJevDecisions({readSettings: () => jevSettings, quotas: () => quotas, adapter: {ask: async request => { asked.push(request); return {answers: answer, model: 'jev-1.13.0', latencyMs: 9}; }}});
   const profiles = validateOrchestration(settings, undefined, {roles: rolesOf(NAMES_BUILD)}).profiles;
   const scheduler = createScheduler({session, adapters: {claude: worker('claude'), codex: worker('codex', codexScript ?? undefined)}, profiles, jev, gitHead: () => null});
   t.after(() => scheduler.close());
@@ -88,16 +91,31 @@ function rig(t, {answer, enabled = true, codexScript = null}) {
 const ORDERS = 'Review src/x.js for defects. Change nothing.';
 
 test('scheduler: a task for an `auto` agent runs the job on the AI Jev picks, and the journal says so', async t => {
-  const {session, scheduler, launched, asked, settled} = rig(t, {answer: {profile: {choice: 'build', confidence: 0.9, probabilities: {build: 0.9}}}});
+  const {session, scheduler, launched, asked, settled} = rig(t, {answer: DESCRIBED});
   const row = scheduler.submit({parent: null, profile: 'reviewer', orders: ORDERS, deadline: null});
   await settled(row.task);
   assert.deepEqual(launched, [['codex', 'gpt-6-astra', 'reviewer', 'read-only', 'reviewer']], 'the reviewer job, on the AI of profile build');
-  assert.deepEqual(Object.keys(asked[0].questions), ['tier', 'profile']);
+  assert.deepEqual(Object.keys(asked[0].questions), ['hardest', 'small_fix', 'long_context']);
   const routed = session.events.filter(e => e.kind === 'jev.routed');
   assert.equal(routed.length, 1);
-  assert.deepEqual([routed[0].chosen, routed[0].agent, routed[0].ai, routed[0].via, routed[0].fallback, routed[0].confidence], ['reviewer@build', 'reviewer', 'build', 'agent-auto', false, 0.9]);
-  assert.equal(routed[0].text, 'Routed reviewer → build (AI chosen by Jev, confidence 0.90)');
+  assert.deepEqual([routed[0].chosen, routed[0].agent, routed[0].ai, routed[0].via, routed[0].fallback, routed[0].tier], ['reviewer@build', 'reviewer', 'build', 'agent-auto', false, 'mid']);
+  assert.deepEqual(routed[0].description, {hardest: 0.2, small_fix: 0.1, long_context: 0.2});
+  assert.deepEqual(routed[0].candidates.map(c => [c.name, c.picked === true]), [['build', true], ['claude_sonnet', false]]);
+  assert.match(routed[0].text, /^Routed reviewer → build \(Jev: tier mid from hardest 0\.20, small fix 0\.10, long context 0\.20; its weekly window resets first \(/);
   assert.equal(scheduler.tasks()[row.task].profile, 'reviewer@build');
+});
+
+// 2026-10-26: the orchestrator may name the tier an `auto` agent's AI comes from; the row says who chose it.
+test('scheduler: a tier on the task wins over Jev\'s, the row says the orchestrator asked for it, and a bad tier is refused', async t => {
+  const {session, scheduler, launched, settled} = rig(t, {answer: {...DESCRIBED, hardest: {noul: 0.9}}});
+  assert.throws(() => scheduler.submit({parent: null, profile: 'reviewer', orders: ORDERS, deadline: null, tier: 'huge'}), /malformed: tier/);
+  const row = scheduler.submit({parent: null, profile: 'reviewer', orders: ORDERS, deadline: null, tier: 'mid'});
+  assert.equal(row.tier, 'mid');
+  await settled(row.task);
+  assert.deepEqual(launched, [['codex', 'gpt-6-astra', 'reviewer', 'read-only', 'reviewer']]);
+  const routed = session.events.find(e => e.kind === 'jev.routed');
+  assert.deepEqual([routed.tier, routed.tierBy, routed.description.hardest], ['mid', 'orchestrator', 0.9]);
+  assert.match(routed.text, /^Routed reviewer → build \(tier mid asked by the orchestrator; Jev: hardest 0\.90, small fix 0\.10, long context 0\.20; its weekly window resets first/);
 });
 
 test('scheduler: with Jev off the job runs on the chain after `auto` and nothing is journaled; in doubt it does too, with the reason', async t => {
@@ -108,17 +126,17 @@ test('scheduler: with Jev off the job runs on the chain after `auto` and nothing
   assert.equal(off.asked.length, 0);
   assert.equal(off.session.events.some(e => e.kind === 'jev.routed'), false, 'Jev off: the journal is what it was before');
 
-  const doubt = rig(t, {answer: {profile: {choice: 'build', confidence: 0.41}}});
+  const doubt = rig(t, {answer: {}});
   const second = doubt.scheduler.submit({parent: null, profile: 'reviewer', orders: ORDERS, deadline: null});
   await doubt.settled(second.task);
   assert.deepEqual(doubt.launched, [['claude', 'sonnet', 'reviewer', 'read-only', 'reviewer']]);
   const routed = doubt.session.events.find(e => e.kind === 'jev.routed');
-  assert.deepEqual([routed.chosen, routed.ai, routed.via, routed.fallback, routed.reason], ['reviewer', null, 'agent-auto', true, 'confidence 0.41 below 0.8']);
-  assert.equal(routed.text, 'Routed reviewer → its own models (fallback: confidence 0.41 below 0.8)');
+  assert.deepEqual([routed.chosen, routed.ai, routed.via, routed.fallback, routed.reason], ['reviewer', null, 'agent-auto', true, 'Jev gave no description']);
+  assert.equal(routed.text, 'Routed reviewer → its own models (fallback: Jev gave no description)');
 });
 
 test('scheduler: when Jev\'s AI fails recoverably the job falls to its own chain, and Jev is not asked a second time', async t => {
-  const {session, scheduler, launched, asked} = rig(t, {answer: {profile: {choice: 'build', confidence: 0.9}}, codexScript: () => [{kind: 'result', status: 'failed', recoverable: true, text: 'endpoint down'}]});
+  const {session, scheduler, launched, asked} = rig(t, {answer: DESCRIBED, codexScript: () => [{kind: 'result', status: 'failed', recoverable: true, text: 'endpoint down'}]});
   const row = scheduler.submit({parent: null, profile: 'reviewer', orders: ORDERS, deadline: null});
   const fallback = await waitFor(() => session.events.find(e => e.kind === 'policy.fallback'));
   assert.deepEqual([fallback.task, fallback.from_profile, fallback.to_profile, fallback.reason], [row.task, 'reviewer@build', 'reviewer', 'worker_runtime']);
@@ -161,7 +179,7 @@ test('scheduler: a job on Jev\'s AI survives a daemon restart and follows the ag
   // its way back to the job's own chain, and the next task is composed from the new file.
   const gate = Promise.withResolvers();
   let turn = 0;
-  const live = rig(t, {answer: {profile: {choice: 'build', confidence: 0.9}}, codexScript: async () => (turn++ === 0 ? (await gate.promise, [{kind: 'result', status: 'failed', recoverable: true, text: 'endpoint down'}]) : [{kind: 'result', status: 'completed', text: 'done'}])});
+  const live = rig(t, {answer: DESCRIBED, codexScript: async () => (turn++ === 0 ? (await gate.promise, [{kind: 'result', status: 'failed', recoverable: true, text: 'endpoint down'}]) : [{kind: 'result', status: 'completed', text: 'done'}])});
   const running = live.scheduler.submit({parent: null, profile: 'reviewer', orders: ORDERS, deadline: null});
   await waitFor(() => live.launched.length === 1);
   const head = live.profiles.reviewer;
@@ -227,5 +245,5 @@ test('the current codex models ship in the roster with their tiers', async () =>
   const {catalogNote} = await import('../src/model-catalog.js');
   const shipped = Object.values(starterProfiles()).filter(p => p.adapter === 'codex').map(p => p.model);
   for (const model of ['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna']) assert.equal(shipped.includes(model), true, model);
-  assert.deepEqual(['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'].map(model => catalogNote(`codex/${model}`)?.tier), ['mid', 'mid', 'cheapest']);
+  assert.deepEqual(['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'].map(model => catalogNote(`codex/${model}`)?.tier), ['strongest', 'strongest', 'cheapest']);
 });

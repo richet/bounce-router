@@ -189,7 +189,7 @@ export function choosingOrders({agents = false, routingOn = false, localOn = fal
     ...(routingOn ? [`    ${agents ? '2' : '1'}. \`auto\` when no agent is clearly the job: Jev routes it.`] : []),
     `    ${[agents, routingOn].filter(Boolean).length + 1}. A worker profile by name ONLY when the user asks for that specific AI (add \`userAsked: true\` to the task), or for a retry (\`retryOf\`); bounce refuses a first attempt that names a profile otherwise.`,
     'After a failed attempt, you may name the next profile for the retry yourself and say why; first attempts still follow the ordering above. Retry first on the agent\'s own next AI: submit the name after the arrow in its chain above (builder~2, then builder~3) with retryOf; it is the lightest AI that has not tried the task. Name a cloud AI yourself only when the cause needs a stronger tier: a mid-tier model (e.g. Sonnet) for routine implementation a local worker could not finish; the top tier (e.g. Opus) only for hard design, cross-module debugging, or work a mid-tier attempt already failed.',
-    routingOn ? 'Do not pick a tier or a model yourself: for an agent or `auto`, Jev weighs the orders and picks the AI per task.'
+    routingOn ? 'Do not pick a model yourself: for an agent or `auto`, Jev weighs the orders and bounce picks the AI per task by load. You may set its tier when you know more than the orders say: `tier: "strongest"` when the work failed before, is security-sensitive or crosses modules, `"cheapest"` for a mechanical fix, `"advisor"` (Fable, Astra) only for the very hardest work. bounce still picks which AI of that tier.'
       : 'An agent runs on the AIs in the order its file lists them; naming a profile skips that list.',
     'Every task.submitted declares requires: ["read"], ["read", "exec"], or ["read", "exec", "write"] to match its deliverables; running a command needs exec even with no edits. Never ask a read-only analyst to run git, checks, lint or tests.',
     'A live container check (starting Docker, inspecting or running one) needs requires including "docker", and only a worker that may write gets it: a read-only or probing analyst never reaches Docker, because a container can write the checkout. Send live container checks to a builder.',
@@ -507,7 +507,8 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
     if (pending) await Promise.race([pending, new Promise(resolve => setTimeout(resolve, ROSTER_WAIT_MS).unref?.())]);
     return rosterSetup.notes();
   };
-  const jev = orchestrating ? createJevDecisions({root, adapter: adapters.typesafe, notes: rosterNotes, order: () => settings.order ?? [], locals: localAIs}) : null;
+  // `quotas` is the store kept current further down; it is read only at dispatch, after it exists.
+  const jev = orchestrating ? createJevDecisions({root, adapter: adapters.typesafe, notes: rosterNotes, order: () => settings.order ?? [], locals: localAIs, quotas: () => quotas ?? {}}) : null;
 
   // Phase 8: the strategy seam, same shape as `adapters`/`profiles` above — a test (or, later, a
   // config-driven caller) may inject a strategy object directly; absent, the declarative

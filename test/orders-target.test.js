@@ -29,7 +29,8 @@ test('the orders say who to submit to: the job first, auto next, a named AI only
     '1. An agent, by the job the task is',
     '2. `auto` when no agent is clearly the job',
     '3. A worker profile by name ONLY when the user asks for that specific AI',
-    'Do not pick a tier or a model yourself',
+    'Do not pick a model yourself',
+    'You may set its tier when you know more than the orders say',
     'Local models are part of the normal path',
     'do not wait for the user to ask for them'])
     assert.equal(text.includes(part), true, part);
@@ -37,7 +38,7 @@ test('the orders say who to submit to: the job first, auto next, a named AI only
 
   const noJev = choosingOrders({agents: true, routingOn: false, localOn: true}).join('\n');
   assert.equal(noJev.includes('`auto`'), false, 'auto is not offered while routing is off');
-  assert.equal(noJev.includes('Do not pick a tier'), false);
+  assert.equal(noJev.includes('Do not pick a model'), false);
   assert.equal(noJev.includes('in the order its file lists them'), true);
   const cloudOnly = choosingOrders({agents: true, routingOn: true, localOn: false}).join('\n');
   assert.equal(cloudOnly.includes('Local models'), false);

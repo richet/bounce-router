@@ -14,13 +14,14 @@ import {createHash} from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import {dataRoot, saveJSON} from './core.js';
+import {catalogNote} from './model-catalog.js';
 
 export const JEV_DEFAULT_MODEL = 'jev-1.13.0'; // pinned: an alias (`jev-latest`) moves between releases and shifts calibrated thresholds
 export const JEV_REVIEWER = 'jev'; // the synthetic read-only critic profile the daemon registers
 export const JEV_KEY_ENV = 'TYPESAFE_API_KEY';
 export const JEV_ENDPOINT = 'https://api.typesafe.ai/v1/systemone';
 export const JEV_TIMEOUT_MS = 10_000;
-export const PROFILE_TIERS = ['cheapest', 'mid', 'strongest'];
+export const PROFILE_TIERS = ['cheapest', 'mid', 'strongest', 'advisor'];
 // A tier is a three-way question Jev answers well (measured live: right 5/5 at 0.60–1.00), so it
 // decides at a lower bar than a choice between named profiles, which never reached 0.8.
 export const JEV_TIER_CONFIDENCE = 0.6;
@@ -449,7 +450,7 @@ export function routingFallback(profiles = {}, preferred = null) {
 
 // Review is mid unless the change is security-sensitive or cross-cutting (integration runs 2026-10-22: every confident
 // review went to opus[1m], the dearest profile, for a 20-line change).
-export const TIER_HINT = {cheapest: 'cheapest: locating files, symbols and call sites; extracting structured facts', mid: 'mid: research, routine implementation, test triage, reviewing a scoped change', strongest: 'strongest: reviewing a security-sensitive or cross-cutting change, ambiguous or cross-cutting debugging, security-sensitive work'};
+export const TIER_HINT = {cheapest: 'cheapest: locating files, symbols and call sites; extracting structured facts', mid: 'mid: research, routine implementation, test triage, reviewing a scoped change', strongest: 'strongest: reviewing a security-sensitive or cross-cutting change, ambiguous or cross-cutting debugging, security-sensitive work', advisor: 'advisor: the hardest work, used sparingly: a subtle defect no one has located, a design decision with no clear answer'};
 
 // One criterion per routable profile: what it runs on, what it may do, and — from the profile's
 // own `tier`/`capabilities` or the roster notes bounce wrote for its model (src/roster-notes.js)
@@ -476,7 +477,8 @@ const profileCriteria = (profiles, notes, {job = false} = {}) => Object.fromEntr
 // `tier`, else the roster notes'), and is left out entirely for a roster nobody tiered.
 const tierOf = (name, profile, notes) => profile.tier ?? notes?.[name]?.tier;
 const tierQuestion = (profiles, notes, locals = []) => {
-  const present = PROFILE_TIERS.filter(tier => locals.some(item => item.tier === tier) || Object.entries(profiles).some(entry => routable(entry) && tierOf(entry[0], entry[1], notes) === tier));
+  // An advisor is never a routing answer: it is offered only by a list that names it, for the work no other tier fits.
+  const present = PROFILE_TIERS.filter(tier => tier !== 'advisor').filter(tier => locals.some(item => item.tier === tier) || Object.entries(profiles).some(entry => routable(entry) && tierOf(entry[0], entry[1], notes) === tier));
   return present.length ? {tier: {
     type: 'choice',
     instructions: {question: 'Which tier of AI do these orders need?', guidance: 'Pick the cheapest tier whose contract fits the orders.'},
@@ -636,23 +638,93 @@ export function decideAI(answers, {profiles = {}, confidence = 0.8, notes = {}, 
   return {ai: reason ? null : chosen, ...(!reason && localChoice ? {local: {endpoint: localChoice.endpoint, model: localChoice.model}} : {}), reason, confidence: conf, probabilities: isObject(answer.probabilities) ? answer.probabilities : {}};
 }
 
-// The AI for one task submitted to an `auto` agent. Never throws. `asked: false` means Jev was not
-// consulted at all (off, or nothing to choose between), so the scheduler journals nothing.
-export async function routeAgentAI({orders, profiles, head, settings, ask, notes = {}, order = [], locals = [], signal} = {}) {
+// ---- the AI for an `auto` agent: Jev describes the task, the load picks between peers ----------------
+
+// Found live 2026-10-26: asked for a tier, Jev said `mid` at 0.90–1.00 for 37 tasks and the provider order then
+// gave every one to claude/sonnet, while codex sat at 1% of its week and the local qwen was idle; asked by name it
+// leaned 0.16–0.38 and flipped between identical asks — peers across vendors are not a question it can answer. These
+// three are: over 30 hand-labelled real tasks they moved by at most 0.10 between asks, and the rule below agreed
+// with 26 of the 30 labels. Each is one condition, said directly; none depends on the list, so the memo keeps them.
+export const AI_DESCRIPTION_QUESTIONS = {
+  hardest: {type: 'noul', instructions: 'These orders are among the hardest software work there is: a subtle defect no one has located, a design decision with no clear answer, or a change whose correctness cannot be checked by running tests.'},
+  small_fix: {type: 'noul', instructions: 'The work these orders ask for is a small, bounded change: a move or rename, a configuration value, or one or two findings from a review.'},
+  long_context: {type: 'noul', instructions: 'Doing these orders requires reading more than about 100,000 tokens of code or documents at once.'},
+};
+export const JEV_HARDEST = 0.7, JEV_SMALL_FIX = 0.6, JEV_LONG_CONTEXT = 0.5;
+
+// Pure: {tier, longContext, description} from the answers, null when Jev gave none. Never `advisor`: an advisor
+// (Fable, Astra) is for the work a person sends it, not a tier a description reaches.
+export function tierFromDescription(answers) {
+  const value = name => { const n = Number(answers?.[name]?.noul); return Number.isFinite(n) ? n : null; };
+  const description = Object.fromEntries(Object.keys(AI_DESCRIPTION_QUESTIONS).map(name => [name, value(name)]));
+  if (Object.values(description).every(n => n === null)) return null;
+  const tier = (description.hardest ?? 0) >= JEV_HARDEST ? 'strongest' : (description.small_fix ?? 0) >= JEV_SMALL_FIX ? 'cheapest' : 'mid';
+  return {tier, longContext: (description.long_context ?? 0) >= JEV_LONG_CONTEXT, description};
+}
+
+// The tier asked for first, then up, then down; up stops below advisor.
+const TIER_WALK = {cheapest: ['cheapest', 'mid', 'strongest'], mid: ['mid', 'strongest', 'cheapest'], strongest: ['strongest', 'mid', 'cheapest'], advisor: ['advisor', 'strongest', 'mid', 'cheapest']};
+const resetOf = (entry, label, now) => entry?.windows?.find(w => w.label === label && Number.isFinite(w.resetsAt) && w.resetsAt > now)?.resetsAt ?? Infinity;
+
+// Pure. Which AI of the agent's own list plays the task, among those of `tier` (or the nearest tier the list has).
+// 2026-10-26: between peers the subscriptions decide — the vendor whose weekly window resets first, then its
+// 5-hour one; a vendor with a window spent or in cooldown is out, one with no reading goes last. A local peer has no
+// window and costs nothing, so it goes first while its slot is free, loaded, and big enough for the orders.
+// Ties keep the list's order. Every candidate comes back with why it lost.
+export function pickAI({profiles = {}, head = null, notes = {}, locals = [], tier = 'mid', longContext = false, quotas = {}, cooldowns = {}, localFree = () => true, now = Date.now()} = {}) {
+  const chain = chainOf(profiles, head);
+  const at = match => { const index = chain.findIndex(match); return index === -1 ? chain.length : index; };
+  const cloud = Object.entries(ownProfiles(profiles, head)).filter(routable).map(([name, p]) => ({name, adapter: p.adapter,
+    tier: p.tier ?? notes[name]?.tier ?? catalogNote(`${p.adapter}/${p.model ?? 'default'}`)?.tier ?? 'mid',
+    index: at(link => !link.backend && link.adapter === p.adapter && link.model === p.model)}));
+  const local = offerable(locals, profiles, head).map(item => ({name: item.name, item, tier: item.tier, index: at(link => link.backend && `${link.endpoint}/${link.model}` === item.name)}));
+  const candidates = [];
+  for (const wanted of TIER_WALK[tier] ?? TIER_WALK.mid) {
+    const locals = local.filter(c => c.tier === wanted).sort((a, b) => a.index - b.index).map(c => ({...c,
+      reason: !c.item.loaded ? 'not loaded' : !localFree(c.item.endpoint, c.item.model) ? 'its slot is taken'
+        : longContext && Number(c.item.context ?? 0) < 200_000 ? 'the orders need a longer context than it has' : null}));
+    const clouds = cloud.filter(c => c.tier === wanted).map(c => {
+      const entry = quotas[c.adapter];
+      const spent = entry?.windows?.find(w => Number(w.percent) >= 100 && !(Number.isFinite(w.resetsAt) && w.resetsAt <= now));
+      return {...c, weekly: resetOf(entry, '7d', now), hours: resetOf(entry, '5h', now),
+        reason: cooldowns[c.adapter] > now ? `${c.adapter} is in cooldown` : spent ? `${c.adapter} ${spent.label} at 100%` : null};
+    }).sort((a, b) => a.weekly - b.weekly || a.hours - b.hours || a.index - b.index);
+    for (const c of [...locals, ...clouds]) candidates.push(c);
+    const first = [...locals, ...clouds].find(c => !c.reason);
+    if (first) {
+      const why = first.item ? 'a free local model' : Number.isFinite(first.weekly) ? `its weekly window resets first (${new Date(first.weekly).toISOString().slice(0, 16)}Z)` : Number.isFinite(first.hours) ? 'its 5-hour window resets first' : 'first in the list';
+      return {ai: first.name, ...(first.item ? {local: {endpoint: first.item.endpoint, model: first.item.model}} : {}), tier: wanted, why,
+        candidates: candidates.map(c => ({name: c.name, tier: c.tier, ...(c === first ? {picked: true} : c.reason ? {reason: c.reason} : {reason: `after ${first.name}`})}))};
+    }
+  }
+  return {ai: null, tier, why: null, candidates: candidates.map(c => ({name: c.name, tier: c.tier, reason: c.reason ?? 'not picked'}))};
+}
+
+// The AI for one task submitted to an `auto` agent. Never throws. `asked: false` means Jev was not consulted at all
+// (off, or nothing to choose between), so the scheduler journals nothing. `load()` is read after Jev answers, at
+// dispatch: {quotas, cooldowns, localFree(endpoint, model), now}; none of it reaches Jev or the memo.
+// `tier` is the orchestrator's, when it knows more than the orders say (2026-10-26; calibration: Jev found
+// strongest work 1 time in 4). It wins over Jev's and names a tier only: the load still picks the AI. Jev is asked
+// anyway, for long_context and the record, and its failure no longer stops the pick.
+export async function routeAgentAI({orders, profiles, head, settings, ask, notes = {}, locals = [], load = () => ({}), tier: asked = null, signal} = {}) {
   const s = normalizeJevSettings(settings);
   if (!s.enabled || !s.routing.enabled || typeof ask !== 'function') return {ai: null, asked: false};
   let known = {};
   try { known = (typeof notes === 'function' ? await notes() : notes) ?? {}; } catch { known = {}; }
   let here = [];
   try { here = (typeof locals === 'function' ? await locals() : locals) ?? []; } catch { here = []; }
-  const questions = aiQuestions(profiles, known, head, here);
-  if (!Object.keys(questions.profile.criteria).length) return {ai: null, asked: false};
-  try {
-    const result = await ask({state: {orders: String(orders ?? '').slice(0, 24_000)}, questions, model: s.model, signal});
-    return {...decideAI(result.answers, {profiles, confidence: s.confidence, notes: known, order, locals: here, head}), asked: true, model: result.model, latencyMs: result.latencyMs};
-  } catch (error) {
-    return {ai: null, asked: true, reason: error?.code ?? error?.message ?? 'error', confidence: 0, probabilities: {}, model: null};
-  }
+  if (!Object.entries(ownProfiles(profiles, head)).some(routable) && !offerable(here, profiles, head).length) return {ai: null, asked: false};
+  const given = PROFILE_TIERS.includes(asked) ? asked : null;
+  let result = null, failure = null;
+  try { result = await ask({state: {orders: String(orders ?? '').slice(0, 24_000)}, questions: AI_DESCRIPTION_QUESTIONS, model: s.model, signal}); }
+  catch (error) { failure = error?.code ?? error?.message ?? 'error'; }
+  const described = result ? tierFromDescription(result.answers) : null;
+  if (!described && !given) return {ai: null, asked: true, reason: failure ?? 'Jev gave no description', confidence: 0, probabilities: {}, model: result?.model ?? null};
+  let state = {};
+  try { state = (await load()) ?? {}; } catch { state = {}; }
+  const picked = pickAI({profiles, head, notes: known, locals: here, tier: given ?? described.tier, longContext: described?.longContext ?? false, ...state});
+  return {...picked, tierBy: given ? 'orchestrator' : 'jev', ...(given ? {tierAsked: given} : {}), reason: picked.ai ? null : 'no AI of its list is free', description: described?.description ?? null,
+    asked: true, model: result?.model ?? null, latencyMs: result?.latencyMs ?? null, confidence: null, probabilities: {}};
 }
 
 // The whole routing decision for one submitted task. Never throws: any Jev failure is a
@@ -778,12 +850,14 @@ export function jevReviewerProfile(settings = {}) {
 // bound to the typesafe adapter's client. `notes` (a function, may be async) supplies the
 // roster's {tier, capabilities} per profile at route time — the roster setup of
 // src/roster-notes.js in the daemon; absent, routing sees adapter/model/role/policy only.
-export function createJevDecisions({root = dataRoot(), adapter, readSettings = () => readJevSettings(root), notes = null, order = () => [], locals = null} = {}) {
+// `quotas()` is the daemon's quota store (src/quota.js): what `auto` agents' AIs are picked by, never sent to Jev.
+export function createJevDecisions({root = dataRoot(), adapter, readSettings = () => readJevSettings(root), notes = null, order = () => [], locals = null, quotas = null} = {}) {
   return {
     reviewer: JEV_REVIEWER,
     settings: readSettings,
     lease: request => judgeLease({...request, settings: readSettings(), ask: adapter?.ask}),
-    routeAI: ({orders, profiles, head, signal}) => routeAgentAI({orders, profiles, head, order: order(), ...(locals ? {locals} : {}), settings: readSettings(), ask: adapter?.ask, ...(notes ? {notes} : {}), signal}),
+    routeAI: ({orders, profiles, head, tier = null, load: live = () => ({}), signal}) => routeAgentAI({orders, profiles, head, tier, ...(locals ? {locals} : {}), settings: readSettings(), ask: adapter?.ask, ...(notes ? {notes} : {}), signal,
+      load: async () => ({quotas: quotas?.() ?? {}, ...(await live())})}),
     route: ({orders, profiles, signal}) => routeTask({orders, profiles, order: order(), ...(locals ? {locals} : {}), settings: readSettings(), ask: adapter?.ask, ...(notes ? {notes} : {}), signal}),
     inPlace: ({citedText, messages, orders, signal}) => judgeInPlace({citedText, messages, orders, settings: readSettings(), ask: adapter?.ask, signal}),
   };

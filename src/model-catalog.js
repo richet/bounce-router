@@ -8,8 +8,11 @@
 // Ranking within a vendor follows the vendor's own catalog descriptions; the sentences say what
 // each model is safe for and what it is wasteful or risky for, in the vocabulary of TIER_HINT
 // (cheapest: locating and extracting; mid: research and routine implementation; strongest:
-// review, ambiguous or cross-cutting debugging, security-sensitive work). Local (LM Studio)
-// models are dynamic and deliberately absent: /local setup describes them.
+// review, ambiguous or cross-cutting debugging, security-sensitive work; advisor: the hardest work, sparingly).
+// A tier goes by the model's name, not its version, so peers across vendors share one (2026-10-26: luna and
+// haiku, terra and sonnet, sol and opus, astra and fable; public coding scores agree: Opus 5 70.8 vs GPT-6.1 Sol 71.1,
+// Sonnet 5 63.2 vs GPT-5.6 Terra 63.4 on SWE-bench Pro). Local (LM Studio) models are dynamic and absent here
+// except for the families named in LOCAL_TIERS; /local setup describes them.
 export const CATALOG_SOURCE = 'catalog';
 
 const CLAUDE_OPUS = {
@@ -18,7 +21,7 @@ const CLAUDE_OPUS = {
 };
 
 const CLAUDE_FABLE = {
-  tier: 'strongest',
+  tier: 'advisor',
   capabilities: 'Fable 5.1 with a 1M-token context: Anthropic\'s most capable model, built for the hardest and longest-running tasks — deep multi-step refactors, subtle cross-cutting bugs, architecture-level decisions and final independent review; the slowest and priciest choice, so reserve it for work Opus 5 struggles with and never spend it on lookups, extraction or routine edits.',
 };
 
@@ -33,13 +36,13 @@ const CLAUDE_HAIKU = {
 };
 
 const CODEX_ASTRA = {
-  tier: 'strongest',
+  tier: 'advisor',
   capabilities: 'GPT-6 Astra: OpenAI\'s most capable model for complex, demanding work — strong multi-step reasoning, solid Codex CLI tool use, good at ambiguous cross-cutting debugging, hard implementation and independent review; the slowest and most expensive Codex option, so wasteful for file lookups, fact extraction or routine edits a mid-tier model handles.',
 };
 
 const CODEX_SOL = {
-  tier: 'mid',
-  capabilities: 'GPT-5.6 Sol: OpenAI\'s reliable agentic workhorse for everyday tasks — steady on multi-step implementation, test triage and research with dependable tool use, the more thorough of the two mid-tier 5.6 models; safe for routine features and bug fixes with clear acceptance criteria; for ambiguous cross-cutting debugging or security review prefer Astra.',
+  tier: 'strongest',
+  capabilities: 'GPT-5.6 Sol: OpenAI\'s reliable agentic workhorse for everyday tasks — steady on multi-step implementation, test triage and research with dependable tool use, the more thorough of the 5.6 models and a peer of Opus; safe for routine features and bug fixes with clear acceptance criteria; for ambiguous cross-cutting debugging or security review prefer Astra.',
 };
 
 const CODEX_TERRA = {
@@ -55,12 +58,12 @@ const CODEX_LUNA = {
 // GPT-6.1 Sol, GPT-6 Sol and GPT-6 Luna: in the codex picker since the 5.6 models became "older" (2026-10-25); the
 // notes start from the vendor's own one-line descriptions there.
 const CODEX_61_SOL = {
-  tier: 'mid',
-  capabilities: 'GPT-6.1 Sol: OpenAI\'s latest workhorse for coding and everyday work (the vendor\'s description) — the default pick for routine implementation, refactors, test triage and research with dependable Codex tool use; for ambiguous cross-cutting debugging or security review prefer Astra.',
+  tier: 'strongest',
+  capabilities: 'GPT-6.1 Sol: OpenAI\'s latest workhorse for coding and everyday work (the vendor\'s description) — a peer of Opus for implementation, refactors, test triage and research with dependable Codex tool use; for ambiguous cross-cutting debugging or security review prefer Astra.',
 };
 
 const CODEX_6_SOL = {
-  tier: 'mid',
+  tier: 'strongest',
   capabilities: 'GPT-6 Sol: the previous-generation Codex workhorse (the vendor\'s description) — fine for routine implementation, test triage and research, a fallback when 6.1 Sol is limited; for ambiguous cross-cutting debugging or security review prefer Astra.',
 };
 
@@ -124,3 +127,8 @@ export const MODEL_CATALOG = Object.freeze({
 
 // The shipped note for a model key (`adapter/model`), or null when bounce does not know it.
 export const catalogNote = key => MODEL_CATALOG[key] ?? null;
+
+// Local model families whose tier is known by name; any other local model is `cheapest` until pinned with
+// `/jev roster set`. qwen3.8 is a peer of sonnet and terra (2026-10-26; Qwen3.8-27B 61.7 on SWE-bench Pro).
+const LOCAL_TIERS = [[/qwen3\.8/i, 'mid']];
+export const localTier = model => LOCAL_TIERS.find(([pattern]) => pattern.test(String(model ?? '')))?.[1] ?? 'cheapest';

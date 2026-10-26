@@ -24,7 +24,7 @@ export const JEV_HELP = [
   '/jev routing default PROFILE|none   Where auto falls back when routing is off or unconfident',
   '/jev roster          What routing knows about each worker profile\'s model: its tier and capabilities, and who described it',
   '/jev roster refresh  Describe the roster\'s models again (one read-only turn of a cloud agent from the roster; cached per model)',
-  '/jev roster set MODEL TIER   Pin a model\'s tier (cheapest, mid or strongest) by hand, e.g. a local model whose tier was guessed from its name',
+  '/jev roster set MODEL TIER   Pin a model\'s tier (cheapest, mid, strongest or advisor) by hand, e.g. a local model whose tier was guessed from its name',
   `/jev model ID        Pin the Jev version (default ${JEV_DEFAULT_MODEL}); avoid jev-latest — an alias moves between releases and shifts the calibrated confidence thresholds`,
   '/jev confidence N    Threshold (0–1, default 0.8) below which a verdict or route falls back to today\'s behaviour',
   '/jev test            One live noul call ("Is this a test?") — prints latency and the answer, or the error',
@@ -122,7 +122,7 @@ export async function jevCommand(parts = [], {root = dataRoot(), cwd = process.c
       // A tier a cloud agent guessed from a model's name can be wrong (integration run 2026-10-21): pin it by hand.
       if (rest[0] === 'set') {
         const [, key, tier] = rest;
-        if (!key || !PROFILE_TIERS.includes(tier)) throw new Error('Use /jev roster set MODEL cheapest|mid|strongest');
+        if (!key || !PROFILE_TIERS.includes(tier)) throw new Error('Use /jev roster set MODEL cheapest|mid|strongest|advisor');
         const notes = readRosterNotes(root);
         writeRosterNotes({...notes, [key]: {tier, capabilities: notes[key]?.capabilities ?? '', by: 'you'}}, root);
         return {text: `${key} → tier ${tier} · pinned by you; /jev roster refresh keeps it`, changed: false};

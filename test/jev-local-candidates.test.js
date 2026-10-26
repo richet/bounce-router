@@ -91,7 +91,7 @@ test('scheduler: Jev\'s local pick runs the job through opencode on that model, 
   const launched = [];
   const worker = (name, script) => { const inner = fakeAdapter(script); return {...inner, launch: async args => { launched.push([name, args.profile.model, args.profile.role, args.profile.policy]); return inner.launch(args); }}; };
   const jev = createJevDecisions({readSettings: () => ({enabled: true, routing: true}), order: () => ['claude'], locals: async () => locals,
-    adapter: {ask: async () => ({answers: tier('strongest', 0.9), model: 'jev-1.13.0', latencyMs: 4})}});
+    adapter: {ask: async () => ({answers: {hardest: {noul: 0.9}, small_fix: {noul: 0.1}, long_context: {noul: 0.1}}, model: 'jev-1.13.0', latencyMs: 4})}});
   const localResolver = {resolve: async ({profile}) => ({...profile, providerID: 'lmstudio', opencodeConfig: {}}), configure() {}};
   const scheduler = createScheduler({...hostless, session, profiles: table(), jev, localResolver, gitHead: () => null, adapters: {
     opencode: worker('opencode', () => [{kind: 'result', status: 'failed', recoverable: true, text: 'endpoint down'}]),
@@ -105,7 +105,7 @@ test('scheduler: Jev\'s local pick runs the job through opencode on that model, 
   assert.deepEqual(launched, [['opencode', 'dense-27b', 'reviewer', 'read-only'], ['claude', 'sonnet', 'reviewer', 'read-only']]);
   const routed = session.events.find(e => e.kind === 'jev.routed');
   assert.deepEqual([routed.chosen, routed.ai, routed.local, routed.tier], ['reviewer@lmstudio/dense-27b', 'lmstudio/dense-27b', {endpoint: 'lmstudio', model: 'dense-27b'}, 'strongest']);
-  assert.equal(routed.text, 'Routed reviewer → lmstudio/dense-27b (AI chosen by Jev: tier strongest, confidence 0.90)');
+  assert.equal(routed.text, 'Routed reviewer → lmstudio/dense-27b (Jev: tier strongest from hardest 0.90, small fix 0.10, long context 0.10; a free local model)');
 });
 
 test('between local models of one tier, the one the agent\'s own list names plays it — a reviewer keeps its reviewer model', () => {

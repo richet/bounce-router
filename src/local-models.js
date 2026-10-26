@@ -1,4 +1,5 @@
 import {createHash} from 'node:crypto';
+import {localTier} from './model-catalog.js';
 
 const cache = new Map();
 // Phase 2: local workers now run a full `opencode serve` per
@@ -273,12 +274,13 @@ export function localCandidates(catalogs = [], notes = {}) {
     .map(model => {
       const name = `${catalog.endpoint}/${model.id}`;
       // Only a tier pinned by hand is read (src/roster-notes.js routingNote): an agent's description is a guess that
-      // changes between askings, and routing must not. Else: cheapest, described by what LM Studio reports.
+      // changes between askings, and routing must not. Else the family's tier by name (model-catalog.js localTier),
+      // described by what LM Studio reports.
       const note = notes[name]?.by === 'you' ? notes[name] : {};
       const context = model.instances?.[0]?.context ?? model.context ?? null;
       const measured = `local model on ${catalog.endpoint}${context ? ` · context ${Math.round(context / 1024)}k` : ''} · runs on this machine at no cost, one turn at a time, slower than a cloud model`;
       return {name, endpoint: catalog.endpoint, model: model.id, loaded: model.ready === true, size: model.size ?? null, context,
-        tier: ['cheapest', 'mid', 'strongest'].includes(note.tier) ? note.tier : 'cheapest', capabilities: note.capabilities || measured};
+        tier: ['cheapest', 'mid', 'strongest', 'advisor'].includes(note.tier) ? note.tier : localTier(model.id), capabilities: note.capabilities || measured};
     }));
   // Loaded first, then the rest: which of these Jev is actually offered is decided per agent in
   // src/jev.js (loaded, or named by the agent's own `models:`), so a big downloaded model nobody

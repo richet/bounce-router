@@ -28,7 +28,9 @@ test('the threshold for a tier is 0.6, and the tier question offers only the tie
   assert.equal(JEV_TIER_CONFIDENCE, 0.6);
   const questions = routingQuestions(roster, notes);
   assert.deepEqual(Object.keys(questions), ['tier', 'profile', 'needs_write', 'needs_shell']);
-  assert.deepEqual(questions.tier.criteria, TIER_HINT);
+  // An advisor is never a routing answer, so the tier question never offers it.
+  const {advisor, ...routed} = TIER_HINT;
+  assert.deepEqual(questions.tier.criteria, routed);
   assert.equal(questions.tier.instructions.question, 'Which tier of AI do these orders need?');
   const {main, scout, haiku, jev} = roster;
   assert.deepEqual(routingQuestions({main, scout, haiku, jev}).tier.criteria, {cheapest: TIER_HINT.cheapest});

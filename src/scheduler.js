@@ -24,7 +24,7 @@ import {discoverLocalModels} from './local-models.js';
 import {createMachineSlots} from './machine-slots.js';
 import {runCheck, validCheck, weakCheck, CHECK_TIMEOUT_MS} from './task-check.js';
 import {seenRun, checkPassed, weakCheckNotice, NO_RUN, NO_RUN_AFTER_CHANGE} from './command-output.js';
-import {routingFallback} from './jev.js';
+import {routingFallback, PROFILE_TIERS} from './jev.js';
 import {validOwns} from './owned-paths.js';
 import {execFileSync} from 'node:child_process';
 import {parseVerdict} from './verdict.js';
@@ -640,6 +640,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (spec.checkpoint != null && typeof spec.checkpoint !== 'object') return 'checkpoint';
     if (spec.check !== undefined && spec.check !== null && !validCheck(spec.check)) return 'check';
     if (spec.risk !== undefined && !RISKS.has(spec.risk)) return 'risk';
+    if (spec.tier !== undefined && !PROFILE_TIERS.includes(spec.tier)) return 'tier';
     if (spec.owns !== undefined && !validOwns(spec.owns)) return 'owns';
     if (spec.size !== undefined && SIZE_FIELDS.some(field => !isNonNegativeInt(spec.size[field]))) return 'size';
     if (spec.depends_on !== undefined) {
@@ -743,6 +744,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       ...(spec.check ? {check: spec.check} : {}),
       ...(spec.owns ? {owns: spec.owns} : {}),
       ...(spec.inPlace ? {inPlace: spec.inPlace} : {}),
+      ...(spec.tier ? {tier: spec.tier} : {}),
       jobId: spec.jobId, retryOf: spec.retryOf,
       ...(spec.continues ? {continues: spec.continues} : {}),
       ...(spec.worker ? {worker: spec.worker} : {}),
@@ -2188,15 +2190,23 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       routing.add(task);
       const agent = row.profile;
       let decision;
-      try { decision = await jev.routeAI({task, orders: row.orders, profiles, head: profiles[agent]}); }
+      // What decides between peers, read at the moment of dispatch: cooldowns, and whether a local model's slot is free here.
+      const load = () => ({cooldowns: reducers.cooldowns(session.events, clock()), now: clock(),
+        localFree: (endpoint, model) => localRunning(endpoint) < localSlots(endpoint) && localRunning(endpoint, model) < modelSlots(endpoint)});
+      try { decision = await jev.routeAI({task, orders: row.orders, profiles, head: profiles[agent], tier: row.tier ?? null, load}); }
       finally { routing.delete(task); }
       if (reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) return;
       const played = decision?.ai ? compose(agent, decision.ai, decision.local ?? null) : null;
       // Jev off asks nothing and journals nothing: the journal is what it was without `auto`.
       if (decision?.asked) {
+        // The row says why on its own: Jev's description of the task, the tier it gives, and each candidate's fate.
+        const described = decision.description ? Object.entries(decision.description).filter(([, value]) => value !== null).map(([name, value]) => `${name.replace('_', ' ')} ${Number(value).toFixed(2)}`).join(', ') : '';
         append({kind: 'jev.routed', task, chosen: played ?? agent, agent, ai: played ? decision.ai : null, via: 'agent-auto', probabilities: decision.probabilities ?? {}, confidence: decision.confidence ?? 0, fallback: !played, reason: played ? null : decision.reason ?? 'unavailable', model: decision.model ?? null,
           ...(played && decision.tier ? {tier: decision.tier} : {}), ...(played && decision.local ? {local: decision.local} : {}),
-          text: played ? `Routed ${agent} → ${decision.ai} (AI chosen by Jev${decision.tier ? `: tier ${decision.tier}` : ''}, confidence ${Number(decision.confidence ?? 0).toFixed(2)})` : `Routed ${agent} → its own models (fallback: ${decision.reason ?? 'unavailable'})`, context});
+          ...(decision.description ? {description: decision.description} : {}), ...(decision.candidates ? {candidates: decision.candidates} : {}),
+          ...(decision.tierBy ? {tierBy: decision.tierBy} : {}),
+          text: played ? `Routed ${agent} → ${decision.ai} (${decision.tierBy === 'orchestrator' ? `tier ${decision.tier} asked by the orchestrator; ${described ? `Jev: ${described}` : 'Jev gave no description'}; ${decision.why ?? 'first fitting'}`
+            : decision.description ? `Jev: tier ${decision.tier} from ${described}; ${decision.why ?? 'first fitting'}` : `AI chosen by Jev${decision.tier ? `: tier ${decision.tier}` : ''}, confidence ${Number(decision.confidence ?? 0).toFixed(2)}`})` : `Routed ${agent} → its own models (fallback: ${decision.reason ?? 'unavailable'})`, context});
         row = submittedRow(task);
       }
     }

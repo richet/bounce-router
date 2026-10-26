@@ -151,7 +151,7 @@ test('M6 task_get can be asked for the whole report, and says so in its schema',
 test('task_submit preserves the task\'s declared constraints', async () => {
   let submitted;
   const s = server({ops: {submit: async event => {submitted = event; return {ok: true, row: event};}}});
-  const constraints = {requires: ['read', 'exec'], owns: ['src/a.js'], depends_on: ['earlier'], deadline: 60000, review: {completion: 'critic'}, steps: 'node --test', risk: 'logic', size: {lines: 1, probes: 1, minutes: 1}, checkpoint: {head: 'abc'}};
+  const constraints = {requires: ['read', 'exec'], owns: ['src/a.js'], depends_on: ['earlier'], deadline: 60000, review: {completion: 'critic'}, steps: 'node --test', risk: 'logic', tier: 'strongest', size: {lines: 1, probes: 1, minutes: 1}, checkpoint: {head: 'abc'}};
   await call(s, 'task_submit', {profile: 'builder', orders: 'verify', ...constraints});
   for (const [key, value] of Object.entries(constraints)) assert.deepEqual(submitted[key], value, key);
 });

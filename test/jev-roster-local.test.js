@@ -55,7 +55,7 @@ test('/jev roster set pins a model\'s tier by hand, keeps its capabilities, and 
   const set = await run('roster set lmstudio/dense-27b mid');
   assert.equal(set.text, 'lmstudio/dense-27b → tier mid · pinned by you; /jev roster refresh keeps it');
   assert.deepEqual(readRosterNotes(root)['lmstudio/dense-27b'], {tier: 'mid', capabilities: 'Dense 27B: careful reader, slow.', by: 'you'});
-  await assert.rejects(run('roster set lmstudio/dense-27b huge'), {message: 'Use /jev roster set MODEL cheapest|mid|strongest'});
+  await assert.rejects(run('roster set lmstudio/dense-27b huge'), {message: 'Use /jev roster set MODEL cheapest|mid|strongest|advisor'});
   await run('roster refresh');
   assert.equal(readRosterNotes(root)['lmstudio/dense-27b'].tier, 'mid', 'a refresh does not undo a hand-pinned tier');
   fs.rmSync(root, {recursive: true, force: true});
