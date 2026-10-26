@@ -89,7 +89,7 @@ test('control MCP: send, then answer, reach the live session the way bounce send
     connect: id => { assert.equal(id, f.session.id); return connectView({path: server.path, token: 'secret'}); },
   });
   const call = async (name, args) => (await control.handle({jsonrpc: '2.0', id: 1, method: 'tools/call', params: {name, arguments: args}})).result;
-  assert.deepEqual((await control.handle({jsonrpc: '2.0', id: 1, method: 'tools/list'})).result.tools.map(tool => tool.name), ['sessions', 'status', 'tasks', 'task', 'send', 'answer']);
+  assert.deepEqual((await control.handle({jsonrpc: '2.0', id: 1, method: 'tools/list'})).result.tools.map(tool => tool.name), ['sessions', 'status', 'tasks', 'task', 'send', 'answer', 'guide']);
   assert.match((await call('sessions', {})).content[0].text, /webapp/);
   const sent = await call('send', {message: 'review the three waves', wait_seconds: 10});
   assert.equal(sent.structuredContent.status, 'completed');
@@ -144,7 +144,7 @@ test('control MCP: status, tasks and task read the session\'s journal', async ()
   const {createControlServer} = await import('../src/mcp-control.js');
   const control = createControlServer({sessions: () => [{id: 'aaaa1111', name: 'webapp', cwd: '/w/webapp', live: true}], connect: () => { throw new Error('reads never connect'); }, events: id => { assert.equal(id, 'aaaa1111'); return journal; }});
   const call = async (name, args) => (await control.handle({jsonrpc: '2.0', id: 1, method: 'tools/call', params: {name, arguments: args}})).result;
-  assert.deepEqual((await control.handle({jsonrpc: '2.0', id: 1, method: 'tools/list'})).result.tools.map(tool => tool.name), ['sessions', 'status', 'tasks', 'task', 'send', 'answer']);
+  assert.deepEqual((await control.handle({jsonrpc: '2.0', id: 1, method: 'tools/list'})).result.tools.map(tool => tool.name), ['sessions', 'status', 'tasks', 'task', 'send', 'answer', 'guide']);
   assert.match((await call('status', {})).content[0].text, /^Orchestrator: running/);
   assert.deepEqual((await call('tasks', {})).structuredContent.tasks.map(t => t.task), ['build-1', 'review-1']);
   const one = await call('task', {task: 'review'});
@@ -166,4 +166,19 @@ test('control MCP: started by an agent inside bounce, it offers no tools and ref
   const refused = (await control.handle({jsonrpc: '2.0', id: 1, method: 'tools/call', params: {name: 'send', arguments: {message: 'accept it'}}})).result;
   assert.equal(refused.isError, true);
   assert.match(refused.content[0].text, /inside a bounce session/);
+});
+
+// How to operate a session travels with the tools, not as a skill: a skill in ~/.claude/skills reaches bounce's own
+// orchestrator and workers too (2026-10-25). Outside bounce, initialize carries the short rules and `guide`
+// the whole of it; inside, neither.
+test('control MCP: the operating rules come with initialize and the guide tool, and never inside bounce', async () => {
+  const {createControlServer} = await import('../src/mcp-control.js');
+  const outside = createControlServer({sessions: () => [], connect: () => { throw new Error('never'); }});
+  const init = (await outside.handle({jsonrpc: '2.0', id: 1, method: 'initialize'})).result;
+  assert.match(init.instructions, /status first/i);
+  assert.match(init.instructions, /guide/);
+  const guide = (await outside.handle({jsonrpc: '2.0', id: 2, method: 'tools/call', params: {name: 'guide', arguments: {}}})).result.content[0].text;
+  for (const heading of ['## The loop', '## Waiting', '## Reading status', '## Verifying', '## Writing to the orchestrator', '## Leave alone']) assert.match(guide, new RegExp(heading));
+  const inside = createControlServer({sessions: () => [], connect: () => { throw new Error('never'); }, inside: true});
+  assert.equal(Object.hasOwn((await inside.handle({jsonrpc: '2.0', id: 1, method: 'initialize'})).result, 'instructions'), false);
 });

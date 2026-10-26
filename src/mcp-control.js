@@ -5,6 +5,7 @@
 import {PROTOCOL_VERSION} from './mcp.js';
 import {sendToOrchestrator, answerOf} from './send.js';
 import {orchestratorStatus, formatStatus} from './control-status.js';
+import {INSTRUCTIONS, GUIDE} from './control-guide.js';
 import {taskView, taskList, taskByRef} from './task-view.js';
 import {formatTaskView, formatTaskList} from './task-report.js';
 import {tasks as taskStates} from './reducers.js';
@@ -25,6 +26,8 @@ const TOOLS = [
     inputSchema: {type: 'object', properties: {message: {type: 'string'}, session, wait_seconds: waitSeconds}, required: ['message']}},
   {name: 'answer', description: 'How a message sent earlier went: whether its turn ended, and the orchestrator\'s answer.',
     inputSchema: {type: 'object', properties: {request: {type: 'string', description: 'The request id `send` returned.'}, session, wait_seconds: waitSeconds}, required: ['request']}},
+  {name: 'guide', description: 'How to operate a bounce session from outside it: the loop, waiting, reading status, verifying, writing to the orchestrator, and what to leave alone. Read it once before operating a session.',
+    inputSchema: {type: 'object', properties: {}}},
 ];
 
 const ok = (text, structuredContent) => ({content: [{type: 'text', text}], ...(structuredContent === undefined ? {} : {structuredContent})});
@@ -56,6 +59,7 @@ export function createControlServer({sessions, connect, events = () => [], versi
 
   async function callTool(name, args = {}) {
     if (inside) return fail(INSIDE);
+    if (name === 'guide') return ok(GUIDE);
     if (name === 'sessions') {
       const live = sessions().filter(row => row.live).map(({id, name: title, cwd, operation}) => ({id, name: title, cwd, operation: operation ?? null}));
       return ok(live.length ? live.map(row => `${row.id.slice(0, 8)}  ${row.name}  ${row.operation ?? ''}  ${row.cwd}`).join('\n') : 'no live bounce session', {sessions: live});
@@ -96,7 +100,7 @@ export function createControlServer({sessions, connect, events = () => [], versi
       const {id, method, params} = message ?? {};
       const reply = result => ({jsonrpc: '2.0', id, result});
       if (id === undefined) return null;
-      if (method === 'initialize') return reply({protocolVersion: PROTOCOL_VERSION, capabilities: {tools: {}}, serverInfo: {name: 'bounce-control', version}});
+      if (method === 'initialize') return reply({protocolVersion: PROTOCOL_VERSION, capabilities: {tools: {}}, serverInfo: {name: 'bounce-control', version}, ...(inside ? {} : {instructions: INSTRUCTIONS})});
       if (method === 'ping') return reply({});
       if (method === 'tools/list') return reply({tools: inside ? [] : TOOLS});
       if (method === 'tools/call') {
