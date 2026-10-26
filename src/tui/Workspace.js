@@ -15,6 +15,9 @@ function sessionLine(metadata) {
 
 // The status rail is on unless switched off (`/sidebar off`), and even then only fits a terminal
 // wide enough to leave a readable conversation beside it.
+// The usage box beside the prompt: a left rule, a space, and the 26 columns its widest line takes.
+const USAGE_WIDTH = 28;
+const usageWidth = (columns, usage = []) => usage?.length && columns - USAGE_WIDTH - 1 >= 60 ? USAGE_WIDTH : 0;
 export function workspaceColumns(columns = 80, {sidebar: wanted = true, inline = false} = {}) {
   const total = Math.max(20, columns);
   const sidebar = wanted && !inline && total >= 100 ? 32 : 0; // inline (classic) draws no sidebar
@@ -182,10 +185,12 @@ export function createWorkspace(React, Ink) {
   // A heading filled with ─ to exactly `columns`: a longer run would be cut by Ink, which ends a cut row with …
   const rule = (head, columns) => head + '─'.repeat(Math.max(0, columns - stringWidth(head)));
   // The menu, the prompt box, the notice and the status line: the bottom of both the full-screen and inline views.
-  function promptArea({view, columns, draft, menu, working, statusText}) {
-    return [
-      ...menu.map((item, index) => React.createElement(Box, {key: `menu:${index}`, height: 1, flexShrink: 0}, React.createElement(Text, {wrap: 'truncate-end', color: item.selected ? 'cyan' : item.muted ? 'gray' : undefined}, item.text.replace(/\n/g, ' ')))),
-      React.createElement(Box, {key: 'prompt', height: draft.length + 3, flexShrink: 0, flexDirection: 'column'},
+  // `usage` (quotaStrip's lines) sits beside the prompt box, as tall as it, when the sidebar is not drawn and the row
+  // leaves the prompt at least 60 columns; the menu above keeps the whole width.
+  function promptArea({view, columns, draft, menu, working, statusText, usage = []}) {
+    const box = usageWidth(columns, usage);
+    if (box) columns -= box + 1;
+    const prompt = React.createElement(Box, {key: 'prompt', height: draft.length + 3, width: columns, flexShrink: 0, flexDirection: 'column'},
         React.createElement(Text, {color: 'cyan', wrap: 'truncate-end'}, rule(`── Message ${view.inputTarget ?? 'orchestrator'} · Enter send · Shift+Enter newline `, columns)),
         ...draft.map((row, index) => React.createElement(Text, {key: `input:${index}`, wrap: 'truncate-end'},
           React.createElement(Text, {color: 'cyan'}, `${index === 0 ? '❯' : ' '} `),
@@ -196,7 +201,13 @@ export function createWorkspace(React, Ink) {
         React.createElement(Text, {color: 'yellow', wrap: 'truncate-end'}, (view.notice ?? '').replace(/\n/g, ' ')),
         // The main worker's status line lives under the prompt box, not above the transcript
         // (2026-10-01): what it is doing and for how long, and — with the sidebar hidden — which AI and mode.
-        React.createElement(Text, {bold: true, color: working ? 'yellow' : 'cyan', wrap: 'truncate-end'}, statusText)),
+        React.createElement(Text, {bold: true, color: working ? 'yellow' : 'cyan', wrap: 'truncate-end'}, statusText));
+    return [
+      ...menu.map((item, index) => React.createElement(Box, {key: `menu:${index}`, height: 1, flexShrink: 0}, React.createElement(Text, {wrap: 'truncate-end', color: item.selected ? 'cyan' : item.muted ? 'gray' : undefined}, item.text.replace(/\n/g, ' ')))),
+      box ? React.createElement(Box, {key: 'prompt-row', flexDirection: 'row', columnGap: 1, flexShrink: 0}, prompt,
+        React.createElement(Box, {key: 'usage', width: box, height: draft.length + 3, flexDirection: 'column', overflow: 'hidden', borderStyle: 'single', borderTop: false, borderRight: false, borderBottom: false, borderColor: 'gray', paddingLeft: 1},
+          ...usage.slice(0, draft.length + 3).map((text, index) => React.createElement(Text, {key: `usage:${index}`, wrap: 'truncate-end'}, text))))
+        : prompt,
     ];
   }
   // Inline: finished rows are printed once into the terminal's own
@@ -206,7 +217,8 @@ export function createWorkspace(React, Ink) {
     const {Static} = Ink;
     const columns = Math.max(20, view.columns ?? 80);
     const height = Math.max(8, view.rows ?? 24);
-    const draft = promptLayout(view.input ?? '', view.inputCursor, columns - 4, Math.max(1, Math.floor(height / 3)));
+    const usage = view.sidebar === false ? [] : view.metadata?.usageLines ?? [];
+    const draft = promptLayout(view.input ?? '', view.inputCursor, columns - 4 - (usageWidth(columns, usage) && USAGE_WIDTH + 1), Math.max(1, Math.floor(height / 3)));
     const menu = (view.menu ?? []).slice(0, Math.max(0, height - draft.length - 6)).map(item => typeof item === 'string' ? {text: item} : item);
     const main = view.main ?? {};
     const now = view.now ?? Date.now();
@@ -219,7 +231,7 @@ export function createWorkspace(React, Ink) {
       React.createElement(Static, {key: `static:${inline.staticKey}`, items: inline.staticItems},
         item => React.createElement(Box, {key: item.id, flexDirection: 'column'}, ...item.lines.map((text, index) => React.createElement(Text, {key: index}, text || ' ')))),
       ...liveRows.map((text, index) => React.createElement(Text, {key: `live:${index}`, wrap: 'truncate-end'}, text || ' ')),
-      ...promptArea({view, columns, draft, menu, working, statusText}));
+      ...promptArea({view, columns, draft, menu, working, statusText, usage}));
   }
   function Workspace({model, transcriptRows, view, onScrollClamp, onLayout, inline}) {
     if (inline) return React.createElement(InlineWorkspace, {inline, view});
@@ -227,7 +239,9 @@ export function createWorkspace(React, Ink) {
     const selectionFor = id => selection?.region === id ? selection : null;
     const {total, content: columns, sidebar} = workspaceColumns(view.columns, {sidebar: view.sidebar});
     const height = Math.max(8, view.rows ?? 24);
-    const draft = promptLayout(view.input ?? '', view.inputCursor, columns - 4, Math.max(1, Math.floor(height / 3)));
+    // The full sidebar shows every plan already; the usage box stands in for it only where it does not fit.
+    const usage = sidebar || view.sidebar === false ? [] : view.metadata?.usageLines ?? [];
+    const draft = promptLayout(view.input ?? '', view.inputCursor, columns - 4 - (usageWidth(columns, usage) && USAGE_WIDTH + 1), Math.max(1, Math.floor(height / 3)));
     const menu = (view.menu ?? []).slice(0, Math.max(0, height - draft.length - 6))
       .map(item => typeof item === 'string' ? {text: item} : item);
     const main = view.main ?? {};
@@ -297,7 +311,7 @@ export function createWorkspace(React, Ink) {
         // blocks, paragraphs and headings; a single space keeps the row.
         : React.createElement(Box, {height: bodyHeight, flexDirection: 'column', overflow: 'hidden'}, ...rows.map((text, index) => React.createElement(Text, {key: `${index}:${text}`, wrap: 'truncate-end'}, marked(text || ' ', selectionFor('orchestrator'), firstShown + index)))),
       view.agentsOpen && remaining ? React.createElement(Text, {color: 'gray'}, `+ ${remaining} more agents · Tab cycles`) : null,
-      ...promptArea({view, columns, draft, menu, working, statusText}));
+      ...promptArea({view, columns, draft, menu, working, statusText, usage}));
     return React.createElement(Box, {flexDirection: 'row', columnGap: sidebar ? 1 : 0, width: total, height}, content,
       sidebar ? React.createElement(Sidebar, {lines: sideLines, height, selection: selectionFor('sidebar')}) : null);
   }

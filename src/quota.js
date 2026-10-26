@@ -223,6 +223,19 @@ const compactAge = (time, now) => {
 // Header form: short enough to sit beside the fallback order.
 export const quotaShort = (entry, now = Date.now()) => (entry?.windows ?? [])
   .map(w => expired(w, now) ? `${w.label} reset` : `${w.label} ${w.percent}%`).join(' · ');
+// The usage box beside the prompt (src/tui/Workspace.js), where the sidebar is not drawn: one line per plan, each
+// window "label N%", painted as the sidebar's bars are. 2026-10-26: inline had lost what the plans have left.
+export function quotaStrip(store, order, {now = Date.now(), cooldowns = {}, paint} = {}) {
+  if (!order.length) return [];
+  const p = {...noPaint, ...paint};
+  const tone = w => w.percent >= 100 ? p.high : w.percent >= 80 ? p.warn : s => s;
+  const name = Math.max(...order.map(provider => provider.length)) + 2;
+  return [p.muted('USAGE · of your whole plan'), ...order.map(provider => {
+    const windows = store[provider]?.windows ?? [];
+    const usage = windows.length ? windows.map(w => expired(w, now) ? p.muted(`${w.label} reset`) : tone(w)(`${w.label} ${w.percent}%`)).join(' · ') : p.muted('no reading');
+    return `${provider.padEnd(name)}${usage}${cooldowns[provider] > now ? p.muted(' · cooldown') : ''}`;
+  })];
+}
 export function quotaReport(store, order, now = Date.now()) {
   return order.map(provider => {
     const entry = store[provider];

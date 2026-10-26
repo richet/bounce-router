@@ -31,7 +31,7 @@ import {createInterface} from 'node:readline';
 import stringWidth from 'string-width';
 import {clean, createFormatter, createWorkSummary, workReview, withAsides, continueMain} from './format.js';
 import {validateOrchestration} from './profiles.js';
-import {loadQuota, recordQuota, refreshQuota, quotaSnapshot, quotaShort, quotaPanel, modelPanel, quotaReport, quotaUnavailable, usageOrder} from './quota.js';
+import {loadQuota, recordQuota, refreshQuota, quotaSnapshot, quotaShort, quotaPanel, quotaStrip, modelPanel, quotaReport, quotaUnavailable, usageOrder} from './quota.js';
 import {skillsCommand, syncSkills, inspectSkills, skillsChanged, importCandidates, importSelected, importSummary, importOrigin, syncSummary, skillAreas} from './skills.js';
 import {expandVendorCommand, findVendorCommand, vendorCommandRows} from './vendor-commands.js';
 import fs from 'node:fs';
@@ -854,7 +854,9 @@ async function main() {
           const quotaLines = quotaPanel(quotas, quotaOrder(), {
             width: 28, now: Date.now(), rows: Math.max(4, sidebarRows - (modelLines.length ? modelLines.length + 1 : 0)), cooldowns: router.cooldowns, paint,
           });
-          return {quotaLines, modelLines};
+          // Where the sidebar is not drawn (inline, or a terminal too narrow for it), the box beside the prompt says it.
+          const usageLines = quotaStrip(quotas, quotaOrder(), {now: Date.now(), cooldowns: router.cooldowns, paint});
+          return {quotaLines, modelLines, usageLines};
         })(),
       },
     });
@@ -1119,7 +1121,7 @@ async function main() {
         } else if (command === 'sidebar') {
           if (!['', 'on', 'off'].includes(arg)) throw new Error('Use /sidebar [on|off]');
           settings.sidebar = arg ? arg === 'on' : !settings.sidebar; save();
-          notice = inlineView ? `Sidebar ${settings.sidebar ? 'on' : 'off'} · saved; it shows in the full-screen view (orchestrator, or /config inline false)` : settings.sidebar
+          notice = inlineView ? `Usage box ${settings.sidebar ? 'shown beside the prompt' : 'hidden'} · the full sidebar is in the full-screen view (orchestrator, or /config inline false)` : settings.sidebar
             ? `Sidebar shown${(process.stdout.columns || 80) < 100 ? ' once the terminal is 100 columns wide' : ''} · /sidebar to hide`
             : 'Sidebar hidden · /sidebar to show';
           render();
