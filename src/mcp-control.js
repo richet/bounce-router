@@ -4,6 +4,10 @@
 // handed a way to speak as the user. Same hand-rolled protocol (initialize, tools/list, tools/call, ping).
 import {PROTOCOL_VERSION} from './mcp.js';
 import {sendToOrchestrator, answerOf} from './send.js';
+import {orchestratorStatus, formatStatus} from './control-status.js';
+import {taskView, taskList, taskByRef} from './task-view.js';
+import {formatTaskView, formatTaskList} from './task-report.js';
+import {tasks as taskStates} from './reducers.js';
 
 // Clients cap a tool call (about 60 s); a longer turn answers `waiting` with its request, and `answer` picks it up.
 export const CONTROL_WAIT_SECONDS_MAX = 45;
@@ -12,6 +16,11 @@ const session = {type: 'string', description: 'The session: an id, id prefix or 
 const waitSeconds = {type: 'number', description: `Wait up to this many seconds (at most ${CONTROL_WAIT_SECONDS_MAX}) for the turn to end. 0 or omitted: do not wait.`};
 const TOOLS = [
   {name: 'sessions', description: 'The live bounce sessions: id, name, workspace, mode.', inputSchema: {type: 'object', properties: {}}},
+  {name: 'status', description: 'What the session\'s orchestrator is doing: in a turn or idle and for how long, its own state note, the live tasks with the agent and AI on each, what waits for a decision, and its last answer.',
+    inputSchema: {type: 'object', properties: {session}}},
+  {name: 'tasks', description: 'The session\'s tasks, one line each: the live ones, or all of them.', inputSchema: {type: 'object', properties: {session, all: {type: 'boolean'}}}},
+  {name: 'task', description: 'One task: state, the AI playing it, its last milestones, findings, summary or review verdict. full: true adds its whole report, verdict and orders.',
+    inputSchema: {type: 'object', properties: {session, task: {type: 'string', description: 'The task id or a unique prefix.'}, full: {type: 'boolean'}}, required: ['task']}},
   {name: 'send', description: 'Send the session\'s orchestrator a message as if the user typed it in its view (journaled as "via bounce send"). A busy orchestrator gets it after its current turn. Returns the request id; with wait_seconds, also the turn\'s end and the orchestrator\'s answer.',
     inputSchema: {type: 'object', properties: {message: {type: 'string'}, session, wait_seconds: waitSeconds}, required: ['message']}},
   {name: 'answer', description: 'How a message sent earlier went: whether its turn ended, and the orchestrator\'s answer.',
@@ -25,8 +34,9 @@ const turnText = result => result.status === 'waiting'
   ? `still running; ask \`answer\` with request ${result.requestId ?? ''} later`.trim()
   : result.status === 'completed' ? (result.answer ?? '(the turn ended with no answer)') : `the turn ended ${result.status}${result.reason ? `: ${result.reason}` : ''}${result.answer ? `\n\n${result.answer}` : ''}`;
 
-// `sessions()` lists sessions as src/sessions.js does; `connect(id)` opens a view channel to that session's daemon.
-export function createControlServer({sessions, connect, version = '0'}) {
+// `sessions()` lists sessions as src/sessions.js does; `connect(id)` opens a view channel to that session's daemon;
+// `events(id)` reads its journal from disk (reads never go through the daemon).
+export function createControlServer({sessions, connect, events = () => [], version = '0'}) {
   function pick(ref) {
     const live = sessions().filter(row => row.live);
     if (ref) {
@@ -42,6 +52,18 @@ export function createControlServer({sessions, connect, version = '0'}) {
     if (name === 'sessions') {
       const live = sessions().filter(row => row.live).map(({id, name: title, cwd, operation}) => ({id, name: title, cwd, operation: operation ?? null}));
       return ok(live.length ? live.map(row => `${row.id.slice(0, 8)}  ${row.name}  ${row.operation ?? ''}  ${row.cwd}`).join('\n') : 'no live bounce session', {sessions: live});
+    }
+    if (['status', 'tasks', 'task'].includes(name)) {
+      const {row, error} = pick(args.session);
+      if (error) return fail(error);
+      const rows = events(row.id);
+      if (name === 'status') { const view = orchestratorStatus(rows); return ok(formatStatus(view), {session: row.id, ...view}); }
+      if (name === 'tasks') { const list = taskList(rows, {all: args.all === true}); return ok(formatTaskList(list), {session: row.id, tasks: list}); }
+      if (typeof args.task !== 'string' || !args.task) return fail('task needs the `task` id');
+      let id;
+      try { id = taskByRef(taskStates(rows), args.task); } catch (refused) { return fail(refused.message); }
+      const view = taskView(rows, id, {report: args.full === true});
+      return view ? ok(formatTaskView(view), view) : fail(`no task ${args.task} in this session`);
     }
     if (name === 'send' || name === 'answer') {
       const {row, error} = pick(args.session);

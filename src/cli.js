@@ -255,7 +255,7 @@ async function main() {
     const {createControlServer} = await import('./mcp-control.js');
     const {serveStdio} = await import('./mcp.js');
     const {connectSession} = await import('./send.js');
-    serveStdio(createControlServer({sessions: () => listSessions(root), connect: id => connectSession(root, id), version}));
+    serveStdio(createControlServer({sessions: () => listSessions(root), connect: id => connectSession(root, id), events: id => new Session(process.cwd(), {root, id}).events, version}));
     return new Promise(() => {});
   }
   if (positionals[0] === 'mcp-serve') {

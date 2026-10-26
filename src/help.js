@@ -30,7 +30,7 @@ export const CLI_USAGE = [
   ['bounce task TASK', '[--session REF] [--json]', 'One task: state, milestones, findings, summary'],
   ['bounce mcp install', '', 'Register bounce\'s MCP server with codex and claude'],
   ['bounce mcp uninstall', '', 'Remove the registration bounce wrote'],
-  ['bounce mcp-serve --control', '', 'Serve `bounce send` as MCP tools (sessions, send, answer) for an agent outside bounce'],
+  ['bounce mcp-serve --control', '', 'Serve a live session to an agent outside bounce as MCP tools: sessions, status, tasks, task, send, answer'],
   ['bounce mcp-serve', '', 'Serve the agent interface over MCP on stdio (registered for you by `bounce mcp install`)'],
   ['bounce jev', '[key KEY|key clear|on|off|review on|off|routing on|off|roster [refresh]|model ID|confidence N|test]', 'Jev (TypeSafe) decision model; no arg shows status'],
   ['bounce skills', '[list|sync|new NAME|add PATH|remove NAME|import [NAME] [--list]|clear|reset] [--scope user|project]', 'Manage the skills bounce installs into every agent'],

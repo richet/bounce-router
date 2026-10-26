@@ -89,7 +89,7 @@ test('control MCP: send, then answer, reach the live session the way bounce send
     connect: id => { assert.equal(id, f.session.id); return connectView({path: server.path, token: 'secret'}); },
   });
   const call = async (name, args) => (await control.handle({jsonrpc: '2.0', id: 1, method: 'tools/call', params: {name, arguments: args}})).result;
-  assert.deepEqual((await control.handle({jsonrpc: '2.0', id: 1, method: 'tools/list'})).result.tools.map(tool => tool.name), ['sessions', 'send', 'answer']);
+  assert.deepEqual((await control.handle({jsonrpc: '2.0', id: 1, method: 'tools/list'})).result.tools.map(tool => tool.name), ['sessions', 'status', 'tasks', 'task', 'send', 'answer']);
   assert.match((await call('sessions', {})).content[0].text, /webapp/);
   const sent = await call('send', {message: 'review the three waves', wait_seconds: 10});
   assert.equal(sent.structuredContent.status, 'completed');
@@ -106,4 +106,49 @@ test('control MCP: with several live sessions, send names them instead of guessi
   const result = (await control.handle({jsonrpc: '2.0', id: 1, method: 'tools/call', params: {name: 'send', arguments: {message: 'hi'}}})).result;
   assert.equal(result.isError, true);
   assert.match(result.content[0].text, /2 live sessions.*aaaa1111 \(webapp\).*bbbb2222 \(api\)/);
+});
+
+// Reading, beside sending (2026-10-25: "de otra manera no se podra controlar de forma efectiva"): what the
+// orchestrator is doing, its own note, the live tasks with the AI on each, what waits for a decision, its last answer.
+const at = (minute, row) => ({time: `2026-10-25T10:${String(minute).padStart(2, '0')}:00.000Z`, ...row});
+const journal = [
+  at(0, {kind: 'user', text: 'do step 14b', via: 'send', seq: 1}),
+  at(0, {kind: 'main.started', requestId: 'r1', seq: 2}),
+  at(1, {kind: 'state', from: 'orchestrator', text: 'Step 14b: builder on it; then the checklist review.', seq: 3}),
+  at(1, {kind: 'task.submitted', task: 'build-1', profile: 'builder', orders: 'refactor data access', seq: 4}),
+  at(2, {kind: 'task.started', task: 'build-1', attempt: 1, requested: 'sonnet', seq: 5}),
+  at(3, {kind: 'task.milestone', task: 'build-1', phase: 'edit', text: 'moving users to data/users.ts', seq: 6}),
+  at(3, {kind: 'task.submitted', task: 'review-1', profile: 'reviewer', orders: 'review 13', seq: 7}),
+  at(4, {kind: 'task.started', task: 'review-1', attempt: 1, requested: 'qwen3.8-27b', seq: 8}),
+  at(5, {kind: 'task.blocked', task: 'review-1', reason: 'review_unreadable', text: 'The review ended without a verdict bounce could read.', seq: 9}),
+  at(6, {kind: 'assistant', from: 'main', text: 'Builder is moving users; I will wait on it.', seq: 10}),
+];
+
+test('status: the orchestrator\'s turn, its note, live tasks with their AI, what is blocked, its last answer', async () => {
+  const {orchestratorStatus, formatStatus} = await import('../src/control-status.js');
+  const view = orchestratorStatus(journal, {now: Date.parse('2026-10-25T10:10:00.000Z')});
+  assert.deepEqual(view.orchestrator, {state: 'running', since: '2026-10-25T10:00:00.000Z', minutes: 10, request: 'r1'});
+  assert.equal(view.note, 'Step 14b: builder on it; then the checklist review.');
+  assert.deepEqual(view.tasks.map(t => [t.task, t.profile, t.ai, t.state]), [['build-1', 'builder', 'sonnet', 'running'], ['review-1', 'reviewer', 'qwen3.8-27b', 'blocked']]);
+  assert.deepEqual(view.blocked, [{task: 'review-1', reason: 'review_unreadable', text: 'The review ended without a verdict bounce could read.'}]);
+  assert.equal(view.lastAnswer, 'Builder is moving users; I will wait on it.');
+  const text = formatStatus(view);
+  assert.match(text, /^Orchestrator: running for 10 min/);
+  assert.match(text, /build-1 · builder on sonnet · running · 8 min · moving users to data\/users\.ts/);
+  assert.match(text, /Waiting on a decision:\n  review-1 · review_unreadable · The review ended/);
+  const idle = orchestratorStatus([...journal, at(7, {kind: 'main.terminal', requestId: 'r1', status: 'completed', seq: 11})], {now: Date.parse('2026-10-25T10:10:00.000Z')});
+  assert.deepEqual([idle.orchestrator.state, idle.orchestrator.since], ['idle', '2026-10-25T10:07:00.000Z']);
+});
+
+test('control MCP: status, tasks and task read the session\'s journal', async () => {
+  const {createControlServer} = await import('../src/mcp-control.js');
+  const control = createControlServer({sessions: () => [{id: 'aaaa1111', name: 'webapp', cwd: '/w/webapp', live: true}], connect: () => { throw new Error('reads never connect'); }, events: id => { assert.equal(id, 'aaaa1111'); return journal; }});
+  const call = async (name, args) => (await control.handle({jsonrpc: '2.0', id: 1, method: 'tools/call', params: {name, arguments: args}})).result;
+  assert.deepEqual((await control.handle({jsonrpc: '2.0', id: 1, method: 'tools/list'})).result.tools.map(tool => tool.name), ['sessions', 'status', 'tasks', 'task', 'send', 'answer']);
+  assert.match((await call('status', {})).content[0].text, /^Orchestrator: running/);
+  assert.deepEqual((await call('tasks', {})).structuredContent.tasks.map(t => t.task), ['build-1', 'review-1']);
+  const one = await call('task', {task: 'review'});
+  assert.equal(one.structuredContent.task, 'review-1');
+  assert.equal((await call('task', {task: 'build-1', full: true})).structuredContent.fullOrders, 'refactor data access');
+  assert.equal((await call('task', {task: 'nope'})).isError, true);
 });
