@@ -78,6 +78,7 @@ bounce run "Implement the feature and run relevant tests" --cwd /path/to/repo
 bounce run "Refactor the parser" --detach   # keep working in the background
 bounce sessions                              # ● marks a live session
 bounce attach SESSION                        # reopen its view; --json streams the journal
+bounce send [--session SESSION] "message"    # message its orchestrator as if typed there; --wait prints the answer
 bounce stop SESSION                          # cancel its task tree and end its daemon
 bounce rename SESSION NAME
 bounce --resume SESSION                      # a name, an id, or a unique id prefix
@@ -175,6 +176,7 @@ Sessions run in a daemon that outlives the view:
 
 - `bounce run "prompt" --detach` starts the session in the background and prints its id; without `--detach`, `run` streams events and exits when the turn ends (`--json` for machine-readable rows).
 - `/detach` closes the interactive view while the orchestrator and its workers keep running.
+- `bounce send "message"` hands a live session's orchestrator a message from another terminal or agent, as if typed in its view (marked "via bounce send"); a busy orchestrator gets it after its current turn. With no `--session` it picks the one live session in the current directory; `--wait` holds until that turn ends and prints the answer. An agent outside bounce gets the same as MCP tools (`sessions`, `send`, `answer`): `claude mcp add bounce-control -- bounce mcp-serve --control`.
 - `bounce attach SESSION` reopens the view on a live session from any terminal; `--json` streams its journal instead. While an attached turn is still active, new prompts are held — use `/steer` to steer it.
 - `bounce stop SESSION` cancels the running task tree and ends the daemon; `/quit` does the same from inside.
 
