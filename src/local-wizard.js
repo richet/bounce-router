@@ -169,7 +169,7 @@ export async function runLocalSetup({settings, ask, write, save, discover = disc
     ensureActive();
     await save(draft);
     if (Object.keys(added).length) { writeYaml(modelsTarget, nextModels, '# This machine\'s models, by alias: what bindings.yml names. bounce local setup wrote it; edit freely.'); write(`Wrote ${modelsTarget}`); }
-    if (writeBindings) { writeYaml(bindingsTarget, bindings, '# Which alias plays each agent, first choice first. auto lets Jev pick; "*" is every other agent.'); write(`Wrote ${bindingsTarget}`); }
+    if (writeBindings) { writeYaml(bindingsTarget, bindings, '# Which alias plays each agent, first choice first. auto lets Jev pick among the rest of the list; "*" is every other agent.'); write(`Wrote ${bindingsTarget}`); }
     for (const role of rewritten) {
       const {file, source, error, binding, chainSettings, models: _m, sampling: _s, ...agent} = role;
       write(`Wrote ${safe(writeAgent(path.dirname(file), agent, {force: true}).file)}`);

@@ -167,7 +167,7 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
     if (agent.error || agent.name === orchestrator) continue;
     const local = normalizeLocalSettings(settings.local);
     const isLocal = provider => Object.hasOwn(local.endpoints, provider);
-    // `auto` first in the list: Jev picks the AI at dispatch (the scheduler composes it with playedBy);
+    // `auto` first in the list: Jev picks the AI at dispatch, among the ones the list names (the scheduler composes it with playedBy);
     // the rest — or, with nothing after it, the provider order — is the chain the job falls to.
     const auto = agent.models?.[0] === 'auto';
     const listed = (agent.models ?? []).filter(ref => ref !== 'auto');
@@ -195,6 +195,8 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
         fallback: chain.slice(index + 1, index + 2), role: agent.name, executables: {...(settings.executables ?? {})},
         agent: {name: agent.name, description: agent.description, policy, prompt: agent.prompt, ...(agent.maxSteps ? {maxSteps: agent.maxSteps} : {}), ...(agent.sampling && profileSamples(agent) ? {sampling: agent.sampling} : {})}};
       if (auto && index === 0) base.auto = true;
+      // `auto` alone has no list to stay within: Jev chooses from the whole roster (src/jev.js ownProfiles).
+      if (auto && index === 0 && !listed.length) base.autoAll = true;
       if (isLocal(provider)) {
         // All a local backend adds is where its model lives and how the job samples; src/local-resolve.js does the rest at dispatch.
         Object.assign(base, {backend: 'lmstudio', endpoint: provider, localOptions: localOptions(agent, backendSettings(agent, backends, index))});

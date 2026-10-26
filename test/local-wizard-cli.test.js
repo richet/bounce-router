@@ -40,7 +40,7 @@ test('real guided CLI offers discovery, accepts confirmation, and never starts a
   assert.match(accepted.output,/LM Studio has: \[1\] loaded/);
   assert.match(accepted.output,/OpenCode bridge ready/);
   assert.equal(await fs.readFile(path.join(root,'models.yaml'),'utf8'),'# This machine\'s models, by alias: what bindings.yml names. bounce local setup wrote it; edit freely.\nloaded: lmstudio/loaded\n');
-  assert.equal(await fs.readFile(path.join(root,'bindings.yml'),'utf8'),'# Which alias plays each agent, first choice first. auto lets Jev pick; "*" is every other agent.\nagents:\n  "*": [auto, loaded, claude/sonnet, codex]\n');
+  assert.equal(await fs.readFile(path.join(root,'bindings.yml'),'utf8'),'# Which alias plays each agent, first choice first. auto lets Jev pick among the rest of the list; "*" is every other agent.\nagents:\n  "*": [auto, loaded, claude/sonnet, codex]\n');
   assert.deepEqual(JSON.parse(await fs.readFile(file)).profiles,{main:{adapter:'claude'}},'no profile is created');
   assert.equal(posts,0,'setup never sends an inference or load request to LM Studio itself');
   assert.deepEqual((await fs.readdir(root)).sort(),['bindings.yml','config.json','models.yaml']);

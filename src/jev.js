@@ -489,22 +489,32 @@ const tierQuestion = (profiles, notes, locals = []) => {
 // `/local` is on. A local model of the needed tier runs first — it costs nothing — a loaded one before
 // one that would have to be loaded; the tiers do the mixing: cheap work local, the rest cloud.
 // The local models an agent's own list names, by walking its derived chain from the head.
-const namedLocals = (profiles, head) => {
-  const names = []; const seen = new Set();
-  for (let current = head; current && !seen.has(current); current = profiles[current.fallback?.[0]]) { seen.add(current); if (current.backend) names.push(`${current.endpoint}/${current.model}`); }
-  return names;
+const chainOf = (profiles, head) => {
+  const links = []; const seen = new Set();
+  for (let current = head; current && !seen.has(current); current = profiles[current.fallback?.[0]]) { seen.add(current); links.push(current); }
+  return links;
+};
+const namedLocals = (profiles, head) => chainOf(profiles, head).filter(link => link.backend).map(link => `${link.endpoint}/${link.model}`);
+// The cloud AIs an `auto` agent may be given: the routable profiles its own list names, the same adapter and model
+// (a link with no model, `codex/default`, names none of them and stays only in the chain). 2026-10-25:
+// `auto` picks within the list a person wrote, never beyond it — a project's builder list had no opus, yet Jev sent 5
+// builds and 5 reviews to opus[1m] from the shipped roster.
+const ownProfiles = (profiles, head) => {
+  if (!head || head.autoAll) return profiles;
+  const links = chainOf(profiles, head).filter(link => !link.backend && link.model);
+  return Object.fromEntries(Object.entries(profiles).filter(([, p]) => links.some(link => link.adapter === p?.adapter && link.model === p?.model)));
 };
 // Which local models an agent may be offered: the loaded ones, plus the ones its own `models:` list
 // names (choosing one costs a load). Found live 2026-09-22: the reviewer's own model was unloaded, so
 // no `strongest` local existed and every review went to the cloud; offering everything downloaded
 // instead would put the machine's biggest models in the running for a job nobody pointed them at.
 export const offerable = (locals = [], profiles = {}, head = null) => {
-  const named = head ? namedLocals(profiles, head) : [];
-  return locals.filter(item => item.loaded || named.includes(item.name));
+  if (head) { const named = namedLocals(profiles, head); return locals.filter(item => named.includes(item.name) || (head.autoAll && item.loaded)); }
+  return locals.filter(item => item.loaded);
 };
 
-function tierPick(answers, {profiles, notes, order = [], fits = () => true, unfit = '', locals = [], head = null}) {
-  locals = offerable(locals, profiles, head);
+function tierPick(answers, {profiles, allProfiles = profiles, notes, order = [], fits = () => true, unfit = '', locals = [], head = null}) {
+  locals = offerable(locals, allProfiles, head);
   if (!isObject(answers?.tier)) return {name: null, reason: null};
   const tier = PROFILE_TIERS.includes(answers.tier.choice) ? answers.tier.choice : null;
   const confidence = Number.isFinite(Number(answers.tier.confidence)) ? Number(answers.tier.confidence) : 0;
@@ -515,7 +525,7 @@ function tierPick(answers, {profiles, notes, order = [], fits = () => true, unfi
     .sort((a, b) => rank(a[1].adapter) - rank(b[1].adapter)).map(([name]) => ({name}));
   // Between local models of the tier: the one the agent's own list names (a reviewer keeps its
   // reviewer model), then a loaded one before one that would have to be loaded.
-  const named = head ? namedLocals(profiles, head) : [];
+  const named = head ? namedLocals(allProfiles, head) : [];
   const local = locals.filter(item => item.tier === tier).sort((a, b) => Number(named.includes(b.name)) - Number(named.includes(a.name)) || Number(b.loaded) - Number(a.loaded)).map(item => ({name: item.name, local: {endpoint: item.endpoint, model: item.model}}));
   const first = [...local, ...cloud][0] ?? null;
   const name = first?.name ?? null;
@@ -597,6 +607,7 @@ export function decideRoute(answers, {profiles = {}, confidence = 0.8, fallback 
 // about ability and cost alone: no role, no policy, no access Nouls.
 export function aiQuestions(profiles = {}, notes = {}, head = null, locals = []) {
   locals = offerable(locals, profiles, head);
+  profiles = ownProfiles(profiles, head);
   const named = {profile: {
     type: 'choice',
     instructions: {
@@ -613,7 +624,8 @@ export function aiQuestions(profiles = {}, notes = {}, head = null, locals = [])
 // Pure: the AI is taken only when it is a routable profile chosen with confidence; the job's policy
 // is its own, so there is no access gate here.
 export function decideAI(answers, {profiles = {}, confidence = 0.8, notes = {}, order = [], locals = [], head = null} = {}) {
-  const tiered = tierPick(answers, {profiles, notes, order, locals, head});
+  const tiered = tierPick(answers, {profiles: ownProfiles(profiles, head), allProfiles: profiles, notes, order, locals, head});
+  profiles = ownProfiles(profiles, head);
   if (tiered.name) return {ai: tiered.name, ...(tiered.local ? {local: tiered.local} : {}), tier: tiered.tier, reason: null, confidence: tiered.confidence, probabilities: tiered.probabilities};
   const answer = isObject(answers?.profile) ? answers.profile : {};
   const chosen = typeof answer.choice === 'string' ? answer.choice : null;

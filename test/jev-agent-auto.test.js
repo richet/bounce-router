@@ -18,6 +18,8 @@ const waitFor = async (fn, timeout = 8000) => { const start = Date.now(); for (;
 const file = models => `---\nname: reviewer\ndescription: Reads for defects; never edits.\npolicy: read-only\nmodels: [${models}]\n---\nYou are the reviewer.\n`;
 const settings = {operation: 'orchestrator', orchestrator: 'main', mode: 'yolo', order: ['claude', 'codex'], models: {},
   profiles: {main: {adapter: 'claude', model: 'opus'}, build: {adapter: 'codex', model: 'gpt-6-astra', tier: 'mid', capabilities: 'routine implementation'}}};
+// A reviewer whose list names the codex model of profile `build`: the AI Jev picks below is one it names.
+const NAMES_BUILD = 'auto, claude/sonnet, codex/gpt-6-astra';
 const rolesOf = models => new Map([['reviewer', {...agentMetadata(file(models)), source: 'user', file: '/x/reviewer.md'}]]);
 
 test('an agent file may put `auto` first in models; the rest is the chain it falls to, and `auto` alone falls to the provider order', () => {
@@ -45,11 +47,12 @@ test('the job played by an AI: the AI\'s adapter and model, everything else the 
 });
 
 test('the AI question leaves the job out of it: what each AI runs on and is good at, no role, no policy, no access questions', () => {
-  const view = validateOrchestration(settings, undefined, {roles: rolesOf('auto, claude/sonnet')});
+  const view = validateOrchestration(settings, undefined, {roles: rolesOf(NAMES_BUILD)});
   const questions = aiQuestions(view.profiles, {build: {tier: 'strongest'}}, view.profiles.reviewer);
   assert.deepEqual(Object.keys(questions), ['tier', 'profile']);
   assert.equal(questions.profile.criteria.build, 'codex/gpt-6-astra · tier mid: research, routine implementation, test triage, reviewing a scoped change · capabilities: routine implementation');
-  // the shipped roster is in the table too; whatever is offered is an AI, never a job or the orchestrator
+  // only what the list names is offered (`build` is codex/gpt-6-astra); never a job or the orchestrator
+  assert.deepEqual(Object.keys(questions.profile.criteria), ['build', 'claude_sonnet']);
   assert.deepEqual(Object.keys(questions.profile.criteria).filter(name => ['main', 'reviewer'].includes(name)), []);
   assert.deepEqual(Object.values(questions.profile.criteria).filter(text => /role |policy /.test(text)), []);
   assert.match(questions.profile.instructions.question, /^Which AI should do this job\? The job: Reads for defects; never edits\. \(policy read-only\)$/);
@@ -76,7 +79,7 @@ function rig(t, {answer, enabled = true, codexScript = null}) {
   const worker = (name, script = () => done(name)) => { const inner = fakeAdapter(script); return {...inner, launch: async args => { launched.push([name, args.profile.model, args.profile.role, args.profile.policy, args.profile.agent?.name ?? null]); prompts.push(args.profile.agent?.prompt ?? null); return inner.launch(args); }}; };
   const jevSettings = {enabled, model: 'jev-1.13.0', review: false, routing: {enabled: true, default: null}, confidence: 0.8};
   const jev = createJevDecisions({readSettings: () => jevSettings, adapter: {ask: async request => { asked.push(request); return {answers: answer, model: 'jev-1.13.0', latencyMs: 9}; }}});
-  const profiles = validateOrchestration(settings, undefined, {roles: rolesOf('auto, claude/sonnet')}).profiles;
+  const profiles = validateOrchestration(settings, undefined, {roles: rolesOf(NAMES_BUILD)}).profiles;
   const scheduler = createScheduler({session, adapters: {claude: worker('claude'), codex: worker('codex', codexScript ?? undefined)}, profiles, jev, gitHead: () => null});
   t.after(() => scheduler.close());
   const settled = async task => waitFor(() => ['completed', 'accepted', 'failed'].includes(scheduler.tasks()[task]?.state));
@@ -148,7 +151,7 @@ test('scheduler: a job on Jev\'s AI survives a daemon restart and follows the ag
   const launched = [];
   const worker = name => { const inner = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done'}]); return {...inner, launch: async args => { launched.push([name, args.profile.role]); return inner.launch(args); }}; };
   const next = createScheduler({session: first.session, adapters: {claude: worker('claude'), codex: worker('codex')}, gitHead: () => null,
-    profiles: validateOrchestration(settings, undefined, {roles: rolesOf('auto, claude/sonnet')}).profiles, jev: {reviewer: 'jev', settings: () => ({}), route: async () => { throw new Error('asked again'); }, routeAI: async () => { throw new Error('asked again'); }}});
+    profiles: validateOrchestration(settings, undefined, {roles: rolesOf(NAMES_BUILD)}).profiles, jev: {reviewer: 'jev', settings: () => ({}), route: async () => { throw new Error('asked again'); }, routeAI: async () => { throw new Error('asked again'); }}});
   t.after(() => next.close());
   await next.reconcile();
   await waitFor(() => ['completed', 'accepted', 'failed'].includes(next.tasks()[row.task]?.state));
@@ -162,7 +165,7 @@ test('scheduler: a job on Jev\'s AI survives a daemon restart and follows the ag
   const running = live.scheduler.submit({parent: null, profile: 'reviewer', orders: ORDERS, deadline: null});
   await waitFor(() => live.launched.length === 1);
   const head = live.profiles.reviewer;
-  live.scheduler.replaceAgent('reviewer', {reviewer: {...head, agent: {...head.agent, prompt: 'You are the STRICT reviewer.'}}}, undefined);
+  live.scheduler.replaceAgent('reviewer', {reviewer: {...head, agent: {...head.agent, prompt: 'You are the STRICT reviewer.'}}, 'reviewer~2': live.profiles['reviewer~2']}, undefined);
   gate.resolve();
   const fallback = await waitFor(() => live.session.events.find(e => e.kind === 'policy.fallback'));
   assert.deepEqual([fallback.task, fallback.from_profile, fallback.to_profile], [running.task, 'reviewer@build', 'reviewer']);
@@ -178,4 +181,31 @@ test('the agent table shows who may play each agent whatever the operation', () 
   const classic = {...settings, operation: 'classic'};
   delete classic.orchestrator;
   assert.deepEqual(agentTable(rolesOf('auto, claude/sonnet'), classic)[0].backends, ['auto (Jev)', 'claude/sonnet']);
+});
+
+// 2026-10-25: `auto` picks within the list a person wrote, never beyond it. In a live session the builder's list was
+// [auto, qwen, claude/sonnet, codex/default], yet Jev sent 5 builds and 5 reviews to opus[1m] from the shipped roster.
+test('an `auto` agent is offered only the AIs its own list names: no shipped profile it does not name, no unnamed local', () => {
+  const builder = `---\nname: builder\ndescription: Writes the change.\npolicy: write\nmodels: [auto, claude/sonnet, codex/default]\n---\nYou are the builder.\n`;
+  const roles = new Map([['builder', {...agentMetadata(builder), source: 'user', file: '/x/builder.md'}]]);
+  const view = validateOrchestration({...settings, profiles: {main: {adapter: 'claude', model: 'opus'}}}, undefined, {roles});
+  const notes = {build_claude: {tier: 'strongest'}, build: {tier: 'strongest'}, claude_sonnet: {tier: 'mid'}, claude_haiku: {tier: 'cheapest'}};
+  const loaded = [{name: 'lmstudio/big-model', endpoint: 'lmstudio', model: 'big-model', tier: 'strongest', loaded: true, capabilities: 'x'}];
+  const questions = aiQuestions(view.profiles, notes, view.profiles.builder, loaded);
+  assert.deepEqual(Object.keys(questions.profile.criteria), ['claude_sonnet']);
+  assert.deepEqual(Object.keys(questions.tier.criteria), ['mid']);
+  const options = {profiles: view.profiles, confidence: 0.8, notes, order: ['claude', 'codex'], locals: loaded, head: view.profiles.builder};
+  assert.equal(decideAI({tier: {choice: 'strongest', confidence: 0.9}}, options).ai, null, 'a strongest tier the list does not name is not reached');
+  assert.equal(decideAI({profile: {choice: 'build_claude', confidence: 0.95}}, options).ai, null);
+  assert.equal(decideAI({tier: {choice: 'mid', confidence: 0.9}}, options).ai, 'claude_sonnet');
+});
+
+// `auto` with nothing after it has no list to stay within: its chain is the provider order with no model named, and
+// Jev keeps choosing from the whole roster, as the shipped team's `models: [auto]` always did.
+test('an `auto` agent with no list after it is still offered the whole roster', () => {
+  const bare = `---\nname: builder\ndescription: Writes the change.\npolicy: write\nmodels: [auto]\n---\nYou are the builder.\n`;
+  const roles = new Map([['builder', {...agentMetadata(bare), source: 'user', file: '/x/builder.md'}]]);
+  const view = validateOrchestration({...settings, profiles: {main: {adapter: 'claude', model: 'opus'}}}, undefined, {roles});
+  const offered = Object.keys(aiQuestions(view.profiles, {}, view.profiles.builder).profile.criteria);
+  assert.equal(offered.includes('build_claude') && offered.includes('claude_sonnet'), true, offered.join(', '));
 });

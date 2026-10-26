@@ -1,9 +1,9 @@
 // Local models as candidates for an `auto` agent's AI.
 // A local model only ever exists as an agent's backend, so it is a candidate for the AI of a JOB —
-// never for a plain `auto` task. Loaded models are preferred; a model that is not loaded is offered
-// only when the agent's own `models:` list names it (found live 2026-09-22: the 27B reviewer model had
-// been unloaded, so Jev saw no `strongest` local at all and sent every review to the cloud). Offering
-// every downloaded model instead would put a 139B nobody asked for in the running. They are only supplied while `/local` is on, and then a local model of the
+// never for a plain `auto` task. Only the models the agent's own `models:` list names are offered, loaded or
+// not (found live 2026-09-22: the 27B reviewer model had been unloaded, so Jev saw no `strongest` local at all
+// and sent every review to the cloud; 2026-10-25: `auto` picks within the list, never beyond it, so a
+// loaded model nobody named is not offered either). Loaded ones rank first. They are only supplied while `/local` is on, and then a local model of the
 // needed tier runs first: it costs nothing. Tiers do the mixing — cheap work local, the rest cloud.
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -38,7 +38,7 @@ test('candidates: every tool-capable model, loaded or not, described by its pinn
 
 const settings = {operation: 'orchestrator', orchestrator: 'main', mode: 'yolo', order: ['claude'], models: {}, local: {enabled: true},
   profiles: {main: {adapter: 'claude', model: 'opus'}, sonnet: {adapter: 'claude', model: 'sonnet', tier: 'strongest'}, haiku: {adapter: 'claude', model: 'haiku', tier: 'cheapest'}}};
-const roles = new Map([['reviewer', {...agentMetadata('---\nname: reviewer\ndescription: Reads for defects.\npolicy: read-only\nmodels: [auto, claude/sonnet]\n---\nYou are the reviewer.\n'), source: 'user', file: '/x/reviewer.md'}]]);
+const roles = new Map([['reviewer', {...agentMetadata('---\nname: reviewer\ndescription: Reads for defects.\npolicy: read-only\nmodels: [auto, claude/sonnet, lmstudio/dense-27b]\n---\nYou are the reviewer.\n'), source: 'user', file: '/x/reviewer.md'}]]);
 const table = () => validateOrchestration(settings, undefined, {roles}).profiles;
 const locals = localCandidates(catalogs([model('coder-30b'), model('dense-27b')]), cache);
 const tier = (choice, confidence) => ({tier: {choice, confidence, probabilities: {[choice]: confidence}}});
@@ -48,7 +48,8 @@ test('the AI question offers the local models beside the profiles; a plain `auto
   const questions = aiQuestions(profiles, {}, profiles.reviewer, locals);
   assert.equal(questions.profile.criteria['lmstudio/dense-27b'], 'local model lmstudio/dense-27b · runs on this machine at no cost · context 64k · tier strongest: reviewing a security-sensitive or cross-cutting change, ambiguous or cross-cutting debugging, security-sensitive work · capabilities: Careful reviewer; slow.');
   const cold = localCandidates(catalogs([model('big-disk', onDisk)]), {});
-  assert.equal(aiQuestions(profiles, {}, profiles.reviewer, cold).profile.criteria['lmstudio/big-disk'], undefined, 'this reviewer does not name it and it is not loaded: not offered');
+  assert.equal(aiQuestions(profiles, {}, profiles.reviewer, cold).profile.criteria['lmstudio/big-disk'], undefined, 'this reviewer does not name it: not offered');
+  assert.equal(questions.profile.criteria['lmstudio/coder-30b'], undefined, 'loaded, but this reviewer does not name it: not offered');
   const {main, haiku} = profiles;
   assert.deepEqual(aiQuestions({main, haiku}, {}, null, locals).tier.criteria, {cheapest: TIER_HINT.cheapest, strongest: TIER_HINT.strongest}, 'a tier only a local model has is offered too');
   assert.equal(Object.keys(routingQuestions(profiles).profile.criteria).some(name => name.startsWith('lmstudio/')), false);
@@ -121,15 +122,15 @@ test('between local models of one tier, the one the agent\'s own list names play
 
 // Found live: the reviewer's own model (the 27B, tier strongest) had been
 // unloaded, the only loaded local was tier mid, and all three reviews went to the cloud. A model the
-// agent's file names is offered even when it is not loaded — loaded ones still rank first, and a model
-// nobody named stays out until it is loaded, so the machine's big models are never picked by surprise.
+// agent's file names is offered even when it is not loaded, and a model nobody named stays out, loaded or not,
+// so the machine's big models are never picked by surprise.
 test('an unloaded local model is offered when the agent names it, and never when nobody does', () => {
   const named = new Map([['reviewer', {...agentMetadata('---\nname: reviewer\ndescription: Reads for defects.\npolicy: write\nmodels: [auto, lmstudio/dense-27b, claude/sonnet]\n---\nYou review.\n'), source: 'user', file: '/x/reviewer.md'}]]);
   const profiles = validateOrchestration(settings, undefined, {roles: named}).profiles;
   const cold = localCandidates(catalogs([model('coder-30b'), model('dense-27b', {...onDisk, size: 16 * 1024 ** 3}), model('huge-139b', {...onDisk, ref: 'lmstudio/huge-139b'})]), {...cache, 'lmstudio/huge-139b': {tier: 'strongest', capabilities: 'Very large.'}});
   const options = {profiles, notes: {}, locals: cold, head: profiles.reviewer, confidence: 0.8};
   assert.deepEqual(Object.keys(aiQuestions(profiles, {}, profiles.reviewer, cold).profile.criteria).filter(k => k.startsWith('lmstudio/')).sort(),
-    ['lmstudio/coder-30b', 'lmstudio/dense-27b'], 'the loaded one and the one the reviewer names; not the 139B nobody named');
+    ['lmstudio/dense-27b'], 'the one the reviewer names; not the loaded coder nor the 139B nobody named');
   assert.deepEqual(decideAI(tier('strongest', 0.95), options), {ai: 'lmstudio/dense-27b', local: {endpoint: 'lmstudio', model: 'dense-27b'}, tier: 'strongest', reason: null, confidence: 0.95, probabilities: {strongest: 0.95}});
   // what choosing it costs is part of what Jev is told: its memory, and the load
   assert.match(aiQuestions(profiles, {}, profiles.reviewer, cold).profile.criteria['lmstudio/dense-27b'],
