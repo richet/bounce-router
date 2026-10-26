@@ -279,6 +279,8 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     // A prompt typed while a turn runs, still held by this view (cli.js pendingTurns): shown where it will
     // land, marked queued, until it is sent (2026-10-01: a queued message not on screen "is not good").
     if (compact && e.kind === 'user' && e.local) return [...block(style.user('>'), wrap(clean(e.text), width - 2).map(line => style.user(line))), clip(`  ${style.muted('⎿')}  ${style.muted('queued · runs when the current turn ends · ↑ to edit')}`, width), ''];
+    // A message sent with `bounce send` is the user's turn too, marked so it is not taken for one typed here.
+    if (compact && e.kind === 'user' && e.via === 'send') return [...block(style.user('>'), wrap(clean(withoutBrief(e.text)), width - 2).map(line => style.user(line))), clip(`  ${style.muted('⎿')}  ${style.muted('via bounce send')}`, width), ''];
     if (compact && e.kind === 'user') return [...block(style.user('>'), wrap(clean(withoutBrief(e.text)), width - 2).map(line => style.user(line))), ''];
     if (compact && e.kind === 'assistant' && e.narration) return [...block(style.muted('∴'), wrap(clean(e.text), width - 2).map(line => style.muted(line))), ''];
     if (compact && ['assistant', 'delta', 'result'].includes(e.kind)) return [...block(style.result('●'), (e.kind === 'delta' ? streamingMarkdown : markdown)(e.text, width - 2).map(line => line ? style.answer(line) : line)), ''];
@@ -289,7 +291,7 @@ export function createFormatter({color = process.stdout.isTTY && !('NO_COLOR' in
     // A row of bounce's own (routing, a verdict, an activation…) is one line in the conversation, and
     // nothing at all when it has nothing to say. It used to be a three-line block headed by its kind.
     if (compact && !names[e.kind] && !inline.includes(e.kind)) return clean(e.text ?? '').trim() ? [oneLine(`  · ${clean(e.text).replace(/\s+/g, ' ').trim()}`, width, style.muted)] : [];
-    const label = e.kind === 'user' ? 'You' : e.kind === 'aside' ? 'You · By the way' : `${who(e)} · ${names[e.kind] || e.kind}`;
+    const label = e.kind === 'user' ? (e.via === 'send' ? 'You · via bounce send' : 'You') : e.kind === 'aside' ? 'You · By the way' : `${who(e)} · ${names[e.kind] || e.kind}`;
     const paint = style[e.kind] || style.muted;
     if (inline.includes(e.kind)) return compact ? hang(`  ${paint(clean(label))}  ${clean(e.text)}`, width) : wrap(`${paint(clean(label))}  ${clean(e.text)}`, width);
     const source = e.kind === 'tool' ? (toolLines(clean(e.text)) ?? [clean(e.text)]).join('\n') : clean(e.text);

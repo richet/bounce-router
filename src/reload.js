@@ -19,7 +19,8 @@ import {Session, config, dataRoot, pidAlive} from './core.js';
 import {loadQuota, recordQuota, quotaSnapshot} from './quota.js';
 import {seedSkills, seedSummary, skillsInUse, skillsBlock} from './skills.js';
 const SEED_NOTABLE = ['invalid', 'unmanaged', 'modified', 'withdrawn', 'failed'];
-import {resolveSessionRef} from './sessions.js';
+import {resolveSessionRef, listSessions} from './sessions.js';
+import {sendToOrchestrator, connectSession} from './send.js';
 import {titleSession, createAsk} from './session-title.js';
 export {pidAlive};
 import {createBus, connectBus} from './bus.js';
@@ -957,6 +958,35 @@ async function attachCommand(args) {
   process.exitCode = 0;
 }
 
+// `bounce send [--session REF] [--wait] [--json] MESSAGE`: the message goes to that session's orchestrator as if typed
+// in its view (src/send.js). With no --session, the one live session started in this directory.
+async function sendCommand(args) {
+  const {values, positionals} = parseArgs({args: args.slice(1), allowPositionals: true, options: {session: {type: 'string'}, wait: {type: 'boolean'}, json: {type: 'boolean'}, cwd: {type: 'string'}}});
+  const text = positionals.join(' ').trim();
+  if (!text) { console.error('bounce: send requires a message: bounce send [--session REF] [--wait] "message"'); process.exitCode = 2; return; }
+  const root = dataRoot();
+  let id = values.session ? resolveOrRaw(values.session) : null;
+  if (!id) {
+    const cwd = fs.realpathSync(values.cwd || process.cwd());
+    const live = listSessions(root).filter(row => row.live && row.cwd === cwd);
+    if (live.length !== 1) {
+      console.error(live.length ? `bounce: ${live.length} live sessions here; name one with --session: ${live.map(row => `${row.id.slice(0, 8)} (${row.name})`).join(', ')}` : 'bounce: no live session in this directory; name one with --session (bounce sessions lists them)');
+      process.exitCode = 1; return;
+    }
+    id = live[0].id;
+  }
+  let channel;
+  try { channel = await connectSession(root, id); }
+  catch (error) { console.error(`bounce: ${error.message}`); process.exitCode = 1; return; }
+  const sent = await sendToOrchestrator(channel, text, {wait: Boolean(values.wait)});
+  if (values.json) console.log(JSON.stringify({session: id, ...sent}));
+  else if (!sent.accepted) console.error(`bounce: the orchestrator did not take the message: ${sent.reason}`);
+  else if (!values.wait) console.log(`${sent.queued ? 'queued: it runs when the current turn ends' : 'sent'} · session ${id.slice(0, 8)} · request ${sent.requestId}`);
+  else if (sent.status === 'completed') console.log(sent.answer ?? '(the turn ended with no answer)');
+  else console.log(`(the turn ended ${sent.status}${sent.reason ? `: ${sent.reason}` : ''})${sent.answer ? `\n${sent.answer}` : ''}`);
+  process.exitCode = sent.accepted && (!values.wait || sent.status === 'completed') ? 0 : 1;
+}
+
 async function stopCommand(args) {
   const id = resolveOrRaw(args[1]);
   if (!id) { console.error('bounce: stop requires a session id'); process.exitCode = 2; return; }
@@ -1005,6 +1035,7 @@ async function waitFor(fn, {timeout = 5000, interval = 20} = {}) {
 export async function supervise(args = process.argv.slice(2), {spawnChild = spawn, updateInstall = installUpdate, adapters, profiles, strategy, onReady} = {}) {
   const command = args[0];
   if (command === 'attach') return attachCommand(args);
+  if (command === 'send') return sendCommand(args);
   if (command === 'stop') return stopCommand(args);
   if (command === 'run' && args.includes('--detach')) return detachRun(args, {spawnChild});
   if (command === 'run') return daemonSupervise(args, {spawnChild, updateInstall, adapters, profiles, strategy, onReady});

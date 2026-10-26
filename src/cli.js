@@ -77,7 +77,7 @@ async function main() {
     image: {type: 'string', multiple: true}, cwd: {type: 'string'}, resume: {type: 'string'}, provider: {type: 'string'}, model: {type: 'string'},
     mode: {type: 'string'}, json: {type: 'boolean'}, verify: {type: 'boolean'}, help: {type: 'boolean', short: 'h'}, version: {type: 'boolean', short: 'v'},
     check: {type: 'boolean'}, scope: {type: 'string'}, force: {type: 'boolean'}, list: {type: 'boolean'}, all: {type: 'boolean'}, session: {type: 'string'}, report: {type: 'boolean'},
-    save: {type: 'boolean'}, fix: {type: 'boolean'}, 'allow-network': {type: 'boolean'}, tasks: {type: 'boolean'}, against: {type: 'string'},
+    save: {type: 'boolean'}, fix: {type: 'boolean'}, 'allow-network': {type: 'boolean'}, tasks: {type: 'boolean'}, against: {type: 'string'}, control: {type: 'boolean'},
   }});
   if (values.help) return console.log(helpText(process.stdout.columns || 100));
   if (values.version) return console.log(`bounce ${version}`);
@@ -250,6 +250,14 @@ async function main() {
   }
   // The agent-facing interface over MCP: the same verbs and views the
   // bridge and these commands use, as typed tools, so an orchestrator stops shelling and parsing.
+  // The user's side (src/mcp-control.js): send the orchestrator a message as if typed in its view.
+  if (positionals[0] === 'mcp-serve' && values.control) {
+    const {createControlServer} = await import('./mcp-control.js');
+    const {serveStdio} = await import('./mcp.js');
+    const {connectSession} = await import('./send.js');
+    serveStdio(createControlServer({sessions: () => listSessions(root), connect: id => connectSession(root, id), version}));
+    return new Promise(() => {});
+  }
   if (positionals[0] === 'mcp-serve') {
     const {createOps, sessionBinding} = await import('./bridge-ops.js');
     const {createMcpServer, serveStdio} = await import('./mcp.js');
