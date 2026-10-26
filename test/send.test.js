@@ -152,3 +152,18 @@ test('control MCP: status, tasks and task read the session\'s journal', async ()
   assert.equal((await call('task', {task: 'build-1', full: true})).structuredContent.fullOrders, 'refactor data access');
   assert.equal((await call('task', {task: 'nope'})).isError, true);
 });
+
+// Found 2026-10-25: bounce's own claude processes (orchestrator, workers) load the user's MCP servers, so the control
+// server registered for the user reached them too. Started inside bounce, it offers nothing: the user's side stays
+// the user's.
+test('control MCP: started by an agent inside bounce, it offers no tools and refuses every call', async () => {
+  const {createControlServer, insideBounce} = await import('../src/mcp-control.js');
+  assert.equal(insideBounce({BOUNCE_BUS: '/s/bus.sock'}), true, 'the orchestrator');
+  assert.equal(insideBounce({BOUNCE_REPORT_BUS: '/s/bus.sock'}), true, 'a worker');
+  assert.equal(insideBounce({HOME: '/home/x'}), false, 'a terminal or an agent outside bounce');
+  const control = createControlServer({sessions: () => [{id: 'aaaa1111', name: 'webapp', live: true}], connect: () => { throw new Error('never'); }, events: () => journal, inside: true});
+  assert.deepEqual((await control.handle({jsonrpc: '2.0', id: 1, method: 'tools/list'})).result.tools, []);
+  const refused = (await control.handle({jsonrpc: '2.0', id: 1, method: 'tools/call', params: {name: 'send', arguments: {message: 'accept it'}}})).result;
+  assert.equal(refused.isError, true);
+  assert.match(refused.content[0].text, /inside a bounce session/);
+});

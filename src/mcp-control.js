@@ -34,9 +34,15 @@ const turnText = result => result.status === 'waiting'
   ? `still running; ask \`answer\` with request ${result.requestId ?? ''} later`.trim()
   : result.status === 'completed' ? (result.answer ?? '(the turn ended with no answer)') : `the turn ended ${result.status}${result.reason ? `: ${result.reason}` : ''}${result.answer ? `\n\n${result.answer}` : ''}`;
 
+// bounce's own agent processes carry these (the orchestrator its bus grant, a worker its report grant). Found
+// 2026-10-25: bounce's claude processes load the user's MCP servers, so the control server registered for the user
+// reached the orchestrator and the workers too. Started there, it offers nothing.
+export const insideBounce = (env = process.env) => ['BOUNCE_BUS', 'BOUNCE_BUS_TOKEN_FILE', 'BOUNCE_REPORT_BUS', 'BOUNCE_REPORT_TOKEN_FILE'].some(name => Boolean(env[name]));
+const INSIDE = 'bounce-control is the user\'s side of a session; it does not serve an agent running inside a bounce session. Use your own bounce tools.';
+
 // `sessions()` lists sessions as src/sessions.js does; `connect(id)` opens a view channel to that session's daemon;
 // `events(id)` reads its journal from disk (reads never go through the daemon).
-export function createControlServer({sessions, connect, events = () => [], version = '0'}) {
+export function createControlServer({sessions, connect, events = () => [], version = '0', inside = false}) {
   function pick(ref) {
     const live = sessions().filter(row => row.live);
     if (ref) {
@@ -49,6 +55,7 @@ export function createControlServer({sessions, connect, events = () => [], versi
   }
 
   async function callTool(name, args = {}) {
+    if (inside) return fail(INSIDE);
     if (name === 'sessions') {
       const live = sessions().filter(row => row.live).map(({id, name: title, cwd, operation}) => ({id, name: title, cwd, operation: operation ?? null}));
       return ok(live.length ? live.map(row => `${row.id.slice(0, 8)}  ${row.name}  ${row.operation ?? ''}  ${row.cwd}`).join('\n') : 'no live bounce session', {sessions: live});
@@ -91,7 +98,7 @@ export function createControlServer({sessions, connect, events = () => [], versi
       if (id === undefined) return null;
       if (method === 'initialize') return reply({protocolVersion: PROTOCOL_VERSION, capabilities: {tools: {}}, serverInfo: {name: 'bounce-control', version}});
       if (method === 'ping') return reply({});
-      if (method === 'tools/list') return reply({tools: TOOLS});
+      if (method === 'tools/list') return reply({tools: inside ? [] : TOOLS});
       if (method === 'tools/call') {
         try { return reply(await callTool(params?.name, params?.arguments ?? {})); }
         catch (error) { return reply(fail(`bounce: ${error.message}`)); }

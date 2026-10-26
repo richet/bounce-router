@@ -252,10 +252,10 @@ async function main() {
   // bridge and these commands use, as typed tools, so an orchestrator stops shelling and parsing.
   // The user's side (src/mcp-control.js): send the orchestrator a message as if typed in its view.
   if (positionals[0] === 'mcp-serve' && values.control) {
-    const {createControlServer} = await import('./mcp-control.js');
+    const {createControlServer, insideBounce} = await import('./mcp-control.js');
     const {serveStdio} = await import('./mcp.js');
     const {connectSession} = await import('./send.js');
-    serveStdio(createControlServer({sessions: () => listSessions(root), connect: id => connectSession(root, id), events: id => new Session(process.cwd(), {root, id}).events, version}));
+    serveStdio(createControlServer({sessions: () => listSessions(root), connect: id => connectSession(root, id), events: id => new Session(process.cwd(), {root, id}).events, version, inside: insideBounce(process.env)}));
     return new Promise(() => {});
   }
   if (positionals[0] === 'mcp-serve') {
