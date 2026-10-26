@@ -11,6 +11,12 @@ export const MILESTONES_SHOWN = 3;
 const TITLE_MAX = 200, TEXT_MAX = 400, SUMMARY_MAX = 1200;
 
 const cut = (value, max) => { const text = String(value ?? '').replace(/\s+/g, ' ').trim(); return text.length > max ? `${text.slice(0, max - 1)}…` : text; };
+// Orders cut in words, not just "…". Found live (2026-10-25): the orchestrator retried a task with orders copied
+// from this view, and the new builder got the first 400 characters and answered "I have no orders".
+const ordersLine = (task, orders) => {
+  const text = String(orders ?? '').replace(/\s+/g, ' ').trim();
+  return text.length > TEXT_MAX ? `${cut(text, TEXT_MAX)} (cut at ${TEXT_MAX} of ${String(orders).length} characters: task_get with full: true, or bounce task ${task.slice(0, 8)} --report, has them whole)` : text;
+};
 const minutes = ms => `${Math.round(ms / 60000)} min`;
 const rowsOf = (events, task, kind) => events.filter(e => e.kind === kind && e.task === task);
 const lastOf = (events, task, kind) => rowsOf(events, task, kind).at(-1) ?? null;
@@ -94,7 +100,7 @@ export function taskView(events, task, {now = Date.now(), journal = null, report
   } : null;
   return {
     task, state: state.state, profile: state.profile ?? null, ai: started?.requested ?? null,
-    orders: cut(submitted?.orders, TEXT_MAX),
+    orders: ordersLine(task, submitted?.orders),
     inPlace,
     elapsed: started ? minutes(now - Date.parse(started.time)) : null,
     lease: leaseRow ? {renewals: leaseRow.renewals, minutes: Math.round(leaseRow.leaseMs / 60000)} : null,
@@ -109,6 +115,7 @@ export function taskView(events, task, {now = Date.now(), journal = null, report
     summary: cut(terminal?.summary ?? terminal?.text ?? state.summary, SUMMARY_MAX) || null,
     // Whole and unreflowed when asked for: a verdict's last line is where it puts its conclusion.
     ...(report ? {
+      fullOrders: submitted?.orders ?? null,
       report: result ? JSON.stringify(result.report) : (terminal?.summary ?? terminal?.text ?? state.summary ?? null),
       candidateReport: result?.report ?? null,
       rawOutput: output?.text ?? null,

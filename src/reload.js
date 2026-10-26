@@ -357,7 +357,7 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     // orchestrator had no way to the rest of a 12 KB verdict — it hunted, gave up, and started redoing the
     // reviewer's work. The way exists now, so the orders are where it is named.
     'A handoff carries the worker\'s answer in full, up to 12,000 characters, so a finished task handed to you needs no second look-up. '
-      + 'That view is bounded on purpose, so its summary is cut. When a task has finished and you need its verdict whole — every finding, its repro and its observed output — ask `task_get` with `full: true` (or `bounce task <id> --report`). That is the one way to the full text, and the reason you never need the journal.',
+      + 'That view is bounded on purpose, so its summary is cut. When a task has finished and you need its verdict whole — every finding, its repro and its observed output — ask `task_get` with `full: true` (or `bounce task <id> --report`); the same call carries the task\'s orders whole, as `fullOrders`. That is the one way to the full text, and the reason you never need the journal.',
     'Example — submit one task, then end your turn:',
     `    bounce publish --event '{"kind":"task.submitted","parent":null,"profile":"${defaultTarget(profiles, orchestrator, {routingOn})}","orders":"<goal, owned paths, acceptance, how to verify>","deadline":${taskLimits(settings).minutes * 60000}}'`,
     '`bounce wait` is for a short wait only, at most 120 seconds, when the very next step depends on an outcome you expect within it:',

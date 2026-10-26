@@ -577,3 +577,29 @@ test('Jev review off and no reviewer agent: no automatic review, as before', asy
   const scheduler = createScheduler({session, adapters: {typesafe}, profiles, jev, gitHead: () => null});
   assert.equal(scheduler.submit({parent: null, profile: 'A', orders: 'go', deadline: null}).review?.completion, undefined);
 });
+
+// Found live (2026-10-25): the local reviewer ended three reviews out of three with no verdict, and each went
+// to the orchestrator, which accepted the work unreviewed. A review with no verdict goes to the next AI in the
+// reviewer's own chain first, the way a builder that cannot finish does.
+test('a reviewer that ends without a verdict hands the review to the next AI in its chain', async t => {
+  const {session} = setup(t);
+  const worker = fakeAdapter(({cwd}) => { if (cwd) fs.writeFileSync(path.join(cwd, 'truncate.js'), 'export const truncate = s => s;\n'); return [{kind: 'result', status: 'completed', text: 'done'}]; });
+  const local = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'I read the diff and ran out of room.'}]);
+  const cloud = [];
+  const rev2 = fakeAdapter(({orders}) => { cloud.push(orders); return [{kind: 'result', status: 'completed', text: 'Verdict: FAIL\nFINDING: {"file": "truncate.js", "line": 1, "severity": "major", "title": "the input is returned whole", "repro": "node -e x", "observed": "abcdef"}'}]; });
+  const agent = {name: 'reviewer', description: 'Grades a change cold', policy: 'read-only', prompt: 'You are the reviewer.'};
+  const reviewer = {adapter: 'local', model: 'q', mode: 'yolo', fallback: ['reviewer~2'], role: 'reviewer', policy: 'read-only', derived: true, agent};
+  const second = {adapter: 'rev2', model: 'sonnet', mode: 'yolo', fallback: [], role: 'reviewer', policy: 'read-only', derived: true, agent};
+  const {profiles, typesafe, jev} = jevScheduler(session, {settings: {enabled: true, review: false}, profiles: {reviewer, 'reviewer~2': second}, respond: () => ({answers: answers('accept', 0.95)})});
+  const scheduler = createScheduler({session, adapters: {worker, typesafe, local, rev2}, profiles, jev, gitHead: () => null});
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'write truncate', deadline: null});
+  await waitFor(() => session.events.some(e => e.kind === 'task.rework' && e.task === row.task));
+  const handed = session.events.filter(e => e.kind === 'review.escalated' && e.task === row.task).slice(0, 2).map(e => [e.to, e.text]);
+  assert.deepEqual(handed, [
+    ['reviewer', "Jev's first-pass review is off: the reviewer agent reviews it"],
+    ['reviewer~2', 'The reviewer ended without a verdict bounce could read: reviewer~2 reviews it'],
+  ]);
+  assert.match(cloud[0], /You are the reviewer|truncate/);
+  assert.equal(session.events.some(e => e.kind === 'review.blocked' && e.task === row.task), false, 'the orchestrator is not asked to decide');
+  assert.match(JSON.stringify(session.events.find(e => e.kind === 'task.rework' && e.task === row.task).findings), /the input is returned whole/);
+});

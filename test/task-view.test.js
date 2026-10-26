@@ -241,3 +241,19 @@ test('a task reference is a full id or a unique prefix of one; anything else is 
   assert.throws(() => taskByRef(tasks, 'zzzz9999'), {message: 'No task zzzz9999 in this session'});
   assert.throws(() => taskByRef(tasks, '165aa'), {message: 'Task 165aa is ambiguous: 165aacdf, 165aaxxx'});
 });
+
+// Found live (2026-10-25): the orchestrator retried a task by copying its orders from `bounce task --json`,
+// which held the first 400 characters ending in "…", and the new builder answered "I have no orders". A cut says
+// so in words, and the orders arrive whole beside the report when asked for.
+test('orders cut in the view say where to get them whole, and arrive whole on request', () => {
+  const orders = `BEFORE WRITING ANY CODE, read these skills. ${'item detail '.repeat(80)}END-OF-ORDERS`;
+  const events = [
+    at(1, {kind: 'task.submitted', seq: 1, task: 'w2', profile: 'builder', orders, deadline: 900000}),
+    at(2, {kind: 'task.started', seq: 2, task: 'w2', requested: 'qwen3.8-27b'}),
+  ];
+  const now = Date.parse('2026-09-22T20:10:00.000Z');
+  const bounded = taskView(events, 'w2', {now});
+  assert.match(bounded.orders, new RegExp(`… \\(cut at 400 of ${orders.length} characters: task_get with full: true, or bounce task w2 --report, has them whole\\)$`));
+  assert.equal(taskView(events, 'w2', {now, report: true}).fullOrders, orders);
+  assert.equal(taskView([at(1, {kind: 'task.submitted', seq: 1, task: 's', profile: 'builder', orders: 'short orders'})], 's', {now}).orders, 'short orders');
+});

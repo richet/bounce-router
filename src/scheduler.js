@@ -2024,6 +2024,27 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
 
   const VERDICT_ACTIONS = new Set(['accept', 'reject', 'rework', 'escalate', 'fail', 'rereview']);
 
+  // A reviewer agent that ended without a verdict bounce could read hands the review to the next AI in its own chain
+  // (reviewer~2, then reviewer~3), the way a builder that cannot finish does; only the last one's goes to the
+  // orchestrator. Found live (2026-10-25): the local reviewer ended three reviews out of three with no verdict,
+  // and each went to the orchestrator, which accepted the work unreviewed.
+  async function reviewDownChain({task, round, reviewer, verdicts, row, context, root, note, stale}) {
+    const head = profiles[reviewer];
+    if (verdicts.length !== 1 || !head || head.adapter === 'typesafe') return verdicts;
+    let from = reviewer;
+    for (const next of head.fallback ?? []) {
+      if (verdicts[0].verdict !== 'unreadable' || verdicts[0].cancelled) break;
+      const profile = profiles[next];
+      if (!profile || profile.role === 'orchestrator' || profile.adapter === 'typesafe' || policyRefusal(profile)) continue;
+      append({kind: 'review.escalated', task, to: next, from: 'bounce', text: `The ${profiles[from].role ?? from} ended without a verdict bounce could read: ${next} reviews it`, context});
+      const nextVerdicts = await runReviewers({task, stage: 'completion', round, reviewers: [next], row, context, root, reserveFirst: false, slot: `fallback:${next}`, note});
+      if (!nextVerdicts || stale()) return null;
+      verdicts = nextVerdicts;
+      from = next;
+    }
+    return verdicts;
+  }
+
   async function runCompletionReview(task, reviewIntent, {note = null} = {}) {
     const view = reducers.tasks(session.events);
     const t = view[task];
@@ -2060,6 +2081,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       if (!agentVerdicts || stale()) return;
       verdicts = agentVerdicts;
     }
+    verdicts = await reviewDownChain({task, round, reviewer: agentReviewer ?? reviewers[0], verdicts, row, context, root, note, stale});
+    if (!verdicts) return;
 
     const hook = invokeHook(() => strategy.onReviewVerdict(task, verdicts, reducers.tasks(session.events), api), task, context);
     if (!hook.ok) return;
