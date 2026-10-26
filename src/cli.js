@@ -27,6 +27,7 @@ import {activateLocalProfiles} from './local-activation.js';
 import {jevCommand} from './jev-command.js';
 import {jevSidebarLabel} from './jev.js';
 import {rolesFor, agentStore, agentsCommand, agentTable, handAIsToJev} from './agents.js';
+import {bindingsCommand, bindingUpdatesNotice, bindingUpdates, bindingsFile, readBindings} from './bindings.js';
 import {createInterface} from 'node:readline';
 import stringWidth from 'string-width';
 import {clean, createFormatter, createWorkSummary, workReview, withAsides, continueMain} from './format.js';
@@ -215,6 +216,11 @@ async function main() {
         try { await client.publish({kind: 'agents.defined', name: report.name, scope: report.scope, file: report.file, text}); } finally { await client.close(); }
       } catch (error) { console.error(`bounce: defined, but not journaled: ${error.message}`); }
     }
+    return console.log(values.json ? JSON.stringify(report, null, 2) : text);
+  }
+  if (positionals[0] === 'bindings') {
+    const catalogs = positionals[1] === 'update' ? await modelCatalog(settings, {maxAge: 0}) : [];
+    const {text, report} = bindingsCommand(positionals.slice(1), {root, cwd, catalogs, save: values.save});
     return console.log(values.json ? JSON.stringify(report, null, 2) : text);
   }
   if (positionals[0] === 'skills') {
@@ -1531,6 +1537,15 @@ async function main() {
     t.unref?.();
   }
   void refreshQuota(settings, {root, store: quotas, cwd: session.cwd}).then(render, () => {});
+  // A vendor shipping a newer release of a model the bindings name (terra 5.6 → 6.1) is said once on open; the
+  // file changes only through bounce bindings update --save. The ready notice is replaced only if still showing.
+  const opening = notice;
+  void (async () => {
+    const inUse = bindingsFile(root, session.cwd);
+    if (!inUse) return;
+    const hint = bindingUpdatesNotice(bindingUpdates(readBindings(inUse.file).agents, await modelCatalog(settings)));
+    if (hint && notice === opening) { notice = hint; render(); }
+  })().catch(() => {});
   // Nothing else refreshes the sidebar while the TUI sits idle between turns: without this, a
   // reading shown on open just grows stale until the next turn or /quota. Checked once a minute,
   // unref'd so it never keeps the process alive.

@@ -121,3 +121,16 @@ test('a tier the orchestrator gives wins over Jev\'s, and still leaves the AI to
   const advisorList = await routeAgentAI({orders: 'x', profiles, head, tier: 'advisor', settings: {enabled: true, routing: {enabled: true}}, ask, locals: [qwen], load: () => load()});
   assert.equal(advisorList.ai, 'codex_61_sol', 'a list with no advisor steps down to strongest');
 });
+
+test('a cloud model bounce has no note for keeps its family tier by name; a local or unknown name has none', async () => {
+  const {cloudTier} = await import('../src/model-catalog.js');
+  const {effectiveNotes} = await import('../src/roster-notes.js');
+  assert.equal(cloudTier('codex/gpt-6.1-terra'), 'mid');
+  assert.equal(cloudTier('codex/gpt-7-sol'), 'strongest');
+  assert.equal(cloudTier('claude/claude-haiku-5'), 'cheapest');
+  assert.equal(cloudTier('codex/gpt-7-astra'), 'advisor');
+  assert.equal(cloudTier('opencode/lmstudio/solar-10b'), null);
+  assert.equal(cloudTier('codex/gpt-9'), null);
+  const notes = effectiveNotes({codex_new: {adapter: 'codex', model: 'gpt-7-sol', routable: true}});
+  assert.equal(notes.codex_new.tier, 'strongest');
+});

@@ -52,7 +52,7 @@ test('config wins; an agent\'s cached description is not routed on; only models 
   assert.deepEqual(notes.build, {model: 'codex/gpt-7-nova', tier: 'mid', capabilities: null, source: null}, 'the profile\'s own tier, not the agent\'s sentence');
   assert.deepEqual(notes.build2, {model: 'codex/gpt-7-nova', tier: null, capabilities: null, source: null});
   assert.deepEqual(notes.own, {model: 'claude/sonnet', tier: 'strongest', capabilities: 'Configured by hand.', source: 'config'});
-  assert.deepEqual(notes.scout, {model: 'claude/haiku-next', tier: null, capabilities: null, source: null});
+  assert.deepEqual(notes.scout, {model: 'claude/haiku-next', tier: 'cheapest', capabilities: null, source: null}, 'an unlisted release keeps its family\'s tier by name');
   assert.deepEqual(undescribedModels(roster(), cache).map(m => m.key), ['claude/haiku-next', 'lmstudio/auto']);
   assert.doesNotMatch(JSON.stringify(routingQuestions(roster(), notes)), /From the cache/);
   fs.writeFileSync(path.join(root, NOTES_FILE), '{broken');
@@ -120,7 +120,7 @@ test('the daemon setup describes only what is missing, once, journals jev.roster
   let changes = 0;
   const profiles = roster();
   const setup = createRosterSetup({root, profiles, session, agent: {adapter: 'claude', model: 'opus'}, run: answering(ANSWER, calls), catalogs: async () => { throw new Error('no catalog'); }, onChange: () => { changes++; }});
-  assert.deepEqual(setup.notes().scout, {model: 'claude/haiku-next', tier: null, capabilities: null, source: null});
+  assert.deepEqual(setup.notes().scout, {model: 'claude/haiku-next', tier: 'cheapest', capabilities: null, source: null});
   const [first, second] = await Promise.all([setup.ensure(), setup.ensure()]);
   assert.equal(calls.length, 1, 'concurrent ensures share one run');
   assert.deepEqual(first, second);
@@ -129,9 +129,9 @@ test('the daemon setup describes only what is missing, once, journals jev.roster
   const row = session.events.find(e => e.kind === 'jev.roster');
   assert.equal(row.by, 'claude/opus');
   // The row lists the tiers routing reads: config and pins only; the agent's answer is cached for reading (2026-10-22).
-  assert.match(row.text, /^Jev roster: claude\/opus described claude\/haiku-next, codex\/gpt-7-nova, lmstudio\/auto · build → mid, own → strongest$/);
+  assert.match(row.text, /^Jev roster: claude\/opus described claude\/haiku-next, codex\/gpt-7-nova, lmstudio\/auto · scout → cheapest, build → mid, own → strongest$/);
   assert.equal(readRosterNotes(root)['claude/haiku-next'].capabilities, 'Fast and cheap; weak at long multi-step edits.');
-  assert.deepEqual(setup.notes().scout, {model: 'claude/haiku-next', tier: null, capabilities: null, source: null});
+  assert.deepEqual(setup.notes().scout, {model: 'claude/haiku-next', tier: 'cheapest', capabilities: null, source: null});
   assert.deepEqual(setup.notes().build, {model: 'codex/gpt-7-nova', tier: 'mid', capabilities: null, source: null});
   assert.equal(await setup.ensure(), null, 'nothing left to describe');
   assert.equal(calls.length, 1);
@@ -195,7 +195,7 @@ test('/jev roster lists what routing knows and who said it; refresh clears this 
 
 test('rosterLines reads plainly with nothing configured', () => {
   assert.deepEqual(rosterLines({}), ['No worker profiles to route between']);
-  assert.deepEqual(rosterLines({a: {adapter: 'claude', model: 'haiku-next'}}), ['a → claude/haiku-next · not rated']);
+  assert.deepEqual(rosterLines({a: {adapter: 'claude', model: 'haiku-next'}}), ['a → claude/haiku-next · tier cheapest · not rated']);
 });
 
 // The shipped catalog sits between config and the cache: a catalog model is never pending, never

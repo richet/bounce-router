@@ -132,3 +132,11 @@ export const catalogNote = key => MODEL_CATALOG[key] ?? null;
 // `/jev roster set`. qwen3.8 is a peer of sonnet and terra (2026-10-26; Qwen3.8-27B 61.7 on SWE-bench Pro).
 const LOCAL_TIERS = [[/qwen3\.8/i, 'mid']];
 export const localTier = model => LOCAL_TIERS.find(([pattern]) => pattern.test(String(model ?? '')))?.[1] ?? 'cheapest';
+
+// A cloud model bounce ships no note for keeps its family's tier, read from its name, so a vendor's next release
+// (gpt-6.1-terra, claude-opus-6) routes like the one it replaces. null when the name says no family bounce knows.
+const CLOUD_TIERS = [[/haiku|luna/i, 'cheapest'], [/sonnet|terra|muse/i, 'mid'], [/opus|sol/i, 'strongest'], [/fable|astra/i, 'advisor']];
+export const cloudTier = key => {
+  const [adapter, model = ''] = String(key ?? '').split(/\/(.*)/);
+  return ['claude', 'codex', 'muse'].includes(adapter) ? CLOUD_TIERS.find(([pattern]) => pattern.test(model))?.[1] ?? null : null;
+};

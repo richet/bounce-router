@@ -102,3 +102,69 @@ export function applyBindings(roles, {root, cwd, sampling}) {
   }
   return roles;
 }
+
+// A model id read as a family and a version, so a newer release of the same model is found by name: gpt-5.6-terra
+// and gpt-6.1-terra are both gpt-terra, claude-opus-4-8 and claude-opus-5 both claude-opus. An id with no version
+// (claude/sonnet, an alias that already follows the newest) has none to upgrade.
+export function modelVersion(id) {
+  const [, base, variant = ''] = String(id).match(/^(.*?)(\[[^\]]*\])?$/);
+  const parts = base.split('-');
+  const version = parts.filter(part => /^\d+(\.\d+)*$/.test(part)).flatMap(part => part.split('.').map(Number));
+  return version.length ? {family: parts.filter(part => !/^\d+(\.\d+)*$/.test(part)).join('-') + variant, version} : null;
+}
+const newer = (a, b) => { for (let i = 0; i < Math.max(a.length, b.length); i++) if ((a[i] ?? 0) !== (b[i] ?? 0)) return (a[i] ?? 0) > (b[i] ?? 0); return false; };
+
+// Each chain entry that names a versioned model, with the newest release of its family a signed-in CLI reports.
+// `catalogs` is src/models.js modelCatalog: what each vendor offers today, so a new model is seen the day it ships.
+export function bindingUpdates(chains, catalogs) {
+  const offered = new Map(catalogs.map(catalog => [catalog.provider, catalog.models.map(model => model.id)]));
+  const updates = [];
+  for (const [agent, chain] of Object.entries(chains)) for (const entry of chain) {
+    const slash = entry.indexOf('/');
+    if (slash < 0) continue;
+    const provider = entry.slice(0, slash), current = modelVersion(entry.slice(slash + 1));
+    if (!current) continue;
+    let best = null;
+    for (const id of offered.get(provider) ?? []) {
+      const release = modelVersion(id);
+      if (release?.family === current.family && newer(release.version, (best ?? current).version)) best = {id, version: release.version};
+    }
+    if (best) updates.push({agent, from: entry, to: `${provider}/${best.id}`});
+  }
+  return updates;
+}
+
+// The upgrades in one line for the TUI, or null when every chain is on its family's newest model.
+export function bindingUpdatesNotice(updates) {
+  if (!updates.length) return null;
+  const pairs = [...new Set(updates.map(update => `${update.from} → ${update.to}`))];
+  return `Newer models: ${pairs.join(', ')} · bounce bindings update shows where, --save applies it`;
+}
+
+// `bounce bindings update [--save]`: lists the upgrades, and with save rewrites those entries in the bindings file in
+// use, keeping its comments and order. When an agent already lists the newer model, the older entry is dropped.
+export function bindingsCommand(words, {root, cwd, catalogs = [], save = false}) {
+  const [action = 'list'] = words.filter(Boolean);
+  const inUse = bindingsFile(root, cwd);
+  if (!['list', 'update'].includes(action)) throw new Error('Use bindings [list] or bindings update [--save]');
+  if (!inUse) return {text: `No ${BINDINGS_FILE} in use: agents play their default chains. bounce local setup writes one.`, report: null};
+  const {agents: chains} = readBindings(inUse.file);
+  if (action === 'list') {
+    const width = Math.max(0, ...Object.keys(chains).map(name => name.length)) + 2;
+    return {text: [`${inUse.file} (${inUse.source})`, ...Object.entries(chains).map(([name, chain]) => `  ${name.padEnd(width)}${chain.join(', ')}`)].join('\n'), report: {...inUse, agents: chains}};
+  }
+  const updates = bindingUpdates(chains, catalogs);
+  const unread = catalogs.filter(catalog => !catalog.models.length).map(catalog => `  ${catalog.provider} not checked: ${catalog.error}`);
+  if (!updates.length) return {text: [`Every model in ${inUse.file} is its family's newest.`, ...unread].join('\n'), report: {file: inUse.file, updates, saved: false}};
+  const rows = updates.map(update => `  ${update.agent}: ${update.from} → ${update.to}`);
+  if (!save) return {text: [`Newer models for ${inUse.file}:`, ...rows, ...unread, 'bounce bindings update --save applies them.'].join('\n'), report: {file: inUse.file, updates, saved: false}};
+  const doc = YAML.parseDocument(fs.readFileSync(inUse.file, 'utf8'));
+  for (const {agent, from, to} of updates) {
+    const seq = doc.getIn(['agents', agent], true);
+    const values = seq.items.map(item => String(YAML.isScalar(item) ? item.value : item));
+    const at = values.indexOf(from);
+    if (values.includes(to)) seq.items.splice(at, 1); else seq.items[at] = doc.createNode(to);
+  }
+  fs.writeFileSync(inUse.file, doc.toString({lineWidth: 0}));
+  return {text: [`Updated ${inUse.file}:`, ...rows, ...unread, 'Used by newly started sessions; a running one keeps its roster.'].join('\n'), report: {file: inUse.file, updates, saved: true}};
+}

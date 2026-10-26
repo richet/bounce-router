@@ -21,6 +21,7 @@ export const CLI_USAGE = [
   ['bounce login', 'claude|codex|muse', 'Open the vendor\'s native login flow'],
   ['bounce models', '[--json]', 'List the models each agent reports, cloud and local'],
   ['bounce agents', '[list|show NAME|set NAME [--force]|remove NAME] [--scope user|project]', 'Agent files (the team); set reads markdown from stdin'],
+  ['bounce bindings', '[update [--save]]', 'Show who plays each agent; update finds newer releases of the models named (terra 5.6 → 6.1)'],
   ['bounce local', '[--verify] [--json]', 'Local status: models, the OpenCode bridge, agents a local model may play'],
   ['bounce local on|off', '', 'Let agents run on local models, or make them skip their local AIs'],
   ['bounce local setup', '', 'Write this machine\'s models (models.yaml) and who plays each agent (bindings.yml)'],

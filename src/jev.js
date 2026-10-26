@@ -14,7 +14,7 @@ import {createHash} from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import {dataRoot, saveJSON} from './core.js';
-import {catalogNote} from './model-catalog.js';
+import {catalogNote, cloudTier} from './model-catalog.js';
 
 export const JEV_DEFAULT_MODEL = 'jev-1.13.0'; // pinned: an alias (`jev-latest`) moves between releases and shifts calibrated thresholds
 export const JEV_REVIEWER = 'jev'; // the synthetic read-only critic profile the daemon registers
@@ -675,7 +675,7 @@ export function pickAI({profiles = {}, head = null, notes = {}, locals = [], tie
   const chain = chainOf(profiles, head);
   const at = match => { const index = chain.findIndex(match); return index === -1 ? chain.length : index; };
   const cloud = Object.entries(ownProfiles(profiles, head)).filter(routable).map(([name, p]) => ({name, adapter: p.adapter,
-    tier: p.tier ?? notes[name]?.tier ?? catalogNote(`${p.adapter}/${p.model ?? 'default'}`)?.tier ?? 'mid',
+    tier: p.tier ?? notes[name]?.tier ?? catalogNote(`${p.adapter}/${p.model ?? 'default'}`)?.tier ?? cloudTier(`${p.adapter}/${p.model ?? ''}`) ?? 'mid',
     index: at(link => !link.backend && link.adapter === p.adapter && link.model === p.model)}));
   const local = offerable(locals, profiles, head).map(item => ({name: item.name, item, tier: item.tier, index: at(link => link.backend && `${link.endpoint}/${link.model}` === item.name)}));
   const candidates = [];

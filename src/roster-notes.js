@@ -14,7 +14,7 @@ import {PROFILE_TIERS, TIER_HINT, routable} from './jev.js';
 import {LOCAL_ADAPTERS} from './profiles.js';
 import {invocation, runProcess} from './providers.js';
 import {resolveExecutable} from './executable.js';
-import {CATALOG_SOURCE, catalogNote} from './model-catalog.js';
+import {CATALOG_SOURCE, catalogNote, cloudTier} from './model-catalog.js';
 
 export const NOTES_FILE = 'roster-notes.json';
 export const SETUP_TIMEOUT_MS = 120_000;
@@ -63,7 +63,7 @@ export function effectiveNotes(profiles = {}, cache = {}) {
   return Object.fromEntries(rosterEntries(profiles).map(([name, p]) => {
     const key = modelKey(p);
     const note = routingNote(key, cache) ?? {};
-    const tier = p.tier ?? (PROFILE_TIERS.includes(note.tier) ? note.tier : null);
+    const tier = p.tier ?? (PROFILE_TIERS.includes(note.tier) ? note.tier : cloudTier(key));
     const capabilities = p.capabilities ?? (typeof note.capabilities === 'string' && note.capabilities ? note.capabilities : null);
     const source = p.capabilities ? 'config' : !capabilities ? null : catalogNote(key) ? CATALOG_SOURCE : note.by ?? 'notes';
     return [name, {model: key, tier, capabilities, source}];
