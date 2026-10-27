@@ -409,12 +409,23 @@ function baselineContent(copy, change, dir) {
 }
 
 // Three-way merge of a text file (git merge-file): the merged content, or null when the edits overlap or it is not text.
-function mergeText(base, ours, theirs) {
+// Every line of `base` is still there, in order: the side only added lines.
+const onlyAdds = (base, side) => {
+  const lines = side.toString('utf8').split('\n');
+  let at = 0;
+  for (const line of base.toString('utf8').split('\n')) { while (at < lines.length && lines[at] !== line) at++; if (at++ >= lines.length) return false; }
+  return true;
+};
+
+// A Markdown file both sides only added to keeps both additions, even at the same place (the checkout's first): that is a
+// log or tracker entry each, never an edit to choose between. Anything else that overlaps still conflicts.
+function mergeText(base, ours, theirs, file) {
   if (!base || [base, ours, theirs].some(data => data.includes(0))) return null;
+  const union = /\.md$/i.test(file) && onlyAdds(base, ours) && onlyAdds(base, theirs);
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-merge-'));
   try {
     for (const [name, data] of [['ours', ours], ['base', base], ['theirs', theirs]]) fs.writeFileSync(path.join(scratch, name), data);
-    const result = spawnSync('git', ['merge-file', '-p', '--quiet', 'ours', 'base', 'theirs'], {cwd: scratch, env: gitEnv(), maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore']});
+    const result = spawnSync('git', ['merge-file', '-p', '--quiet', ...(union ? ['--union'] : []), 'ours', 'base', 'theirs'], {cwd: scratch, env: gitEnv(), maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore']});
     return result.status === 0 ? result.stdout : null;
   } catch {
     return null;
@@ -447,6 +458,7 @@ export function integrateArtifact({cwd, artifact, dir, base = null}) {
   const applied = new Set(record.applied);
   const merged = {...(record.merged ?? {})}; // path -> hash of the merged content written
   const plans = new Map();
+  const conflicts = [];
   for (const change of artifact.changes) {
     const state = targetState(root, change);
     const desired = change.kind === 'delete' ? null : change.after;
@@ -455,10 +467,12 @@ export function integrateArtifact({cwd, artifact, dir, base = null}) {
     // Only content is merged: a checkout that changed the file's mode (or only its mode) keeps the conflict.
     const contentOnly = state && change.before && change.kind !== 'delete' && state.mode === change.before.mode && state.hash !== change.before.hash;
     const ours = contentOnly ? fs.readFileSync(safeJoin(root, change.path)) : null;
-    const data = ours && mergeText(baselineContent(base, change, dir), ours, Buffer.from(change.data, 'base64'));
-    if (!data) return {status: 'conflict', path: change.path};
+    const data = ours && mergeText(baselineContent(base, change, dir), ours, Buffer.from(change.data, 'base64'), change.path);
+    if (!data) { conflicts.push(change.path); continue; }
     plans.set(change.path, {ours: state.hash, data});
   }
+  // Every file that conflicts is named, so the one decision covers them all.
+  if (conflicts.length) return {status: 'conflict', path: conflicts[0], paths: conflicts};
   record.status = 'prepared'; record.applied = [...applied]; record.merged = merged; atomicJSON(recordFile, record);
   for (const change of artifact.changes) {
     if (applied.has(change.path)) continue;

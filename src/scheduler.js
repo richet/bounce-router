@@ -277,7 +277,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const name = pinnedName(agent, ref);
     // The AI was named, so nothing falls under it: a run that cannot finish goes back to the orchestrator, never down
     // the agent's own chain to an AI nobody asked for.
-    if (!profiles[name]) profiles[name] = {...playedBy(head, ref, {adapter, model}, local), fallback: [], pinned: true};
+    // The agent's own settings for that AI (its binding's sampling) come along when the AI is on its list.
+    const own = local && Object.values(profiles).find(p => p.derived && !p.ai && p.agent?.name === agent && p.backend && `${p.endpoint}/${p.model}` === ref && p.localOptions);
+    if (!profiles[name]) profiles[name] = {...playedBy(head, ref, {adapter, model}, local), ...(own ? {localOptions: own.localOptions} : {}), fallback: [], pinned: true};
     return name;
   }
   const ensurePinned = name => { const match = typeof name === 'string' && !profiles[name] ? PINNED.exec(name) : null; if (match) pin(match[1], `${match[2]}/${match[3]}`); };
@@ -619,6 +621,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const found = ref => ({ref, listed: listed.includes(ref)});
     if (word.includes('/')) return found(word);
     if (isModelProfile(profiles[word])) return found(refOf(profiles[word]));
+    const alias = aliasProfile(word, agent);
+    if (alias) return found(refOf(alias));
     const family = word.toLowerCase();
     const own = [...new Set(listed.filter(ref => familyOf(ref, family)))].sort(newestFirst);
     if (own.length) return found(own[0]);
@@ -626,6 +630,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return other.length ? found(other[0]) : null;
   }
   const agentOf = name => profiles[name]?.agent?.name ?? null;
+  // A name from the bindings (models.yaml) for an AI: the agent's own entry first, else any agent's.
+  const aliasProfile = (word, agent = null) => { const named = Object.values(profiles).filter(p => p.derived && !p.ai && p.alias === word); return named.find(p => p.agent?.name === agent) ?? named[0] ?? null; };
   const reviewAgent = () => agentHeads().find(name => REVIEW_ROLES.has(profiles[name].role)) ?? null;
   // Corrections, not refusals, wherever the intent of a submission is clear (2026-09-27: refusals cost whole
   // orchestrator turns). Each is said in `corrections` on the journaled row and as a task.corrected row.
@@ -651,6 +657,17 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       const name = agent && pin(agent, ref);
       if (name) {
         corrections.push(`profile: ${spec.profile} is an AI, not an agent: it runs as the ${agent} agent on ${ref} (profile names the agent, model the AI)`);
+        spec = {...spec, profile: name};
+      }
+    }
+    // A binding's name for an AI given as the profile (`profile: qwen3.8_builder_2`) is the same case.
+    const alias = !profiles[spec.profile] && spec.from === 'orchestrator' && typeof spec.profile === 'string' ? aliasProfile(spec.profile) : null;
+    if (alias) {
+      const agent = agentOf(rawSubmittedRow(spec.retryOf ?? spec.replaces)?.profile) ?? matchingAgent({...spec, profile: undefined}) ?? alias.agent.name;
+      const ref = refOf(aliasProfile(spec.profile, agent));
+      const name = pin(agent, ref);
+      if (name) {
+        corrections.push(`profile: ${spec.profile} is an AI (a name in the bindings), not an agent: it runs as the ${agent} agent on ${ref} (profile names the agent, model the AI)`);
         spec = {...spec, profile: name};
       }
     }
@@ -2769,7 +2786,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         const copy = session.events.findLast(e => e.kind === 'task.artifact' && e.task === action.task)?.cwd ?? null;
         const result = integrateArtifact({cwd: session.cwd, artifact, dir, base: copy});
         if (result.status !== 'integrated') {
-          append({kind: 'task.blocked', task: action.task, reason: `integration_${result.status}`, text: `Artifact integration ${result.status}${result.path ? `: ${result.path}` : ''}; isolated work preserved`, artifactId});
+          append({kind: 'task.blocked', task: action.task, reason: `integration_${result.status}`, text: `Artifact integration ${result.status}${result.paths?.length ? `: ${result.paths.join(', ')}` : result.path ? `: ${result.path}` : ''}; isolated work preserved`, ...(result.paths ? {paths: result.paths} : {}), artifactId});
           return;
         }
         if (!session.events.some(e => e.kind === 'task.integrated' && e.task === action.task && e.artifactId === artifactId)) append({kind: 'task.integrated', task: action.task, artifactId, resultHash: artifact.resultHash,

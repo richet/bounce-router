@@ -288,6 +288,9 @@ export function localCandidates(catalogs = [], notes = {}) {
   return [...usable.filter(item => item.loaded), ...usable.filter(item => !item.loaded)];
 }
 
+// Why a profile's own model was taken: it was named for the task, or it is that place on the agent's list.
+const pinReason = profile => profile.pinned ? 'named for this task' : profile.alias && profile.role ? `${profile.alias}, on the ${profile.role}'s list` : 'profile pin';
+
 export function resolveLocalModel({local, profile, catalogs, requirements = {}, override} = {}) {
   const settings = normalizeLocalSettings(local);
   const fail = (message, code) => { throw error(message, code); };
@@ -297,7 +300,7 @@ export function resolveLocalModel({local, profile, catalogs, requirements = {}, 
   const rolePreference = profile.role && settings.preferences[profile.role] || {};
   const exclusions = new Set([...settings.exclude, ...(rolePreference.exclude ?? []), ...(profile.exclude ?? [])]);
   const all = catalogs.filter(row => row?.provider === 'local' && row.backend === 'lmstudio' && !row.stale).flatMap(row => (row.models ?? []).map(model => ({endpoint: row.endpoint, model})));
-  const exact = override ? {ref: override, reason: 'override'} : profile.model && profile.model !== 'auto' ? {ref: `${profile.endpoint ?? 'lmstudio'}/${profile.model}`, reason: 'profile pin'} : null;
+  const exact = override ? {ref: override, reason: 'override'} : profile.model && profile.model !== 'auto' ? {ref: `${profile.endpoint ?? 'lmstudio'}/${profile.model}`, reason: pinReason(profile)} : null;
   if (exact) {
     const parsed = splitRef(exact.ref);
     if (!parsed) fail(`Invalid local model ref ${exact.ref}`, 'INVALID_LOCAL_MODEL_REF');

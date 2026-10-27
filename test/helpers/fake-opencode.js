@@ -131,6 +131,16 @@ if (argv[0] !== 'serve') process.stdin.on('end', async () => {
   // FAKE_OC_SCENARIO=opener-then-silence: says one sentence, does tool work, then the turn ends with
   // no text after the last tool call — the shape of a worker that went quiet (observed live: that
   // opener became the task's completion).
+  // FAKE_OC_SCENARIO=leaked-call: the shape observed live (qwen3.8-27b on LM Studio, 1 turn in 3382): tool work, then a
+  // final message that is a Qwen3-Coder tool call written as text, which the server never parsed and nothing ran.
+  if (scenario === 'leaked-call') {
+    emit('tool_use', {type: 'tool', tool: 'read', state: {status: 'completed', input: {filePath: 'a.js'}, output: 'x'}});
+    emit('step_finish', {type: 'step-finish', reason: 'tool-calls', tokens: usage});
+    emit('step_start', {type: 'step-start'});
+    emit('text', {type: 'text', text: "\n\n<tool_call>\n<function=shell>\n<parameter=command>\ndeno check src/cli/reading.ts\n</parameter>\n</function>\n</tool_call>"});
+    emit('step_finish', {type: 'step-finish', reason: 'stop', tokens: usage});
+    return process.exit(0);
+  }
   if (scenario === 'opener-then-silence') {
     emit('text', {type: 'text', text: 'I will execute this task systematically. Let me start by reading the owned files.'});
     emit('tool_use', {type: 'tool', tool: 'read', state: {status: 'completed', input: {filePath: 'a.js'}, output: 'x'}});

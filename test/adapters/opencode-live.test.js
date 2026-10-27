@@ -522,6 +522,27 @@ test('when the worker will not answer even then, the turn fails and the next AI 
   assert.deepEqual(events.at(-1), {kind: 'result', status: 'failed', recoverable: true, text: 'no answer: the worker said nothing after its last tool call'});
 });
 
+// Found live (a session): a qwen reviewer's last message was a Qwen3-Coder tool call written as text. The server never
+// parsed it, so nothing ran, and bounce took the raw call as the review's answer: unreadable.
+test('a tool call written as text is not an answer: the worker is told it never ran and asked for its answer', async t => {
+  const {cwd, dir} = setup(t, {FAKE_OC_SCENARIO: 'leaked-call', FAKE_OC_CONCLUDE: 'answer'});
+  const adapter = createOpencodeLive({});
+  const events = await drain(adapter, await adapter.launch({peer: 'worker:leak', profile: profileFor({policy: 'read-only'}), cwd, dir, orders: 'review it'}));
+  assert.equal(events.at(-1).status, 'completed');
+  assert.match(events.at(-1).text, /^FAIL: the boundary is off by one/);
+  assert.deepEqual(events.find(e => e.kind === 'diagnostic' && e.reason === 'leaked_tool_call'),
+    {kind: 'diagnostic', text: 'its last message was a tool call written as text, so it never ran; asked once, tools off, for its answer', reason: 'leaked_tool_call', phase: 'conclusion', toolsDisabled: true});
+  const prompts = fs.readFileSync(path.join(dir, 'fake.log'), 'utf8').split('\n').filter(l => l.startsWith('PROMPT ')).map(l => JSON.parse(l.slice(7)));
+  assert.match(prompts[1], /\(your last message was a tool call written as text, so it never ran\)/);
+});
+
+test('a worker that leaks a tool call and will not answer fails with that reason, not as unreadable', async t => {
+  const {cwd, dir} = setup(t, {FAKE_OC_SCENARIO: 'leaked-call'});
+  const adapter = createOpencodeLive({});
+  const events = await drain(adapter, await adapter.launch({peer: 'worker:leak2', profile: profileFor({policy: 'read-only'}), cwd, dir, orders: 'review it'}));
+  assert.deepEqual(events.at(-1), {kind: 'result', status: 'failed', recoverable: true, text: 'no answer: the worker wrote a tool call as text instead of calling the tool, so it never ran'});
+});
+
 // Found live: a reviewer hit opencode's step cap; opencode injected
 // "CRITICAL - MAXIMUM STEPS REACHED … Respond with text only", and bounce recorded THAT as the
 // worker's answer — the review was blocked as an unreadable verdict after 24 minutes. The notice is

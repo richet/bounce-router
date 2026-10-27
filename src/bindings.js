@@ -66,7 +66,7 @@ export function readModels(file, sampling) {
 }
 
 function resolveEntry(entry, models) {
-  if (models[entry]) return {ref: models[entry].model, settings: models[entry].settings};
+  if (models[entry]) return {ref: models[entry].model, settings: models[entry].settings, alias: entry};
   if (MODEL_REF.test(entry)) return {ref: entry, settings: null};
   if (PROVIDERS.has(entry)) return {ref: `${entry}/default`, settings: null};
   return {skipped: {entry, reason: `bindings ask for ${entry}; ${MODELS_FILE} does not define it`}};
@@ -98,6 +98,7 @@ export function applyBindings(roles, {root, cwd, sampling}) {
     const resolved = chain.filter(entry => entry !== AUTO).map(entry => resolveEntry(entry, models));
     role.models = [...(chain[0] === AUTO ? [AUTO] : []), ...resolved.filter(item => item.ref).map(item => item.ref)];
     role.chainSettings = resolved.filter(item => item.ref).map(item => item.settings);
+    role.chainAliases = resolved.filter(item => item.ref).map(item => item.alias ?? null);
     role.binding = {source: inUse.source, file: inUse.file, from: own ? role.name : '*', skipped: resolved.filter(item => item.skipped).map(item => item.skipped)};
   }
   return roles;

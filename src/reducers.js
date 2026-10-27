@@ -53,7 +53,7 @@ export function tasks(events) {
       if (t && !TERMINAL.has(t.state) && typeof e.chosen === 'string' && e.chosen) t.profile = e.chosen;
       continue;
     }
-    if (!e.kind?.startsWith('task.')) continue;
+    if (!e.kind?.startsWith('task.') && e.kind !== 'review.started' && e.kind !== 'review.finished') continue;
     if (typeof e.task !== 'string' || !e.task) continue; // a malformed row never becomes a task
     if (e.kind === 'task.submitted') {
       const t = ensure(e.task);
@@ -92,6 +92,18 @@ export function tasks(events) {
         }
         break;
       case 'task.input_required': t.state = 'input_required'; break;
+      // bounce's own steps after the work speak through the same line: a check that ended and a review that runs
+      // never leave the task saying "Running the task's check" (found live: read as a hung check during a review).
+      case 'task.check':
+        t.checked = e.passed ? `The check passed (exit ${e.exit})` : e.timedOut ? 'The check timed out' : `The check failed (exit ${e.exit})`;
+        t.lastMilestone = {time: e.time, text: t.checked};
+        break;
+      case 'review.started':
+        t.lastMilestone = {time: e.time, text: `${t.checked ? `${t.checked}; ` : ''}${e.profile} is reviewing it (round ${e.round})`};
+        break;
+      case 'review.finished':
+        t.lastMilestone = {time: e.time, text: `Review round ${e.round} ended: ${e.verdict}`};
+        break;
       case 'task.milestone':
         if (t.state === 'waiting') priorState[e.task] = 'running';
         else if (t.state === 'blocked' || t.state === 'input_required') t.state = 'running';

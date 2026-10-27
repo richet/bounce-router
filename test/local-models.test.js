@@ -260,3 +260,14 @@ test('a pinned model that cannot be used says why, not just that it "does not me
   assert.throws(() => resolveLocalModel({local: {endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234'}}}, catalogs, profile: profile('big'), requirements: {tools: true, context: 300000}}),
     /Pinned model lmstudio\/big cannot be used: context 262144 is below the 300000 the profile needs/);
 });
+
+// Found live (a session): 25 selections said "Selected lmstudio/qwen3.8-27b-gsq-rco · profile pin", which read as an
+// override of what the orchestrator asked for. Each one was the first AI on an agent's list; the reason now says so.
+test('a selection says why that AI: named for the task, or the place it holds on the agent\'s list', () => {
+  const settings = normalizeLocalSettings(local({lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234'}}));
+  const catalogs = [{provider: 'local', endpoint: 'lmstudio', backend: 'lmstudio', stale: false, models: [{id: 'qwen', ref: 'lmstudio/qwen', label: 'qwen', type: 'llm', tools: true, context: 16000, ready: true, instances: []}]}];
+  const reason = profile => resolveLocalModel({local: settings, catalogs, profile: {backend: 'lmstudio', endpoint: 'lmstudio', model: 'qwen', ...profile}}).reason;
+  assert.equal(reason({role: 'reviewer', alias: 'qwen3.8_reviewer'}), "qwen3.8_reviewer, on the reviewer's list");
+  assert.equal(reason({role: 'reviewer', pinned: true}), 'named for this task');
+  assert.equal(reason({}), 'profile pin');
+});

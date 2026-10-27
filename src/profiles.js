@@ -197,6 +197,9 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
       const base = {derived: true, adapter: isLocal(provider) ? 'opencode' : provider, model, mode, policy,
         fallback: chain.slice(index + 1, index + 2), role: agent.name, executables: {...(settings.executables ?? {})},
         agent: {name: agent.name, description: agent.description, policy, prompt: agent.prompt, ...(agent.maxSteps ? {maxSteps: agent.maxSteps} : {}), ...(agent.sampling && profileSamples(agent) ? {sampling: agent.sampling} : {})}};
+      // The binding's name for this AI (models.yaml), so the orchestrator can name it as the user did.
+      const alias = agent.chainAliases?.[backends[index].at];
+      if (alias) base.alias = alias;
       if (auto && index === 0) base.auto = true;
       // `auto` alone has no list to stay within: Jev chooses from the whole roster (src/jev.js ownProfiles).
       if (auto && index === 0 && !listed.length) base.autoAll = true;

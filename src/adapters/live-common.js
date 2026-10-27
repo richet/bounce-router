@@ -138,20 +138,27 @@ export function classifyText(vendor, text, {marked = null} = {}) {
 // lease end, the ceiling. The reason is named; the instruction never changes.
 export const concludeAsk = why => `Stop using tools and give your final answer now, in full, as the orders asked (${why}). Say what is unfinished.`;
 
+// A tool call the model wrote as text (the Qwen3-Coder XML form) that the server never parsed: nothing ran it.
+// Found live: a qwen reviewer's last message was one, and became the review's unreadable verdict.
+export const LEAKED_TOOL_CALL = /<tool_call>\s*<function=[^>\s]+>|^\s*<function=[^>\s]+>\s*<parameter=/;
+
 // The worker's answer: the last thing IT said, said after its last tool call. An opener before six minutes
-// of tool work is not an answer (observed live), and text with no letter or digit says nothing.
+// of tool work is not an answer (observed live), text with no letter or digit says nothing, and a tool call
+// written as text is a call that never ran, not something said.
 export function createAnswer() {
-  let spoken = null, afterTools = true;
+  let spoken = null, afterTools = true, leaked = false;
   return {
     said(speaker, text) {
       if (speaker !== SPEAKER.worker) return false;
       const value = String(text ?? '').trim();
       if (!value || !/[\p{L}\p{N}]/u.test(value)) return false;
-      spoken = value; afterTools = true; return true;
+      if (LEAKED_TOOL_CALL.test(value)) { leaked = true; afterTools = false; return false; }
+      spoken = value; afterTools = true; leaked = false; return true;
     },
-    tooled() { afterTools = false; },
+    tooled() { afterTools = false; leaked = false; },
     get value() { return afterTools ? spoken : null; },
     get spoken() { return spoken; },
+    get leaked() { return leaked; },
   };
 }
 

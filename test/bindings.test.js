@@ -106,6 +106,7 @@ test('a local backend carries its alias\'s settings, and none when the alias has
   assert.deepEqual(profiles.reviewer.localOptions.sampling, {temperature: 1}, 'the alias\'s, not the profile\'s 0.6');
   assert.equal(profiles['reviewer~2'].localOptions.sampling, undefined, 'qwen has no settings: none sent');
   assert.equal(profiles.scout.localOptions.sampling, undefined);
+  assert.deepEqual([profiles.reviewer.alias, profiles['reviewer~2'].alias, profiles.scout.alias], ['qwen_explore', 'qwen', 'qwen'], 'each AI keeps the name the bindings gave it');
 });
 
 // The views say which team and which bindings are in use, where each chain came from, and what cannot run here.

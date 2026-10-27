@@ -363,3 +363,23 @@ test('a parked task never expires here, however long nobody answers it', () => {
   assert.deepEqual(watchdog(blocked, parkedAt + 36000000, {activity: new Map(), watchdog: cfg}).find(r => r.task === 'ask').verdicts, ['blocked'],
     'ten hours blocked is still just the one escalation verdict, never an expiry');
 });
+
+// Found live (a session): after a rework the check passed in 69 s and a review started, yet the task kept saying
+// "Running the task's check" for the whole review; the orchestrator found no check process and reported a hang.
+test('a task says how its check ended and who reviews it, not the check it already finished', () => {
+  const at = n => `2026-10-26T23:${String(n).padStart(2, '0')}:00.000Z`;
+  const events = [
+    {kind: 'task.submitted', task: 't', parent: null, profile: 'builder', review: {completion: 'reviewer'}, time: at(0)},
+    {kind: 'task.started', task: 't', attempt: 1, time: at(1)},
+    {kind: 'task.completed', task: 't', summary: 'done', time: at(2)},
+    {kind: 'task.milestone', task: 't', attempt: 1, phase: 'check', text: "Running the task's check: npm test", time: at(2)},
+  ];
+  assert.equal(tasks(events).t.lastMilestone.text, "Running the task's check: npm test");
+  events.push({kind: 'task.check', task: 't', attempt: 1, exit: 0, passed: true, time: at(3)});
+  assert.equal(tasks(events).t.lastMilestone.text, 'The check passed (exit 0)');
+  events.push({kind: 'review.started', task: 't', stage: 'completion', round: 1, profile: 'reviewer@codex:gpt-6.1-sol', time: at(3)});
+  assert.equal(tasks(events).t.lastMilestone.text, 'The check passed (exit 0); reviewer@codex:gpt-6.1-sol is reviewing it (round 1)');
+  events.push({kind: 'review.finished', task: 't', stage: 'completion', round: 1, verdict: 'unreadable', time: at(5)});
+  assert.equal(tasks(events).t.lastMilestone.text, 'Review round 1 ended: unreadable');
+  assert.equal(tasks([...events.slice(0, 4), {kind: 'task.check', task: 't', attempt: 1, exit: null, passed: false, timedOut: true, time: at(9)}]).t.lastMilestone.text, 'The check timed out');
+});

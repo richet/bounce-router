@@ -48,6 +48,7 @@ const CONCLUDE_STEPS = 2;
 const CAP_PROMPT = concludeAsk('your step budget is spent');
 const CONCLUDE_PROMPT = concludeAsk('you repeated the same call with nothing new');
 const SILENT_PROMPT = concludeAsk('your turn ended without an answer');
+const LEAKED_PROMPT = concludeAsk('your last message was a tool call written as text, so it never ran');
 const READS = new Set(['read', 'grep']); // listing files (glob) is not reading material
 const CHANGES = new Set(['write', 'edit', 'apply_patch', 'bash', 'patch', 'shell']);
 const SHELL = new Set(['bash', 'shell']);
@@ -215,13 +216,15 @@ export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HE
           // A clean turn that did work and said nothing after its last tool call has no answer — and that
           // is itself the reason to ask for one. Found live: both local-worker failures were
           // this shape, 6 and 14 minutes of work thrown away without the question ever being put.
-          const unanswered = event.code === 0 && answer.value === null && didWork;
-          const ask = reportedFinal ? null : handle.concludeWith ?? (capped ? CAP_PROMPT : stalled && reads > 0 ? CONCLUDE_PROMPT : unanswered ? SILENT_PROMPT : null);
+          const leaked = event.code === 0 && answer.value === null && answer.leaked;
+          const unanswered = event.code === 0 && answer.value === null && (didWork || leaked);
+          const ask = reportedFinal ? null : handle.concludeWith ?? (capped ? CAP_PROMPT : stalled && reads > 0 ? CONCLUDE_PROMPT : leaked ? LEAKED_PROMPT : unanswered ? SILENT_PROMPT : null);
           if (ask !== null && !handle.conclude && handle.sessionId) {
             const reason = handle.concludeWith !== undefined ? 'watchdog'
-              : capped ? 'step_cap' : stalled ? 'repeated_tools' : 'missing_answer';
+              : capped ? 'step_cap' : stalled ? 'repeated_tools' : leaked ? 'leaked_tool_call' : 'missing_answer';
             const text = handle.concludeWith !== undefined ? `asked, tools off, for its conclusion: ${ask}`
               : capped ? 'opencode stopped at its step cap; asked once, tools off, for its answer'
+              : leaked && !stalled ? 'its last message was a tool call written as text, so it never ran; asked once, tools off, for its answer'
               : unanswered && !stalled ? 'the turn ended without an answer; asked once, tools off, for it'
               : `stalled after reading ${reads} file${reads === 1 ? '' : 's'}; asked once, tools off, for its conclusion`;
             yield {kind: 'diagnostic', text, reason, phase: 'conclusion', toolsDisabled: true};
@@ -236,6 +239,7 @@ export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HE
             yield {kind: 'diagnostic', text: 'the conclusion turn gave no answer'};
             if (capped && !lastError) lastError = 'step cap reached without an answer';
           }
+          if ((event.code === 0 || concluded) && leaked && !lastError) lastError = 'no answer: the worker wrote a tool call as text instead of calling the tool, so it never ran';
           if ((event.code === 0 || concluded) && answer.spoken !== null && !lastError && answer.value === null) lastError = 'no answer: the worker said nothing after its last tool call';
           if (event.code === 0 && reportedFinal) yield {kind: 'result', status: 'completed', text: answer.value ?? 'Final report submitted via bounce_report'};
           else if ((event.code === 0 || concluded) && answer.value !== null && !lastError) yield {kind: 'result', status: 'completed', text: answer.value};

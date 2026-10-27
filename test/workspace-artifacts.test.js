@@ -343,14 +343,34 @@ test('a text file changed in the checkout and in the copy is merged when the edi
   assert.equal(moved.baseline['PROGRESS.md'].hash, crypto.createHash('sha256').update(fs.readFileSync(path.join(source, 'PROGRESS.md'))).digest('hex'));
 });
 
-test('edits that overlap, and a file with no baseline to merge against, still conflict, untouched', () => {
+// Found live (a session): two entries added at the same line of a project's progress log, a real conflict for a line merge, and
+// the whole task was refused. In a Markdown file, two sides that only ADDED lines keep both: the checkout's, then the copy's.
+test('two Markdown entries added at the same place both land, the checkout\'s first', () => {
   const {source, dir} = setup(test);
   gitRepo(source, {'PROGRESS.md': LOG});
-  const copy = createAttemptWorkspace({cwd: source, dir, owns: ['PROGRESS.md'], attemptId: 'overlap'});
+  const copy = createAttemptWorkspace({cwd: source, dir, owns: ['PROGRESS.md'], attemptId: 'same-place'});
   write(copy.cwd, 'PROGRESS.md', LOG.replace('top\n', 'top\n- the copy\'s entry\n'));
   write(source, 'PROGRESS.md', LOG.replace('top\n', 'top\n- the checkout\'s entry\n'));
-  assert.equal(integrateArtifact({cwd: source, dir, artifact: captureArtifact(copy), base: copy.cwd}).status, 'conflict');
-  assert.equal(fs.readFileSync(path.join(source, 'PROGRESS.md'), 'utf8'), LOG.replace('top\n', 'top\n- the checkout\'s entry\n'));
+  const result = integrateArtifact({cwd: source, dir, artifact: captureArtifact(copy), base: copy.cwd});
+  assert.equal(result.status, 'integrated');
+  assert.deepEqual(result.merged, ['PROGRESS.md']);
+  assert.equal(fs.readFileSync(path.join(source, 'PROGRESS.md'), 'utf8'), LOG.replace('top\n', 'top\n- the checkout\'s entry\n- the copy\'s entry\n'));
+});
+
+test('edits that overlap, and a file with no baseline to merge against, still conflict, untouched, every file named', () => {
+  const {source, dir} = setup(test);
+  gitRepo(source, {'PROGRESS.md': LOG, 'src/a.js': 'one\n'});
+  const copy = createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'overlap'});
+  write(copy.cwd, 'PROGRESS.md', LOG.replace('one\n', 'one, as the copy has it\n'));
+  write(source, 'PROGRESS.md', LOG.replace('one\n', 'one, as the checkout has it\n'));
+  write(copy.cwd, 'src/a.js', 'two\n');
+  write(source, 'src/a.js', 'three\n');
+  const refused = integrateArtifact({cwd: source, dir, artifact: captureArtifact(copy), base: copy.cwd});
+  assert.equal(refused.status, 'conflict');
+  assert.deepEqual(refused.paths, ['PROGRESS.md', 'src/a.js']);
+  assert.equal(fs.readFileSync(path.join(source, 'PROGRESS.md'), 'utf8'), LOG.replace('one\n', 'one, as the checkout has it\n'));
+  write(source, 'src/a.js', 'one\n');
+  write(source, 'PROGRESS.md', LOG.replace('top\n', 'top\n- the checkout\'s entry\n'));
   const other = createAttemptWorkspace({cwd: source, dir, owns: ['PROGRESS.md'], attemptId: 'nobase'});
   write(other.cwd, 'PROGRESS.md', fs.readFileSync(path.join(source, 'PROGRESS.md'), 'utf8').replace('bottom\n', 'bottom\n- mine\n'));
   write(source, 'PROGRESS.md', LOG);

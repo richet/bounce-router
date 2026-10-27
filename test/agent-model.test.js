@@ -104,3 +104,23 @@ test('a review agent on a cloud AI gets its own instructions, and one the user n
   assert.deepEqual([...new Set(reviews.map(s => `${s.adapter}/${s.model}`))], ['codex/gpt-6.1-sol'], 'every review ran on the AI the user named');
   assert.equal(session.events.some(e => e.kind === 'review.escalated' && e.task === row.task), false);
 });
+
+// Found live (a session): the user moved the builders to `qwen3.8_builder_2`, a name from models.yaml that bindings.yml
+// lists for the builder. The orchestrator sent it as the profile; bounce answered "is not a profile here; it runs as
+// the builder agent" and the AI the user named was dropped. A binding's name is an AI: it plays the agent, with the
+// settings that name carries.
+test('a name from the bindings is an AI: as the profile or as the model it plays the agent, with its own settings', t => {
+  const table = profiles();
+  table['builder~2'] = {...table['builder~2'], alias: 'qwen_builder', adapter: 'opencode', backend: 'lmstudio', endpoint: 'lmstudio', model: 'qwen3.8-27b', localOptions: {thinking: false, temperature: 0.6}};
+  table['reviewer~2'] = {...table['reviewer~2'], alias: 'qwen_reviewer', adapter: 'opencode', backend: 'lmstudio', endpoint: 'lmstudio', model: 'qwen3.8-27b', localOptions: {thinking: false, temperature: 0.2}};
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-agent-model-'));
+  const scheduler = createScheduler({session: new Session(root, {root}), adapters: {claude: adapter, codex: adapter, opencode: adapter}, profiles: table, watchdog: {interval: null}});
+  t.after(() => { scheduler.close(); fs.rmSync(root, {recursive: true, force: true}); });
+  const asProfile = scheduler.prepare({...base, profile: 'qwen_builder', userAsked: true});
+  assert.equal(asProfile.profile, 'builder@lmstudio:qwen3.8-27b');
+  assert.deepEqual(asProfile.corrections, ['profile: qwen_builder is an AI (a name in the bindings), not an agent: it runs as the builder agent on lmstudio/qwen3.8-27b (profile names the agent, model the AI)']);
+  assert.deepEqual(table['builder@lmstudio:qwen3.8-27b'].localOptions, {thinking: false, temperature: 0.6}, "the builder's own settings for that AI");
+  assert.equal(scheduler.prepare({...base, profile: 'builder', model: 'qwen_builder'}).profile, 'builder@lmstudio:qwen3.8-27b');
+  assert.equal(scheduler.prepare({...base, profile: 'builder', review: {completion: {profile: 'reviewer', model: 'qwen_reviewer'}}}).review.completion, 'reviewer@lmstudio:qwen3.8-27b');
+  assert.deepEqual(table['reviewer@lmstudio:qwen3.8-27b'].localOptions, {thinking: false, temperature: 0.2});
+});
