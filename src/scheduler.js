@@ -249,7 +249,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const policies = adapters[selectedAdapter]?.capabilities?.().executionPolicies;
     if (Array.isArray(policies) && !policies.includes(effectivePolicy(profiles[agent] ?? {}))) return null;
     const name = `${agent}@${ai}`;
-    if (profiles[agent]?.auto === true && (local || profiles[ai])) profiles[name] = playedBy(profiles[agent], ai, profiles[ai], local);
+    if (profiles[agent]?.auto === true && (local || profiles[ai])) profiles[name] = {...playedBy(profiles[agent], ai, profiles[ai], local), routed: true};
     return profiles[name] ? name : null;
   };
   for (const e of session.events) if ((e.kind === 'jev.routed' || e.kind === 'review.routed') && e.agent && e.ai) compose(e.agent, e.ai, e.local ?? null);
@@ -828,6 +828,14 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       ...(original ? {replaces: predecessor, retryOf: predecessor, parent: original.parent ?? null,
         deadline: original.deadline, requires: original.requires ?? spec.requires, budget: undefined, owns: spec.owns ?? original.owns, review: original.review ?? undefined,
         depends_on: original.depends_on ?? []} : {})};
+    // A review agent's verdict is the task's result: nothing reviews a review (found live: Jev read a FAIL verdict as
+    // unmet acceptance and escalated it to another review).
+    if (REVIEW_ROLES.has(profiles[spec.profile]?.role)) {
+      if (!spec.review?.completion) return spec;
+      const {completion: _completion, ...review} = spec.review;
+      return {...spec, review: Object.keys(review).length ? review : undefined,
+        corrections: [...(spec.corrections ?? []), `review.completion: dropped; ${spec.profile} is a review task, and its verdict is the result: nothing reviews a review`]};
+    }
     const reviewer = jev && profiles[jev.reviewer];
     if (!reviewer || reviewer.adapter !== 'typesafe' || !READONLY_ROLES.has(reviewer.role) || strategy !== defaultStrategy) return spec;
     if (spec.review?.completion) return spec;

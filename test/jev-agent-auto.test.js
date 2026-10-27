@@ -264,6 +264,7 @@ test('scheduler: a review on an `auto` agent runs on the AI Jev picks, said in r
   assert.match(routed[0].text, /^Routed the review: reviewer → build \(Jev: tier mid/);
   assert.equal(session.events.find(e => e.kind === 'review.started' && e.task === row.task).profile, 'reviewer@build');
   assert.equal(session.events.some(e => e.kind === 'jev.routed' && e.task === row.task), false, "the task's own profile is untouched");
+  assert.equal(profiles['reviewer@build'].routed, true, "Jev's pick is marked as one, so its selection reads as Jev's");
   assert.equal(scheduler.tasks()[row.task].profile, 'builder');
 });
 

@@ -288,8 +288,8 @@ export function localCandidates(catalogs = [], notes = {}) {
   return [...usable.filter(item => item.loaded), ...usable.filter(item => !item.loaded)];
 }
 
-// Why a profile's own model was taken: it was named for the task, or it is that place on the agent's list.
-const pinReason = profile => profile.pinned ? 'named for this task' : profile.alias && profile.role ? `${profile.alias}, on the ${profile.role}'s list` : 'profile pin';
+// Why a profile's own model was taken: it was named for the task, Jev picked it, or it is that place on the agent's list.
+const pinReason = profile => profile.pinned ? 'named for this task' : profile.routed ? "Jev's pick" : profile.alias && profile.role ? `${profile.alias}, on the ${profile.role}'s list` : 'profile pin';
 
 export function resolveLocalModel({local, profile, catalogs, requirements = {}, override} = {}) {
   const settings = normalizeLocalSettings(local);
