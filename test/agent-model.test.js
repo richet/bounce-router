@@ -10,6 +10,8 @@ import os from 'node:os';
 import path from 'node:path';
 import {Session} from '../src/core.js';
 import {createScheduler} from '../src/scheduler.js';
+import {fakeAdapter} from './helpers/fake-adapter.js';
+import {waitFor} from './helpers/wait.js';
 
 const builder = {name: 'builder', description: 'builds', policy: 'write', prompt: 'build it'};
 const reviewer = {name: 'reviewer', description: 'reviews', policy: 'write', prompt: 'review it; end with PASS or FAIL'};
@@ -40,7 +42,7 @@ test('the session case: an AI the user asked for plays the agent, for the work a
   const work = table['builder@codex:gpt-6.1-sol'], review = table['reviewer@codex:gpt-6.1-sol'];
   assert.deepEqual([work.agent.prompt, work.role, work.adapter, work.model], ['build it', 'builder', 'codex', 'gpt-6.1-sol']);
   assert.deepEqual([review.agent.prompt, review.role, review.adapter, review.model], ['review it; end with PASS or FAIL', 'reviewer', 'codex', 'gpt-6.1-sol']);
-  assert.deepEqual(review.fallback, ['reviewer'], 'without a verdict it falls to the reviewer, never the builder');
+  assert.deepEqual([work.fallback, review.fallback], [[], []], 'the AI the user asked for has no chain under it');
   assert.deepEqual(row.corrections, [
     'profile: codex_61_sol is an AI, not an agent: it runs as the builder agent on codex/gpt-6.1-sol (profile names the agent, model the AI)',
     'review.completion: codex_61_sol is an AI, not an agent: the reviewer agent reviews on codex/gpt-6.1-sol',
@@ -82,4 +84,23 @@ test('an agent on a named AI is rebuilt from its name after a restart', t => {
   t.after(() => again.close());
   assert.equal(fresh[row.profile]?.agent?.name, 'builder');
   assert.equal(fresh[row.review.completion]?.agent?.name, 'reviewer');
+});
+
+// Found live (a session): the user asked for a Codex review. The codex reviewer got only the builder's orders and its
+// report, with nothing saying it was reviewing, so it did the work again and ended with a build report; bounce read no
+// verdict and handed the review to the reviewer agent's own chain, whose first AI was the local qwen ("profile pin").
+test('a review agent on a cloud AI gets its own instructions, and one the user named does not fall to the agent chain', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-agent-model-'));
+  const session = new Session(root, {root});
+  const seen = [];
+  const answer = text => fakeAdapter(args => { seen.push({adapter: args.profile.adapter, model: args.profile.model, orders: args.orders, review: Boolean(args.review)}); return [{kind: 'result', status: 'completed', text: args.review ? text : 'built it'}]; });
+  const scheduler = createScheduler({session, adapters: {claude: answer('PASS'), codex: answer('Fixed and verified.')}, profiles: profiles(), watchdog: {interval: null}});
+  t.after(() => { scheduler.close(); fs.rmSync(root, {recursive: true, force: true}); });
+  const row = scheduler.submit({...base, profile: 'builder', model: 'sol', userAsked: true, requires: ['read'], review: {completion: {profile: 'reviewer', model: 'sol'}}});
+  await waitFor(() => ['accepted', 'failed', 'blocked', 'completed'].includes(scheduler.tasks()[row.task]?.state) && !session.events.some(e => e.kind === 'review.started' && e.task === row.task && !session.events.some(f => f.kind === 'review.finished' && f.seq > e.seq)), {timeout: 6000});
+  const reviews = seen.filter(s => s.review);
+  assert.ok(reviews.length >= 1, JSON.stringify(seen));
+  assert.equal(reviews[0].orders.startsWith('review it; end with PASS or FAIL\n\n---\n\nimplement step 10'), true, reviews[0].orders);
+  assert.deepEqual([...new Set(reviews.map(s => `${s.adapter}/${s.model}`))], ['codex/gpt-6.1-sol'], 'every review ran on the AI the user named');
+  assert.equal(session.events.some(e => e.kind === 'review.escalated' && e.task === row.task), false);
 });

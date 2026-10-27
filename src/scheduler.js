@@ -275,7 +275,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const policies = adapters[adapter].capabilities?.().executionPolicies;
     if (Array.isArray(policies) && !policies.includes(effectivePolicy(head))) return null;
     const name = pinnedName(agent, ref);
-    if (!profiles[name]) profiles[name] = {...playedBy(head, ref, {adapter, model}, local), pinned: true};
+    // The AI was named, so nothing falls under it: a run that cannot finish goes back to the orchestrator, never down
+    // the agent's own chain to an AI nobody asked for.
+    if (!profiles[name]) profiles[name] = {...playedBy(head, ref, {adapter, model}, local), fallback: [], pinned: true};
     return name;
   }
   const ensurePinned = name => { const match = typeof name === 'string' && !profiles[name] ? PINNED.exec(name) : null; if (match) pin(match[1], `${match[2]}/${match[3]}`); };
@@ -2072,9 +2074,13 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       const single = reviewers.length === 1;
       const dir = path.join(session.dir, 'tasks', task, single ? `review-${stage}-${round}` : `review-${stage}-${round}-${i}`);
       fs.mkdirSync(dir, {recursive: true, mode: 0o700});
-      const orders = stage === 'completion'
+      // A review agent leads with its own instructions the way a worker does (OpenCode runs it as the agent instead):
+      // without them a cloud reviewer reads the builder's orders as its own and does the work again.
+      const lead = withLessons(reviewProfile, row).agent?.prompt;
+      const roleLead = lead && reviewProfile.adapter !== 'opencode' && reviewProfile.adapter !== 'typesafe' ? `${lead}\n\n---\n\n` : '';
+      const orders = roleLead + (stage === 'completion'
         ? (reviewProfile.role === 'verifier' ? row.steps : `${row.orders}\n\n--- worker report ---\n${reducers.tasks(session.events)[task]?.summary ?? ''}`)
-        : row.orders;
+        : row.orders);
       // What a decision-model reviewer (typesafe) judges: the raw orders, the worker's final
       // report and the tree's HEAD when the lineage's first worker started — the diff base.
       const reported = session.events.findLast(e => e.kind === 'task.reported' && e.task === task);
