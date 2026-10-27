@@ -32,8 +32,10 @@ function jsonObjects(text) {
 
 const LABELLED = /^[\s>*#_-]*(?:final\s+)?(?:verdict|decision|review\s+verdict)\s*[:：=-]\s*[*_`"]*\s*([A-Za-z][A-Za-z ]{0,24}?)\s*[*_`".!]*\s*$/i;
 const FINDING = /^\s*[-*>]*\s*[*_`]*FINDING[*_`]*\s*[:：]\s*(.+?)[*_`]*\s*$/i;
-// A line that is nothing but a verdict word ("PASS", "**FAIL**"): what reviewer agents are told to write.
-const BARE = /^[\s>*#_`-]*([A-Za-z][A-Za-z ]{0,24}?)[\s*_`.!]*(?:[(—–:-].*)?$/;
+// A line that is nothing but a verdict word ("PASS", "**FAIL**"): what reviewer agents are told to write. The word
+// may close its own sentence and the line go on ("PASS. No must-fix issues.", "PASS; no must-fixes."): found live,
+// both were read as no verdict and the task blocked.
+const BARE = /^[\s>*#_`-]*([A-Za-z][A-Za-z ]{0,24}?)[*_`]*(?:[.!;][*_`]*)?\s*(?:[(—–:;-].*|(?<=[.!;][*_`]*\s+)\S.*)?$/;
 const REASON_MAX = 6000;
 const BLOCKING = /"severity"\s*:\s*"(blocker|major)"/i;
 
