@@ -269,5 +269,6 @@ test('a selection says why that AI: named for the task, or the place it holds on
   const reason = profile => resolveLocalModel({local: settings, catalogs, profile: {backend: 'lmstudio', endpoint: 'lmstudio', model: 'qwen', ...profile}}).reason;
   assert.equal(reason({role: 'reviewer', alias: 'qwen3.8_reviewer'}), "qwen3.8_reviewer, on the reviewer's list");
   assert.equal(reason({role: 'reviewer', pinned: true}), 'named for this task');
+  assert.equal(reason({role: 'reviewer', routed: true}), "Jev's pick", 'an AI Jev picked for an auto agent says so (found live: it read as a pin)');
   assert.equal(reason({}), 'profile pin');
 });
