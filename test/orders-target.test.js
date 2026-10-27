@@ -28,7 +28,7 @@ test('the orders say who to submit to: the job first, auto next, a named AI only
   for (const part of [
     '1. An agent, by the job the task is',
     '2. `auto` when no agent is clearly the job',
-    '3. A worker profile by name ONLY when the user asks for that specific AI',
+    '3. A specific AI ONLY when the user asks for it', '`profile` stays the agent (the job) and `model` names the AI',
     'Do not pick a model yourself',
     'You may set its tier when you know more than the orders say',
     'Local models are part of the normal path',

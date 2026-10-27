@@ -8,6 +8,7 @@ import {createAttemptWorkspace, captureArtifact, integrateArtifact, advanceBasel
 import * as reducers from './reducers.js';
 import {takeCheckpoint, sameTree} from './checkpoint.js';
 import {POLICY_RANK, effectivePolicy, LOCAL_ADAPTERS, playedBy, READ_ONLY_ROLES as READONLY_ROLES} from './profiles.js';
+import {modelVersion} from './bindings.js';
 import {defaultStrategy} from './strategy.js';
 import {reportEvent, validateReport, remainingWork} from './reporting.js';
 import {inspectFinalReport, synthesizeReport, synthesizeReportFromChanges, FINAL_REPORT_INSTRUCTION} from './final-report.js';
@@ -252,6 +253,34 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return profiles[name] ? name : null;
   };
   for (const e of session.events) if (e.kind === 'jev.routed' && e.agent && e.ai) compose(e.agent, e.ai, e.local ?? null);
+  // A profile is an agent's, a model is an AI: an agent on an AI someone named is `agent@provider:model`, composed the
+  // way Jev's picks are (playedBy: the agent's prompt, policy and chain, the AI's adapter and model). Its name is all it
+  // takes to rebuild it, so a restart composes it again from the rows that name it.
+  const PINNED = /^([^@:]+)@([a-z0-9][a-z0-9_-]*):(.+)$/;
+  const pinnedName = (agent, ref) => `${agent}@${ref.replace('/', ':')}`;
+  const localEndpoints = () => {
+    let configured = {};
+    try { configured = normalizeLocalSettings(localSettings).endpoints; } catch {}
+    return new Set([...Object.keys(configured), ...Object.values(profiles).filter(p => p.backend).map(p => p.endpoint)]);
+  };
+  function pin(agent, ref) {
+    const head = profiles[agent];
+    if (!head?.derived || head.agent?.name !== agent || head.ai) return null;
+    const cut = ref.indexOf('/');
+    if (cut < 1) return null;
+    const provider = ref.slice(0, cut), model = ref.slice(cut + 1);
+    const local = localEndpoints().has(provider) ? {endpoint: provider, model} : null;
+    const adapter = local ? 'opencode' : provider;
+    if (!adapters[adapter]) return null;
+    const policies = adapters[adapter].capabilities?.().executionPolicies;
+    if (Array.isArray(policies) && !policies.includes(effectivePolicy(head))) return null;
+    const name = pinnedName(agent, ref);
+    if (!profiles[name]) profiles[name] = {...playedBy(head, ref, {adapter, model}, local), pinned: true};
+    return name;
+  }
+  const ensurePinned = name => { const match = typeof name === 'string' && !profiles[name] ? PINNED.exec(name) : null; if (match) pin(match[1], `${match[2]}/${match[3]}`); };
+  const reviewNames = review => [review?.prelaunch, review?.completion].flatMap(value => Array.isArray(value) ? value : [value]).filter(name => typeof name === 'string');
+  for (const e of session.events) if (e.kind === 'task.submitted') [e.profile, ...reviewNames(e.review)].forEach(ensurePinned);
   // Jev's diff base (`head` on the first task.started) is recorded only for a task a
   // decision-model (typesafe) reviewer will judge — the `jev` critic prepare() names when Jev
   // review is on. Otherwise the row carries no `head` and no git call is made, so with Jev
@@ -572,6 +601,30 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const byNeed = Array.isArray(requires) && requires.includes('write') ? 'builder' : ['reviewer', 'critic', 'verifier'].includes(role) ? 'reviewer' : 'analyst';
     return [byName, heads.includes(role) ? role : null, byNeed].find(name => name && heads.includes(name) && fits(name)) ?? heads.find(fits) ?? null;
   }
+  // An AI by the name a person uses: a family (sol, terra, opus, qwen) — the newest of it the agent lists, else the newest
+  // the roster runs —, a provider/model ref, or a roster profile's name. `listed` says whether the agent's own list has it.
+  const REVIEW_ROLES = new Set(['reviewer', 'critic', 'verifier']);
+  const isModelProfile = p => Boolean(p) && !p.derived && p.model !== undefined && p.role !== 'orchestrator' && p.adapter !== 'typesafe' && !REVIEW_ROLES.has(p.role) && !READONLY_ROLES.has(p.role);
+  const refOf = p => p.backend ? `${p.endpoint}/${p.model}` : `${p.adapter}/${p.model}`;
+  const familyOf = (ref, word) => ref.slice(ref.indexOf('/') + 1).toLowerCase().split(/[-_./:[\]]/).some(token => token === word || (token.startsWith(word) && /^\d/.test(token.slice(word.length))));
+  const versionOf = ref => modelVersion(ref.slice(ref.indexOf('/') + 1))?.version ?? [];
+  const newestFirst = (a, b) => { const x = versionOf(a), y = versionOf(b); for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] ?? 0) !== (y[i] ?? 0)) return (y[i] ?? 0) - (x[i] ?? 0); return 0; };
+  function resolveModel(agent, wanted) {
+    const word = String(wanted ?? '').trim();
+    if (!word) return null;
+    const listed = Object.values(profiles).filter(p => p.derived && p.agent?.name === agent && !p.ai && p.model).map(refOf);
+    const roster = Object.values(profiles).filter(p => p.model && !p.ai && (isModelProfile(p) || (p.derived && p.agent))).map(refOf);
+    const found = ref => ({ref, listed: listed.includes(ref)});
+    if (word.includes('/')) return found(word);
+    if (isModelProfile(profiles[word])) return found(refOf(profiles[word]));
+    const family = word.toLowerCase();
+    const own = [...new Set(listed.filter(ref => familyOf(ref, family)))].sort(newestFirst);
+    if (own.length) return found(own[0]);
+    const other = [...new Set(roster.filter(ref => familyOf(ref, family)))].sort(newestFirst);
+    return other.length ? found(other[0]) : null;
+  }
+  const agentOf = name => profiles[name]?.agent?.name ?? null;
+  const reviewAgent = () => agentHeads().find(name => REVIEW_ROLES.has(profiles[name].role)) ?? null;
   // Corrections, not refusals, wherever the intent of a submission is clear (2026-09-27: refusals cost whole
   // orchestrator turns). Each is said in `corrections` on the journaled row and as a task.corrected row.
   function correct(spec) {
@@ -587,6 +640,53 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         corrections.push(`profile: ${spec.profile} is one AI; a first attempt runs as the ${agent} agent, which tries its own AIs lightest first (name an AI only for a retry, or add userAsked: true when the user asked for it)`);
         spec = {...spec, profile: agent};
       }
+    }
+    // An AI named where the agent goes (`profile: codex_61_sol`) plays the agent the task is, never instead of it: the
+    // agent of the task a retry continues, else the one its orders match.
+    if (isModelProfile(profiles[spec.profile]) && profiles[spec.profile].model && spec.from === 'orchestrator' && agentHeads().length) {
+      const agent = agentOf(rawSubmittedRow(spec.retryOf ?? spec.replaces)?.profile) ?? matchingAgent(spec);
+      const ref = refOf(profiles[spec.profile]);
+      const name = agent && pin(agent, ref);
+      if (name) {
+        corrections.push(`profile: ${spec.profile} is an AI, not an agent: it runs as the ${agent} agent on ${ref} (profile names the agent, model the AI)`);
+        spec = {...spec, profile: name};
+      }
+    }
+    if (spec.model !== undefined) {
+      ensurePinned(spec.profile);
+      const agent = agentOf(spec.profile) ?? matchingAgent({...spec, profile: undefined});
+      const found = agent ? resolveModel(agent, spec.model) : null;
+      const name = found && pin(agent, found.ref);
+      if (!name) return {...spec, modelProblem: `model: no AI named ${JSON.stringify(spec.model)} here${agent ? ` for the ${agent} agent` : ''}; name a family (sol, terra, opus, qwen) or a provider/model ref`};
+      if (!found.listed) corrections.push(`model: ${found.ref} is not on the ${agent}'s list; it plays the ${agent} because it was named`);
+      spec = {...spec, profile: name};
+    }
+    // Only a review agent reviews. A stage may name the reviewer with its AI ({profile: "reviewer", model: "sol"}); an
+    // AI or a non-review agent named as the reviewer becomes the review agent, on that AI when one was named.
+    if (spec.review && typeof spec.review === 'object' && !Array.isArray(spec.review)) {
+      const review = {...spec.review};
+      for (const stage of ['prelaunch', 'completion']) {
+        if (review[stage] === undefined) continue;
+        const one = value => {
+          const given = value && typeof value === 'object' && !Array.isArray(value) ? value : {profile: value};
+          if (typeof given.profile !== 'string') return value;
+          ensurePinned(given.profile);
+          const named = profiles[given.profile];
+          const reviews = named && (named.adapter === 'typesafe' || REVIEW_ROLES.has(named.role) || READONLY_ROLES.has(named.role));
+          if (reviews && given.model === undefined) return given.profile;
+          const agent = reviews && named.derived ? agentOf(given.profile) : reviews ? null : reviewAgent();
+          if (!agent) return reviews ? given.profile : value;
+          const found = given.model !== undefined ? resolveModel(agent, given.model) : isModelProfile(named) ? {ref: refOf(named), listed: true} : null;
+          if (given.model !== undefined && !found) return value;
+          const name = found ? pin(agent, found.ref) : agent;
+          if (!name) return value;
+          if (isModelProfile(named)) corrections.push(`review.${stage}: ${given.profile} is an AI, not an agent: the ${agent} agent reviews on ${found.ref}`);
+          else if (!reviews) corrections.push(`review.${stage}: ${given.profile} is not a review agent: the ${agent} agent reviews${found ? ` on ${found.ref}` : ''}`);
+          return name;
+        };
+        review[stage] = Array.isArray(review[stage]) ? review[stage].map(one) : one(review[stage]);
+      }
+      spec = {...spec, review};
     }
     if (spec.profile !== AUTO_PROFILE && !profiles[spec.profile]) {
       const agent = matchingAgent(spec);
@@ -616,6 +716,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       const previous = session.events.filter(e => e.kind === 'task.submitted' && e.jobId === spec.jobId);
       if (previous.length && !spec.replaces && !spec.retryOf) return 'job already exists; use retryOf';
     }
+    if (spec.modelProblem) return spec.modelProblem;
+    ensurePinned(spec.profile);
     if (spec.profile === AUTO_PROFILE ? !routingFallback(profiles) : !profiles[spec.profile]) return `profile: ${JSON.stringify(spec.profile ?? null)} is not a profile or agent here; send one of ${JSON.stringify(Object.keys(profiles).filter(name => profiles[name].role !== 'orchestrator' && profiles[name].adapter !== 'typesafe'))}`;
     if (spec.inPlace !== undefined) {
       // Structural check (always): the cited row must exist and
@@ -659,8 +761,12 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         const names = Array.isArray(name) ? name : [name];
         if (!names.length) return 'review';
         for (const n of names) {
+          ensurePinned(n);
           const p = profiles[n];
-          if (!p) return 'review';
+          // Only a review agent reviews (restored 2026-10-26, by role rather than policy: reviewer agents may run
+          // commands). Without it a builder profile reviewed, rebuilt the work it was judging and gave no verdict. A
+          // roster with no agents at all has only profiles, and any of them may review, as before agents existed.
+          if (!p || (agentHeads().length && !(p.adapter === 'typesafe' || REVIEW_ROLES.has(p.role) || READONLY_ROLES.has(p.role)))) return 'review';
         }
       }
     }
@@ -740,6 +846,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       size: spec.size ?? {lines: 0, probes: 0, minutes: 0},
       depends_on: spec.depends_on ?? [],
       review: spec.review ?? null,
+      ...(spec.model !== undefined ? {model: spec.model} : {}),
       steps: spec.steps ?? null,
       ...(spec.check ? {check: spec.check} : {}),
       ...(spec.owns ? {owns: spec.owns} : {}),
@@ -1900,6 +2007,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const verdicts = [];
     for (let i = 0; i < reviewers.length; i++) {
       const profileName = reviewers[i];
+      ensurePinned(profileName);
       const reviewProfile = profiles[profileName];
       const candidate = candidateResult(session.events, task);
       // `slot` names a second review of the same candidate (an unsure Jev handing over), so the first one's finished
@@ -2977,10 +3085,13 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         localResolver.configure(local);
       }
       // `name@ai` entries are this agent played by an AI Jev picked: they follow the new head, or go with `auto`.
-      const played = Object.entries(profiles).filter(([, profile]) => profile.agent?.name === name && profile.ai).map(([, profile]) => [profile.ai, profile.backend ? {endpoint: profile.endpoint, model: profile.model} : null]);
+      const played = Object.entries(profiles).filter(([, profile]) => profile.agent?.name === name && profile.ai && !profile.pinned).map(([, profile]) => [profile.ai, profile.backend ? {endpoint: profile.endpoint, model: profile.model} : null]);
+      // `name@provider:model` entries are this agent on an AI someone named: they follow the new head the same way.
+      const pinned = Object.keys(profiles).filter(key => profiles[key].agent?.name === name && profiles[key].pinned);
       for (const key of Object.keys(profiles)) if (profiles[key].agent?.name === name && !Object.hasOwn(chain, key)) delete profiles[key];
       Object.assign(profiles, chain);
       for (const [ai, local] of played) compose(name, ai, local);
+      for (const key of pinned) ensurePinned(key);
     },
     // The submit predicate, exposed so the bus refuses a malformed task.submitted before it is journaled.
     validate: spec => validate(spec, reducers.tasks(session.events)),
