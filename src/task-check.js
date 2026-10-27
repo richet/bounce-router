@@ -9,6 +9,7 @@ import {outputTail} from './command-output.js';
 export const CHECK_MAX = 2000; // characters of command
 export const CHECK_TIMEOUT_MS = 10 * 60_000;
 const KEEP = 64 * 1024; // of output, while it runs
+const DRAIN_MS = 1000; // for output still in the pipes once the shell has exited
 
 // Commands that only look: they read files and text, and run nothing of the work.
 const LOOKS = new Set(['test', '[', 'grep', 'egrep', 'fgrep', 'rg', 'ls', 'cat', 'head', 'tail', 'wc', 'stat', 'true', 'echo']);
@@ -39,10 +40,12 @@ export function runCheck({command, cwd, timeoutMs = CHECK_TIMEOUT_MS, env = vend
     let output = '';
     let timedOut = false;
     let settled = false;
+    let exitCode;
     const done = exit => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      clearTimeout(timer); clearTimeout(drain);
+      child.stdout.destroy(); child.stderr.destroy();
       // A tool the shell could not find, or a shell that did not start: the check said nothing about
       // the work. Exit 127 alone does not say that: found live, a missing script the task was to write
       // ends the same way ("No such file or directory"), and that is the work's to fix.
@@ -54,10 +57,16 @@ export function runCheck({command, cwd, timeoutMs = CHECK_TIMEOUT_MS, env = vend
     };
     // Its own process group, so a check that started servers or children is stopped whole.
     const child = spawn('/bin/sh', ['-c', command], {cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe']});
+    // The pipes close only when every process holding them has: something the check left running outside its group
+    // (a daemon, a container runtime, setsid) keeps them open after the shell is gone. The shell's exit is the end of
+    // the check; its last output gets a moment to arrive, and past the time limit nothing is waited for.
+    let drain = null;
     const timer = setTimeout(() => {
       timedOut = true;
       try { process.kill(-child.pid, 'SIGKILL'); } catch {}
+      drain = setTimeout(() => done(exitCode ?? null), DRAIN_MS);
     }, timeoutMs);
+    child.on('exit', code => { exitCode = code; if (!drain) drain = setTimeout(() => done(code), DRAIN_MS); });
     const collect = chunk => { output = (output + chunk).slice(-KEEP); };
     child.stdout.on('data', collect);
     child.stderr.on('data', collect);

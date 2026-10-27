@@ -44,3 +44,29 @@ test('the result of a weak check says so', async t => {
   assert.deepEqual([weak.passed, weak.weak], [true, true]);
   assert.deepEqual([strong.passed, strong.weak ?? false], [true, false]);
 });
+
+// A check whose shell has exited but left a process outside its group holding stdout open (a daemon, a container
+// runtime, anything started with setsid) ran nothing more, yet its pipes never closed: the check waited on them
+// forever and the task said "Running the task's check" with no process behind it. The shell's exit ends the check.
+test('a check ends when its shell exits, even while something it left behind holds its output open', {timeout: 8000}, async t => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-check-orphan-'));
+  const pidFile = path.join(cwd, 'orphan.pid');
+  t.after(() => { try { process.kill(Number(fs.readFileSync(pidFile, 'utf8'))); } catch {} fs.rmSync(cwd, {recursive: true, force: true}); });
+  const orphan = `${JSON.stringify(process.execPath)} -e "const c=require('child_process').spawn('sleep',['30'],{detached:true,stdio:['ignore',1,2]});require('fs').writeFileSync('orphan.pid',String(c.pid));c.unref()"`;
+  const started = Date.now();
+  const result = await runCheck({command: `${orphan}; echo checked`, cwd, env: process.env, timeoutMs: 60_000});
+  assert.equal(result.passed, true);
+  assert.equal(result.exit, 0);
+  assert.match(result.output, /checked/);
+  assert.ok(Date.now() - started < 5000, `took ${Date.now() - started} ms`);
+});
+
+test('a check past its time ends even when what holds its output is outside its group', {timeout: 8000}, async t => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-check-orphan-'));
+  const pidFile = path.join(cwd, 'orphan.pid');
+  t.after(() => { try { process.kill(Number(fs.readFileSync(pidFile, 'utf8'))); } catch {} fs.rmSync(cwd, {recursive: true, force: true}); });
+  const orphan = `${JSON.stringify(process.execPath)} -e "const c=require('child_process').spawn('sleep',['30'],{detached:true,stdio:['ignore',1,2]});require('fs').writeFileSync('orphan.pid',String(c.pid));c.unref()"`;
+  const result = await runCheck({command: `${orphan}; sleep 30`, cwd, env: process.env, timeoutMs: 500});
+  assert.equal(result.passed, false);
+  assert.equal(result.timedOut, true);
+});
