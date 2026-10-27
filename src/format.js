@@ -662,7 +662,7 @@ export function withAsides(text, asides = []) {
 // before reading a word. Pure.
 export function stateGlyph(state) {
   if (state === 'queued') return '◌';
-  if (state === 'running' || state === 'waiting' || state === 'reviewing') return '●';
+  if (state === 'running' || state === 'waiting' || state === 'reviewing' || state === 'checking') return '●';
   if (state === 'blocked' || state === 'input_required') return '◐';
   if (state === 'completed' || state === 'accepted') return '✔';
   if (state === 'failed' || state === 'timed_out' || state === 'cancelled' || state === 'rejected') return '✗';

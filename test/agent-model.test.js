@@ -124,3 +124,14 @@ test('a name from the bindings is an AI: as the profile or as the model it plays
   assert.equal(scheduler.prepare({...base, profile: 'builder', review: {completion: {profile: 'reviewer', model: 'qwen_reviewer'}}}).review.completion, 'reviewer@lmstudio:qwen3.8-27b');
   assert.deepEqual(table['reviewer@lmstudio:qwen3.8-27b'].localOptions, {thinking: false, temperature: 0.2});
 });
+
+// Found live: the orchestrator sent `profile: builder@claude:sonnet` and `debugger@codex:gpt-6.1-sol`, names no earlier
+// row in the session had used. Each was corrected to "is not a profile here; it runs as the builder agent", the AI was
+// dropped, and an agent on `auto` was routed to a local model nobody asked for.
+test('an agent on a named AI, given as the profile for the first time in a session, runs on that AI', t => {
+  const {scheduler, profiles: table} = rig(t);
+  const row = scheduler.submit({...base, profile: 'builder@claude:opus', userAsked: true});
+  assert.equal(row.profile, 'builder@claude:opus');
+  assert.equal(row.corrections, undefined);
+  assert.deepEqual([table['builder@claude:opus'].agent.prompt, table['builder@claude:opus'].adapter, table['builder@claude:opus'].model, table['builder@claude:opus'].fallback], ['build it', 'claude', 'opus', []]);
+});

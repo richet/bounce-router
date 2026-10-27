@@ -4,7 +4,7 @@
 export const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const FRAME_MS = 120;
 // A review is a worker still working (found live: a local review ran for minutes beside a still ●).
-const WORKING = new Set(['running', 'working', 'starting', 'reviewing']);
+const WORKING = new Set(['running', 'working', 'starting', 'checking', 'reviewing']);
 const FIXED = {queued: '◌', completed: '✓', accepted: '✓', failed: '✗', cancelled: '✗', timed_out: '✗', rejected: '✗', blocked: '!', input_required: '?'};
 
 export const isWorking = state => WORKING.has(state);

@@ -86,3 +86,15 @@ test('the orders say a deadline is a task to resubmit smaller, not a reason to s
   assert.equal(text.includes('it is not a reason to stop the run'), true);
   assert.equal(/task\.cancelled, task\.deadline or',\n\s*'task\.rejected mean stop/.test(text), false, 'a deadline is no longer listed among the stop reasons');
 });
+
+// Found live (a session): a reviewer left a reproduction script among the integrated evidence, ending in a trap that
+// stopped its stack on exit. The orchestrator ran it twice in the real checkout (the second time in the same command
+// as the `head` meant to read it) and took the user's running stack down both times.
+test('the orders say a worker\'s script is read first and runs in the worker\'s copy, never in the real checkout', () => {
+  const text = fs.readFileSync(new URL('../src/reload.js', import.meta.url), 'utf8').replaceAll("\\'", "'");
+  for (const part of ['A script a worker wrote (a reproduction, a probe, a review\'s evidence) is the worker\'s',
+    'read all of it in its own step before running any of it',
+    'never run it in the real checkout',
+    'stop, reset or wipe the user\'s running services'])
+    assert.equal(text.includes(part), true, part);
+});

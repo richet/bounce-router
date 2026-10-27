@@ -247,3 +247,34 @@ test('the current codex models ship in the roster with their tiers', async () =>
   for (const model of ['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna']) assert.equal(shipped.includes(model), true, model);
   assert.deepEqual(['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'].map(model => catalogNote(`codex/${model}`)?.tier), ['strongest', 'strongest', 'cheapest']);
 });
+
+// Found live (a session): the reviewer's list opens with `auto`, yet every review the scheduler launched ran on the
+// list's first AI (the local qwen): only a dispatch asked Jev, a review never did. A review on an `auto` agent is
+// routed the way its dispatch would be, journaled as review.routed, and rebuilt from that row after a restart.
+test('scheduler: a review on an `auto` agent runs on the AI Jev picks, said in review.routed', async t => {
+  const {session, scheduler, launched, settled, profiles} = rig(t, {answer: DESCRIBED});
+  profiles.builder = {adapter: 'claude', model: 'opus', mode: 'yolo', policy: 'write', fallback: [], role: 'builder'};
+  const row = scheduler.submit({parent: null, profile: 'builder', orders: ORDERS, deadline: null, review: {completion: 'reviewer'}});
+  await waitFor(() => session.events.some(e => e.kind === 'review.finished' && e.task === row.task));
+  assert.deepEqual(launched.slice(0, 2).map(([name, model, role]) => [name, model, role]), [['claude', 'opus', 'builder'], ['codex', 'gpt-6-astra', 'reviewer']]);
+  await waitFor(() => ['accepted', 'failed', 'blocked'].includes(scheduler.tasks()[row.task]?.state));
+  const routed = session.events.filter(e => e.kind === 'review.routed');
+  assert.equal(routed.length, 1, 'the re-ask for a readable verdict reuses the pick, and the chain under it is not routed again');
+  assert.deepEqual([routed[0].task, routed[0].stage, routed[0].agent, routed[0].ai, routed[0].chosen, routed[0].tier], [row.task, 'completion', 'reviewer', 'build', 'reviewer@build', 'mid']);
+  assert.match(routed[0].text, /^Routed the review: reviewer → build \(Jev: tier mid/);
+  assert.equal(session.events.find(e => e.kind === 'review.started' && e.task === row.task).profile, 'reviewer@build');
+  assert.equal(session.events.some(e => e.kind === 'jev.routed' && e.task === row.task), false, "the task's own profile is untouched");
+  assert.equal(scheduler.tasks()[row.task].profile, 'builder');
+});
+
+test('scheduler: a review routed before a restart runs on the same AI after it, without asking Jev again', async t => {
+  const first = rig(t, {answer: DESCRIBED});
+  first.profiles.builder = {adapter: 'claude', model: 'opus', mode: 'yolo', policy: 'write', fallback: [], role: 'builder'};
+  first.scheduler.close();
+  first.session.append({kind: 'review.routed', task: 'r1', stage: 'completion', round: 1, peer: 'review:r1', chosen: 'reviewer@build', agent: 'reviewer', ai: 'build', fallback: false, reason: null});
+  const fresh = validateOrchestration(settings, undefined, {roles: rolesOf(NAMES_BUILD)}).profiles;
+  const again = createScheduler({session: first.session, adapters: {}, profiles: fresh, gitHead: () => null,
+    jev: {reviewer: 'jev', settings: () => ({}), route: async () => { throw new Error('asked again'); }, routeAI: async () => { throw new Error('asked again'); }}});
+  t.after(() => again.close());
+  assert.deepEqual([fresh['reviewer@build']?.adapter, fresh['reviewer@build']?.model, fresh['reviewer@build']?.agent?.name], ['codex', 'gpt-6-astra', 'reviewer']);
+});

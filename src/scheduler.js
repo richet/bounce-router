@@ -252,7 +252,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (profiles[agent]?.auto === true && (local || profiles[ai])) profiles[name] = playedBy(profiles[agent], ai, profiles[ai], local);
     return profiles[name] ? name : null;
   };
-  for (const e of session.events) if (e.kind === 'jev.routed' && e.agent && e.ai) compose(e.agent, e.ai, e.local ?? null);
+  for (const e of session.events) if ((e.kind === 'jev.routed' || e.kind === 'review.routed') && e.agent && e.ai) compose(e.agent, e.ai, e.local ?? null);
   // A profile is an agent's, a model is an AI: an agent on an AI someone named is `agent@provider:model`, composed the
   // way Jev's picks are (playedBy: the agent's prompt, policy and chain, the AI's adapter and model). Its name is all it
   // takes to rebuild it, so a restart composes it again from the rows that name it.
@@ -637,6 +637,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // orchestrator turns). Each is said in `corrections` on the journaled row and as a task.corrected row.
   function correct(spec) {
     const corrections = [];
+    // `agent@provider:model` is composed from its name the first time it is given, not only once a row has used it.
+    ensurePinned(spec.profile);
     // Found live (session d1bc0206): 11 of 23 first attempts named `build_claude` (Opus) directly, skipping the
     // builder agent's own order (local, then Sonnet, then Opus). A first attempt from the orchestrator runs
     // as the matching agent; a profile is for a retry, or for an AI the user asked for (`userAsked: true`).
@@ -2022,12 +2024,37 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return check?.passed ? [...(Array.isArray(evidence) ? evidence : []), checkPassed(check)] : evidence;
   };
 
-  async function runReviewers({task, stage, round, reviewers, row, context, root, reserveFirst, note = null, slot = null}) {
+  // What decides between peers, read at the moment of a launch: cooldowns, and whether a local model's slot is free here.
+  const routingLoad = () => ({cooldowns: reducers.cooldowns(session.events, clock()), now: clock(),
+    localFree: (endpoint, model) => localRunning(endpoint) < localSlots(endpoint) && localRunning(endpoint, model) < modelSlots(endpoint)});
+
+  // A review on an agent whose list opens with `auto` is routed the way a dispatch is: Jev picks the AI among the ones
+  // the list names (found live: every review ran on the list's first AI, because only a dispatch ever asked). The pick
+  // is review.routed — never jev.routed, which is the task's own profile — and a restart reuses it for the same slot.
+  async function routeReview({task, stage, round, agent, peer, row, context}) {
+    if (profiles[agent]?.auto !== true || !jev?.routeAI) return agent;
+    const earlier = session.events.findLast(e => e.kind === 'review.routed' && e.task === task && e.stage === stage && e.round === round && e.peer === peer);
+    if (earlier) return earlier.chosen && profiles[earlier.chosen] ? earlier.chosen : agent;
+    let decision;
+    try { decision = await jev.routeAI({task, orders: row.orders, profiles, head: profiles[agent], tier: row.tier ?? null, load: routingLoad}); }
+    catch { decision = null; }
+    const played = decision?.ai ? compose(agent, decision.ai, decision.local ?? null) : null;
+    if (!decision?.asked) return agent;
+    const described = decision.description ? Object.entries(decision.description).filter(([, value]) => value !== null).map(([name, value]) => `${name.replace('_', ' ')} ${Number(value).toFixed(2)}`).join(', ') : '';
+    append({kind: 'review.routed', task, stage, round, peer, chosen: played ?? agent, agent, ai: played ? decision.ai : null, fallback: !played, reason: played ? null : decision.reason ?? 'unavailable',
+      ...(played && decision.tier ? {tier: decision.tier} : {}), ...(played && decision.local ? {local: decision.local} : {}),
+      ...(decision.description ? {description: decision.description} : {}), ...(decision.candidates ? {candidates: decision.candidates} : {}),
+      text: played ? `Routed the review: ${agent} → ${decision.ai} (${described ? `Jev: tier ${decision.tier} from ${described}` : `Jev${decision.tier ? `: tier ${decision.tier}` : ''}`}; ${decision.why ?? 'first fitting'})`
+        : `Routed the review: ${agent} → its own models (fallback: ${decision.reason ?? 'unavailable'})`, context});
+    return played ?? agent;
+  }
+
+  async function runReviewers({task, stage, round, reviewers, row, context, root, reserveFirst, note = null, slot = null, route = true}) {
     const verdicts = [];
     for (let i = 0; i < reviewers.length; i++) {
-      const profileName = reviewers[i];
+      let profileName = reviewers[i];
       ensurePinned(profileName);
-      const reviewProfile = profiles[profileName];
+      let reviewProfile = profiles[profileName];
       const candidate = candidateResult(session.events, task);
       // `slot` names a second review of the same candidate (an unsure Jev handing over), so the first one's finished
       // verdict is not found again and reused for it.
@@ -2044,6 +2071,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         verdicts.push(verdict.verdict === recovered.verdict ? verdict : {verdict: recovered.verdict});
         continue;
       }
+      if (route) { profileName = await routeReview({task, stage, round, agent: profileName, peer, row, context}); reviewProfile = profiles[profileName]; }
       // A review profile is a profile too: the same shared check runs before
       // its launch. The first reviewer's refusal handling differs by stage (matches pre-Phase-8
       // behavior exactly): prelaunch (`reserveFirst: false`) releases its already-made shared
@@ -2170,7 +2198,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       const profile = profiles[next];
       if (!profile || profile.role === 'orchestrator' || profile.adapter === 'typesafe' || policyRefusal(profile)) continue;
       append({kind: 'review.escalated', task, to: next, from: 'bounce', text: `The ${profiles[from].role ?? from} ended without a verdict bounce could read: ${next} reviews it`, context});
-      const nextVerdicts = await runReviewers({task, stage: 'completion', round, reviewers: [next], row, context, root, reserveFirst: false, slot: `fallback:${next}`, note});
+      const nextVerdicts = await runReviewers({task, stage: 'completion', round, reviewers: [next], row, context, root, reserveFirst: false, slot: `fallback:${next}`, note, route: false});
       if (!nextVerdicts || stale()) return null;
       verdicts = nextVerdicts;
       from = next;
@@ -2321,10 +2349,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       routing.add(task);
       const agent = row.profile;
       let decision;
-      // What decides between peers, read at the moment of dispatch: cooldowns, and whether a local model's slot is free here.
-      const load = () => ({cooldowns: reducers.cooldowns(session.events, clock()), now: clock(),
-        localFree: (endpoint, model) => localRunning(endpoint) < localSlots(endpoint) && localRunning(endpoint, model) < modelSlots(endpoint)});
-      try { decision = await jev.routeAI({task, orders: row.orders, profiles, head: profiles[agent], tier: row.tier ?? null, load}); }
+      try { decision = await jev.routeAI({task, orders: row.orders, profiles, head: profiles[agent], tier: row.tier ?? null, load: routingLoad}); }
       finally { routing.delete(task); }
       if (reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) return;
       const played = decision?.ai ? compose(agent, decision.ai, decision.local ?? null) : null;
