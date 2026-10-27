@@ -218,6 +218,40 @@ test('b: two tasks whose owns overlap on the same file: the first to finish inte
   assert.equal(fs.readFileSync(path.join(cwd, 'x.txt'), 'utf8'), 'from first', 'the first task\'s content survives the refused second integration');
 });
 
+// Found live (2026-10-26): two parallel tasks each added an entry to docs/PROGRESS.md and the second was refused
+// whole. Edits to different parts of one text file now both land: the second is merged against its copy's baseline.
+test('b2: two tasks that edit different parts of one text file both integrate; the second is merged and says so', async t => {
+  const {session, cwd} = fixture(t);
+  const LOG = 'top\n\none\ntwo\nthree\nfour\nfive\nsix\n\nbottom\n';
+  fs.writeFileSync(path.join(cwd, 'PROGRESS.md'), LOG);
+  const {execFileSync} = await import('node:child_process');
+  const git = (...args) => execFileSync('git', args, {cwd, stdio: 'ignore'});
+  git('init', '-q'); git('add', '-A'); git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'init');
+  const launched = new Map();
+  let ready;
+  const bothReady = new Promise(resolve => { ready = resolve; });
+  const adapter = {
+    async launch(args) { const handle = {task: args.task, cwd: args.cwd}; launched.set(args.task, handle); return handle; },
+    async *events(handle) { yield await new Promise(resolve => { handle.finish = resolve; if ([...launched.values()].filter(h => h.finish).length === 2) ready(); }); },
+    async cancel() { return {verified: true}; },
+  };
+  const scheduler = createScheduler({session, adapters: {fake: adapter}, profiles: {builder: {adapter: 'fake', policy: 'write'}}, watchdog: {interval: null}});
+  t.after(() => scheduler.close());
+  const integratedFirst = next(session, e => e.kind === 'task.integrated' && e.task === 'first');
+  const integratedSecond = next(session, e => e.kind === 'task.integrated' && e.task === 'second');
+  scheduler.submit({task: 'first', profile: 'builder', orders: 'Log step 10', owns: ['PROGRESS.md']});
+  scheduler.submit({task: 'second', profile: 'builder', orders: 'Log step 11', owns: ['PROGRESS.md']});
+  await bothReady;
+  fs.writeFileSync(path.join(launched.get('first').cwd, 'PROGRESS.md'), LOG.replace('top\n', 'top\n- step 10\n'));
+  fs.writeFileSync(path.join(launched.get('second').cwd, 'PROGRESS.md'), LOG.replace('bottom\n', 'bottom\n- step 11\n'));
+  launched.get('first').finish({kind: 'result', status: 'completed', text: 'done first'});
+  await integratedFirst;
+  launched.get('second').finish({kind: 'result', status: 'completed', text: 'done second'});
+  const second = await integratedSecond;
+  assert.deepEqual(second.merged, ['PROGRESS.md']);
+  assert.equal(fs.readFileSync(path.join(cwd, 'PROGRESS.md'), 'utf8'), LOG.replace('top\n', 'top\n- step 10\n').replace('bottom\n', 'bottom\n- step 11\n'));
+});
+
 // Rewritten 2026-09-27: a review that gives no verdict no longer holds finished work. The task is accepted
 // with advice saying the review gave none, and its isolated work integrates into the checkout.
 // 2026-09-29: that is so for work its check verified; without one the work waits for the orchestrator.

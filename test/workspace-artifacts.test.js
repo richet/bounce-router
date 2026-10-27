@@ -316,3 +316,57 @@ test('an ignored binary or large file is left out and named; the rest of the wor
   write(ws.cwd, 'tracked.bin', Buffer.from([0, 1, 2]));
   assert.deepEqual(captureArtifact(ws).unsupported, [{path: 'tracked.bin', reason: 'binary'}], 'a binary the project would track still refuses');
 });
+
+// Found live (2026-10-26): two parallel tasks each added a line to docs/PROGRESS.md; the second was refused whole
+// ("Artifact integration conflict: docs/PROGRESS.md") and the orchestrator copied its files over by hand. A text file
+// changed on both sides is merged three ways against the copy's own baseline; only edits that overlap still conflict.
+const gitRepo = (dir, files) => {
+  for (const [name, value] of Object.entries(files)) write(dir, name, value);
+  const git = (...args) => execFileSync('git', args, {cwd: dir, stdio: 'ignore'});
+  git('init', '-q'); git('add', '-A'); git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'init');
+};
+const LOG = 'top\n\none\ntwo\nthree\nfour\nfive\nsix\n\nbottom\n';
+
+test('a text file changed in the checkout and in the copy is merged when the edits do not overlap', () => {
+  const {source, dir} = setup(test);
+  gitRepo(source, {'PROGRESS.md': LOG});
+  const copy = createAttemptWorkspace({cwd: source, dir, owns: ['PROGRESS.md'], attemptId: 'merge'});
+  write(copy.cwd, 'PROGRESS.md', LOG.replace('top\n', 'top\n- the copy\'s entry\n'));
+  write(source, 'PROGRESS.md', LOG.replace('bottom\n', 'bottom\n- the checkout\'s entry\n'));
+  const artifact = captureArtifact(copy);
+  const result = integrateArtifact({cwd: source, dir, artifact, base: copy.cwd});
+  assert.equal(result.status, 'integrated');
+  assert.deepEqual(result.merged, ['PROGRESS.md']);
+  assert.equal(fs.readFileSync(path.join(source, 'PROGRESS.md'), 'utf8'), LOG.replace('top\n', 'top\n- the copy\'s entry\n').replace('bottom\n', 'bottom\n- the checkout\'s entry\n'));
+  assert.equal(integrateArtifact({cwd: source, dir, artifact, base: copy.cwd}).status, 'integrated', 'integrating again after a restart finds it done');
+  const moved = advanceBaseline(copy, artifact, result.mergedStates);
+  assert.equal(moved.baseline['PROGRESS.md'].hash, crypto.createHash('sha256').update(fs.readFileSync(path.join(source, 'PROGRESS.md'))).digest('hex'));
+});
+
+test('edits that overlap, and a file with no baseline to merge against, still conflict, untouched', () => {
+  const {source, dir} = setup(test);
+  gitRepo(source, {'PROGRESS.md': LOG});
+  const copy = createAttemptWorkspace({cwd: source, dir, owns: ['PROGRESS.md'], attemptId: 'overlap'});
+  write(copy.cwd, 'PROGRESS.md', LOG.replace('top\n', 'top\n- the copy\'s entry\n'));
+  write(source, 'PROGRESS.md', LOG.replace('top\n', 'top\n- the checkout\'s entry\n'));
+  assert.equal(integrateArtifact({cwd: source, dir, artifact: captureArtifact(copy), base: copy.cwd}).status, 'conflict');
+  assert.equal(fs.readFileSync(path.join(source, 'PROGRESS.md'), 'utf8'), LOG.replace('top\n', 'top\n- the checkout\'s entry\n'));
+  const other = createAttemptWorkspace({cwd: source, dir, owns: ['PROGRESS.md'], attemptId: 'nobase'});
+  write(other.cwd, 'PROGRESS.md', fs.readFileSync(path.join(source, 'PROGRESS.md'), 'utf8').replace('bottom\n', 'bottom\n- mine\n'));
+  write(source, 'PROGRESS.md', LOG);
+  assert.equal(integrateArtifact({cwd: source, dir, artifact: captureArtifact(other)}).status, 'conflict', 'no copy to read the baseline from');
+});
+
+// The live case exactly: docs/ is a repository of its own, ignored by the project's, so the copy's baseline commit has
+// no docs/PROGRESS.md to merge against. The copy keeps such a text file's content by hash when it is made.
+test('a text file outside the baseline commit (a nested, ignored repository) is merged from the content the copy kept', () => {
+  const {source, dir} = setup(test);
+  gitRepo(source, {'.gitignore': 'docs/\n', 'src/a.js': 'a\n'});
+  gitRepo(path.join(source, 'docs'), {'PROGRESS.md': LOG});
+  const copy = createAttemptWorkspace({cwd: source, dir, owns: ['docs/PROGRESS.md'], attemptId: 'nested'});
+  write(copy.cwd, 'docs/PROGRESS.md', LOG.replace('top\n', 'top\n- step 11\n'));
+  write(source, 'docs/PROGRESS.md', LOG.replace('bottom\n', 'bottom\n- step 10\n'));
+  const result = integrateArtifact({cwd: source, dir, artifact: captureArtifact(copy), base: copy.cwd});
+  assert.equal(result.status, 'integrated');
+  assert.equal(fs.readFileSync(path.join(source, 'docs/PROGRESS.md'), 'utf8'), LOG.replace('top\n', 'top\n- step 11\n').replace('bottom\n', 'bottom\n- step 10\n'));
+});

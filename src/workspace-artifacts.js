@@ -174,7 +174,32 @@ export function createAttemptWorkspace({cwd, dir, owns, attemptId, copyRoot, ski
   const baselineHash = manifestHash(baseline);
   const result = {id: path.basename(workspace), attemptId, cwd: workspace, source, dir, owns: allowed, baseline, baselineHash};
   atomicJSON(path.join(workspace, '.attempt-workspace.json'), {...result, cwd: undefined});
+  keepBaselines(result);
   return result;
+}
+
+// A text file the baseline commit does not hold — ignored, untracked, or inside a repository of its own (found live:
+// docs/ was its own repository, ignored by the project's) — keeps its content here by hash, so integration can
+// merge against the file as the copy got it. Small text files only, and a bounded total: binaries are never merged.
+const KEPT_FILE_MAX = 1024 * 1024;
+const KEPT_TOTAL_MAX = 64 * 1024 * 1024;
+const keptDir = dir => path.join(dir, 'baselines');
+function keepBaselines(workspace) {
+  let tracked = new Set();
+  try {
+    tracked = new Set(execFileSync('git', ['ls-files', '-z'], {cwd: workspace.cwd, env: gitEnv(), maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore']}).toString().split('\0').filter(Boolean));
+  } catch {}
+  let total = 0;
+  for (const [rel, entry] of Object.entries(workspace.baseline)) {
+    if (tracked.has(rel) || entry.binary || entry.unsupported || entry.size > KEPT_FILE_MAX) continue;
+    if ((total += entry.size) > KEPT_TOTAL_MAX) return;
+    const file = path.join(keptDir(workspace.dir), entry.hash);
+    if (fs.existsSync(file)) continue;
+    try {
+      fs.mkdirSync(keptDir(workspace.dir), {recursive: true, mode: 0o700});
+      fs.writeFileSync(file, fs.readFileSync(path.join(workspace.cwd, rel)), {mode: 0o600});
+    } catch {}
+  }
 }
 
 const clipped = (value, max) => (value?.length > max ? `${value.slice(0, max)}\n[… truncated …]` : (value ?? ''));
@@ -348,11 +373,11 @@ function writeAtomic(root, change) {
 // copied from — otherwise its own unrelated edits collide with the checkout's own prior integration.
 // Advance only the paths that were just integrated; a genuine concurrent edit of an untouched path
 // still shows up against the recorded baseline for that path.
-export function advanceBaseline(workspace, artifact) {
+export function advanceBaseline(workspace, artifact, mergedStates = {}) {
   const baseline = {...workspace.baseline};
   for (const change of artifact.changes) {
     if (change.kind === 'delete') delete baseline[change.path];
-    else baseline[change.path] = change.after;
+    else baseline[change.path] = mergedStates[change.path] ?? change.after; // a merged file is what the checkout now has
   }
   const baselineHash = manifestHash(baseline);
   const updated = {...workspace, baseline, baselineHash};
@@ -360,7 +385,48 @@ export function advanceBaseline(workspace, artifact) {
   return updated;
 }
 
-export function integrateArtifact({cwd, artifact, dir}) {
+const BASELINE_MESSAGE = 'bounce: baseline of the checkout this copy was made from';
+const gitEnv = () => Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+
+// A file as the copy got it — kept by hash when the copy was made, else from the baseline commit giveGit made — and
+// only while its hash is still the change's `before`: the checkout itself cannot say, it is the side that changed.
+function baselineContent(copy, change, dir) {
+  if (!change.before) return null;
+  try {
+    const kept = dir ? fs.readFileSync(path.join(keptDir(dir), change.before.hash)) : null;
+    if (kept && hash(kept) === change.before.hash) return kept;
+  } catch {}
+  if (!copy) return null;
+  try {
+    const run = args => execFileSync('git', args, {cwd: copy, env: gitEnv(), maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore']});
+    const commit = run(['log', '-1', '--format=%H', '--fixed-strings', `--grep=${BASELINE_MESSAGE}`]).toString().trim();
+    if (!commit) return null;
+    const data = run(['show', `${commit}:${change.path}`]);
+    return hash(data) === change.before.hash ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+// Three-way merge of a text file (git merge-file): the merged content, or null when the edits overlap or it is not text.
+function mergeText(base, ours, theirs) {
+  if (!base || [base, ours, theirs].some(data => data.includes(0))) return null;
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-merge-'));
+  try {
+    for (const [name, data] of [['ours', ours], ['base', base], ['theirs', theirs]]) fs.writeFileSync(path.join(scratch, name), data);
+    const result = spawnSync('git', ['merge-file', '-p', '--quiet', 'ours', 'base', 'theirs'], {cwd: scratch, env: gitEnv(), maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore']});
+    return result.status === 0 ? result.stdout : null;
+  } catch {
+    return null;
+  } finally {
+    fs.rmSync(scratch, {recursive: true, force: true});
+  }
+}
+
+// `base` is the worker's copy: a text file the checkout also changed since the copy was taken is merged three ways
+// against the copy's baseline, so two tasks adding to one file both land (found live: a second PROGRESS.md entry was
+// refused whole and copied over by hand). Edits that overlap, or a file with no readable baseline, still conflict.
+export function integrateArtifact({cwd, artifact, dir, base = null}) {
   const root = fs.realpathSync(cwd);
   if (!artifact || !Array.isArray(artifact.changes)) throw new Error('invalid artifact');
   const binding = {target: artifact.target, attemptId: artifact.attemptId, baselineHash: artifact.baselineHash, resultHash: artifact.resultHash, owns: artifact.owns, changes: artifact.changes, violations: artifact.violations, unsupported: artifact.unsupported};
@@ -379,21 +445,33 @@ export function integrateArtifact({cwd, artifact, dir}) {
     manifest: artifact.changes.map(change => ({path: change.path, kind: change.kind, before: change.before, after: change.after})),
   };
   const applied = new Set(record.applied);
+  const merged = {...(record.merged ?? {})}; // path -> hash of the merged content written
+  const plans = new Map();
   for (const change of artifact.changes) {
     const state = targetState(root, change);
     const desired = change.kind === 'delete' ? null : change.after;
-    if (matches(state, desired)) { applied.add(change.path); continue; }
-    if (!matches(state, change.before)) return {status: 'conflict', path: change.path};
+    if (matches(state, desired) || (merged[change.path] && state?.hash === merged[change.path])) { applied.add(change.path); continue; }
+    if (matches(state, change.before)) continue;
+    // Only content is merged: a checkout that changed the file's mode (or only its mode) keeps the conflict.
+    const contentOnly = state && change.before && change.kind !== 'delete' && state.mode === change.before.mode && state.hash !== change.before.hash;
+    const ours = contentOnly ? fs.readFileSync(safeJoin(root, change.path)) : null;
+    const data = ours && mergeText(baselineContent(base, change, dir), ours, Buffer.from(change.data, 'base64'));
+    if (!data) return {status: 'conflict', path: change.path};
+    plans.set(change.path, {ours: state.hash, data});
   }
-  record.status = 'prepared'; record.applied = [...applied]; atomicJSON(recordFile, record);
+  record.status = 'prepared'; record.applied = [...applied]; record.merged = merged; atomicJSON(recordFile, record);
   for (const change of artifact.changes) {
     if (applied.has(change.path)) continue;
     // Recheck after persisting the manifest, immediately before touching this path.
     // Another process may have edited it since the batch preflight.
-    if (!matches(targetState(root, change), change.before)) return {status: 'conflict', path: change.path};
-    writeAtomic(root, change); applied.add(change.path);
-    record.applied = [...applied]; atomicJSON(recordFile, record);
+    const plan = plans.get(change.path);
+    const state = targetState(root, change);
+    if (plan ? state?.hash !== plan.ours : !matches(state, change.before)) return {status: 'conflict', path: change.path};
+    writeAtomic(root, plan ? {...change, data: plan.data.toString('base64')} : change); applied.add(change.path);
+    if (plan) merged[change.path] = hash(plan.data);
+    record.applied = [...applied]; record.merged = merged; atomicJSON(recordFile, record);
   }
-  record.status = 'integrated'; record.applied = [...applied]; atomicJSON(recordFile, record);
-  return {status: 'integrated', id: artifact.id};
+  record.status = 'integrated'; record.applied = [...applied]; record.merged = merged; atomicJSON(recordFile, record);
+  const paths = Object.keys(merged);
+  return {status: 'integrated', id: artifact.id, ...(paths.length ? {merged: paths, mergedStates: Object.fromEntries(paths.map(file => [file, targetState(root, {path: file})]))} : {})};
 }

@@ -2760,16 +2760,18 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         const {artifactId, file, dir, continuation} = action.payload;
         const artifact = JSON.parse(fs.readFileSync(file, 'utf8'));
         if (artifact.id !== artifactId) throw new Error('artifact identity mismatch');
-        const result = integrateArtifact({cwd: session.cwd, artifact, dir});
+        const copy = session.events.findLast(e => e.kind === 'task.artifact' && e.task === action.task)?.cwd ?? null;
+        const result = integrateArtifact({cwd: session.cwd, artifact, dir, base: copy});
         if (result.status !== 'integrated') {
           append({kind: 'task.blocked', task: action.task, reason: `integration_${result.status}`, text: `Artifact integration ${result.status}${result.path ? `: ${result.path}` : ''}; isolated work preserved`, artifactId});
           return;
         }
-        if (!session.events.some(e => e.kind === 'task.integrated' && e.task === action.task && e.artifactId === artifactId)) append({kind: 'task.integrated', task: action.task, artifactId, resultHash: artifact.resultHash});
+        if (!session.events.some(e => e.kind === 'task.integrated' && e.task === action.task && e.artifactId === artifactId)) append({kind: 'task.integrated', task: action.task, artifactId, resultHash: artifact.resultHash,
+          ...(result.merged ? {merged: result.merged, text: `Merged with what the checkout changed meanwhile: ${result.merged.join(', ')}`} : {})});
         // A follow-up (retryOf) reusing this same workspace diffs against what's now in the
         // checkout, not the pre-integration copy it started from — see advanceBaseline.
         const workspace = existingWorkspace(action.task);
-        if (workspace) workspaces.set(action.task, advanceBaseline(workspace, artifact));
+        if (workspace) workspaces.set(action.task, advanceBaseline(workspace, artifact, result.mergedStates));
         append(continuation);
       } catch (error) {
         append({kind: 'task.blocked', task: action.task, reason: 'integration_interrupted', text: `Artifact integration interrupted: ${error.message}; durable manifest retained for restart recovery`});
