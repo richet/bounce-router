@@ -57,3 +57,13 @@ test('a verdict that sends the work back with no FINDING lines carries the revie
   const long = parseVerdict('completed', `**FAIL**\n\n${'x'.repeat(9000)}`);
   assert.equal(long.findings[0].length <= 6000, true, 'bounded');
 });
+
+// Found live (2026-10-26): two reviews that plainly passed ("PASS. No must-fix issues." and "PASS; no must-fixes.")
+// were read as no verdict, because the line went on after a full stop or a semicolon, and the task was blocked.
+test('a verdict word that opens a line followed by a sentence is read', async () => {
+  const {parseVerdict} = await import('../src/verdict.js');
+  assert.equal(parseVerdict('completed', 'PASS. No must-fix issues.\n\nIndependent run: `test` exited 0.').verdict, 'accept');
+  assert.equal(parseVerdict('completed', 'PASS; no must-fixes.\n\nIndependent verification:\n- tests: 3 passed').verdict, 'accept');
+  assert.equal(parseVerdict('completed', '**FAIL.** The red test was never run.').verdict, 'rework');
+  assert.equal(parseVerdict('completed', 'Ok so I looked at the diff and it seems fine overall.').verdict, 'unreadable', 'prose that only starts with a verdict-like word is not a verdict');
+});
