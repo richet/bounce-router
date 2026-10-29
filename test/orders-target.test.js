@@ -99,12 +99,12 @@ test('the orders say a worker\'s script is read first and runs in the worker\'s 
     assert.equal(text.includes(part), true, part);
 });
 
-// Agreed with the user: a worker's copy lives while its session is open, and services a worker starts in it are its
-// own to stop (found live: a stopped stack from a worker's copy was left behind). The orchestrator makes sure.
-test('the orders say a worker\'s copy goes when the session closes, and that a worker\'s services are stopped', () => {
+// A worker's copy is temporary (the user prunes it), and services a worker starts in it are its own to stop (found
+// live: a stopped stack from a worker's copy was left behind). The orchestrator makes sure.
+test('the orders say a worker\'s copy is temporary, and that a worker\'s services are stopped', () => {
   const read = file => fs.readFileSync(new URL(file, import.meta.url), 'utf8').replaceAll("\\'", "'");
   const orders = read('../src/reload.js'), contract = read('../src/scheduler.js');
-  for (const part of ['Each worker\'s copy is removed when this session closes (/quit)', 'goes into the checkout first',
+  for (const part of ['A worker\'s copy is temporary: the user removes copies with /prune', 'goes into the checkout',
     'make sure a worker that started services in its copy stopped them', 'stop what is still running'])
     assert.equal(orders.includes(part), true, part);
   assert.equal(contract.includes('Services you start in your copy (a stack, containers, a server) you stop before you end'), true);

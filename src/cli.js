@@ -29,6 +29,7 @@ import {jevSidebarLabel} from './jev.js';
 import {rolesFor, agentStore, agentsCommand, agentTable, handAIsToJev} from './agents.js';
 import {bindingsCommand, bindingUpdatesNotice, bindingUpdates, bindingsFile, readBindings} from './bindings.js';
 import {createInterface} from 'node:readline';
+import {listCopies, copyTable, chooseCopies, removeCopies} from './prune.js';
 import stringWidth from 'string-width';
 import {clean, createFormatter, createWorkSummary, workReview, withAsides, continueMain} from './format.js';
 import {validateOrchestration} from './profiles.js';
@@ -191,6 +192,25 @@ async function main() {
     const fleet = await discoverLocalModels(settings.local, {maxAge: 0}).catch(() => []);
     if (values.json) return console.log(JSON.stringify({machine, fleet}, null, 2));
     return console.log(resourceReport({machine, fleet, busy: []}));
+  }
+  if (positionals[0] === 'prune') {
+    const copies = listCopies({root});
+    if (values.json) return console.log(JSON.stringify(copies, null, 2));
+    console.log(copyTable(copies));
+    if (!copies.some(copy => !copy.live)) return;
+    if (!process.stdin.isTTY) return console.log('\nRun bounce prune in a terminal to choose which to remove.');
+    const prompt = createInterface({input: process.stdin, output: process.stdout});
+    let chosen = null;
+    while (chosen === null) {
+      const answer = await new Promise(resolve => prompt.question('\nRemove which? y = all, n = none, or numbers (1,3-5): ', resolve));
+      chosen = chooseCopies(answer, copies);
+      if (chosen === null) console.log('Answer y, n, or numbers from the list.');
+    }
+    prompt.close();
+    const {removed, failed} = await removeCopies(chosen);
+    console.log(`Removed ${removed.length} ${removed.length === 1 ? 'copy' : 'copies'}.${copies.some(copy => copy.live) ? ' Copies of running tasks were kept.' : ''}`);
+    for (const {copy, error} of failed) console.log(`Could not remove ${copy.name}: ${error}`);
+    return;
   }
   if (positionals[0] === 'quota') {
     const store = await refreshQuota(settings, {root, cwd});
@@ -373,6 +393,7 @@ async function main() {
     migratedPolicies.length ? `Local models now load on demand (${migratedPolicies.map(name => name.split('.')[1]).join(', ')}: the old loaded-only default was dropped).` : '',
   ].filter(Boolean).join(' ');
   let skillNotice = '';
+  let pruneListed = null; // the copies /prune last listed, which its numbers refer to
   if (settings.skills.autoSync) {
     try { if (skillsChanged(syncSkills({root, scope: settings.skills.scope, cwd}))) skillNotice = 'Skills installed to your agents.'; }
     catch (error) { skillNotice = `Skills not synced: ${error.message}`; }
@@ -1132,6 +1153,18 @@ async function main() {
             : 'Sidebar hidden · /sidebar to show';
           render();
           return;
+        } else if (command === 'prune') {
+          // The list comes first; numbers refer to the list last shown, so a copy made meanwhile is never picked by them.
+          if (!arg || !pruneListed) {
+            pruneListed = listCopies({root});
+            session.append({kind: 'status', text: `${copyTable(pruneListed)}${pruneListed.some(copy => !copy.live) ? '\n\nRemove with /prune all, or /prune and the numbers (1,3-5). Copies of running tasks are kept.' : ''}`});
+            if (!arg) return;
+          }
+          const chosen = chooseCopies(arg, pruneListed);
+          if (chosen === null) throw new Error('Use /prune to list, then /prune all, /prune none, or /prune 1,3-5');
+          const {removed, failed} = await removeCopies(chosen);
+          pruneListed = null;
+          session.append({kind: 'status', text: `Removed ${removed.length} ${removed.length === 1 ? 'copy' : 'copies'}.${failed.map(({copy, error}) => ` Could not remove ${copy.name}: ${error}.`).join('')}`});
         } else if (command === 'quota') {
           await refreshQuota(settings, {root, store: quotas, cwd: session.cwd});
           session.append({kind: 'quota', text: quotaReport(quotas, quotaOrder())});

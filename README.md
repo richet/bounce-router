@@ -70,6 +70,7 @@ bounce login muse
 bounce doctor                       # versions and quota; --fix installs an opencode bounce can drive if yours is missing or unsupported
 bounce models
 bounce quota
+bounce prune                        # the workers' copies: last used, integrated or not; remove the ones you pick
 bounce skills
 bounce agents                       # the team: which AI plays each job
 bounce local                        # local models, the OpenCode bridge, agents a local model may play
@@ -463,6 +464,10 @@ Every turn starts a fresh native CLI process with a handoff. The handoff include
 ## What a session cost and got
 
 `/stats` in the TUI, or `bounce stats [SESSION] [--json] [--tasks] [--against SESSION]`, folds a session's journal into one screen — nothing is recorded for it beyond what the journal already holds. Outcome: tasks submitted, accepted (and how many at the first attempt), held, failed, corrections of accepted work, by agent. Time: how long someone was running, the orchestrator's turns, each AI's attempts with totals and medians, quiet gaps over 20 minutes. Tokens in and out by AI (thinking tokens where the adapter reports them), per accepted task. Checks run, passed, failed, only-looking, unrunnable, send-backs; review verdicts and how many fell below the bar; standing workers continued, retired, compacted; lessons recorded; sweeps fired. `--tasks` (or `/stats tasks`) is one line per task with what ate its time; `--against` puts two sessions side by side with the change per line. Every number names what it counts and over which span; what the journal cannot tell — thinking tokens of Claude and Codex workers, money — is named as missing rather than guessed.
+
+## Worker copies
+
+Each task runs in its own copy of the repository under `~/.bounce/w`, and bounce never removes one on its own. `bounce prune` (or `/prune` inside bounce) lists every copy with its session and task, when it was last used and whether its work reached the checkout, then removes all of them, none, or the numbers you give (`1,3-5`). A copy whose task is still running is kept.
 
 ## Quota
 
