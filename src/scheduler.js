@@ -85,6 +85,8 @@ const reportInstruction = profile => reportsByTool(profile)
 // 18 were rejected as invalid and 19 rewritten by bounce. To be measured on real sessions against Jev's
 // ranking of wrong work; `reports: "structured"` brings the fixed format back.
 const PLAIN_ENDING = 'End your last turn with a plain answer in your own words: what you did, each check you ran with the last lines it printed, and what is left of this assignment. No JSON and no report call for the end. If you could not finish, begin the answer with "Blocked:" or "Failed:" and say why.';
+// A worker's copy is removed when its session closes (src/workspace-retention.js); what it started there is not.
+const STOP_SERVICES = 'Services you start in your copy (a stack, containers, a server) you stop before you end, and your answer names the command that stopped them: your copy is removed when the session closes, and what you leave running is not.';
 const plainContract = profile => [
   `To report progress, ${reportInstruction(profile)} using your scoped report endpoint (it is the only bounce command you need; \`bounce\` alone starts nothing useful here).`,
   'A progress report is a JSON object with op ("milestone" | "blocked" | "input_required"), phase ("inspect" | "plan" | "implement" | "test" | "verify" | "review" | "document" | "done"),',
@@ -93,6 +95,7 @@ const plainContract = profile => [
   'You run headless, as one turn: ending your turn ends your process, and nothing re-invokes you. Never background a command, set a',
   'monitor, or stop to "pick up when it finishes" — run long commands (deploys, test suites) in the foreground with a generous timeout,',
   'then give your answer in this same turn. Work you leave running when you stop is orphaned.',
+  STOP_SERVICES,
   `Example: ${reportsByTool(profile) ? 'bounce_report ' : "bounce report --report '"}{"op":"milestone","phase":"inspect","text":"Read the three files the orders name","next":"Implement the helper","evidence":["src/a.js"]}${reportsByTool(profile) ? '' : "'"}`,
   PLAIN_ENDING,
 ].join('\n');
@@ -108,6 +111,7 @@ const reportContract = profile => [
   'You run headless, as one turn: ending your turn ends your process, and nothing re-invokes you. Never background a command, set a',
   'monitor, or stop to "pick up when it finishes" — run long commands (deploys, test suites) in the foreground with a generous timeout,',
   'then send the final report in this same turn. Work you leave running when you stop is orphaned and the task is failed as unreported.',
+  STOP_SERVICES,
   `Example: ${reportsByTool(profile) ? 'bounce_report ' : "bounce report --report '"}{"op":"milestone","phase":"inspect","text":"Read the three files the orders name","next":"Implement the helper","evidence":["src/a.js"]}${reportsByTool(profile) ? '' : "'"}`,
 ].join('\n');
 
@@ -1742,6 +1746,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // task's next AI is tried. It used to be a bare `error`, which no fallback follows (found live:
       // a codex thread/resume timed out after a Jev rework and the session stopped).
       if (reportOnly) { await repairUnavailable(task, error.message, context); return; }
+      // The worker the resume was for may still be live (found live: a worker blocked mid-turn kept its thread, the
+      // resume was refused as a second writer, and the first worker ran on for ten minutes after the task failed).
+      const live = handles.get(task);
+      if (live?.handle) { try { await live.adapter.cancel(live.handle); } catch {} }
       append({kind: 'task.failed', task, ...startFailure(error), from: workerFrom(task), context});
       return;
     }
@@ -2039,12 +2047,36 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // A review on an agent whose list opens with `auto` is routed the way a dispatch is: Jev picks the AI among the ones
   // the list names (found live: every review ran on the list's first AI, because only a dispatch ever asked). The pick
   // is review.routed — never jev.routed, which is the task's own profile — and a restart reuses it for the same slot.
-  async function routeReview({task, stage, round, agent, peer, row, context}) {
-    if (profiles[agent]?.auto !== true || !jev?.routeAI) return agent;
+  // A review runs on a local model only when one was named for it (found live: reviews escalated to the reviewer agent
+  // ran on its list's first AI, the local qwen, for minutes on the user's GPU with no verdict bounce could read): Jev
+  // picks among the cloud AIs, and a list that opens with a local model gives its first cloud AI instead.
+  const firstCloud = agent => {
+    const seen = new Set();
+    for (const queue = [agent]; queue.length;) {
+      const name = queue.shift();
+      if (seen.has(name) || !profiles[name]) continue;
+      seen.add(name);
+      if (!profiles[name].backend && adapters[profiles[name].adapter]) return name;
+      queue.push(...(profiles[name].fallback ?? []));
+    }
+    return null;
+  };
+  async function routeReview(slot) {
+    const {task, stage, round, agent, peer, context} = slot;
     const earlier = session.events.findLast(e => e.kind === 'review.routed' && e.task === task && e.stage === stage && e.round === round && e.peer === peer);
     if (earlier) return earlier.chosen && profiles[earlier.chosen] ? earlier.chosen : agent;
+    const name = await jevReview(slot);
+    if (name !== agent || !profiles[name]?.backend || profiles[name].pinned) return name;
+    const cloud = firstCloud(agent);
+    if (!cloud || cloud === name) return name;
+    append({kind: 'review.routed', task, stage, round, peer, chosen: cloud, agent, ai: null, fallback: true, reason: 'local_unnamed',
+      text: `Routed the review: ${agent} → ${cloud} (a review runs on a local model only when one is named for it)`, context});
+    return cloud;
+  }
+  async function jevReview({task, stage, round, agent, peer, row, context}) {
+    if (profiles[agent]?.auto !== true || !jev?.routeAI) return agent;
     let decision;
-    try { decision = await jev.routeAI({task, orders: row.orders, profiles, head: profiles[agent], tier: row.tier ?? null, load: routingLoad}); }
+    try { decision = await jev.routeAI({task, orders: row.orders, profiles, head: profiles[agent], tier: row.tier ?? null, load: routingLoad, local: false}); }
     catch { decision = null; }
     const played = decision?.ai ? compose(agent, decision.ai, decision.local ?? null) : null;
     if (!decision?.asked) return agent;

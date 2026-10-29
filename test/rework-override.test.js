@@ -122,3 +122,26 @@ test('task.rework from a non-orchestrator peer is refused', async t => {
   t.after(() => worker.close());
   await assert.rejects(worker.publish({kind: 'task.rework', task: 'fix', text: 'fix it'}), error => error.code === -32001);
 });
+
+// Found live (a session): a worker blocked itself mid-turn and stayed live. A rework then tried to resume its codex
+// thread from a second connection ("thread … already has an active writer"); the task was marked failed, and the first
+// worker went on for ten more minutes on resources a replacement task was about to use. A task that ends while its
+// worker is live stops that worker.
+test('a rework whose resume fails while the worker is still live stops that worker before the task fails', {timeout: 5000}, async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-rework-override-'));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const session = new Session(root, {root});
+  let calls = 0;
+  const worker = fakeAdapter(() => (++calls === 1
+    ? {events: [{kind: 'native', sessionId: 'native-1'}, {kind: 'blocked', text: 'the model is not loaded'}], never: true}
+    : {launchError: 'thread_busy'}));
+  const scheduler = createScheduler({session, adapters: {worker}, profiles: {builder: {adapter: 'worker', model: 'w', mode: 'yolo', fallback: [], policy: 'write'}},
+    gitHead: () => null, watchdog: {interval: null}});
+  t.after(() => scheduler.close());
+  scheduler.submit({task: 'fix', parent: null, profile: 'builder', from: 'orchestrator', requires: ['read', 'exec', 'write'], orders: 'change a'});
+  await waitFor(() => tasks(session.events).fix?.state === 'blocked');
+  scheduler.reworkOverride({task: 'fix', text: 'go on without the model', overrides: 'worker_blocked'});
+  await waitFor(() => tasks(session.events).fix?.state === 'failed');
+  await waitFor(() => worker.calls.cancel >= 1, 1000);
+  assert.equal(worker.calls.cancel, 1, 'the live worker was stopped');
+});
