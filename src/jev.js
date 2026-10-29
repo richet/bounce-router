@@ -856,7 +856,7 @@ export function createJevDecisions({root = dataRoot(), adapter, readSettings = (
     reviewer: JEV_REVIEWER,
     settings: readSettings,
     lease: request => judgeLease({...request, settings: readSettings(), ask: adapter?.ask}),
-    routeAI: ({orders, profiles, head, tier = null, load: live = () => ({}), signal}) => routeAgentAI({orders, profiles, head, tier, ...(locals ? {locals} : {}), settings: readSettings(), ask: adapter?.ask, ...(notes ? {notes} : {}), signal,
+    routeAI: ({orders, profiles, head, tier = null, load: live = () => ({}), local = true, signal}) => routeAgentAI({orders, profiles, head, tier, ...(locals && local ? {locals} : {}), settings: readSettings(), ask: adapter?.ask, ...(notes ? {notes} : {}), signal,
       load: async () => ({quotas: quotas?.() ?? {}, ...(await live())})}),
     route: ({orders, profiles, signal}) => routeTask({orders, profiles, order: order(), ...(locals ? {locals} : {}), settings: readSettings(), ask: adapter?.ask, ...(notes ? {notes} : {}), signal}),
     inPlace: ({citedText, messages, orders, signal}) => judgeInPlace({citedText, messages, orders, settings: readSettings(), ask: adapter?.ask, signal}),

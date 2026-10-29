@@ -390,3 +390,31 @@ test('a text file outside the baseline commit (a nested, ignored repository) is 
   assert.equal(result.status, 'integrated');
   assert.equal(fs.readFileSync(path.join(source, 'docs/PROGRESS.md'), 'utf8'), LOG.replace('top\n', 'top\n- step 11\n').replace('bottom\n', 'bottom\n- step 10\n'));
 });
+
+// Found live (a session): two tasks were refused with a conflict whose copy's change was already in the checkout: a
+// worker's three ignore lines the checkout had also appended at the same place (among more), and a test file where
+// the checkout had the copy's same edits and a longer block appended where the copy appended its own. Taking the
+// checkout loses nothing; a different edit of the same line still conflicts.
+test('a copy whose change the checkout already holds integrates as the checkout, and a different edit of the line still conflicts', () => {
+  const {source, dir} = setup(test);
+  const IGNORE = 'node_modules\n.git\ndb\n';
+  const SPEC = 'a\nb\nc\nd\nend\n';
+  gitRepo(source, {'.dockerignore': IGNORE, 'spec.ts': SPEC, 'TABLE.md': '| x | 1 |\n| y | 2 |\n'});
+  const copy = createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'contained'});
+  write(copy.cwd, '.dockerignore', `${IGNORE}\n!db/\n!db/migrations/\n`);
+  write(source, '.dockerignore', `${IGNORE.replace('db\n', 'db/*\n')}\nexports\n!db/\n!db/migrations/\n# deploy\n`);
+  write(copy.cwd, 'spec.ts', SPEC.replace('b\n', 'B\n').replace('end\n', 'end\nnew 1\nnew 2\n'));
+  write(source, 'spec.ts', SPEC.replace('b\n', 'B\n').replace('end\n', 'end\nnew 1\nnew 2\nnew 3\n'));
+  const artifact = captureArtifact(copy);
+  const result = integrateArtifact({cwd: source, dir, artifact, base: copy.cwd});
+  assert.equal(result.status, 'integrated', JSON.stringify(result.paths));
+  assert.deepEqual(result.merged.sort(), ['.dockerignore', 'spec.ts']);
+  assert.equal(fs.readFileSync(path.join(source, 'spec.ts'), 'utf8'), SPEC.replace('b\n', 'B\n').replace('end\n', 'end\nnew 1\nnew 2\nnew 3\n'));
+
+  const row = createAttemptWorkspace({cwd: source, dir, owns: ['TABLE.md'], attemptId: 'row'});
+  write(row.cwd, 'TABLE.md', '| x | 1, as the copy has it |\n| y | 2 |\n');
+  write(source, 'TABLE.md', '| x | 1, as the checkout has it |\n| y | 2 |\n');
+  assert.equal(integrateArtifact({cwd: source, dir, artifact: captureArtifact(row), base: row.cwd}).status, 'conflict');
+  write(row.cwd, 'TABLE.md', '| y | 2 |\n');
+  assert.equal(integrateArtifact({cwd: source, dir, artifact: captureArtifact(row), base: row.cwd}).status, 'conflict', 'a deletion of a row the checkout changed is not held by it');
+});

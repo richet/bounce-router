@@ -135,3 +135,26 @@ test('an agent on a named AI, given as the profile for the first time in a sessi
   assert.equal(row.corrections, undefined);
   assert.deepEqual([table['builder@claude:opus'].agent.prompt, table['builder@claude:opus'].adapter, table['builder@claude:opus'].model, table['builder@claude:opus'].fallback], ['build it', 'claude', 'opus', []]);
 });
+
+// Found live (a session): two reviews escalated to the reviewer agent ran on the local qwen, its list's first AI — 18 and
+// 6 minutes on the user's GPU, no verdict bounce could read — before falling to the cloud reviewer that answered.
+// A review runs on a local model only when one was named for it.
+test('a review on an agent whose list opens with a local model runs on its first cloud AI, said in review.routed', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-agent-model-'));
+  const session = new Session(root, {root});
+  const seen = [];
+  const answer = text => fakeAdapter(args => { seen.push({adapter: args.profile.adapter, review: Boolean(args.review)}); return [{kind: 'result', status: 'completed', text: args.review ? text : 'built it'}]; });
+  const table = profiles();
+  table.reviewer = {derived: true, adapter: 'opencode', backend: 'lmstudio', endpoint: 'lmstudio', model: 'qwen', policy: 'write', role: 'reviewer', agent: reviewer, fallback: ['reviewer~2']};
+  const scheduler = createScheduler({session, adapters: {claude: answer('PASS'), codex: answer('PASS'), opencode: answer('PASS')}, profiles: table, watchdog: {interval: null}});
+  t.after(() => { scheduler.close(); fs.rmSync(root, {recursive: true, force: true}); });
+  const row = scheduler.submit({...base, profile: 'builder~3', requires: ['read'], review: {completion: 'reviewer'}});
+  await waitFor(() => session.events.some(e => e.kind === 'review.finished' && e.task === row.task));
+  assert.deepEqual(seen.filter(s => s.review).map(s => s.adapter), ['codex'], 'the review ran on reviewer~2, never on the local head');
+  const routed = session.events.find(e => e.kind === 'review.routed' && e.task === row.task);
+  assert.deepEqual([routed?.agent, routed?.chosen], ['reviewer', 'reviewer~2']);
+  assert.match(routed.text, /a review runs on a local model only when one is named for it/);
+
+  const named = scheduler.prepare({...base, profile: 'builder~3', requires: ['read'], review: {completion: 'reviewer@lmstudio:qwen'}});
+  assert.equal(named.review.completion, 'reviewer@lmstudio:qwen', 'a local reviewer someone named stays');
+});

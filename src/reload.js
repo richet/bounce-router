@@ -1,3 +1,4 @@
+import {sweepCopies} from './workspace-retention.js';
 import fs from 'node:fs';
 import {createClaudeLive} from './adapters/claude-live.js';
 import {createCodexLive} from './adapters/codex-live.js';
@@ -345,6 +346,9 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     // The view prefills the input from this line (src/tui/suggestion.js): Tab accepts it, Enter sends it.
     // Found live (session 159f4746): it sent a user-requested commit to workers seven times; none had git.
     'Workers run in copies of the repository: only an in-place task (task.submitted with `inPlace: {authorizedBy: <seq>}`) runs in the real checkout, for a version-control or other real-folder step (commit, push, open a PR) the user\'s own message asked for. Cite that message\'s seq (omit authorizedBy to cite the user\'s latest message) and keep the orders to exactly what it asked — push and PR only when it asked for them. A refusal names what exceeded the request.',
+    // Agreed with the user: a copy lives while its session is open (src/workspace-retention.js), and services a worker
+    // started in it are stopped (found live: a stopped stack from a worker's copy was left behind).
+    'Each worker\'s copy is removed when this session closes (/quit): anything you want to keep from it (evidence, a report, a probe or its output) goes into the checkout first, and a path into a copy is no reference to keep. Before you accept a task, make sure a worker that started services in its copy stopped them (its answer names the command); otherwise stop what is still running yourself, from that copy.',
     // Found live (a session): a review's reproduction script, run in the real checkout, stopped the user's stack on exit.
     'A script a worker wrote (a reproduction, a probe, a review\'s evidence) is the worker\'s, made for its copy: read all of it in its own step before running any of it, and never run it in the real checkout — it may stop, reset or wipe the user\'s running services (a `down`, a reset, a trap on exit). To see it run again, run it in the worker\'s copy or send it to a worker.',
     'When one prompt from the user would move the work forward (an approval, a decision, a follow-up request), end the answer with one line `Next: <the prompt, as the user would type it>` — the view offers it prefilled in the input. One concrete prompt, not a question or a list; omit the line when nothing is needed from the user.',
@@ -713,6 +717,8 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
         const {unverified} = await scheduler.stop();
         const mainStopped = await main.cancel();
         if (unverified.length || mainStopped?.verified !== true) return {verified: false, reason: 'termination_unverified'};
+        // A worker's copy lives while its session is open: closing the session removes the copies it made.
+        try { await sweepCopies({root: session.root, closing: session.id}); } catch {}
         return {verified: true, afterAck: () => finish(0)};
       }
     }});
@@ -720,6 +726,8 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // Now discoverable: a signal from here on is caught by onSigterm and torn down cleanly.
   writeDaemonJson(session.dir, {pid: process.pid, bus: bus.path, started: new Date().toISOString(), userToken: userGrant.file,
     ...(viewServer ? {view: viewServer.path, protocol: 1, profile: orchestratorProfile} : {})});
+  // The copies of sessions that are no longer running go (a crash or a kill left them); this session's stay.
+  void sweepCopies({root: session.root, keep: session.id}).catch(() => {});
   if (viewServer) {
     await new Promise(resolve => { if (finished) resolve(); else wakeViewDaemon = resolve; });
     return;

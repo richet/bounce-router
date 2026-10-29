@@ -383,3 +383,25 @@ test('a task says how its check ended and who reviews it, not the check it alrea
   assert.equal(tasks(events).t.lastMilestone.text, 'Review round 1 ended: unreadable');
   assert.equal(tasks([...events.slice(0, 4), {kind: 'task.check', task: 't', attempt: 1, exit: null, passed: false, timedOut: true, time: at(9)}]).t.lastMilestone.text, 'The check timed out');
 });
+
+// Found live (a session): a worker blocked itself, got the orchestrator's answer live and went on working — usage and
+// tool rows, no milestone yet. The task still read `blocked`, so the orchestrator sent it to rework, which collided with
+// the worker that was still running. Work after a live delivery is the task running again.
+test('a blocked task whose worker works on after a live message reads as running; work before the message does not', () => {
+  const at = s => `2026-10-29T00:${s}.000Z`;
+  const base = [
+    {kind: 'task.submitted', task: 't1', time: at('50:00'), deadline: null},
+    {kind: 'task.started', task: 't1', time: at('50:01'), attempt: 1},
+    {kind: 'task.blocked', task: 't1', time: at('52:11'), text: 'the model is not loaded', from: 'worker:t1'},
+    {kind: 'task.usage', task: 't1', time: at('52:12'), from: 'worker:t1'},
+  ];
+  assert.equal(tasks(base).t1.state, 'blocked', 'the tail of the turn that blocked is not a resume');
+  const resumed = [...base,
+    {kind: 'task.delivered', task: 't1', time: at('52:34'), tier: 'live', message: 'm1'},
+    {kind: 'task.observed', task: 't1', time: at('52:40'), text: 'Running · mkdir -p /tmp/proof', from: 'worker:t1'},
+  ];
+  assert.equal(tasks(resumed).t1.state, 'running');
+  assert.equal(tasks(resumed).t1.blocker, null);
+  const queued = [...base, {kind: 'task.delivered', task: 't1', time: at('52:34'), tier: 'queued', message: 'm1'}, {kind: 'task.usage', task: 't1', time: at('52:40'), from: 'worker:t1'}];
+  assert.equal(tasks(queued).t1.state, 'blocked', 'a queued message resumes nothing');
+});
