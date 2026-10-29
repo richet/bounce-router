@@ -166,3 +166,19 @@ test('the provider · mode line carries the Jev state only while Jev does someth
   assert.ok(rail({metadata: {...metadata, jev: 'jev+routing'}}).some(line => line === 'claude · plan · jev+routing'));
   assert.ok(rail({metadata: {...metadata, jev: ''}}).some(line => line === 'claude · plan'));
 });
+
+// Found in the real-console pass 2026-10-21: inline classic draws no sidebar, yet its pickers were cut as if one took
+// the right 32 columns (/model's descriptions ended at 88 of 120).
+test('an inline view keeps no columns for a sidebar it does not draw', () => {
+  assert.deepEqual(workspaceColumns(120, {sidebar: true, inline: true}), {total: 120, sidebar: 0, content: 120});
+  assert.deepEqual(workspaceColumns(120, {sidebar: true}), {total: 120, sidebar: 32, content: 87});
+});
+
+// Found in the real-console pass 2026-10-21: the prompt's rule was a long run of ─ cut by Ink, which ends a cut line
+// with an ellipsis: "── Message main · … ───…".
+test('the prompt rule runs exactly to the edge of its column, with no ellipsis', () => {
+  for (const view of [{sidebar: false}, {}]) {
+    const rule = frame(120, false, view).split('\n').find(row => row.startsWith('── Message'));
+    assert.equal(rule.split('│')[0].trimEnd().endsWith('─'), true, rule);
+  }
+});

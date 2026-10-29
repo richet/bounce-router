@@ -25,14 +25,14 @@ import {
 // journal — each ended only by the user cancelling. The row itself carries the question that was waiting.
 const HANDOFF_KINDS = OUTCOME_KINDS;
 const HANDOFF_TEXT_MAX = 2000; // per task: a final report summary or failure text, never a transcript
-// The worker's answer goes with it whole: found live (ACE e3bd01d5), the orchestrator asked for the full
+// The worker's answer goes with it whole: found live (session e3bd01d5), the orchestrator asked for the full
 // answer after 41 of 43 handoffs. Answers were 1,140 characters at the median and 10,588 at most.
 const HANDOFF_ANSWER_MAX = 12000;
 // How long after a vendor refuses a typed message bounce tries it once more.
 const TYPED_RETRY_MS = 3000;
 const HANDOFF_DELAY_MS = 1000; // several tasks ending together become one wake-up turn
-// The quiet sweep (docs/plans/lessons-and-sweep.md §2): nothing in flight, held work waiting, and no row
-// for sweepMs — the orchestrator is asked once what is waiting on it. Found live (ACE e3bd01d5,
+// The quiet sweep: nothing in flight, held work waiting, and no row
+// for sweepMs — the orchestrator is asked once what is waiting on it. Found live (session e3bd01d5,
 // 2026-09-30): two held tasks waited 91 minutes with nothing running and nobody noticing.
 const SWEEP_MINUTES = 20;
 const SWEEP_PROMPT = 'Decide what is waiting on you: accept it (task.accepted with what you checked), send it back (task.rework with what to fix), or retry it on another AI (retryOf) — or say that nothing is, and end your turn.';
@@ -77,7 +77,7 @@ export function handoffBlock(session, ended) {
     const check = row.kind === 'task.accepted' ? session.events.findLast(event => event.kind === 'task.check' && event.task === row.task && typeof event.passed === 'boolean') : null;
     if (check) lines.push(`  check: ${check.passed ? 'passed' : 'FAILED'} (exit code ${check.exit})${check.passed && check.weak ? ', but it only looks for files or text and did not run the work' : ''} · ${String(check.command).slice(0, 500)}`);
     // A correction of accepted work, or a check that failed twice: the moment a lesson is in hand
-    // (docs/plans/lessons-and-sweep.md). The orchestrator decides whether there is one.
+    //. The orchestrator decides whether there is one.
     const retryOf = session.events.find(event => event.kind === 'task.submitted' && event.task === row.task)?.retryOf;
     const redid = retryOf && view[retryOf]?.state === 'accepted' && ['task.completed', 'task.accepted', 'task.blocked', 'task.failed'].includes(row.kind);
     if (redid || (row.kind === 'task.blocked' && row.reason === 'check_failed')) {
@@ -102,7 +102,7 @@ export function handoffBlock(session, ended) {
     if (earlier.length) lines.push(`  this job has now failed ${earlier.length + 1} times the same way (${[...earlier.map(a => a.reason), row.reason ?? row.kind].join(', ')}): change the scope or the AI before asking again — bounce refuses a third identical attempt.`);
   }
   lines.push(running.length ? `Still running: ${running.map(t => `${t.id} (${t.profile}, ${t.state})`).join(', ')}` : 'No other task of yours is still running.');
-  // Standing workers (docs/plans/standing-workers.md §3): who exists, what each did, who is idle or heavy.
+  // Standing workers: who exists, what each did, who is idle or heavy.
   const roster = rosterLines(session.events);
   if (roster.length) lines.push('Your workers:', ...roster);
   return lines.join('\n');
@@ -162,7 +162,7 @@ export function createMainService({session, adapters, profile, settings, profile
   const replayRequest = session.events.findLast(event => event.kind === 'main.requested'
     && !session.events.some(later => later.seq > event.seq && later.requestId === event.requestId
       && ['main.starting', 'main.started', 'main.terminal', 'main.blocked'].includes(later.kind)));
-  // Found live (ACE d1bc0206): a turn orphaned by a crash blocked the orchestrator on every later restart,
+  // Found live (session d1bc0206): a turn orphaned by a crash blocked the orchestrator on every later restart,
   // for good — nothing cleared it. A turn whose vendor process was recorded and is now gone ended with
   // it; one with no record (older journals) stays blocked until the user says it is gone (unblock).
   const startedRow = requestId => session.events.findLast(event => event.kind === 'main.started' && event.requestId === requestId);
@@ -372,8 +372,8 @@ export function createMainService({session, adapters, profile, settings, profile
           : await adapter.launch({...options, orders: text});
       } catch (error) {
         // The thread this session last used cannot be reopened. Found live: the thread was still in the
-        // app's ~/.codex after bounce moved Codex to its own home ("no rollout found", ACE 36ecaacd), and
-        // a reopen that never answered left a session silent (ACE d1bc0206). Whatever the reason, a fresh
+        // app's ~/.codex after bounce moved Codex to its own home ("no rollout found", session 36ecaacd), and
+        // a reopen that never answered left a session silent (session d1bc0206). Whatever the reason, a fresh
         // thread from the session's handoff carries the conversation forward. A usage limit or a missing
         // executable is not the thread's fault: those go to the next provider, as before.
         if (!run.resumed || run.cancelled || closed || run.finished || ['limited', 'missing'].includes(error?.code)) throw error;
@@ -412,6 +412,9 @@ export function createMainService({session, adapters, profile, settings, profile
         if (event.kind === 'error' && event.code === 'missing') result = {status: 'missing', text: event.text};
         if (['assistant', 'tool', 'delta', 'progress', 'activity'].includes(event.kind)) run.spoke = true;
         const row = {...event, provider: run.provider, from: 'main', context: session.id};
+        // The finished message of a block that streamed (codex's app-server) takes the deltas' place on screen.
+        if (event.kind === 'delta') run.streaming = true;
+        if (event.kind === 'assistant' && run.streaming) { row.streamed = true; run.streaming = false; }
         if (['delta', 'progress', 'activity'].includes(event.kind)) session.publish(row);
         else session.append(row);
       }
@@ -425,7 +428,7 @@ export function createMainService({session, adapters, profile, settings, profile
       const status = run.cancelled || closed ? 'interrupted' : result?.status;
       if (['limited', 'missing'].includes(status)) return status;
       // A message the user typed, refused by the vendor before the orchestrator said or did anything,
-      // is tried once more. Found live (ACE e3bd01d5): "model 'gpt-6-sol' is not enabled" on the first
+      // is tried once more. Found live (session e3bd01d5): "model 'gpt-6-sol' is not enabled" on the first
       // message of a session, which was answered when typed again a minute later. A turn that had
       // started working is never run twice, and an outcome bounce handed over has its own retries.
       if (status === 'failed' && !run.wake && !run.retried && !run.spoke) {
@@ -487,6 +490,8 @@ export function createMainService({session, adapters, profile, settings, profile
     if (params.files !== undefined && (!Array.isArray(params.files) || params.files.some(file => typeof file !== 'string'))) return {accepted: false, reason: 'invalid_attachments'};
     if (params.mode !== undefined && !['yolo', 'plan'].includes(params.mode)) return {accepted: false, reason: 'invalid_mode'};
     if (params.typed !== undefined && (typeof params.typed !== 'string' || !params.typed.startsWith('/'))) return {accepted: false, reason: 'invalid_typed'};
+    // `bounce send` (src/send.js): a user turn typed outside the view, marked so the journal says so.
+    if (params.via !== undefined && params.via !== 'send') return {accepted: false, reason: 'invalid_via'};
     if (params.routing !== undefined && (!params.routing || !Array.isArray(params.routing.order)
       || params.routing.order.some(p => !['claude', 'codex', 'muse'].includes(p))
       || !params.routing.models || typeof params.routing.models !== 'object'
@@ -510,7 +515,7 @@ export function createMainService({session, adapters, profile, settings, profile
       // row itself: a daemon restart rebuilds queuedPrompts from the journal (below), not from this
       // in-memory array, and needs enough here to call start() again unchanged.
       session.append({kind: 'user', text: params.text, queued: true, requestId: id,
-        ...(params.typed ? {typed: params.typed} : {}), ...(images.length ? {images} : {}),
+        ...(params.typed ? {typed: params.typed} : {}), ...(params.via ? {via: params.via} : {}), ...(images.length ? {images} : {}),
         ...(params.provider ? {provider: params.provider} : {}), ...(params.model ? {model: params.model} : {}),
         ...(params.mode ? {mode: params.mode} : {}), ...(params.routing ? {routing: params.routing} : {})});
       if (isFirstPrompt) { try { onFirstUserPrompt(session, settings); } catch {} }
@@ -545,7 +550,7 @@ export function createMainService({session, adapters, profile, settings, profile
       dueAt: wake ? now() : null, ...(params.recoveryOf ? {recoveryOf: params.recoveryOf, rootRequestId: run.rootRequestId} : {})};
     const committed = [requested];
     // A dispatch drained from the queue already journaled its `user` row when it was queued.
-    if (!wake && !fromQueue) committed.unshift({kind: 'user', text: params.text, ...(params.typed ? {typed: params.typed} : {}), ...(images.length ? {images} : {})});
+    if (!wake && !fromQueue) committed.unshift({kind: 'user', text: params.text, ...(params.typed ? {typed: params.typed} : {}), ...(params.via ? {via: params.via} : {}), ...(images.length ? {images} : {})});
     if (sweep) committed.push({kind: 'handoff', wake, sweep: true, requestId: run.id, actionIds: [], outcomeSeqs: [], tasks: held.map(t => t.id), text: `${run.outcomes}\n\n${params.text}`, from: 'bounce'});
     else if (actions.length) committed.push({kind: 'handoff', wake, requestId: run.id,
       actionIds: run.actionIds, outcomeSeqs: run.outcomeSeqs, tasks: actions.filter(action => action.task).map(action => action.task),

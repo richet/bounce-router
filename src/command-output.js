@@ -40,7 +40,7 @@ export function weakCheckNotice(command) {
 
 // What a worker is told when the task's check fails.
 export function checkFinding(check) {
-  // Found live (ACE e3bd01d5): all 6 false reports were written in the round after this message, which
+  // Found live (session e3bd01d5): all 6 false reports were written in the round after this message, which
   // then said "Fix what it reports"; and 18 first checks failed because the evidence was saved outside
   // the working copy.
   if (check.weak) {
@@ -61,8 +61,8 @@ export function checkCouldNotRun(check) {
   return `The task's check could not be run, so nothing verified this work and it was not put in the checkout. bounce ran \`${check.command}\` in the worker's copy: ${ending(check)}.${printed(check.output)}${joined(check.output)}The check runs in a plain shell with bounce's own environment: name the tool by its full path, or set PATH inside the check. The work is kept. Decide: accept it with what you checked yourself (task.accepted), or retry it with a check that runs (retryOf).`;
 }
 
-// Work that changed files and that no check has run waits for the orchestrator (Daniel, 2026-09-29).
-// Found live (ACE e3bd01d5): 6 wrong results were put in the checkout as soon as their worker finished,
+// Work that changed files and that no check has run waits for the orchestrator (2026-09-29).
+// Found live (session e3bd01d5): 6 wrong results were put in the checkout as soon as their worker finished,
 // and corrected afterwards by the orchestrator, who had caught every one of them by reading it.
 export function heldForAccept({check = null, byBounce = false, said = '', copy = null} = {}) {
   const why = `${check?.weak ? 'the task\'s check only looks for files or text' : 'the task names no check'}${byBounce ? ', and the worker wrote no report (bounce wrote one from what it saw)' : ''}`;

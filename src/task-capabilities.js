@@ -17,9 +17,6 @@ export function taskCapabilities(profile) {
   switch (effectivePolicy(profile)) {
     case 'plan':
     case 'read-only': return ['read'];
-    // A probe worker never gets Docker: a container can bind-mount the checkout and write it, which no
-    // sandbox around the worker can stop (decided 2026-09-25: Docker only for tasks that may write).
-    case 'probe': return ['read', 'exec'];
     // A full write/yolo worker runs unsandboxed, local or cloud alike: the Docker socket is already reachable.
     default: return ['read', 'exec', 'write', 'docker'];
   }

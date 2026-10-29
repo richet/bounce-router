@@ -1,3 +1,5 @@
+import {normalizeUsage} from '../reducers.js';
+
 const WORKER_STATES = {
   'task.submitted': 'queued',
   'task.started': 'running',
@@ -19,7 +21,7 @@ const HIDDEN = new Set(['turn', 'attempt', 'main.starting', 'main.started', 'mai
 // the hand-off prompt is written FOR the orchestrator, a review's start and raw verdict JSON are
 // covered by the verdict line and the worker's block, control rows are the user's own commands, and
 // a stall ping is what the rail's red row already says.
-const PLUMBING = /^(hook_started|hook_response|background_tasks_changed|task_updated|Task (started|stopped|completed|updated) ·)/;
+export const PLUMBING = /^(hook_started|hook_response|background_tasks_changed|task_updated|status$|Task (started|stopped|completed|updated) ·)/;
 // A skill-sync summary (src/skills.js seedSummary) is one line per skill; "your own copy is kept"
 // is the routine no-op (the user's own edit is left alone, nothing bounce did). A batch where
 // every line is that no-op is quiet plumbing; one line worth acting on keeps the whole row visible.
@@ -45,6 +47,21 @@ function tldrOf(answer) {
 }
 // The part of a progress reading that names what is happening: `Thinking` of `Thinking · ~50 tokens`.
 const progressLabel = event => String(event.text ?? '').split(' · ')[0];
+// A turn's footer (interactive-polish step 6): how long it took and the tokens it read and wrote, the read side
+// with how much of it came from the provider's cache.
+const tokens = n => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+function footerText(status, seconds, usage, thinking, context) {
+  const read = (usage.input ?? 0) + (usage.cache_read ?? 0) + (usage.cache_write ?? 0);
+  const parts = [status === 'completed' ? `${seconds.toFixed(1)} s` : `${status} after ${seconds.toFixed(1)} s`];
+  if (read) parts.push(`in ${tokens(read)}${usage.cache_read ? ` (${tokens(usage.cache_read)} cached)` : ''}`);
+  if (usage.output) parts.push(`out ${tokens(usage.output)}`);
+  if (thinking) parts.push(`thought ${tokens(thinking)}`);
+  // How full the model's window now is: the context the turn's last request filled.
+  if (context?.window) parts.push(`context ${Math.round(100 * context.used / context.window)}%`);
+  return parts.join(' · ');
+}
+// Thinking tokens, by each vendor's name for them.
+const thinkingOf = raw => raw?.thinking ?? raw?.output_tokens_details?.thinking_tokens ?? raw?.reasoning_output_tokens ?? raw?.reasoning ?? 0;
 
 // Display-only reduction: retain the journal verbatim for diagnostics and handoffs.
 export function conversationEvents(events, {details = false} = {}) {
@@ -59,8 +76,35 @@ export function conversationEvents(events, {details = false} = {}) {
   // a native id) do not end it; only the conversation moving on does. Seen live 2026-10-02: the
   // `session.titled` row landed between two deltas and the first answer rendered cut in half.
   let openDelta = null;
+  // The last route shown: "Using claude / sonnet / yolo" says something when the AI, model or mode changes,
+  // nothing at every turn (2026-09-30; interactive-polish step 1). /details keeps every one.
+  let lastRoute = null;
+  // The turn in progress: when its prompt was sent, and the tokens reported since.
+  let turnStart = null, turnUsage = {}, turnFirstRow = 0, turnThinking = 0, turnContext = null;
 
   for (const event of events) {
+    // A wake-up turn (the orchestrator handed worker outcomes) journals no user row; its request opens the turn.
+    if (event.kind === 'user' || (event.kind === 'main.requested' && event.wake)) { turnStart = Date.parse(event.time); turnUsage = {}; turnFirstRow = rows.length; turnThinking = 0; turnContext = null; }
+    if (event.kind === 'usage') {
+      for (const [key, value] of Object.entries(normalizeUsage(event.usage ?? event))) turnUsage[key] = (turnUsage[key] ?? 0) + value;
+      turnThinking += Number(event.thinking ?? thinkingOf(event.usage ?? event)) || 0;
+      if (event.context?.window) turnContext = event.context;
+      if (!details) continue;
+    }
+    if (event.kind === 'turn' && !details && Number.isFinite(turnStart) && Number.isFinite(Date.parse(event.time))) {
+      // Live progress ("Ready · 88 tools", "Thinking · ~218 tokens") was the turn's spinner; once it ends, the
+      // footer says how long it took and the readings go.
+      // Cleared in place, like a replaced worker row: a worker remembers the index of the row its next update replaces.
+      for (let index = turnFirstRow; index < rows.length; index++) if (rows[index]?.kind === 'progress') rows[index] = null;
+      rows.push({kind: 'turn.footer', id: `${event.id}:footer`, text: footerText(event.text, (Date.parse(event.time) - turnStart) / 1000, turnUsage, turnThinking, turnContext)});
+      turnStart = null; turnUsage = {};
+      continue;
+    }
+    if (event.kind === 'route' && !details) {
+      const same = lastRoute && lastRoute.provider === event.provider && lastRoute.model === event.model && lastRoute.mode === event.mode;
+      lastRoute = event;
+      if (same) continue;
+    }
     // A reported model is header metadata with no text; it would only split a progress run.
     if (event.kind === 'model') continue;
     if (event.kind === 'user' || event.kind === 'main.starting') lastAnswer = null;
@@ -69,9 +113,16 @@ export function conversationEvents(events, {details = false} = {}) {
       lastAnswer = event.text?.trim();
       lastProvider = event.provider;
     }
+    // The journaled copy of a block just streamed takes the live deltas' place (Router.run assembles it).
+    if (event.kind === 'assistant' && event.streamed) {
+      // Rows bounce journals meanwhile (a session title, a status) do not stand between them.
+      let live = rows.length - 1;
+      while (live >= 0 && !['user', 'assistant', 'delta', 'tool', 'result', 'error'].includes(rows[live]?.kind)) live--;
+      if (live >= 0 && rows[live].kind === 'delta' && rows[live].provider === event.provider) { rows[live] = event; openDelta = null; continue; }
+    }
     // A streamed answer is many small deltas, each its own journal row. They read as one block;
     // the row's id changes as it grows so a cached rendering of it is not reused.
-    if (event.kind === 'delta' && !details) {
+    if (event.kind === 'delta') {
       if (openDelta && openDelta.provider === event.provider) {
         openDelta.text += event.text ?? '';
         openDelta.id = `${openDelta.first}+${++openDelta.merged}`;
@@ -142,7 +193,7 @@ export function conversationEvents(events, {details = false} = {}) {
     // in the default view; earlier ones stay in the journal and in /details. Older journals never
     // marked a /tasks status row with `view`, so an unmarked one can't be told apart from an
     // ordinary status row — leave those alone.
-    const view = ['review', 'help', 'quota', 'settings', 'stats'].includes(event.kind) ? event.kind : event.kind === 'status' && event.view === 'tasks' ? 'tasks' : null;
+    const view = ['review', 'help', 'quota', 'settings', 'stats', 'sessions'].includes(event.kind) ? event.kind : event.kind === 'status' && event.view === 'tasks' ? 'tasks' : null;
     if (view) {
       const previous = viewSlots.get(view);
       if (previous) rows[previous.index] = null;

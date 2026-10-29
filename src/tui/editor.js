@@ -128,3 +128,33 @@ export function deleteWordForward(input, offset) {
   const position = cursor(input, offset);
   return replace(input, position, moveWord(input, position, 'right'), '');
 }
+
+// Ctrl+K: from the caret to the end of its line; at a line's end, the newline (joining the next line).
+export function killLineEnd(input, offset) {
+  const position = cursor(input, offset);
+  const end = moveLineEnd(input, position);
+  const to = end === position && position < input.length ? position + 1 : end;
+  return {...replace(input, position, to, ''), killed: input.slice(position, to)};
+}
+
+// Ctrl+W: the word before the caret and the space after it, as a shell does.
+export function killWordBackward(input, offset) {
+  const position = cursor(input, offset);
+  const start = moveWord(input, position, 'left');
+  return {...replace(input, start, position, ''), killed: input.slice(start, position)};
+}
+
+// Ctrl+_ undo: the drafts before each edit, newest last, `limit` deep.
+export function createUndo(limit = 100) {
+  const stack = [];
+  return {
+    push(state) {
+      const last = stack.at(-1);
+      if (last && last.input === state.input) return;
+      stack.push({input: state.input, cursor: state.cursor});
+      if (stack.length > limit) stack.shift();
+    },
+    pop() { return stack.pop() ?? null; },
+    clear() { stack.length = 0; },
+  };
+}

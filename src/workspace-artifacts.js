@@ -37,9 +37,13 @@ function assertNoSymlink(root, rel) {
     if (fs.existsSync(cursor) && fs.lstatSync(cursor).isSymbolicLink()) throw new Error(`symlink denied: ${rel}`);
   }
 }
+// A skill bounce wrote into a copy carries this file; the manifest never sees it, so it is never integrated back.
+const GENERATED = '.bounce-generated';
+const NATIVE_SKILLS = ['.claude/skills', '.codex/skills', '.agents/skills'];
 function manifest(root) {
   const files = {};
   const visit = (dir, prefix = '') => {
+    if (fs.existsSync(path.join(dir, GENERATED))) return;
     for (const entry of fs.readdirSync(dir, {withFileTypes: true})) {
       if (EXCLUDED.has(entry.name)) continue;
       const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
@@ -93,7 +97,7 @@ function realAncestor(dir) {
 // on the source's branch, with a baseline commit of the checkout as copied (see below). It has no remote, so nothing a worker does in git can reach the source, and
 // .git is outside every manifest, so only file changes are ever integrated. A source that is not a git
 // checkout, or a clone that fails, leaves the copy without git as before.
-function giveGit(source, copy) {
+function giveGit(source, copy, generated = []) {
   if (!fs.existsSync(path.join(source, '.git'))) return;
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
   const git = (cwd, ...args) => execFileSync('git', args, {cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']}).trim();
@@ -112,9 +116,9 @@ function giveGit(source, copy) {
     const omitted = execFileSync('git', ['ls-files', '-z', '--', '.bounce', ':(glob)**/.bounce/**'], {cwd: copy, env, stdio: ['ignore', 'pipe', 'ignore']});
     if (omitted.length) execFileSync('git', ['update-index', '--skip-worktree', '-z', '--stdin'], {cwd: copy, env, input: omitted, stdio: ['pipe', 'ignore', 'ignore']});
     fs.mkdirSync(path.join(copy, '.git', 'info'), {recursive: true});
-    fs.appendFileSync(path.join(copy, '.git', 'info', 'exclude'), '\n/.attempt-workspace.json\n');
+    fs.appendFileSync(path.join(copy, '.git', 'info', 'exclude'), `\n/.attempt-workspace.json\n${generated.map(rel => `/${rel}/\n`).join('')}`);
     // The checkout as the copy got it — the user's uncommitted edits included — becomes a baseline
-    // commit, so `git status` starts clean and `git diff` is only the worker's own work. Found live (ACE
+    // commit, so `git status` starts clean and `git diff` is only the worker's own work. Found live (session
     // 36ecaacd, task 7bafef8e): a worker read the user's uncommitted edits as its own out-of-scope
     // changes and reverted them. Local identity, no hooks, no signing: the commit never leaves the copy.
     git(copy, 'add', '-A');
@@ -136,9 +140,26 @@ function shortCopyDir(root) {
 }
 
 // `copyRoot` puts the working copy at a short path of its own (<copyRoot>/<8 hex>) instead of under
-// `dir`. Found live (ACE d1bc0206): a local model typing the default ~200-character path, three
+// `dir`. Found live (session d1bc0206): a local model typing the default ~200-character path, three
 // UUIDs deep, garbled it (`de83` for `dee3`, a doubled segment) and spent its steps on "File not found".
-export function createAttemptWorkspace({cwd, dir, owns, attemptId, disposable = false, copyRoot}) {
+// The skills in use go into the copy (they live in .bounce, which the copy leaves out): at .bounce/skills, where the
+// prompt's index points, and in each vendor's own project folder so claude, codex and muse also load them natively.
+// A vendor folder the project already has for a skill is left as the project keeps it.
+function giveSkills(copy, skills) {
+  const generated = [];
+  for (const skill of skills) {
+    for (const area of ['.bounce/skills', ...NATIVE_SKILLS]) {
+      const rel = `${area}/${skill.name}`, target = path.join(copy, rel);
+      if (fs.existsSync(target)) continue;
+      fs.cpSync(skill.dir, target, {recursive: true, dereference: false, filter: from => !fs.lstatSync(from).isSymbolicLink() && path.basename(from) !== '.bounce-skill.json'});
+      fs.writeFileSync(path.join(target, GENERATED), '');
+      generated.push(rel);
+    }
+  }
+  return generated;
+}
+
+export function createAttemptWorkspace({cwd, dir, owns, attemptId, copyRoot, skills = []}) {
   const source = fs.realpathSync(cwd);
   const allowed = ownList(owns);
   const resolvedDir = fs.existsSync(dir) ? fs.realpathSync(dir) : path.resolve(dir);
@@ -148,12 +169,37 @@ export function createAttemptWorkspace({cwd, dir, owns, attemptId, disposable = 
   if (copyRoot && !path.relative(source, realAncestor(copyRoot)).startsWith('..')) throw new Error('workspace dir must be outside source');
   const workspace = copyRoot ? shortCopyDir(copyRoot) : path.join(dir, 'workspaces', `${attemptId}-${crypto.randomUUID()}`);
   copyTree(source, workspace);
-  giveGit(source, workspace);
+  giveGit(source, workspace, giveSkills(workspace, skills));
   const baseline = manifest(workspace);
   const baselineHash = manifestHash(baseline);
-  const result = {id: path.basename(workspace), attemptId, cwd: workspace, source, dir, owns: allowed, baseline, baselineHash, ...(disposable ? {disposable: true} : {})};
+  const result = {id: path.basename(workspace), attemptId, cwd: workspace, source, dir, owns: allowed, baseline, baselineHash};
   atomicJSON(path.join(workspace, '.attempt-workspace.json'), {...result, cwd: undefined});
+  keepBaselines(result);
   return result;
+}
+
+// A text file the baseline commit does not hold — ignored, untracked, or inside a repository of its own (found live:
+// docs/ was its own repository, ignored by the project's) — keeps its content here by hash, so integration can
+// merge against the file as the copy got it. Small text files only, and a bounded total: binaries are never merged.
+const KEPT_FILE_MAX = 1024 * 1024;
+const KEPT_TOTAL_MAX = 64 * 1024 * 1024;
+const keptDir = dir => path.join(dir, 'baselines');
+function keepBaselines(workspace) {
+  let tracked = new Set();
+  try {
+    tracked = new Set(execFileSync('git', ['ls-files', '-z'], {cwd: workspace.cwd, env: gitEnv(), maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore']}).toString().split('\0').filter(Boolean));
+  } catch {}
+  let total = 0;
+  for (const [rel, entry] of Object.entries(workspace.baseline)) {
+    if (tracked.has(rel) || entry.binary || entry.unsupported || entry.size > KEPT_FILE_MAX) continue;
+    if ((total += entry.size) > KEPT_TOTAL_MAX) return;
+    const file = path.join(keptDir(workspace.dir), entry.hash);
+    if (fs.existsSync(file)) continue;
+    try {
+      fs.mkdirSync(keptDir(workspace.dir), {recursive: true, mode: 0o700});
+      fs.writeFileSync(file, fs.readFileSync(path.join(workspace.cwd, rel)), {mode: 0o600});
+    } catch {}
+  }
 }
 
 const clipped = (value, max) => (value?.length > max ? `${value.slice(0, max)}\n[… truncated …]` : (value ?? ''));
@@ -193,7 +239,7 @@ function lineDiff(before, after) {
   }
 }
 
-// What a review reads of one change: its real line diff. Found live (ACE d1bc0206, task 99bd27ea):
+// What a review reads of one change: its real line diff. Found live (session d1bc0206, task 99bd27ea):
 // this was the first 4096 characters of the old file and then of the new one, so a change past that
 // point was never shown — of 121 lines a worker added to files of 33 KB and 40 KB, the review saw 1.
 // A file whose earlier content cannot be read any more gets those previews, and says so.
@@ -216,7 +262,7 @@ function describeChange(source, change) {
 
 function describeChanges(source, changes) {
   const described = changes.map(change => ({path: change.path, ...describeChange(source, change)}));
-  // The shortest change first: a review reads a bounded length of this text, and found live (ACE
+  // The shortest change first: a review reads a bounded length of this text, and found live (session
   // e3bd01d5) long test logs under evidence/ came before, and hid, the source changes under src/.
   const shortestFirst = [...described].sort((left, right) => left.text.length - right.text.length || left.path.localeCompare(right.path));
   return {
@@ -246,7 +292,7 @@ function diffParts(artifact) {
 }
 
 // What a review is sent: the changes without the evidence and logs the worker saved, which are named
-// instead. Found live (ACE e3bd01d5): test logs made a review 75,000 to 750,000 characters long, the
+// instead. Found live (session e3bd01d5): test logs made a review 75,000 to 750,000 characters long, the
 // service refused 8 of 31, and a reviewer reads less well the more it is given that the decision
 // does not need.
 export function reviewDiff(artifact) {
@@ -264,17 +310,32 @@ export function reviewDiff(artifact) {
   return [...parts.filter(part => !isEvidence(part.path)).map(part => part.text), ...note].join('\n');
 }
 
+// The paths git ignores in the copy; none when it has no git or git fails, so nothing is left out unasked.
+function ignoredPaths(cwd, paths) {
+  if (!paths.length || !fs.existsSync(path.join(cwd, '.git'))) return new Set();
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+  try {
+    const out = execFileSync('git', ['check-ignore', '-z', '--stdin'], {cwd, env, input: paths.join('\0'), stdio: ['pipe', 'pipe', 'ignore']});
+    return new Set(out.toString('utf8').split('\0').filter(Boolean));
+  } catch { return new Set(); } // exit 1: none is ignored
+}
+
 export function captureArtifact(workspace) {
   const result = manifest(workspace.cwd);
   const paths = [...new Set([...Object.keys(workspace.baseline), ...Object.keys(result)])].sort();
-  const changes = [], unsupported = [];
+  const changes = [], refused = [];
   for (const file of paths) {
     const before = workspace.baseline[file] ?? null, after = result[file] ?? null;
     if (JSON.stringify(before) === JSON.stringify(after)) continue;
-    if (before?.unsupported || after?.unsupported || before?.binary || after?.binary) { unsupported.push({path: file, reason: before?.unsupported ?? after?.unsupported ?? 'binary'}); continue; }
+    if (before?.unsupported || after?.unsupported || before?.binary || after?.binary) { refused.push({path: file, reason: before?.unsupported ?? after?.unsupported ?? 'binary'}); continue; }
     if (!after) changes.push({path: file, kind: 'delete', before});
     else changes.push({path: file, kind: 'write', before, after, data: fs.readFileSync(safeJoin(workspace.cwd, file)).toString('base64'), mode: after.mode});
   }
+  // A binary or large file the project's .gitignore ignores (a build's output, a .pyc) is left out and named, so it
+  // does not refuse the rest of the work (found live: compiled binaries in dist/ refused a whole CLI step).
+  const ignored = ignoredPaths(workspace.cwd, refused.map(entry => entry.path));
+  const unsupported = refused.filter(entry => !ignored.has(entry.path));
+  const leftOut = refused.filter(entry => ignored.has(entry.path));
   const resultHash = manifestHash(result);
   // owns is a hint, not a fence (2026-09-29): every workspace owns everything, so nothing here is
   // ever a violation. `owns` and `violations` stay in the digest binding, in this exact order, so an
@@ -283,7 +344,7 @@ export function captureArtifact(workspace) {
   const binding = {target: workspace.source, attemptId: workspace.attemptId, baselineHash: workspace.baselineHash, resultHash, owns: workspace.owns, changes, violations: [], unsupported};
   const digest = hash(json(binding));
   const id = digest.slice(0, 32);
-  const artifact = {id, digest, ...binding, files: Object.keys(result).sort(), ...describeChanges(workspace.source, changes)};
+  const artifact = {id, digest, ...binding, leftOut, files: Object.keys(result).sort(), ...describeChanges(workspace.source, changes)};
   atomicJSON(path.join(workspace.dir, 'artifacts', `${id}.json`), artifact);
   return artifact;
 }
@@ -312,11 +373,11 @@ function writeAtomic(root, change) {
 // copied from — otherwise its own unrelated edits collide with the checkout's own prior integration.
 // Advance only the paths that were just integrated; a genuine concurrent edit of an untouched path
 // still shows up against the recorded baseline for that path.
-export function advanceBaseline(workspace, artifact) {
+export function advanceBaseline(workspace, artifact, mergedStates = {}) {
   const baseline = {...workspace.baseline};
   for (const change of artifact.changes) {
     if (change.kind === 'delete') delete baseline[change.path];
-    else baseline[change.path] = change.after;
+    else baseline[change.path] = mergedStates[change.path] ?? change.after; // a merged file is what the checkout now has
   }
   const baselineHash = manifestHash(baseline);
   const updated = {...workspace, baseline, baselineHash};
@@ -324,7 +385,81 @@ export function advanceBaseline(workspace, artifact) {
   return updated;
 }
 
-export function integrateArtifact({cwd, artifact, dir}) {
+const BASELINE_MESSAGE = 'bounce: baseline of the checkout this copy was made from';
+const gitEnv = () => Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+
+// A file as the copy got it — kept by hash when the copy was made, else from the baseline commit giveGit made — and
+// only while its hash is still the change's `before`: the checkout itself cannot say, it is the side that changed.
+function baselineContent(copy, change, dir) {
+  if (!change.before) return null;
+  try {
+    const kept = dir ? fs.readFileSync(path.join(keptDir(dir), change.before.hash)) : null;
+    if (kept && hash(kept) === change.before.hash) return kept;
+  } catch {}
+  if (!copy) return null;
+  try {
+    const run = args => execFileSync('git', args, {cwd: copy, env: gitEnv(), maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore']});
+    const commit = run(['log', '-1', '--format=%H', '--fixed-strings', `--grep=${BASELINE_MESSAGE}`]).toString().trim();
+    if (!commit) return null;
+    const data = run(['show', `${commit}:${change.path}`]);
+    return hash(data) === change.before.hash ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+// Three-way merge of a text file (git merge-file): the merged content, or null when the edits overlap or it is not text.
+// Every line of `base` is still there, in order: the side only added lines.
+const onlyAdds = (base, side) => {
+  const lines = side.toString('utf8').split('\n');
+  let at = 0;
+  for (const line of base.toString('utf8').split('\n')) { while (at < lines.length && lines[at] !== line) at++; if (at++ >= lines.length) return false; }
+  return true;
+};
+
+// A Markdown file both sides only added to keeps both additions, even at the same place (the checkout's first): that is a
+// log or tracker entry each, never an edit to choose between. Anything else that overlaps still conflicts.
+// The copy's change is already in the checkout: every block it added is there as a run of lines, and every block it
+// removed is gone (found live: a worker's ignore lines and a test's edits the checkout had made too, among more).
+const hasRun = (lines, run) => { for (let i = 0; i + run.length <= lines.length; i++) if (run.every((line, j) => lines[i + j] === line)) return true; return false; };
+function holds(scratch, ours) {
+  const diff = spawnSync('git', ['diff', '--no-index', '--no-color', '-U0', 'base', 'theirs'], {cwd: scratch, env: gitEnv(), maxBuffer: 64 * 1024 * 1024, encoding: 'utf8'});
+  if (diff.status !== 1) return false;
+  const hunks = [];
+  for (const line of diff.stdout.split('\n')) {
+    if (line.startsWith('@@')) hunks.push({added: [], removed: []});
+    else if (hunks.length && line.startsWith('+')) hunks.at(-1).added.push(line.slice(1));
+    else if (hunks.length && line.startsWith('-')) hunks.at(-1).removed.push(line.slice(1));
+  }
+  // A block's blank lines at either end are spacing, not content: the checkout may space its own additions differently.
+  const trim = run => { let a = 0, b = run.length; while (a < b && !run[a].trim()) a++; while (b > a && !run[b - 1].trim()) b--; return run.slice(a, b); };
+  const lines = ours.toString('utf8').split('\n');
+  // A removal counts only as part of a replacement the checkout made too: a bare deletion of lines the checkout
+  // changed is a real conflict, left to the line merge.
+  return hunks.length > 0 && hunks.every(({added, removed}) => trim(removed).length
+    ? trim(added).length > 0 && hasRun(lines, trim(added)) && !hasRun(lines, trim(removed))
+    : !trim(added).length || hasRun(lines, trim(added)));
+}
+function mergeText(base, ours, theirs, file) {
+  if (!base || [base, ours, theirs].some(data => data.includes(0))) return null;
+  const union = /\.md$/i.test(file) && onlyAdds(base, ours) && onlyAdds(base, theirs);
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-merge-'));
+  try {
+    for (const [name, data] of [['ours', ours], ['base', base], ['theirs', theirs]]) fs.writeFileSync(path.join(scratch, name), data);
+    if (holds(scratch, ours)) return ours;
+    const result = spawnSync('git', ['merge-file', '-p', '--quiet', ...(union ? ['--union'] : []), 'ours', 'base', 'theirs'], {cwd: scratch, env: gitEnv(), maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore']});
+    return result.status === 0 ? result.stdout : null;
+  } catch {
+    return null;
+  } finally {
+    fs.rmSync(scratch, {recursive: true, force: true});
+  }
+}
+
+// `base` is the worker's copy: a text file the checkout also changed since the copy was taken is merged three ways
+// against the copy's baseline, so two tasks adding to one file both land (found live: a second PROGRESS.md entry was
+// refused whole and copied over by hand). Edits that overlap, or a file with no readable baseline, still conflict.
+export function integrateArtifact({cwd, artifact, dir, base = null}) {
   const root = fs.realpathSync(cwd);
   if (!artifact || !Array.isArray(artifact.changes)) throw new Error('invalid artifact');
   const binding = {target: artifact.target, attemptId: artifact.attemptId, baselineHash: artifact.baselineHash, resultHash: artifact.resultHash, owns: artifact.owns, changes: artifact.changes, violations: artifact.violations, unsupported: artifact.unsupported};
@@ -343,21 +478,36 @@ export function integrateArtifact({cwd, artifact, dir}) {
     manifest: artifact.changes.map(change => ({path: change.path, kind: change.kind, before: change.before, after: change.after})),
   };
   const applied = new Set(record.applied);
+  const merged = {...(record.merged ?? {})}; // path -> hash of the merged content written
+  const plans = new Map();
+  const conflicts = [];
   for (const change of artifact.changes) {
     const state = targetState(root, change);
     const desired = change.kind === 'delete' ? null : change.after;
-    if (matches(state, desired)) { applied.add(change.path); continue; }
-    if (!matches(state, change.before)) return {status: 'conflict', path: change.path};
+    if (matches(state, desired) || (merged[change.path] && state?.hash === merged[change.path])) { applied.add(change.path); continue; }
+    if (matches(state, change.before)) continue;
+    // Only content is merged: a checkout that changed the file's mode (or only its mode) keeps the conflict.
+    const contentOnly = state && change.before && change.kind !== 'delete' && state.mode === change.before.mode && state.hash !== change.before.hash;
+    const ours = contentOnly ? fs.readFileSync(safeJoin(root, change.path)) : null;
+    const data = ours && mergeText(baselineContent(base, change, dir), ours, Buffer.from(change.data, 'base64'), change.path);
+    if (!data) { conflicts.push(change.path); continue; }
+    plans.set(change.path, {ours: state.hash, data});
   }
-  record.status = 'prepared'; record.applied = [...applied]; atomicJSON(recordFile, record);
+  // Every file that conflicts is named, so the one decision covers them all.
+  if (conflicts.length) return {status: 'conflict', path: conflicts[0], paths: conflicts};
+  record.status = 'prepared'; record.applied = [...applied]; record.merged = merged; atomicJSON(recordFile, record);
   for (const change of artifact.changes) {
     if (applied.has(change.path)) continue;
     // Recheck after persisting the manifest, immediately before touching this path.
     // Another process may have edited it since the batch preflight.
-    if (!matches(targetState(root, change), change.before)) return {status: 'conflict', path: change.path};
-    writeAtomic(root, change); applied.add(change.path);
-    record.applied = [...applied]; atomicJSON(recordFile, record);
+    const plan = plans.get(change.path);
+    const state = targetState(root, change);
+    if (plan ? state?.hash !== plan.ours : !matches(state, change.before)) return {status: 'conflict', path: change.path};
+    writeAtomic(root, plan ? {...change, data: plan.data.toString('base64')} : change); applied.add(change.path);
+    if (plan) merged[change.path] = hash(plan.data);
+    record.applied = [...applied]; record.merged = merged; atomicJSON(recordFile, record);
   }
-  record.status = 'integrated'; record.applied = [...applied]; atomicJSON(recordFile, record);
-  return {status: 'integrated', id: artifact.id};
+  record.status = 'integrated'; record.applied = [...applied]; record.merged = merged; atomicJSON(recordFile, record);
+  const paths = Object.keys(merged);
+  return {status: 'integrated', id: artifact.id, ...(paths.length ? {merged: paths, mergedStates: Object.fromEntries(paths.map(file => [file, targetState(root, {path: file})]))} : {})};
 }

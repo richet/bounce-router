@@ -1,7 +1,8 @@
 import {createHash} from 'node:crypto';
+import {localTier} from './model-catalog.js';
 
 const cache = new Map();
-// Phase 2 (docs/plans/opencode-adapter.md): local workers now run a full `opencode serve` per
+// Phase 2: local workers now run a full `opencode serve` per
 // worker instead of a single in-process loop, so the concurrency that was safe before has not been
 // measured for the new shape. Default to one until it is.
 // on-demand by default: LM Studio unloads idle models on its own, and its server loads a requested
@@ -22,7 +23,7 @@ const isLoopback = url => ['127.0.0.1', '::1', '[::1]', 'localhost'].includes(ur
 
 function endpointConfig(id, input) {
   if (!endpointIdPattern.test(id) || !isObject(input)) throw error(`Invalid local endpoint ${id}`);
-  const fields = new Set(['backend', 'url', 'apiKeyEnv', 'trusted', 'loadPolicy', 'maxConcurrent', 'contextTokens', 'slotsPerModel', 'reserveGb', 'waitMinutes', 'pollMs']);
+  const fields = new Set(['backend', 'url', 'apiKeyEnv', 'trusted', 'loadPolicy', 'maxConcurrent', 'contextTokens', 'slotsPerModel', 'reserveGb', 'waitMinutes', 'pollMs', 'queueSeconds']);
   if (Object.keys(input).some(field => !fields.has(field))) throw error(`Endpoint ${id} has unsupported settings`);
   if (input.backend !== 'lmstudio') throw error(`Endpoint ${id} must use backend lmstudio`);
   if (Object.hasOwn(input, 'apiKey')) throw error(`Endpoint ${id} must use apiKeyEnv, not apiKey`);
@@ -45,12 +46,15 @@ function endpointConfig(id, input) {
   if (input.reserveGb !== undefined && (!Number.isFinite(input.reserveGb) || input.reserveGb < 0)) throw error(`Endpoint ${id} reserveGb must be a non-negative number of gigabytes`);
   if (input.waitMinutes !== undefined && (!Number.isInteger(input.waitMinutes) || input.waitMinutes < 1)) throw error(`Endpoint ${id} waitMinutes must be a positive whole number of minutes`);
   if (input.pollMs !== undefined && (!Number.isInteger(input.pollMs) || input.pollMs < 1)) throw error(`Endpoint ${id} pollMs must be a positive integer`);
+  // How long a task waits for a busy slot before it falls to the next AI of its chain (0: not at all). A task with no
+  // other AI in its chain waits as long as it takes.
+  if (input.queueSeconds !== undefined && (!Number.isInteger(input.queueSeconds) || input.queueSeconds < 0)) throw error(`Endpoint ${id} queueSeconds must be a whole number of seconds, 0 or more`);
   const normalized = {backend: 'lmstudio', url: parsed.href.replace(/\/$/, ''), loadPolicy: input.loadPolicy ?? DEFAULT_ENDPOINT.loadPolicy, maxConcurrent: input.maxConcurrent ?? DEFAULT_ENDPOINT.maxConcurrent};
   if (input.apiKeyEnv) normalized.apiKeyEnv = input.apiKeyEnv;
   if (input.trusted) normalized.trusted = true;
   if (input.contextTokens !== undefined) normalized.contextTokens = input.contextTokens;
   if (input.slotsPerModel !== undefined) normalized.slotsPerModel = input.slotsPerModel;
-  for (const key of ['reserveGb', 'waitMinutes', 'pollMs']) if (input[key] !== undefined) normalized[key] = input[key];
+  for (const key of ['reserveGb', 'waitMinutes', 'pollMs', 'queueSeconds']) if (input[key] !== undefined) normalized[key] = input[key];
   return normalized;
 }
 
@@ -267,14 +271,25 @@ export function switchLocal(settings, on) {
 // by its roster note (`<endpoint>/<model>` in roster-notes.json) or, with none, conservatively.
 export function localCandidates(catalogs = [], notes = {}) {
   const usable = catalogs.flatMap(catalog => (catalog.models ?? []).filter(model => model.type !== 'embedding' && model.tools !== false && (model.ready === true || model.ready === false))
-    .map(model => { const name = `${catalog.endpoint}/${model.id}`; const note = notes[name] ?? {};
-      return {name, endpoint: catalog.endpoint, model: model.id, loaded: model.ready === true, size: model.size ?? null, context: model.instances?.[0]?.context ?? model.context ?? null,
-        tier: ['cheapest', 'mid', 'strongest'].includes(note.tier) ? note.tier : 'cheapest', capabilities: note.capabilities || 'unknown local model: single-file reading only'}; }));
+    .map(model => {
+      const name = `${catalog.endpoint}/${model.id}`;
+      // Only a tier pinned by hand is read (src/roster-notes.js routingNote): an agent's description is a guess that
+      // changes between askings, and routing must not. Else the family's tier by name (model-catalog.js localTier),
+      // described by what LM Studio reports.
+      const note = notes[name]?.by === 'you' ? notes[name] : {};
+      const context = model.instances?.[0]?.context ?? model.context ?? null;
+      const measured = `local model on ${catalog.endpoint}${context ? ` · context ${Math.round(context / 1024)}k` : ''} · runs on this machine at no cost, one turn at a time, slower than a cloud model`;
+      return {name, endpoint: catalog.endpoint, model: model.id, loaded: model.ready === true, size: model.size ?? null, context,
+        tier: ['cheapest', 'mid', 'strongest', 'advisor'].includes(note.tier) ? note.tier : localTier(model.id), capabilities: note.capabilities || measured};
+    }));
   // Loaded first, then the rest: which of these Jev is actually offered is decided per agent in
   // src/jev.js (loaded, or named by the agent's own `models:`), so a big downloaded model nobody
   // asked for never enters the running.
   return [...usable.filter(item => item.loaded), ...usable.filter(item => !item.loaded)];
 }
+
+// Why a profile's own model was taken: it was named for the task, Jev picked it, or it is that place on the agent's list.
+const pinReason = profile => profile.pinned ? 'named for this task' : profile.routed ? "Jev's pick" : profile.alias && profile.role ? `${profile.alias}, on the ${profile.role}'s list` : 'profile pin';
 
 export function resolveLocalModel({local, profile, catalogs, requirements = {}, override} = {}) {
   const settings = normalizeLocalSettings(local);
@@ -285,7 +300,7 @@ export function resolveLocalModel({local, profile, catalogs, requirements = {}, 
   const rolePreference = profile.role && settings.preferences[profile.role] || {};
   const exclusions = new Set([...settings.exclude, ...(rolePreference.exclude ?? []), ...(profile.exclude ?? [])]);
   const all = catalogs.filter(row => row?.provider === 'local' && row.backend === 'lmstudio' && !row.stale).flatMap(row => (row.models ?? []).map(model => ({endpoint: row.endpoint, model})));
-  const exact = override ? {ref: override, reason: 'override'} : profile.model && profile.model !== 'auto' ? {ref: `${profile.endpoint ?? 'lmstudio'}/${profile.model}`, reason: 'profile pin'} : null;
+  const exact = override ? {ref: override, reason: 'override'} : profile.model && profile.model !== 'auto' ? {ref: `${profile.endpoint ?? 'lmstudio'}/${profile.model}`, reason: pinReason(profile)} : null;
   if (exact) {
     const parsed = splitRef(exact.ref);
     if (!parsed) fail(`Invalid local model ref ${exact.ref}`, 'INVALID_LOCAL_MODEL_REF');

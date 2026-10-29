@@ -85,8 +85,8 @@ test('the TUI treats an agent-owned /NAME as a turn, offers it in the picker and
   const extra = () => [['triage', 'Triage a ticket (claude · project)', '<REC-####>'], ['seed-account', 'Seed (claude · project)', ''], ['skills', 'a clash', '']];
   assert.deepEqual(completions('/tri', extra).map(r => r[0]), ['triage']);
   assert.deepEqual(completions('/s', extra).map(r => r[0]), ['steer', 'sessions', 'skills', 'sidebar', 'stop', 'stats', 'seed-account']);
-  assert.equal(completions('/', extra).length, 36, 'own commands, then the two extras that do not clash');
-  assert.equal(completions('/', ).length, 34);
+  assert.equal(completions('/', extra).length, 37, 'own commands, then the two extras that do not clash');
+  assert.equal(completions('/', ).length, 35);
   assert.equal(typedCommand('/triage', extra), 'triage');
   assert.equal(typedCommand('/seed-account', extra), 'seed-account');
   assert.equal(typedCommand('/triage'), '');
@@ -104,7 +104,7 @@ test('the journal keeps the expansion as the request and the typed line for the 
   const user = session.events.find(e => e.kind === 'user');
   assert.equal(user.typed, '/triage REC-7');
   assert.match(user.text, /Triage \*\*REC-7\*\* end-to-end\./);
-  // A first turn is the request itself (docs/plans/classic-conversation.md): the expansion, then the workspace.
+  // A first turn is the request itself: the expansion, then the workspace.
   assert.match(attempts[0].prompt, /^Command: \/triage \(claude · project\)[^\n]*\n\nTriage \*\*REC-7\*\* end-to-end\.\n\nWorkspace: /);
   // A later turn's history carries the instructions, not just the slash line.
   await router.run('Carry on');

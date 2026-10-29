@@ -6,7 +6,7 @@
 // persists it; the caller renders `text` and, in the TUI, opens the masked prompt on `prompt`.
 import {
   JEV_DEFAULT_MODEL, JEV_KEY_ENV, clearJevKey, createJevClient, jevStatusLine, normalizeJevSettings,
-  persistedJevSettings, readJevKey, writeJevKey,
+  persistedJevSettings, readJevKey, writeJevKey, PROFILE_TIERS,
 } from './jev.js';
 import {createRosterSetup, readRosterNotes, rosterLines, setupAgent, undescribedModels, writeRosterNotes, modelKey} from './roster-notes.js';
 import {validateOrchestration} from './profiles.js';
@@ -19,11 +19,12 @@ export const JEV_HELP = [
   '/jev key [KEY]       Store the TypeSafe API key (0600 file under ~/.bounce; TYPESAFE_API_KEY overrides it); no KEY opens a masked prompt',
   '/jev key clear       Remove the stored key',
   '/jev on | off        Enable or disable everything Jev does (off by default; on means verdicts and routing)',
-  '/jev review on|off   Completion verdicts: a fast accept/rework check on each root task without its own reviewer (default on)',
+  '/jev review on|off   Completion verdicts: a fast accept/rework check on each root task without its own reviewer (default on); off sends changed work straight to the reviewer agent',
   '/jev routing on|off  Model routing for tasks submitted with "profile":"auto" (default on)',
   '/jev routing default PROFILE|none   Where auto falls back when routing is off or unconfident',
   '/jev roster          What routing knows about each worker profile\'s model: its tier and capabilities, and who described it',
   '/jev roster refresh  Describe the roster\'s models again (one read-only turn of a cloud agent from the roster; cached per model)',
+  '/jev roster set MODEL TIER   Pin a model\'s tier (cheapest, mid, strongest or advisor) by hand, e.g. a local model whose tier was guessed from its name',
   `/jev model ID        Pin the Jev version (default ${JEV_DEFAULT_MODEL}); avoid jev-latest — an alias moves between releases and shifts the calibrated confidence thresholds`,
   '/jev confidence N    Threshold (0–1, default 0.8) below which a verdict or route falls back to today\'s behaviour',
   '/jev test            One live noul call ("Is this a test?") — prints latency and the answer, or the error',
@@ -102,12 +103,15 @@ export async function jevCommand(parts = [], {root = dataRoot(), cwd = process.c
         try { const local = normalizeLocalSettings(settings.local); return local.enabled ? localCandidates(await discover(local), readRosterNotes(root)) : []; } catch { return []; }
       };
       const asExtra = items => items.map(item => ({key: item.name, adapter: 'opencode', model: item.model, endpoint: item.endpoint}));
-      const localLines = items => { const cache = readRosterNotes(root); return items.map(item => `${item.name} → local · ${item.loaded ? 'loaded' : 'not loaded'}${item.context ? ` · ${Math.round(item.context / 1024)}k` : ''} · tier ${item.tier} · ${cache[item.name]?.capabilities ? `${item.capabilities}${cache[item.name].by ? ` (${cache[item.name].by})` : ''}` : `not described yet: ${item.capabilities}`}`); };
+      // A local model's tier is the one pinned by hand, else cheapest; an agent's guess is shown apart, unused.
+      const localLines = items => { const cache = readRosterNotes(root); return items.map(item => { const note = cache[item.name];
+        return `${item.name} → local · ${item.loaded ? 'loaded' : 'not loaded'}${item.context ? ` · ${Math.round(item.context / 1024)}k` : ''} · tier ${item.tier}${note?.by === 'you' ? ' (pinned by you)' : ' (default; /jev roster set pins one)'} · ${item.capabilities}${note?.by && note.by !== 'you' ? ` · ${note.by} guessed ${note.tier}, not routed on` : ''}`; }); };
       if (rest[0] === 'refresh') {
         // Forget this roster's notes; the TUI's daemon rewrites them (control.jev refresh), headless
         // writes them here and now with the same agent the daemon would use.
         const keys = new Set([...Object.values(profiles).map(modelKey), ...(await localModels()).map(item => item.name)]);
-        writeRosterNotes(Object.fromEntries(Object.entries(readRosterNotes(root)).filter(([key]) => !keys.has(key))), root);
+        // A tier pinned by hand (/jev roster set) is kept: it is what the person decided, not a description to redo.
+        writeRosterNotes(Object.fromEntries(Object.entries(readRosterNotes(root)).filter(([key, note]) => !keys.has(key) || note?.by === 'you')), root);
         if (interactive) return {text: 'Roster notes cleared · describing the models again in the background; /jev roster shows them when written', changed: false, refresh: 'roster'};
         const agent = setupAgent({profiles, orchestrator, order: settings.order ?? [], models: settings.models ?? {}});
         const rows = [];
@@ -115,12 +119,20 @@ export async function jevCommand(parts = [], {root = dataRoot(), cwd = process.c
         await setup.ensure({force: true});
         return {text: [...rows.map(row => row.text), ...rosterLines(profiles, readRosterNotes(root)), ...localLines(await localModels())].join('\n'), changed: false};
       }
-      if (rest[0]) throw new Error('Use /jev roster, or /jev roster refresh');
+      // A tier a cloud agent guessed from a model's name can be wrong (integration run 2026-10-21): pin it by hand.
+      if (rest[0] === 'set') {
+        const [, key, tier] = rest;
+        if (!key || !PROFILE_TIERS.includes(tier)) throw new Error('Use /jev roster set MODEL cheapest|mid|strongest|advisor');
+        const notes = readRosterNotes(root);
+        writeRosterNotes({...notes, [key]: {tier, capabilities: notes[key]?.capabilities ?? '', by: 'you'}}, root);
+        return {text: `${key} → tier ${tier} · pinned by you; /jev roster refresh keeps it`, changed: false};
+      }
+      if (rest[0]) throw new Error('Use /jev roster, /jev roster refresh, or /jev roster set MODEL TIER');
       const here = await localModels();
       const pending = undescribedModels(profiles, readRosterNotes(root), asExtra(here));
       return {text: [`Jev roster · ${jevStatusLine(settings.jev, key()).split(' · ').find(part => part.startsWith('routing')) ?? 'routing off'}`,
         ...[...rosterLines(profiles, readRosterNotes(root)), ...localLines(here)].map(line => `  ${line}`),
-        ...(pending.length ? [`${pending.length} model${pending.length === 1 ? '' : 's'} not described yet: bounce describes them when routing is on and the daemon starts, or on /jev roster refresh`] : [])].join('\n'), changed: false};
+        ...(pending.length ? [`${pending.length} model${pending.length === 1 ? '' : 's'} not rated: routing sees adapter/model/role/policy for ${pending.length === 1 ? 'it' : 'them'}; /jev roster set MODEL TIER rates one, /jev roster refresh shows what an agent would guess`] : [])].join('\n'), changed: false};
     }
     case 'model': {
       const id = rest.join(' ').trim();

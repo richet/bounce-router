@@ -10,23 +10,25 @@
 // probability distribution plus a confidence; a Noul is a yes/no probability. It emits no
 // text, so every decision below is combined in code, and the sanctioned pattern of gating
 // on confidence (below the threshold → today's behaviour) is applied everywhere.
+import {createHash} from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import {dataRoot, saveJSON} from './core.js';
+import {catalogNote, cloudTier} from './model-catalog.js';
 
 export const JEV_DEFAULT_MODEL = 'jev-1.13.0'; // pinned: an alias (`jev-latest`) moves between releases and shifts calibrated thresholds
 export const JEV_REVIEWER = 'jev'; // the synthetic read-only critic profile the daemon registers
 export const JEV_KEY_ENV = 'TYPESAFE_API_KEY';
 export const JEV_ENDPOINT = 'https://api.typesafe.ai/v1/systemone';
 export const JEV_TIMEOUT_MS = 10_000;
-export const PROFILE_TIERS = ['cheapest', 'mid', 'strongest'];
+export const PROFILE_TIERS = ['cheapest', 'mid', 'strongest', 'advisor'];
 // A tier is a three-way question Jev answers well (measured live: right 5/5 at 0.60–1.00), so it
 // decides at a lower bar than a choice between named profiles, which never reached 0.8.
 export const JEV_TIER_CONFIDENCE = 0.6;
 // The bar for sending finished work back once: its own bar, as TypeSafe asks (one per action, chosen
 // on one's own cases by what a wrong call costs). A Choice between two options reports a confidence of
 // 2 × probability − 1 (checked against 95 recorded verdicts), so 0.9 is a probability of 0.95. Measured
-// on the real Jev over the 27 accepted build tasks of ACE e3bd01d5, 6 of them later found wrong: 0.9
+// on the real Jev over the 27 accepted build tasks of session e3bd01d5, 6 of them later found wrong: 0.9
 // sends back 4 wrong and 2 good, 0.8 sends back 4 and 5, 0.6 sends back 5 and 8. A needless send-back
 // costs a worker round, and a wrong result missed here is still read by the orchestrator.
 export const JEV_SEND_BACK_CONFIDENCE = 0.9;
@@ -126,7 +128,7 @@ export function retryAfterMs(header, {now = Date.now(), max = 15_000, fallback =
   return fallback;
 }
 
-export function createJevClient({fetchImpl = (...args) => globalThis.fetch(...args), readKey = () => readJevKey(), endpoint = JEV_ENDPOINT, timeoutMs = JEV_TIMEOUT_MS, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), clock = Date.now} = {}) {
+export function createJevClient({fetchImpl = (...args) => globalThis.fetch(...args), readKey = () => readJevKey(), endpoint = JEV_ENDPOINT, timeoutMs = JEV_TIMEOUT_MS, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), clock = Date.now, samples = 1, memoFile = null} = {}) {
   async function once(body, key, signal) {
     const controller = new AbortController();
     const abort = () => controller.abort(jevError('aborted', 'TypeSafe request cancelled'));
@@ -146,7 +148,24 @@ export function createJevClient({fetchImpl = (...args) => globalThis.fetch(...ar
   // Resolves {answers, model, usage, latencyMs}; rejects with error.code in
   // missing_key | timeout | aborted | network | http_<status> | protocol. The key is read
   // here and only ever placed on the request header — never on the error, never returned.
+  // Jev is not deterministic: the same request, byte for byte, answered 0.76–0.80 and once picked another model
+  // (measured 2026-10-22), and TypeSafe refuses temperature and seed. So a request is asked `samples` times at once,
+  // the majority answer is kept (median confidence), and that answer is remembered for that exact request — in the
+  // process, and in `memoFile` when given — so the same inputs always get the same decision.
+  // The daemon turns both on (src/reload.js: samples JEV_SAMPLES, memoFile); a bare client asks once and remembers nothing.
+  const memo = memoFile ? loadMemo(memoFile) : null;
   async function ask({state, questions, model = JEV_DEFAULT_MODEL, signal} = {}) {
+    if (samples === 1 && !memo) return askOnce({state, questions, model, signal});
+    const key = createHash('sha256').update(JSON.stringify({model, state, questions})).digest('hex');
+    if (memo?.has(key)) return {...memo.get(key), latencyMs: 0, remembered: true};
+    const settled = await Promise.allSettled(Array.from({length: Math.max(1, samples)}, () => askOnce({state, questions, model, signal})));
+    const answered = settled.filter(result => result.status === 'fulfilled').map(result => result.value);
+    if (!answered.length) throw settled[0].reason;
+    const result = {answers: majority(answered.map(reply => reply.answers)), model: answered[0].model, usage: answered[0].usage, latencyMs: Math.max(...answered.map(reply => reply.latencyMs ?? 0))};
+    if (memo) { memo.set(key, {answers: result.answers, model: result.model, usage: result.usage}); saveMemo(memoFile, memo); }
+    return result;
+  }
+  async function askOnce({state, questions, model = JEV_DEFAULT_MODEL, signal} = {}) {
     const found = readKey();
     if (!found?.key) throw jevError('missing_key', `No TypeSafe API key: set ${JEV_KEY_ENV} or run /jev key`);
     const body = {state, model, questions};
@@ -172,6 +191,40 @@ export function createJevClient({fetchImpl = (...args) => globalThis.fetch(...ar
   }
 
   return {ask};
+}
+
+export const JEV_SAMPLES = 3;
+const MEMO_MAX = 2000;
+const median = values => { const sorted = [...values].sort((a, b) => a - b); const mid = Math.floor(sorted.length / 2); return sorted.length % 2 ? sorted[mid] : Math.round(((sorted[mid - 1] + sorted[mid]) / 2) * 1000) / 1000; };
+// Per question: a choice is the one most samples picked (ties: the higher mean confidence), with the median confidence
+// of the samples that picked it and the mean probabilities; a yes/no (noul) is the median; anything else, the first.
+export function majority(sets) {
+  const names = [...new Set(sets.flatMap(answers => Object.keys(answers ?? {})))];
+  return Object.fromEntries(names.map(name => {
+    const all = sets.map(answers => answers?.[name]).filter(isObject);
+    if (all.some(answer => typeof answer.choice === 'string')) {
+      const picked = all.filter(answer => typeof answer.choice === 'string');
+      const groups = Map.groupBy(picked, answer => answer.choice);
+      const mean = list => list.reduce((sum, answer) => sum + Number(answer.confidence ?? 0), 0) / list.length;
+      const [choice, chosen] = [...groups].sort((a, b) => b[1].length - a[1].length || mean(b[1]) - mean(a[1]))[0];
+      const keys = [...new Set(picked.flatMap(answer => Object.keys(answer.probabilities ?? {})))];
+      const probabilities = Object.fromEntries(keys.map(k => [k, Math.round(picked.reduce((sum, answer) => sum + Number(answer.probabilities?.[k] ?? 0), 0) / picked.length * 1000) / 1000]));
+      return [name, {...chosen[0], choice, confidence: median(chosen.map(answer => Number(answer.confidence ?? 0))), probabilities}];
+    }
+    if (all.some(answer => Number.isFinite(Number(answer.noul)))) return [name, {...all[0], noul: median(all.filter(answer => Number.isFinite(Number(answer.noul))).map(answer => Number(answer.noul)))}];
+    return [name, all[0]];
+  }));
+}
+function loadMemo(file) {
+  const memo = new Map();
+  if (!file) return memo;
+  try { for (const [key, value] of Object.entries(JSON.parse(fs.readFileSync(file, 'utf8')))) memo.set(key, value); } catch {}
+  return memo;
+}
+function saveMemo(file, memo) {
+  if (!file) return;
+  while (memo.size > MEMO_MAX) memo.delete(memo.keys().next().value);
+  try { fs.mkdirSync(path.dirname(file), {recursive: true}); fs.writeFileSync(file, JSON.stringify(Object.fromEntries(memo)), {mode: 0o600}); } catch {}
 }
 
 // ---- completion verdict: one Choice {accept, rework} plus narrow Nouls over {orders, report, diff} ----
@@ -261,7 +314,7 @@ export const VERDICT_QUESTIONS = {
       true: example('The orders ask to add, edit or remove files.',
         'Add a --version flag to the CLI, with a test.', 'Write scripts/install-smoke.sh.'),
       false: example('The orders ask only to read, run or report.',
-        'Review remove.ts and report findings only; do not change code.', 'Where does Ace validate workspace names?'),
+        'Review remove.ts and report findings only; do not change code.', 'Where does the app validate workspace names?'),
     },
   },
 };
@@ -395,7 +448,9 @@ export function routingFallback(profiles = {}, preferred = null) {
     ?? null;
 }
 
-export const TIER_HINT = {cheapest: 'cheapest: locating files, symbols and call sites; extracting structured facts', mid: 'mid: research, routine implementation, test triage', strongest: 'strongest: independent review, ambiguous or cross-cutting debugging, security-sensitive work'};
+// Review is mid unless the change is security-sensitive or cross-cutting (integration runs 2026-10-22: every confident
+// review went to opus[1m], the dearest profile, for a 20-line change).
+export const TIER_HINT = {cheapest: 'cheapest: locating files, symbols and call sites; extracting structured facts', mid: 'mid: research, routine implementation, test triage, reviewing a scoped change', strongest: 'strongest: reviewing a security-sensitive or cross-cutting change, ambiguous or cross-cutting debugging, security-sensitive work', advisor: 'advisor: the hardest work, used sparingly: a subtle defect no one has located, a design decision with no clear answer'};
 
 // One criterion per routable profile: what it runs on, what it may do, and — from the profile's
 // own `tier`/`capabilities` or the roster notes bounce wrote for its model (src/roster-notes.js)
@@ -422,7 +477,8 @@ const profileCriteria = (profiles, notes, {job = false} = {}) => Object.fromEntr
 // `tier`, else the roster notes'), and is left out entirely for a roster nobody tiered.
 const tierOf = (name, profile, notes) => profile.tier ?? notes?.[name]?.tier;
 const tierQuestion = (profiles, notes, locals = []) => {
-  const present = PROFILE_TIERS.filter(tier => locals.some(item => item.tier === tier) || Object.entries(profiles).some(entry => routable(entry) && tierOf(entry[0], entry[1], notes) === tier));
+  // An advisor is never a routing answer: it is offered only by a list that names it, for the work no other tier fits.
+  const present = PROFILE_TIERS.filter(tier => tier !== 'advisor').filter(tier => locals.some(item => item.tier === tier) || Object.entries(profiles).some(entry => routable(entry) && tierOf(entry[0], entry[1], notes) === tier));
   return present.length ? {tier: {
     type: 'choice',
     instructions: {question: 'Which tier of AI do these orders need?', guidance: 'Pick the cheapest tier whose contract fits the orders.'},
@@ -435,22 +491,32 @@ const tierQuestion = (profiles, notes, locals = []) => {
 // `/local` is on. A local model of the needed tier runs first — it costs nothing — a loaded one before
 // one that would have to be loaded; the tiers do the mixing: cheap work local, the rest cloud.
 // The local models an agent's own list names, by walking its derived chain from the head.
-const namedLocals = (profiles, head) => {
-  const names = []; const seen = new Set();
-  for (let current = head; current && !seen.has(current); current = profiles[current.fallback?.[0]]) { seen.add(current); if (current.backend) names.push(`${current.endpoint}/${current.model}`); }
-  return names;
+const chainOf = (profiles, head) => {
+  const links = []; const seen = new Set();
+  for (let current = head; current && !seen.has(current); current = profiles[current.fallback?.[0]]) { seen.add(current); links.push(current); }
+  return links;
+};
+const namedLocals = (profiles, head) => chainOf(profiles, head).filter(link => link.backend).map(link => `${link.endpoint}/${link.model}`);
+// The cloud AIs an `auto` agent may be given: the routable profiles its own list names, the same adapter and model
+// (a link with no model, `codex/default`, names none of them and stays only in the chain). 2026-10-25:
+// `auto` picks within the list a person wrote, never beyond it — a project's builder list had no opus, yet Jev sent 5
+// builds and 5 reviews to opus[1m] from the shipped roster.
+const ownProfiles = (profiles, head) => {
+  if (!head || head.autoAll) return profiles;
+  const links = chainOf(profiles, head).filter(link => !link.backend && link.model);
+  return Object.fromEntries(Object.entries(profiles).filter(([, p]) => links.some(link => link.adapter === p?.adapter && link.model === p?.model)));
 };
 // Which local models an agent may be offered: the loaded ones, plus the ones its own `models:` list
 // names (choosing one costs a load). Found live 2026-09-22: the reviewer's own model was unloaded, so
 // no `strongest` local existed and every review went to the cloud; offering everything downloaded
 // instead would put the machine's biggest models in the running for a job nobody pointed them at.
 export const offerable = (locals = [], profiles = {}, head = null) => {
-  const named = head ? namedLocals(profiles, head) : [];
-  return locals.filter(item => item.loaded || named.includes(item.name));
+  if (head) { const named = namedLocals(profiles, head); return locals.filter(item => named.includes(item.name) || (head.autoAll && item.loaded)); }
+  return locals.filter(item => item.loaded);
 };
 
-function tierPick(answers, {profiles, notes, order = [], fits = () => true, unfit = '', locals = [], head = null}) {
-  locals = offerable(locals, profiles, head);
+function tierPick(answers, {profiles, allProfiles = profiles, notes, order = [], fits = () => true, unfit = '', locals = [], head = null}) {
+  locals = offerable(locals, allProfiles, head);
   if (!isObject(answers?.tier)) return {name: null, reason: null};
   const tier = PROFILE_TIERS.includes(answers.tier.choice) ? answers.tier.choice : null;
   const confidence = Number.isFinite(Number(answers.tier.confidence)) ? Number(answers.tier.confidence) : 0;
@@ -461,7 +527,7 @@ function tierPick(answers, {profiles, notes, order = [], fits = () => true, unfi
     .sort((a, b) => rank(a[1].adapter) - rank(b[1].adapter)).map(([name]) => ({name}));
   // Between local models of the tier: the one the agent's own list names (a reviewer keeps its
   // reviewer model), then a loaded one before one that would have to be loaded.
-  const named = head ? namedLocals(profiles, head) : [];
+  const named = head ? namedLocals(allProfiles, head) : [];
   const local = locals.filter(item => item.tier === tier).sort((a, b) => Number(named.includes(b.name)) - Number(named.includes(a.name)) || Number(b.loaded) - Number(a.loaded)).map(item => ({name: item.name, local: {endpoint: item.endpoint, model: item.model}}));
   const first = [...local, ...cloud][0] ?? null;
   const name = first?.name ?? null;
@@ -489,7 +555,7 @@ export function routingQuestions(profiles = {}, notes = {}) {
       type: 'choice',
       instructions: {
         question: 'Which worker profile should carry out these orders?',
-        guidance: 'Weigh each profile\'s capabilities against what the orders demand, then prefer the cheapest tier whose contract fits: cheapest for locating files and extracting facts, mid for research and routine implementation, strongest for independent review, ambiguous or cross-cutting debugging and security-sensitive work. A read-only profile cannot edit files or run commands.',
+        guidance: 'Weigh each profile\'s capabilities against what the orders demand, then prefer the cheapest tier whose contract fits: cheapest for locating files and extracting facts, mid for research, routine implementation and reviewing a scoped change, strongest for reviewing a security-sensitive or cross-cutting change, ambiguous or cross-cutting debugging and security-sensitive work. A read-only profile cannot edit files or run commands.',
       },
       criteria,
     },
@@ -543,11 +609,12 @@ export function decideRoute(answers, {profiles = {}, confidence = 0.8, fallback 
 // about ability and cost alone: no role, no policy, no access Nouls.
 export function aiQuestions(profiles = {}, notes = {}, head = null, locals = []) {
   locals = offerable(locals, profiles, head);
+  profiles = ownProfiles(profiles, head);
   const named = {profile: {
     type: 'choice',
     instructions: {
       question: `Which AI should do this job?${head?.agent ? ` The job: ${head.agent.description} (policy ${head.policy})` : ''}`,
-      guidance: 'Weigh each AI\'s capabilities against what the orders demand, then prefer the cheapest tier that fits: cheapest for locating files and extracting facts, mid for research and routine implementation, strongest for independent review, ambiguous or cross-cutting debugging and security-sensitive work.',
+      guidance: 'Weigh each AI\'s capabilities against what the orders demand, then prefer the cheapest tier that fits: cheapest for locating files and extracting facts, mid for research, routine implementation and reviewing a scoped change, strongest for reviewing a security-sensitive or cross-cutting change, ambiguous or cross-cutting debugging and security-sensitive work.',
     },
     criteria: {...profileCriteria(profiles, notes, {job: true}), ...Object.fromEntries(locals.map(item => [item.name, [
       `local model ${item.name}`, 'runs on this machine at no cost', ...(item.size ? [`${(item.size / 1024 ** 3).toFixed(1)} GB of memory`] : []), ...(item.loaded ? [] : ['not loaded: choosing it costs a model load first']),
@@ -559,7 +626,8 @@ export function aiQuestions(profiles = {}, notes = {}, head = null, locals = [])
 // Pure: the AI is taken only when it is a routable profile chosen with confidence; the job's policy
 // is its own, so there is no access gate here.
 export function decideAI(answers, {profiles = {}, confidence = 0.8, notes = {}, order = [], locals = [], head = null} = {}) {
-  const tiered = tierPick(answers, {profiles, notes, order, locals, head});
+  const tiered = tierPick(answers, {profiles: ownProfiles(profiles, head), allProfiles: profiles, notes, order, locals, head});
+  profiles = ownProfiles(profiles, head);
   if (tiered.name) return {ai: tiered.name, ...(tiered.local ? {local: tiered.local} : {}), tier: tiered.tier, reason: null, confidence: tiered.confidence, probabilities: tiered.probabilities};
   const answer = isObject(answers?.profile) ? answers.profile : {};
   const chosen = typeof answer.choice === 'string' ? answer.choice : null;
@@ -570,23 +638,93 @@ export function decideAI(answers, {profiles = {}, confidence = 0.8, notes = {}, 
   return {ai: reason ? null : chosen, ...(!reason && localChoice ? {local: {endpoint: localChoice.endpoint, model: localChoice.model}} : {}), reason, confidence: conf, probabilities: isObject(answer.probabilities) ? answer.probabilities : {}};
 }
 
-// The AI for one task submitted to an `auto` agent. Never throws. `asked: false` means Jev was not
-// consulted at all (off, or nothing to choose between), so the scheduler journals nothing.
-export async function routeAgentAI({orders, profiles, head, settings, ask, notes = {}, order = [], locals = [], signal} = {}) {
+// ---- the AI for an `auto` agent: Jev describes the task, the load picks between peers ----------------
+
+// Found live 2026-10-26: asked for a tier, Jev said `mid` at 0.90–1.00 for 37 tasks and the provider order then
+// gave every one to claude/sonnet, while codex sat at 1% of its week and the local qwen was idle; asked by name it
+// leaned 0.16–0.38 and flipped between identical asks — peers across vendors are not a question it can answer. These
+// three are: over 30 hand-labelled real tasks they moved by at most 0.10 between asks, and the rule below agreed
+// with 26 of the 30 labels. Each is one condition, said directly; none depends on the list, so the memo keeps them.
+export const AI_DESCRIPTION_QUESTIONS = {
+  hardest: {type: 'noul', instructions: 'These orders are among the hardest software work there is: a subtle defect no one has located, a design decision with no clear answer, or a change whose correctness cannot be checked by running tests.'},
+  small_fix: {type: 'noul', instructions: 'The work these orders ask for is a small, bounded change: a move or rename, a configuration value, or one or two findings from a review.'},
+  long_context: {type: 'noul', instructions: 'Doing these orders requires reading more than about 100,000 tokens of code or documents at once.'},
+};
+export const JEV_HARDEST = 0.7, JEV_SMALL_FIX = 0.6, JEV_LONG_CONTEXT = 0.5;
+
+// Pure: {tier, longContext, description} from the answers, null when Jev gave none. Never `advisor`: an advisor
+// (Fable, Astra) is for the work a person sends it, not a tier a description reaches.
+export function tierFromDescription(answers) {
+  const value = name => { const n = Number(answers?.[name]?.noul); return Number.isFinite(n) ? n : null; };
+  const description = Object.fromEntries(Object.keys(AI_DESCRIPTION_QUESTIONS).map(name => [name, value(name)]));
+  if (Object.values(description).every(n => n === null)) return null;
+  const tier = (description.hardest ?? 0) >= JEV_HARDEST ? 'strongest' : (description.small_fix ?? 0) >= JEV_SMALL_FIX ? 'cheapest' : 'mid';
+  return {tier, longContext: (description.long_context ?? 0) >= JEV_LONG_CONTEXT, description};
+}
+
+// The tier asked for first, then up, then down; up stops below advisor.
+const TIER_WALK = {cheapest: ['cheapest', 'mid', 'strongest'], mid: ['mid', 'strongest', 'cheapest'], strongest: ['strongest', 'mid', 'cheapest'], advisor: ['advisor', 'strongest', 'mid', 'cheapest']};
+const resetOf = (entry, label, now) => entry?.windows?.find(w => w.label === label && Number.isFinite(w.resetsAt) && w.resetsAt > now)?.resetsAt ?? Infinity;
+
+// Pure. Which AI of the agent's own list plays the task, among those of `tier` (or the nearest tier the list has).
+// 2026-10-26: between peers the subscriptions decide — the vendor whose weekly window resets first, then its
+// 5-hour one; a vendor with a window spent or in cooldown is out, one with no reading goes last. A local peer has no
+// window and costs nothing, so it goes first while its slot is free, loaded, and big enough for the orders.
+// Ties keep the list's order. Every candidate comes back with why it lost.
+export function pickAI({profiles = {}, head = null, notes = {}, locals = [], tier = 'mid', longContext = false, quotas = {}, cooldowns = {}, localFree = () => true, now = Date.now()} = {}) {
+  const chain = chainOf(profiles, head);
+  const at = match => { const index = chain.findIndex(match); return index === -1 ? chain.length : index; };
+  const cloud = Object.entries(ownProfiles(profiles, head)).filter(routable).map(([name, p]) => ({name, adapter: p.adapter,
+    tier: p.tier ?? notes[name]?.tier ?? catalogNote(`${p.adapter}/${p.model ?? 'default'}`)?.tier ?? cloudTier(`${p.adapter}/${p.model ?? ''}`) ?? 'mid',
+    index: at(link => !link.backend && link.adapter === p.adapter && link.model === p.model)}));
+  const local = offerable(locals, profiles, head).map(item => ({name: item.name, item, tier: item.tier, index: at(link => link.backend && `${link.endpoint}/${link.model}` === item.name)}));
+  const candidates = [];
+  for (const wanted of TIER_WALK[tier] ?? TIER_WALK.mid) {
+    const locals = local.filter(c => c.tier === wanted).sort((a, b) => a.index - b.index).map(c => ({...c,
+      reason: !c.item.loaded ? 'not loaded' : !localFree(c.item.endpoint, c.item.model) ? 'its slot is taken'
+        : longContext && Number(c.item.context ?? 0) < 200_000 ? 'the orders need a longer context than it has' : null}));
+    const clouds = cloud.filter(c => c.tier === wanted).map(c => {
+      const entry = quotas[c.adapter];
+      const spent = entry?.windows?.find(w => Number(w.percent) >= 100 && !(Number.isFinite(w.resetsAt) && w.resetsAt <= now));
+      return {...c, weekly: resetOf(entry, '7d', now), hours: resetOf(entry, '5h', now),
+        reason: cooldowns[c.adapter] > now ? `${c.adapter} is in cooldown` : spent ? `${c.adapter} ${spent.label} at 100%` : null};
+    }).sort((a, b) => a.weekly - b.weekly || a.hours - b.hours || a.index - b.index);
+    for (const c of [...locals, ...clouds]) candidates.push(c);
+    const first = [...locals, ...clouds].find(c => !c.reason);
+    if (first) {
+      const why = first.item ? 'a free local model' : Number.isFinite(first.weekly) ? `its weekly window resets first (${new Date(first.weekly).toISOString().slice(0, 16)}Z)` : Number.isFinite(first.hours) ? 'its 5-hour window resets first' : 'first in the list';
+      return {ai: first.name, ...(first.item ? {local: {endpoint: first.item.endpoint, model: first.item.model}} : {}), tier: wanted, why,
+        candidates: candidates.map(c => ({name: c.name, tier: c.tier, ...(c === first ? {picked: true} : c.reason ? {reason: c.reason} : {reason: `after ${first.name}`})}))};
+    }
+  }
+  return {ai: null, tier, why: null, candidates: candidates.map(c => ({name: c.name, tier: c.tier, reason: c.reason ?? 'not picked'}))};
+}
+
+// The AI for one task submitted to an `auto` agent. Never throws. `asked: false` means Jev was not consulted at all
+// (off, or nothing to choose between), so the scheduler journals nothing. `load()` is read after Jev answers, at
+// dispatch: {quotas, cooldowns, localFree(endpoint, model), now}; none of it reaches Jev or the memo.
+// `tier` is the orchestrator's, when it knows more than the orders say (2026-10-26; calibration: Jev found
+// strongest work 1 time in 4). It wins over Jev's and names a tier only: the load still picks the AI. Jev is asked
+// anyway, for long_context and the record, and its failure no longer stops the pick.
+export async function routeAgentAI({orders, profiles, head, settings, ask, notes = {}, locals = [], load = () => ({}), tier: asked = null, signal} = {}) {
   const s = normalizeJevSettings(settings);
   if (!s.enabled || !s.routing.enabled || typeof ask !== 'function') return {ai: null, asked: false};
   let known = {};
   try { known = (typeof notes === 'function' ? await notes() : notes) ?? {}; } catch { known = {}; }
   let here = [];
   try { here = (typeof locals === 'function' ? await locals() : locals) ?? []; } catch { here = []; }
-  const questions = aiQuestions(profiles, known, head, here);
-  if (!Object.keys(questions.profile.criteria).length) return {ai: null, asked: false};
-  try {
-    const result = await ask({state: {orders: String(orders ?? '').slice(0, 24_000)}, questions, model: s.model, signal});
-    return {...decideAI(result.answers, {profiles, confidence: s.confidence, notes: known, order, locals: here, head}), asked: true, model: result.model, latencyMs: result.latencyMs};
-  } catch (error) {
-    return {ai: null, asked: true, reason: error?.code ?? error?.message ?? 'error', confidence: 0, probabilities: {}, model: null};
-  }
+  if (!Object.entries(ownProfiles(profiles, head)).some(routable) && !offerable(here, profiles, head).length) return {ai: null, asked: false};
+  const given = PROFILE_TIERS.includes(asked) ? asked : null;
+  let result = null, failure = null;
+  try { result = await ask({state: {orders: String(orders ?? '').slice(0, 24_000)}, questions: AI_DESCRIPTION_QUESTIONS, model: s.model, signal}); }
+  catch (error) { failure = error?.code ?? error?.message ?? 'error'; }
+  const described = result ? tierFromDescription(result.answers) : null;
+  if (!described && !given) return {ai: null, asked: true, reason: failure ?? 'Jev gave no description', confidence: 0, probabilities: {}, model: result?.model ?? null};
+  let state = {};
+  try { state = (await load()) ?? {}; } catch { state = {}; }
+  const picked = pickAI({profiles, head, notes: known, locals: here, tier: given ?? described.tier, longContext: described?.longContext ?? false, ...state});
+  return {...picked, tierBy: given ? 'orchestrator' : 'jev', ...(given ? {tierAsked: given} : {}), reason: picked.ai ? null : 'no AI of its list is free', description: described?.description ?? null,
+    asked: true, model: result?.model ?? null, latencyMs: result?.latencyMs ?? null, confidence: null, probabilities: {}};
 }
 
 // The whole routing decision for one submitted task. Never throws: any Jev failure is a
@@ -616,7 +754,7 @@ export async function routeTask({orders, profiles, settings, ask, notes = {}, or
 
 // ---- the lease judge: is a running task still getting somewhere, at the end of its lease? --------
 
-// One Choice over the worker's recent text and tool calls against its orders (docs/plans/task-leases.md).
+// One Choice over the worker's recent text and tool calls against its orders.
 // Jev only adds to bounce's own progress rule: `stuck` concludes the task, `drifting` renews it and
 // tells whoever submitted it. Off, failing or unsure, the verdict is null and the rule alone decides —
 // bounce never depends on Jev being installed.
@@ -712,12 +850,14 @@ export function jevReviewerProfile(settings = {}) {
 // bound to the typesafe adapter's client. `notes` (a function, may be async) supplies the
 // roster's {tier, capabilities} per profile at route time — the roster setup of
 // src/roster-notes.js in the daemon; absent, routing sees adapter/model/role/policy only.
-export function createJevDecisions({root = dataRoot(), adapter, readSettings = () => readJevSettings(root), notes = null, order = () => [], locals = null} = {}) {
+// `quotas()` is the daemon's quota store (src/quota.js): what `auto` agents' AIs are picked by, never sent to Jev.
+export function createJevDecisions({root = dataRoot(), adapter, readSettings = () => readJevSettings(root), notes = null, order = () => [], locals = null, quotas = null} = {}) {
   return {
     reviewer: JEV_REVIEWER,
     settings: readSettings,
     lease: request => judgeLease({...request, settings: readSettings(), ask: adapter?.ask}),
-    routeAI: ({orders, profiles, head, signal}) => routeAgentAI({orders, profiles, head, order: order(), ...(locals ? {locals} : {}), settings: readSettings(), ask: adapter?.ask, ...(notes ? {notes} : {}), signal}),
+    routeAI: ({orders, profiles, head, tier = null, load: live = () => ({}), local = true, signal}) => routeAgentAI({orders, profiles, head, tier, ...(locals && local ? {locals} : {}), settings: readSettings(), ask: adapter?.ask, ...(notes ? {notes} : {}), signal,
+      load: async () => ({quotas: quotas?.() ?? {}, ...(await live())})}),
     route: ({orders, profiles, signal}) => routeTask({orders, profiles, order: order(), ...(locals ? {locals} : {}), settings: readSettings(), ask: adapter?.ask, ...(notes ? {notes} : {}), signal}),
     inPlace: ({citedText, messages, orders, signal}) => judgeInPlace({citedText, messages, orders, settings: readSettings(), ask: adapter?.ask, signal}),
   };

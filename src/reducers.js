@@ -53,7 +53,7 @@ export function tasks(events) {
       if (t && !TERMINAL.has(t.state) && typeof e.chosen === 'string' && e.chosen) t.profile = e.chosen;
       continue;
     }
-    if (!e.kind?.startsWith('task.')) continue;
+    if (!e.kind?.startsWith('task.') && e.kind !== 'review.started' && e.kind !== 'review.finished') continue;
     if (typeof e.task !== 'string' || !e.task) continue; // a malformed row never becomes a task
     if (e.kind === 'task.submitted') {
       const t = ensure(e.task);
@@ -80,7 +80,7 @@ export function tasks(events) {
         t.attempt = e.attempt;
         break;
       case 'task.blocked':
-        t.state = 'blocked'; t.blocker = e.text;
+        t.state = 'blocked'; t.blocker = e.text; t.resuming = false;
         if (e.reason === 'integration_interrupted') integrationBlocked.add(e.task);
         else integrationBlocked.delete(e.task);
         break;
@@ -91,7 +91,27 @@ export function tasks(events) {
           t.state = t.review?.completion ? 'reviewing' : 'running'; t.blocker = null;
         }
         break;
-      case 'task.input_required': t.state = 'input_required'; break;
+      case 'task.input_required': t.state = 'input_required'; t.resuming = false; break;
+      // A parked worker messaged live goes on in the same process: its next row of work means it runs again (found
+      // live: usage and tool rows for a minute after the answer, the task still `blocked`, and a rework collided with it).
+      case 'task.delivered':
+        if ((t.state === 'blocked' || t.state === 'input_required') && e.tier === 'live') t.resuming = true;
+        break;
+      case 'task.usage': case 'task.observed':
+        if (t.resuming && (t.state === 'blocked' || t.state === 'input_required') && String(e.from ?? '').startsWith('worker:')) { t.state = 'running'; t.blocker = null; t.resuming = false; }
+        break;
+      // bounce's own steps after the work speak through the same line: a check that ended and a review that runs
+      // never leave the task saying "Running the task's check" (found live: read as a hung check during a review).
+      case 'task.check':
+        t.checked = e.passed ? `The check passed (exit ${e.exit})` : e.timedOut ? 'The check timed out' : `The check failed (exit ${e.exit})`;
+        t.lastMilestone = {time: e.time, text: t.checked};
+        break;
+      case 'review.started':
+        t.lastMilestone = {time: e.time, text: `${t.checked ? `${t.checked}; ` : ''}${e.profile} is reviewing it (round ${e.round})`};
+        break;
+      case 'review.finished':
+        t.lastMilestone = {time: e.time, text: `Review round ${e.round} ended: ${e.verdict}`};
+        break;
       case 'task.milestone':
         if (t.state === 'waiting') priorState[e.task] = 'running';
         else if (t.state === 'blocked' || t.state === 'input_required') t.state = 'running';
@@ -253,6 +273,9 @@ export function watchdog(events, now, {activity = new Map(), watchdog: cfg} = {}
     }
     // A completion review is a worker turn too, with its own lease from `review.started` — the worker's
     // own elapsed time is not the reviewer's budget. Found live: a 24-minute review nothing was watching.
+    // A task that has ended is never watched, even when its review never finished: found live (session fb6036ee), two
+    // tasks cancelled while their review waited for the local model were escalated every tick for four hours.
+    if (t.state !== 'completed' && TERMINAL.has(t.state)) continue;
     const activeReview = events.findLast(e => e.task === t.id && ['review.started', 'review.finished'].includes(e.kind));
     const reviewing = t.state === 'reviewing' || activeReview?.kind === 'review.started';
     if (t.state !== 'running' && !reviewing) continue;
@@ -308,7 +331,7 @@ export function attemptLease(events, task, {defaultDeadlineMs = 3600000, ceiling
   const ownStart = events.findLast(e => e.kind === 'task.started' && e.task === task);
   const start = reviewing ? review : ownStart ?? rootStart;
   if (!start) return null;
-  // The ceiling counts from this task's own first start, not the task it replaces (Daniel, 2026-09-30).
+  // The ceiling counts from this task's own first start, not the task it replaces (2026-09-30).
   const startedAt = Date.parse((ownStart ?? rootStart ?? start).time);
   const leaseFrom = Date.parse(start.time);
   const submitted = events.find(e => e.kind === 'task.submitted' && e.task === root);
@@ -343,6 +366,9 @@ export function normalizeUsage(raw) {
     const value = raw[key];
     if (Number.isFinite(value)) usage[canon] = (usage[canon] || 0) + value;
   }
+  // codex counts its cached input inside input_tokens (measured on 0.162: 15 085 input, 12 288 of them cached);
+  // claude reports input_tokens without the cache. Canonical `input` is the uncached part for both.
+  if (Number.isFinite(raw.input_tokens) && Number.isFinite(raw.cached_input_tokens)) usage.input = Math.max(0, raw.input_tokens - raw.cached_input_tokens);
   return usage;
 }
 const TOKEN_KEYS = ['input', 'cache_read', 'cache_write', 'output'];

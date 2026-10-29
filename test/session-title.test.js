@@ -37,7 +37,7 @@ test('sanitizeTitle: strips surrounding quotes', () => {
 });
 
 test('sanitizeTitle: strips a leading label and caps at 5 words', () => {
-  assert.equal(sanitizeTitle('Title: Fix the ACE review gate!'), 'fix-the-ace-review-gate');
+  assert.equal(sanitizeTitle('Title: Fix the API review gate!'), 'fix-the-api-review-gate');
 });
 
 test('sanitizeTitle: caps overlong answers to 5 words', () => {
@@ -217,7 +217,7 @@ test('createAsk: a local reasoning model gets room to finish thinking, and an em
   const answer = await createAsk({fetchImpl, run})({prompt: 'title me', settings: {local: {enabled: true}, order: ['claude'], profiles: {}}});
   assert.equal(bodies[0].max_tokens, 4096);
   assert.equal(cloud, 1);
-  // Found live: "Name this conversation in 2-5 lowercase words" threads in Daniel's ChatGPT app.
+  // Found live: "Name this conversation in 2-5 lowercase words" threads in the user's ChatGPT app.
   assert.equal(cloudArgs.includes('--no-session-persistence'), true);
   assert.equal(answer.text, 'fix the reply queue');
 });

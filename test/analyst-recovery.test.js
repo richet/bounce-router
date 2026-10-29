@@ -39,7 +39,7 @@ test('an uncertain completion review accepts the candidate with advice, without 
   assert.equal(session.events.some(e => e.kind === 'review.reasked' || e.kind === 'task.blocked'), false);
 });
 
-// Reversed 2026-09-26 (ACE d1bc0206): blocking "done, but X remains" threw away finished work whose X
+// Reversed 2026-09-26 (session d1bc0206): blocking "done, but X remains" threw away finished work whose X
 // was another task's job, and it was redone on Opus. It now completes; X reaches the orchestrator as a
 // follow-up. Still no report-only repair turn.
 test('a completed report naming unfinished work completes with that work as a follow-up, without a report-only continuation', {timeout: 3000}, async t => {
@@ -71,17 +71,15 @@ test('capability mismatch is refused before a worker is launched, and new orches
   assert.equal(session.events.some(e => e.kind === 'task.started'), false);
 });
 
-test('a profile whose sandbox cannot honor docker is refused at submit with the capability-mismatch message', t => {
+test('a read-only profile is refused docker at submit with the capability-mismatch message', t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-docker-capability-'));
   const session = new Session(root, {root});
   const worker = fakeAdapter(() => []);
-  // A codex-adapter probe (or any read-only profile) has no allow-list mechanism for the Docker
-  // socket (src/adapters/codex-live.js permissionsFor): task-capabilities.js refuses it docker.
+  // A read-only profile has no allow-list mechanism for the Docker socket: task-capabilities.js refuses it docker.
   const scheduler = createScheduler({session, adapters: {worker}, profiles: {
-    codexProbe: {adapter: 'codex', policy: 'probe'}, readOnly: {adapter: 'claude', policy: 'read-only'},
+    readOnly: {adapter: 'claude', policy: 'read-only'},
   }, requireFinalReport: true, watchdog: {interval: null}});
   t.after(() => {scheduler.close(); fs.rmSync(root, {recursive: true, force: true});});
-  assert.throws(() => scheduler.submit({profile: 'codexProbe', orders: 'check docker', requires: ['read', 'exec', 'docker']}), /capability mismatch: docker unavailable on codexProbe/);
   assert.throws(() => scheduler.submit({profile: 'readOnly', orders: 'check docker', requires: ['read', 'docker']}), /capability mismatch: docker unavailable on readOnly/);
   assert.equal(session.events.some(e => e.kind === 'task.started'), false);
 });

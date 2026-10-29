@@ -1,4 +1,4 @@
-// Phase 5 (CONTRACT.md #5 bullets 3-4, #6 last paragraph): `bounce sessions` rows gain a
+// Phase 5: `bounce sessions` rows gain a
 // `spend` field recomputed from the journal via reducers.spend, and `bounce task compare
 // <session> <a> <b>` is the built-in A/B, both driven through the real `src/cli.js` as a
 // user would run it (spawned, BOUNCE_HOME in a tmp root — same pattern as test/e2e.test.js).
@@ -41,8 +41,8 @@ function writeConfig(root) {
   }));
 }
 
-// Two root tasks under one orchestrator session, each with its own usage rows — mirrors
-// CONTRACT.md #5's W11-style fold, but through the journal a real `bounce sessions`/`task
+// Two root tasks under one orchestrator session, each with its own usage rows — the usage
+// fold, but through the journal a real `bounce sessions`/`task
 // compare` call reads, not the reducer called directly.
 function seedSession(root, cwd) {
   const session = new Session(cwd, {root});
@@ -208,4 +208,21 @@ test('bounce agents set on a config with no profiles block leaves the config alo
   assert.deepEqual(Object.keys(orchestration.profiles).filter(name => !orchestration.profiles[name].derived), Object.keys(starterProfiles(config)));
   assert.deepEqual([orchestration.profiles.researcher.adapter, orchestration.profiles['researcher~2'].adapter], ['opencode', 'claude']);
   assert.equal(orchestration.profiles.build.adapter, 'codex');
+});
+
+// Found in the real-console pass 2026-10-21: `bounce tasks` lists eight-character ids and `bounce task <that id>` said
+// "Unknown task".
+test('bounce task takes the short id bounce tasks prints, and names a missing one', async t => {
+  const root = tmpRoot('bounce-cli-'), cwd = tmpRoot('bounce-cli-cwd-');
+  t.after(() => { fs.rmSync(root, {recursive: true, force: true}); fs.rmSync(cwd, {recursive: true, force: true}); });
+  writeConfig(root);
+  const session = new Session(cwd, {root});
+  session.append({kind: 'task.submitted', task: '1e940e8b-46d0-4677-a5db-d36acb0933b1', parent: null, orders: 'write slow.txt', profile: 'builder'});
+  session.append({kind: 'task.started', task: '1e940e8b-46d0-4677-a5db-d36acb0933b1', attempt: 1});
+  const found = await run(['task', '1e940e8b', '--json', '--session', session.id], bounceEnv(root));
+  assert.equal(found.code, 0, found.stderr);
+  assert.equal(JSON.parse(found.stdout).task, '1e940e8b-46d0-4677-a5db-d36acb0933b1');
+  const missing = await run(['task', 'zzzz9999', '--session', session.id], bounceEnv(root));
+  assert.equal(missing.code, 1);
+  assert.match(missing.stderr, /No task zzzz9999 in this session/);
 });

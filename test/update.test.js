@@ -54,3 +54,11 @@ test('install pins checked version and detected prefix; failures propagate witho
   assert.equal(installs, 0);
   await assert.rejects(installUpdate({detect, run: async args => {if (args[0] === 'install') throw new Error('EACCES'); return JSON.stringify(next);}}), /EACCES/);
 });
+
+// Found in the real-console pass 2026-10-21: npm 12 answers `view <pkg>@latest version --json` with a one-item array,
+// so every update check failed with "invalid stable release version".
+test('an update check reads the version npm 12 wraps in an array', async t => {
+  const result = await checkUpdate({root: temp(t), run: async () => '[\n  "99.0.0"\n]\n', force: true});
+  assert.deepEqual(result, {latest: '99.0.0', available: true});
+  await assert.rejects(checkUpdate({run: async () => '["1.0.0", "2.0.0"]', force: true}), /invalid/, 'several versions are not one answer');
+});

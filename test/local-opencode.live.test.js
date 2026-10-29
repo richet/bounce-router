@@ -10,7 +10,7 @@ import {createLocalResolver} from '../src/local-resolve.js';
 // The only cases that touch the REAL `opencode` binary and a REAL LM Studio model. Opt-in:
 //   BOUNCE_LIVE_OPENCODE=1 node --test test/local-opencode.live.test.js
 // This is the gate for anything that changes how local workers run: every defect that reached a
-// user in 2026-09 passed the unit suite and failed here (docs/plans/local-design-v2.md).
+// user in 2026-09 passed the unit suite and failed here.
 const skip = process.env.BOUNCE_LIVE_OPENCODE === '1' ? false : 'set BOUNCE_LIVE_OPENCODE=1 to run';
 const local = {endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234'}}};
 

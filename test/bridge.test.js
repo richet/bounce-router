@@ -178,3 +178,12 @@ test('the plain publish reply shows the task id the next wait needs; non-task ro
   const message = await bridgeCommand(['publish', '--event', JSON.stringify({kind: 'message', to: 'user', text: 'hi'})], env);
   assert.equal(message.stdout, '[worker:x:message] hi\n');
 });
+
+// Found by the integration run 2026-10-22 (concurrency): the orchestrator published three tasks with `&` and read the
+// `task=<id>` replies back in the wrong order. A submission's reply now names what was submitted.
+test('a task.submitted reply names its profile and the start of its orders, so parallel replies can be matched', async () => {
+  const {formatRow} = await import('../src/bridge.js');
+  const row = {from: 'orchestrator', kind: 'task.submitted', task: '2f6b3f2a-0d91', profile: 'analyst', orders: 'Read-only question; do not change any file. Question (b): List every regular expression in src/', text: ''};
+  assert.equal(formatRow(row, false), '[orchestrator:task.submitted] task=2f6b3f2a-0d91 profile=analyst orders="Read-only question; do not change any file. Question (b): Li…" ');
+  assert.equal(formatRow({from: 'worker:x', kind: 'task.milestone', task: 't1', text: 'm'}, false), '[worker:x:task.milestone] task=t1 m', 'other task rows are unchanged');
+});

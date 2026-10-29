@@ -4,7 +4,7 @@ import {createCodexLive} from './adapters/codex-live.js';
 import {createMuseLive} from './adapters/muse-live.js';
 import {createOpencodeLive} from './adapters/opencode-live.js';
 import {createTypesafeLive} from './adapters/typesafe-live.js';
-import {JEV_REVIEWER, createJevActivation, createJevDecisions, jevReviewerProfile, readJevSettings, routingFallback} from './jev.js';
+import {JEV_REVIEWER, JEV_SAMPLES, createJevActivation, createJevDecisions, jevReviewerProfile, readJevSettings, routingFallback} from './jev.js';
 import {createRosterSetup, effectiveNotes, readRosterNotes, setupAgent} from './roster-notes.js';
 import {modelCatalog} from './models.js';
 import os from 'node:os';
@@ -17,9 +17,10 @@ import {spawn, execFileSync} from 'node:child_process';
 import {parseArgs} from 'node:util';
 import {Session, config, dataRoot, pidAlive} from './core.js';
 import {loadQuota, recordQuota, quotaSnapshot} from './quota.js';
-import {seedSkills, seedSummary} from './skills.js';
+import {seedSkills, seedSummary, skillsInUse, skillsBlock} from './skills.js';
 const SEED_NOTABLE = ['invalid', 'unmanaged', 'modified', 'withdrawn', 'failed'];
-import {resolveSessionRef} from './sessions.js';
+import {resolveSessionRef, listSessions} from './sessions.js';
+import {sendToOrchestrator, connectSession} from './send.js';
 import {titleSession, createAsk} from './session-title.js';
 export {pidAlive};
 import {createBus, connectBus} from './bus.js';
@@ -75,7 +76,7 @@ export async function validate(root = projectRoot, emit = () => {}) {
 function daemonJsonPath(dir) { return path.join(dir, 'daemon.json'); }
 
 // A detached daemon used to run with stdio 'ignore', so whatever killed it was lost. Found live
-// (ACE d1bc0206): the daemon died at 08:14 with nothing on record, and the TUI showed its tasks as
+// (session d1bc0206): the daemon died at 08:14 with nothing on record, and the TUI showed its tasks as
 // working for four more hours. Its stdout and stderr now go to <session>/daemon.log (V8's own
 // out-of-memory message included), rotated once past 10 MB.
 const DAEMON_LOG_MAX = 10 * 1024 * 1024;
@@ -90,7 +91,7 @@ const daemonLogTail = dir => { try { return fs.readFileSync(path.join(dir, 'daem
 
 // A bounce daemon for this session that holds its lock but never became ready (no daemon.json of
 // its own) is stuck, and every resume fails behind it with "already open in another bounce process".
-// Found live (ACE d1bc0206): a daemon that failed to start kept the lock for half an hour. Such a
+// Found live (session d1bc0206): a daemon that failed to start kept the lock for half an hour. Such a
 // process — this session's own daemon command line, alive past `minAgeMs` — is stopped (SIGTERM,
 // then SIGKILL) so the resume can start a fresh one. Anything else holding the lock is left alone.
 const elapsedMs = etime => {
@@ -150,7 +151,7 @@ function formatRow(row, json) {
 }
 
 // Derives Phase 2's single orchestration profile from legacy settings — real adapters
-// arrive in Phase 3; see docs/local-orchestration.md "Process model".
+// arrive in Phase 3.
 // A session opened in the home folder: every worker — a local model with a shell included — runs
 // from there. Said once, at the top of the session; null anywhere else.
 export function homeSessionWarning(cwd, home = os.homedir()) {
@@ -184,13 +185,13 @@ export function defaultTarget(profiles = {}, orchestrator = 'main', {routingOn =
 export function choosingOrders({agents = false, routingOn = false, localOn = false} = {}) {
   if (!agents && !routingOn) return [];
   return ['Who to submit to — the job, not the AI:',
-    ...(agents ? ['    1. An agent, by the job the task is: analyst to inspect and run checks, builder to implement (and, when its orders say so, to own shared files and run the full gate), reviewer to review, debugger to root-cause a failure that resisted a first attempt. Analysts and verifiers run commands in disposable workspaces by default. Explicit read-only profiles are for source-only inspection.'] : []),
+    ...(agents ? ['    1. An agent, by the job the task is: analyst to inspect and run checks, builder to implement (and, when its orders say so, to own shared files and run the full gate), reviewer to review, debugger to root-cause a failure that resisted a first attempt. Analysts, reviewers and debuggers run commands in their own working copy like any write agent; their orders say what they must not change. Read-only agents are for source-only inspection.'] : []),
     ...(routingOn ? [`    ${agents ? '2' : '1'}. \`auto\` when no agent is clearly the job: Jev routes it.`] : []),
-    `    ${[agents, routingOn].filter(Boolean).length + 1}. A worker profile by name ONLY when the user asks for that specific AI (add \`userAsked: true\` to the task), or for a retry (\`retryOf\`); bounce refuses a first attempt that names a profile otherwise.`,
+    `    ${[agents, routingOn].filter(Boolean).length + 1}. A specific AI ONLY when the user asks for it (add \`userAsked: true\`), or for a retry (\`retryOf\`): \`profile\` stays the agent (the job) and \`model\` names the AI — a family (sol, terra, opus, qwen) or a provider/model ref. "Build it with Sol" is \`profile: "builder", model: "sol"\`; the agent keeps its prompt, rules and policy on that AI. An AI named as the profile is corrected to the agent on that AI.`,
     'After a failed attempt, you may name the next profile for the retry yourself and say why; first attempts still follow the ordering above. Retry first on the agent\'s own next AI: submit the name after the arrow in its chain above (builder~2, then builder~3) with retryOf; it is the lightest AI that has not tried the task. Name a cloud AI yourself only when the cause needs a stronger tier: a mid-tier model (e.g. Sonnet) for routine implementation a local worker could not finish; the top tier (e.g. Opus) only for hard design, cross-module debugging, or work a mid-tier attempt already failed.',
-    routingOn ? 'Do not pick a tier or a model yourself: for an agent or `auto`, Jev weighs the orders and picks the AI per task.'
+    routingOn ? 'Do not pick a model yourself: for an agent or `auto`, Jev weighs the orders and bounce picks the AI per task by load. You may set its tier when you know more than the orders say: `tier: "strongest"` when the work failed before, is security-sensitive or crosses modules, `"cheapest"` for a mechanical fix, `"advisor"` (Fable, Astra) only for the very hardest work. bounce still picks which AI of that tier.'
       : 'An agent runs on the AIs in the order its file lists them; naming a profile skips that list.',
-    'Every task.submitted declares requires: ["read"], ["read", "exec"], or ["read", "exec", "write"] to match its deliverables; running a command needs exec even with no edits. Probe tasks run in disposable copies. Never ask a read-only analyst to run git, checks, lint or tests.',
+    'Every task.submitted declares requires: ["read"], ["read", "exec"], or ["read", "exec", "write"] to match its deliverables; running a command needs exec even with no edits. Never ask a read-only analyst to run git, checks, lint or tests.',
     'A live container check (starting Docker, inspecting or running one) needs requires including "docker", and only a worker that may write gets it: a read-only or probing analyst never reaches Docker, because a container can write the checkout. Send live container checks to a builder.',
     'Once you have dispatched a task, end your turn: say in a line what you dispatched and what comes next, then stop. bounce wakes you with each outcome as your next turn (a `handoff` row), so nothing is lost. Do not hold your turn open in `bounce wait` while workers run — a turn held open keeps its whole context live and idle (observed: 74% of a 35-minute turn spent waiting), and do not investigate the same question yourself in parallel — that spends the worker\'s whole slot for nothing. If you must take the work back, cancel the task first.',
     ...(localOn ? ['Local models are part of the normal path, not a special request: an agent runs on a local model when one fits the task, at no cost — do not wait for the user to ask for them, and do not route around them by naming a cloud profile.',
@@ -231,9 +232,9 @@ export const breakdownOrders = (minutes, {ceiling = Math.max(TASK_CEILING_MINUTE
   'For work big enough to need phases, do not hand one worker the whole job. Plan the phases first; within a phase submit every chunk whose',
   'owned paths are disjoint at once, so they run in parallel; give a task that needs another\'s result depends_on with its task id, so',
   'phases run in sequence without you polling. Each chunk gets disjoint owned paths, its own acceptance and how to verify it.',
-  'Owned paths are where a chunk\'s work lands, not a fence: they tell the worker where its work belongs and help you plan chunks that can run side by side. Bounce integrates whatever the worker actually changed, and refuses only a file that changed in the checkout in the meantime (a conflict) — never tell a worker to stop over a change outside its owned paths.',
+  'Owned paths are where a chunk\'s work lands, not a fence: they tell the worker where its work belongs and help you plan chunks that can run side by side. Bounce integrates whatever the worker actually changed. A text file that also changed in the checkout in the meantime is merged when the two edits touch different lines; only edits to the same lines are refused (a conflict) — never tell a worker to stop over a change outside its owned paths. Shared tracking files (a progress log, a changelog) are yours: workers running side by side should not edit them; update them yourself once their work is integrated.',
   'Acceptance must be reachable with the authority you grant: never require live proof (Docker, a real run) from a worker whose orders forbid it — grant it (`requires` docker) or plan the live check as its own task.',
-  'A review of a whole phase, or of more than one risk area, is heavy: split it into one reviewer per area (for example locking and journaling, ownership, the CLI), each with the verification commands for its area. Reviewers probe: they run commands but cannot change the tree.',
+  'A review of a whole phase, or of more than one risk area, is heavy: split it into one reviewer per area (for example locking and journaling, ownership, the CLI), each with the verification commands for its area. Reviewers run commands; their orders, not a sandbox, keep them from changing the tree.',
   'Review each phase before the next one starts: read what the chunks produced, integrate, run the gate, then submit the next',
   'phase. A chunk that stops making progress or reaches the ceiling is asked for its conclusion and reported as is: resubmit what is left with that progress in its orders, or do the small remaining step yourself.',
   'bounce continues a worker that hits its step limit while progressing (up to 3 times); when a local worker still fails, read the actual cause in its outcome (step limit, blocked, or an error) before switching AI, and prefer retrying the same local worker when the cause was the step limit or a fixable command mistake.', ''];
@@ -256,6 +257,13 @@ export function orchestratorBridgeEnv({session, bus, grant, profile}) {
 
 // The orchestrator profile's standing brief, written once per daemon start: where its skill
 // lives and how to reach the bridge. The prompt line cli.js prepends points at this file.
+// The orchestrator's view of the skills in use: each by its real path, and what its workers get.
+export function ordersSkills(root, cwd) {
+  const {skills} = skillsInUse(root, cwd);
+  const block = skillsBlock(skills, skill => path.join(skill.dir, 'SKILL.md'));
+  return block ? ['', block, 'Every worker gets the same list in its prompt, with the files in its own copy: name a skill in the orders only when the task needs one it might not pick.', ''] : [];
+}
+
 function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, jev = null, notes = {}, roles = null, settings = {}, adapterNames = []}) {
   const dir = path.join(session.dir, 'orchestrator');
   const autoFallback = routingFallback(profiles, jev?.routing?.default);
@@ -323,19 +331,25 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
         '`bounce agents` lists the team in force; `bounce agents show NAME` prints one.', '',
       ];
     })(),
-    // The project's lessons (docs/plans/lessons-and-sweep.md): every line, with its job, and how one is recorded.
+    // The project's lessons: every line, with its job, and how one is recorded.
     ...(() => { const block = lessonsBlock(session.cwd, 'orchestrator'); return block ? ['', block, ''] : []; })(),
+    ...ordersSkills(root, session.cwd),
     'Lessons: when a task redid work that had been accepted, or a check failed twice, the handoff asks whether there is a lesson. If there is, record it with the lesson tool (or publish lesson.learned): agent (the job it is for, or all) and text (one sentence, imperative, no task ids). It lands in .bounce/LESSONS.md in the project and in every later worker\'s prompt for that job; a person deletes a line to withdraw it. Record what a worker should do differently here, not what happened.', '',
     `Worker profiles (one AI each): ${Object.entries(profiles).filter(([name, p]) => name !== orchestrator && name !== JEV_REVIEWER && !p.derived).map(([name, p]) => p.model ? `${name} (${p.model})` : name).join(', ') || 'none configured'} — name one only when the user asks for that AI, or for a retry (see above).`,
     ...(jev && autoFallback ? [`    auto → ${routingOn ? 'Jev (TypeSafe) routes each task: to the agent above whose job the orders clearly describe (that agent\'s own models then decide the AI), otherwise by the tier the orders need — the first fitting worker profile of that tier in the provider order; unconfident picks go to' : 'Jev routing is off (/jev routing on): resolves to'} ${autoFallback}`] : []),
     'Local discovery checks eligibility at dispatch. A downloaded model is not necessarily loaded or tool-capable.',
     'If the user asks for a LOCAL worker specifically and no agent can run on one, report that and point to /local on and /local setup; do not quietly substitute a cloud worker for that request.',
     'Capacity waits, progress and failures are journaled. Do not infer a worker crash from silence alone; inspect its latest task state.',
-    'A local worker (… via opencode) uses the workspace and tools allowed by its policy: read-only agents read and search but cannot run commands; probe agents can run sandboxed verification commands; write agents edit files and run commands in their assigned workspace. Its answer is its report. Never ask a read-only analyst to claim it ran tests; delegate execution to a command-capable worker and cite its results.',
+    'A local worker (… via opencode) uses the workspace and tools allowed by its policy: read-only agents read and search but cannot run commands; write agents edit files and run commands in their assigned workspace. Its answer is its report. Never ask a read-only analyst to claim it ran tests; delegate execution to a command-capable worker and cite its results.',
     'Require observed tests from local builders, and review their diff as you would any worker\'s.',
     // The view prefills the input from this line (src/tui/suggestion.js): Tab accepts it, Enter sends it.
     // Found live (session 159f4746): it sent a user-requested commit to workers seven times; none had git.
     'Workers run in copies of the repository: only an in-place task (task.submitted with `inPlace: {authorizedBy: <seq>}`) runs in the real checkout, for a version-control or other real-folder step (commit, push, open a PR) the user\'s own message asked for. Cite that message\'s seq (omit authorizedBy to cite the user\'s latest message) and keep the orders to exactly what it asked — push and PR only when it asked for them. A refusal names what exceeded the request.',
+    // A copy is removed when the user prunes it (src/prune.js), and services a worker started in it are stopped
+    // (found live: a stopped stack from a worker's copy was left behind).
+    'A worker\'s copy is temporary: the user removes copies with /prune, so anything you want to keep from one (evidence, a report, a probe or its output) goes into the checkout, and a path into a copy is no reference to keep. Before you accept a task, make sure a worker that started services in its copy stopped them (its answer names the command); otherwise stop what is still running yourself, from that copy.',
+    // Found live (a session): a review's reproduction script, run in the real checkout, stopped the user's stack on exit.
+    'A script a worker wrote (a reproduction, a probe, a review\'s evidence) is the worker\'s, made for its copy: read all of it in its own step before running any of it, and never run it in the real checkout — it may stop, reset or wipe the user\'s running services (a `down`, a reset, a trap on exit). To see it run again, run it in the worker\'s copy or send it to a worker.',
     'When one prompt from the user would move the work forward (an approval, a decision, a follow-up request), end the answer with one line `Next: <the prompt, as the user would type it>` — the view offers it prefilled in the input. One concrete prompt, not a question or a list; omit the line when nothing is needed from the user.',
     ...(jev?.enabled && jev?.review ? ['Jev completion verdicts are on: a root task you submit without review.completion gets a fast Jev accept/rework check against its orders, report and diff before it is accepted; a confident rework sends the same worker one rework round. Name a review.completion profile yourself to replace it.'] : []),
     '',
@@ -349,7 +363,7 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     // orchestrator had no way to the rest of a 12 KB verdict — it hunted, gave up, and started redoing the
     // reviewer's work. The way exists now, so the orders are where it is named.
     'A handoff carries the worker\'s answer in full, up to 12,000 characters, so a finished task handed to you needs no second look-up. '
-      + 'That view is bounded on purpose, so its summary is cut. When a task has finished and you need its verdict whole — every finding, its repro and its observed output — ask `task_get` with `full: true` (or `bounce task <id> --report`). That is the one way to the full text, and the reason you never need the journal.',
+      + 'That view is bounded on purpose, so its summary is cut. When a task has finished and you need its verdict whole — every finding, its repro and its observed output — ask `task_get` with `full: true` (or `bounce task <id> --report`); the same call carries the task\'s orders whole, as `fullOrders`. That is the one way to the full text, and the reason you never need the journal.',
     'Example — submit one task, then end your turn:',
     `    bounce publish --event '{"kind":"task.submitted","parent":null,"profile":"${defaultTarget(profiles, orchestrator, {routingOn})}","orders":"<goal, owned paths, acceptance, how to verify>","deadline":${taskLimits(settings).minutes * 60000}}'`,
     '`bounce wait` is for a short wait only, at most 120 seconds, when the very next step depends on an outcome you expect within it:',
@@ -358,15 +372,15 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     'submitted that no `wait` of yours returned is handed to you by bounce, as your next turn when you are idle (a `handoff` row in',
     'the journal) or in front of the next prompt, so you never need to poll. A `[bounce:wait.interrupted]` reply means the user sent',
     'you a message during the wait: it is in your turn now — read it and act on it before anything else.',
-    'Fields: parent (null for a root task), profile (a name above), orders (the brief, required), deadline (ms, optional),',
+    'Fields: parent (null for a root task), profile (an agent above: the job), model (optional: the AI that plays it, see above), orders (the brief, required), deadline (ms, optional),',
     'jobId (stable logical job) and retryOf (the previous task attempt). A retry continues the same job; use retryOf rather than parent, which creates dependent work instead of retrying the job.',
-    'Workers stand: a worker is a session per agent that outlives its tasks (builder#1, builder#2 …; the handoff and tasks_list list them with what each has done, how long idle, and its last context size). A new task for an agent goes to its idle worker by itself; a busy one means a second worker starts, so parallel work stays parallel. `worker: "builder#1"` names one; `worker: "new"` asks for a fresh one on purpose — do that after a correction of wrong work. Retire one with worker_retire (or publish worker.retire) when its context has grown heavy or its work went wrong; give a handoff when the next worker should open with what it knew, or set ask: true and the retiring worker writes its own handoff (one read-only turn). A Claude worker can compact instead (worker_compact): one turn on its session, its context shrinks, it keeps what it did; OpenCode and Codex workers cannot — retire those. bounce reports; you decide.',
+    'Workers stand: a worker is a session per agent that outlives its tasks (builder#1, builder#2 …; the handoff and tasks_list list them with what each has done, how long idle, and its last context size). A new task for an agent goes to its idle worker by itself, unless its context is past 150k (the roster says so); a busy or over-cap one means a fresh worker starts, so parallel work stays parallel. `worker: "builder#1"` names one; `worker: "new"` asks for a fresh one on purpose — do that after a correction of wrong work. Retire one with worker_retire (or publish worker.retire) when its context has grown heavy or its work went wrong; give a handoff when the next worker should open with what it knew, or set ask: true and the retiring worker writes its own handoff (one read-only turn). A Claude worker can compact instead (worker_compact): one turn on its session, its context shrinks, it keeps what it did; OpenCode and Codex workers cannot — retire those. bounce reports; you decide.',
     'continues (a task of yours): the worker that did that task is resumed, with its memory of the project, into this task\'s own copy, and told where it is. Use it for a follow-up on the same area by the same job — it saves the worker re-reading the project. After a correction of wrong work, start fresh instead: a session that produced the wrong result keeps the misunderstanding that produced it. bounce launches fresh and says why when the earlier task ran on another profile or left no session.',
-    'depends_on (task ids, optional), review ({"prelaunch": <profile>, "completion": <profile>}, optional, review-role profiles only),',
+    'depends_on (task ids, optional), review ({"prelaunch": <reviewer>, "completion": <reviewer>}, optional): only a review agent reviews — the reviewer, or a critic or verifier profile; give its AI as {"profile": "reviewer", "model": "sol"}. A builder or an AI named here is corrected to the reviewer agent (on that AI),',
     'steps (the verification steps, as text) — required when the completion reviewer is a verifier profile, refused with reason `steps` without it.',
     'check (one shell command that proves the work is done, optional but give one to every task that changes files; it must run the work — its tests, its script — and fail when the result is wrong, because a check that only looks for a file or a phrase passes on a false report; bounce tells you when you submit one, and passing it does not count as verification): bounce runs it in the worker\'s copy when the worker finishes, in a plain shell with its own environment (give a tool that is not on the path its full path), and only work that passes (exit 0) reaches the checkout by itself. A failure goes back to the worker once with what the check printed. Work that changed files and that no such check has verified (the check still fails, could not run, only looks, or was not given) is kept in the worker\'s copy and comes to you as task.blocked (reason `check_failed`, `check_unrunnable` or `unverified`) with the folder it is in and what the review said: that is not a failure, it is work waiting for you. Read or run it there, then accept it (task.accepted with what you checked, which puts it in the checkout), send it back, or retry it on another AI.',
     'A verifier is handed steps alone as its orders, so they must stand on their own. A strict session requires both review stages as well.',
-    'The publish reply shows the task id as `task=<id>` (add --json for the whole row). Always match on kind AND task: a match on the task alone returns the task.submitted row at once.',
+    'The publish reply shows the task id as `task=<id>`, and a submission also its `profile=` and the start of its `orders=` (add --json for the whole row). Replies to publishes run in parallel arrive in any order: pair each id with its task by profile and orders, never by reply order. Always match on kind AND task: a match on the task alone returns the task.submitted row at once.',
     'The publish reply carries the task id. `wait` on a task outcome follows replacements and waits for completion review when configured. Read the',
     'returned row\'s `kind`: task.completed or task.accepted is done. task.deadline (and the task.cancelled with reason `deadline` that',
     'follows it) means the worker ran out of time with the work unfinished: use its partial progress to submit a smaller continuation with retryOf; it is not a reason to stop the run.',
@@ -452,7 +466,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   const settings = config(root);
   // The live adapters are orchestrator mode's workers; a test may replace any of them by name.
   // Classic mode never dispatches, so registering them costs it nothing.
-  const adapters = {claude: createClaudeLive(), codex: createCodexLive(), muse: createMuseLive(), opencode: createOpencodeLive(), typesafe: createTypesafeLive(), ...extraAdapters};
+  const adapters = {claude: createClaudeLive(), codex: createCodexLive(), muse: createMuseLive(), opencode: createOpencodeLive(), typesafe: createTypesafeLive({samples: JEV_SAMPLES, memoFile: path.join(root, 'jev-memo.json')}), ...extraAdapters};
   // Validated once, before anything is created: an invalid orchestration config throws out of
   // supervise() (cli.js prints it and exits 1) with no session, daemon.json or socket behind it.
   // A profile whose vendor binary is absent fails at dispatch as task.failed{reason:'missing'}.
@@ -498,7 +512,8 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
     if (pending) await Promise.race([pending, new Promise(resolve => setTimeout(resolve, ROSTER_WAIT_MS).unref?.())]);
     return rosterSetup.notes();
   };
-  const jev = orchestrating ? createJevDecisions({root, adapter: adapters.typesafe, notes: rosterNotes, order: () => settings.order ?? [], locals: localAIs}) : null;
+  // `quotas` is the store kept current further down; it is read only at dispatch, after it exists.
+  const jev = orchestrating ? createJevDecisions({root, adapter: adapters.typesafe, notes: rosterNotes, order: () => settings.order ?? [], locals: localAIs, quotas: () => quotas ?? {}}) : null;
 
   // Phase 8: the strategy seam, same shape as `adapters`/`profiles` above — a test (or, later, a
   // config-driven caller) may inject a strategy object directly; absent, the declarative
@@ -514,7 +529,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
       reportTokens.set(peer, true);
       return {BOUNCE_REPORT_BUS: bus.path, BOUNCE_REPORT_TOKEN_FILE: grant.file};
     }, strategy: strategyOverride ?? orchestration.strategy, jev});
-  // A lesson lands in the project's .bounce/LESSONS.md for a job this project has (docs/plans/lessons-and-sweep.md).
+  // A lesson lands in the project's .bounce/LESSONS.md for a job this project has.
   const keepLesson = ({agent, text}) => {
     const kept = recordLesson(session.cwd, {agent, text}, {agents: new Set([...readRoles().values()].filter(role => !role.error).map(role => role.name)), session: session.id});
     return kept;
@@ -549,9 +564,9 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   const orders = () => writeOrders({session, root, bus, grant: orchestratorGrant, profiles, orchestrator: orchestration.orchestrator, jev: jevBlock() ? readJevSettings(root) : null,
     notes: effectiveNotes(profiles, readRosterNotes(root)), roles: readRoles(), settings, adapterNames});
   if (orchestrating) orders();
-  // Routing on: describe the roster's models now so the first `auto` need not wait; the outcome
-  // is journaled either way.
-  if (orchestrating) { const jevNow = readJevSettings(root); if (jevNow.enabled && jevNow.routing.enabled) rosterSetup.ensure().catch(() => {}); }
+  // No agent is asked to describe the roster's models at start: what it wrote changed between askings and routing
+  // flipped with it (integration runs 2026-10-22). Routing reads the catalog, pins and LM Studio's own numbers
+  // (src/roster-notes.js routingNote); /jev roster refresh still asks, for reading only.
   if (homeSessionWarning(session.cwd)) session.append({kind: 'status', text: homeSessionWarning(session.cwd)});
   if (orchestrating) session.append({kind: 'operation', operation: 'orchestrator', orchestrator: orchestration.orchestrator, shape: orchestration.shape, text: `Operation: orchestrator on ${orchestration.orchestrator} (${orchestration.shape})`});
   const bridgeEnv = orchestrating ? orchestratorBridgeEnv({session, bus, grant: orchestratorGrant, profile: orchestratorProfile}) : null;
@@ -949,6 +964,35 @@ async function attachCommand(args) {
   process.exitCode = 0;
 }
 
+// `bounce send [--session REF] [--wait] [--json] MESSAGE`: the message goes to that session's orchestrator as if typed
+// in its view (src/send.js). With no --session, the one live session started in this directory.
+async function sendCommand(args) {
+  const {values, positionals} = parseArgs({args: args.slice(1), allowPositionals: true, options: {session: {type: 'string'}, wait: {type: 'boolean'}, json: {type: 'boolean'}, cwd: {type: 'string'}}});
+  const text = positionals.join(' ').trim();
+  if (!text) { console.error('bounce: send requires a message: bounce send [--session REF] [--wait] "message"'); process.exitCode = 2; return; }
+  const root = dataRoot();
+  let id = values.session ? resolveOrRaw(values.session) : null;
+  if (!id) {
+    const cwd = fs.realpathSync(values.cwd || process.cwd());
+    const live = listSessions(root).filter(row => row.live && row.cwd === cwd);
+    if (live.length !== 1) {
+      console.error(live.length ? `bounce: ${live.length} live sessions here; name one with --session: ${live.map(row => `${row.id.slice(0, 8)} (${row.name})`).join(', ')}` : 'bounce: no live session in this directory; name one with --session (bounce sessions lists them)');
+      process.exitCode = 1; return;
+    }
+    id = live[0].id;
+  }
+  let channel;
+  try { channel = await connectSession(root, id); }
+  catch (error) { console.error(`bounce: ${error.message}`); process.exitCode = 1; return; }
+  const sent = await sendToOrchestrator(channel, text, {wait: Boolean(values.wait)});
+  if (values.json) console.log(JSON.stringify({session: id, ...sent}));
+  else if (!sent.accepted) console.error(`bounce: the orchestrator did not take the message: ${sent.reason}`);
+  else if (!values.wait) console.log(`${sent.queued ? 'queued: it runs when the current turn ends' : 'sent'} · session ${id.slice(0, 8)} · request ${sent.requestId}`);
+  else if (sent.status === 'completed') console.log(sent.answer ?? '(the turn ended with no answer)');
+  else console.log(`(the turn ended ${sent.status}${sent.reason ? `: ${sent.reason}` : ''})${sent.answer ? `\n${sent.answer}` : ''}`);
+  process.exitCode = sent.accepted && (!values.wait || sent.status === 'completed') ? 0 : 1;
+}
+
 async function stopCommand(args) {
   const id = resolveOrRaw(args[1]);
   if (!id) { console.error('bounce: stop requires a session id'); process.exitCode = 2; return; }
@@ -997,6 +1041,7 @@ async function waitFor(fn, {timeout = 5000, interval = 20} = {}) {
 export async function supervise(args = process.argv.slice(2), {spawnChild = spawn, updateInstall = installUpdate, adapters, profiles, strategy, onReady} = {}) {
   const command = args[0];
   if (command === 'attach') return attachCommand(args);
+  if (command === 'send') return sendCommand(args);
   if (command === 'stop') return stopCommand(args);
   if (command === 'run' && args.includes('--detach')) return detachRun(args, {spawnChild});
   if (command === 'run') return daemonSupervise(args, {spawnChild, updateInstall, adapters, profiles, strategy, onReady});

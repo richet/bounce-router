@@ -4,7 +4,7 @@ import {completions, typedCommand, frameDiff} from '../src/terminal.js';
 import {commandCatalog} from '../src/commands.js';
 import {resolveExecutable} from '../src/executable.js';
 test('slash shows all commands; prefixes narrow and arguments dismiss',()=>{
- assert.equal(completions('/').length,34);
+ assert.equal(completions('/').length,35);
  assert.deepEqual(completions('/re').map(x=>x[0]),['rename','resume','review','retry','restart']);
  assert.deepEqual(completions('/je').map(x=>x[0]),['jev']);
  assert.deepEqual(completions('/b').map(x=>x[0]),['btw']);
@@ -29,7 +29,7 @@ test('idle frames produce no writes and typing leaves transcript untouched',()=>
  assert.equal(frameDiff(before,['title','transcript','❯ /m']),'\x1b[3;1H\x1b[2K❯ /m');
  assert.equal(frameDiff(['a','b'],['a']),'\x1b[2;1H\x1b[2K');
 });
-// Daniel, 2026-09-27: the Codex desktop app is off limits — its bundled CLI is never a candidate.
+// 2026-09-27: the Codex desktop app is off limits — its bundled CLI is never a candidate.
 test('Codex discovery respects override and PATH and never falls back to the desktop app\'s bundled CLI',()=>{
  const options={env:{PATH:'/bin'},home:'/user',accessible:p=>p==='/Applications/ChatGPT.app/Contents/Resources/codex'||p==='/Applications/Codex.app/Contents/Resources/codex'};
  assert.equal(resolveExecutable('codex',undefined,options),'codex');
@@ -54,25 +54,40 @@ test('OpenCode discovery finds the installer location when PATH does not carry i
 
 test('mouse input handles split/coalesced wheel reports without changing prompt text', async () => {
  const {createMouseInput, mouseTracking} = await import('../src/terminal.js');
- const text = [], scroll = [];
- let presses = 0;
- const feed = createMouseInput(s => text.push(s), n => scroll.push(n), () => presses++);
+ const text = [], scroll = [], pointer = [];
+ const feed = createMouseInput(s => text.push(s), (n, at) => scroll.push([n, at.x, at.y]), event => pointer.push(event));
  feed('hello\x1b['); feed('<64;10;'); feed('5M\x1b[<65;10;5Mworld');
- feed('\x1b[<0;10;5M\x1b[<0;10;5m'); // Click and release are consumed.
  feed('\x1b[<68;10;5M\x1b[<66;10;5M'); // Modified up, horizontal wheel.
  assert.equal(text.join(''), 'helloworld');
- assert.deepEqual(scroll, [3, -3, 3]);
- // Tracking the wheel swallows the click that would have started a selection: the press is
- // reported once, so the prompt can say how to select, and the release adds no second hint.
- assert.equal(presses, 1);
- feed('\x1b[<2;10;5M\x1b[<64;10;5M'); // Right button and the wheel are not selection attempts.
- assert.equal(presses, 1);
+ assert.deepEqual(scroll, [[3, 10, 5], [-3, 10, 5], [3, 10, 5]], 'the wheel says where the pointer is, so the region under it scrolls');
+ assert.deepEqual(pointer, []);
  feed('\x1b[A'); feed('\x1b'); feed.flush();
  assert.equal(text.join(''), 'helloworld\x1b[A\x1b');
- // Alternate scroll mode stays off in both states: it would turn the wheel into arrow keys
- // that walk prompt history instead of the transcript.
- assert.equal(mouseTracking(true), '\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1007l\x1b[?1000h\x1b[?1006h');
+ // Button-event tracking (1002) reports a drag while the button is down, which selection needs. Alternate scroll
+ // mode stays off in both states: it would turn the wheel into arrow keys that walk prompt history.
+ assert.equal(mouseTracking(true), '\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1007l\x1b[?1002h\x1b[?1006h');
  assert.equal(mouseTracking(false), '\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1007l');
+});
+
+test('a left-button press, drag and release reach selection with their cells; other buttons do not', async () => {
+ const {createMouseInput} = await import('../src/terminal.js');
+ const pointer = [];
+ const feed = createMouseInput(() => {}, () => {}, event => pointer.push(event));
+ feed('\x1b[<0;10;5M\x1b[<32;12;5M'); feed('\x1b[<32;14;6M\x1b[<0;14;6m');
+ feed('\x1b[<2;3;3M\x1b[<2;3;3m\x1b[<34;4;3M'); // Right button press, release and drag.
+ assert.deepEqual(pointer, [
+  {kind: 'press', x: 10, y: 5}, {kind: 'drag', x: 12, y: 5}, {kind: 'drag', x: 14, y: 6}, {kind: 'release', x: 14, y: 6},
+ ]);
+});
+
+test('a mouse report split across reads survives the input flush: no half of it is typed into the prompt', async () => {
+ const {createMouseInput} = await import('../src/terminal.js');
+ const text = [], pointer = [];
+ const feed = createMouseInput(s => text.push(s), () => {}, event => pointer.push(event));
+ feed('\x1b[<32;37;3M\x1b[<'); feed.flush(); // The flush timer fires between the two reads.
+ feed('0;37;3m');
+ assert.deepEqual(pointer, [{kind: 'drag', x: 37, y: 3}, {kind: 'release', x: 37, y: 3}]);
+ assert.deepEqual(text, []);
 });
 
 test('input grows with wrapping and newlines, keeping the cursor within the viewport', async () => {
@@ -131,7 +146,7 @@ test('handing the terminal to a vendor login releases stdin and restores the mai
   assert.equal(out, '\x1b[?1049h\x1b[?25l\x1b[?2004h\x1b[>1u\x1b[>4;2m\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1007l');
   calls.length = 0; out = '';
   resumeTerminal(stdin, stdout, {mouse: true});
-  assert.ok(out.endsWith('\x1b[?1000h\x1b[?1006h'));
+  assert.ok(out.endsWith('\x1b[?1002h\x1b[?1006h'));
   // A stream without setRawMode (a pipe under test) must not throw.
   suspendTerminal({pause: () => {}}, stdout);
 });
@@ -166,4 +181,23 @@ test('a command typed in full is recognised, so Enter runs it instead of complet
   // one Enter used to accept. Typing the command out in full has to beat that.
   assert.deepEqual(completions('/mode').map(x => x[0]), ['model', 'mode']);
   assert.equal(typedCommand('/mode'), 'mode');
+});
+
+// Found in the real-console pass 2026-10-21: under the kitty protocol (tmux, kitty, Ghostty) Ctrl+J arrives encoded and
+// became a bare control key, so the newline the help promises never opened.
+test('Ctrl+J opens a line under the kitty protocol and under modifyOtherKeys, as the raw line feed does', async () => {
+  const {createKeyInput} = await import('../src/terminal.js');
+  let newlines = 0; const control = [];
+  const feed = createKeyInput(() => {}, () => newlines++, (s, key) => control.push(key.name));
+  feed('\x1b[106;5u'); feed('\x1b[27;5;106~');
+  assert.equal(newlines, 2);
+  assert.deepEqual(control, []);
+});
+
+// Found in the real-console pass 2026-10-21: /config's help and /local setup's text were wrapped like the prompt
+// draft, at the column, so words broke across rows ("The f / irst", "promp / t.").
+test('prose wraps at word boundaries, and only a word longer than the row is cut', async () => {
+  const {wordRows} = await import('../src/terminal.js');
+  assert.deepEqual(wordRows('Type cancel at any prompt.', 16), ['Type cancel at', 'any prompt.']);
+  assert.deepEqual(wordRows('abcdefghij xy', 4), ['abcd', 'efgh', 'ij', 'xy']);
 });

@@ -28,8 +28,9 @@ test('the orders say who to submit to: the job first, auto next, a named AI only
   for (const part of [
     '1. An agent, by the job the task is',
     '2. `auto` when no agent is clearly the job',
-    '3. A worker profile by name ONLY when the user asks for that specific AI',
-    'Do not pick a tier or a model yourself',
+    '3. A specific AI ONLY when the user asks for it', '`profile` stays the agent (the job) and `model` names the AI',
+    'Do not pick a model yourself',
+    'You may set its tier when you know more than the orders say',
     'Local models are part of the normal path',
     'do not wait for the user to ask for them'])
     assert.equal(text.includes(part), true, part);
@@ -37,14 +38,14 @@ test('the orders say who to submit to: the job first, auto next, a named AI only
 
   const noJev = choosingOrders({agents: true, routingOn: false, localOn: true}).join('\n');
   assert.equal(noJev.includes('`auto`'), false, 'auto is not offered while routing is off');
-  assert.equal(noJev.includes('Do not pick a tier'), false);
+  assert.equal(noJev.includes('Do not pick a model'), false);
   assert.equal(noJev.includes('in the order its file lists them'), true);
   const cloudOnly = choosingOrders({agents: true, routingOn: true, localOn: false}).join('\n');
   assert.equal(cloudOnly.includes('Local models'), false);
   assert.deepEqual(choosingOrders({agents: false, routingOn: false, localOn: false}), [], 'no agents and no routing: there is nothing to choose between but profiles');
 });
 
-// Found live (ACE session): the orchestrator dispatched an analyst, then spent 19 tool calls of its own
+// Found live (a session): the orchestrator dispatched an analyst, then spent 19 tool calls of its own
 // answering the same question and wrote the next task from its own findings; the analyst's whole
 // 15-minute slot was wasted.
 test('the orders tell the orchestrator to hand off what it dispatched instead of doing it itself', () => {
@@ -54,7 +55,7 @@ test('the orders tell the orchestrator to hand off what it dispatched instead of
   assert.equal(text.includes('cancel the task first'), true);
 });
 
-// Found live (ACE session): the orchestrator spent 1560 s of a 2115 s turn inside seven `bounce wait`
+// Found live (a session): the orchestrator spent 1560 s of a 2115 s turn inside seven `bounce wait`
 // calls — a 35-minute turn held open, its whole context live, doing nothing bounce would not have
 // done for it with a handoff. And a /steer delivered into that turn was read only when the wait returned.
 test('the orders make ending the turn the rule after dispatch, and a wait short and for a dependent step only', () => {
@@ -84,4 +85,28 @@ test('the orders say a deadline is a task to resubmit smaller, not a reason to s
   const text = fs.readFileSync(new URL('../src/reload.js', import.meta.url), 'utf8');
   assert.equal(text.includes('it is not a reason to stop the run'), true);
   assert.equal(/task\.cancelled, task\.deadline or',\n\s*'task\.rejected mean stop/.test(text), false, 'a deadline is no longer listed among the stop reasons');
+});
+
+// Found live (a session): a reviewer left a reproduction script among the integrated evidence, ending in a trap that
+// stopped its stack on exit. The orchestrator ran it twice in the real checkout (the second time in the same command
+// as the `head` meant to read it) and took the user's running stack down both times.
+test('the orders say a worker\'s script is read first and runs in the worker\'s copy, never in the real checkout', () => {
+  const text = fs.readFileSync(new URL('../src/reload.js', import.meta.url), 'utf8').replaceAll("\\'", "'");
+  for (const part of ['A script a worker wrote (a reproduction, a probe, a review\'s evidence) is the worker\'s',
+    'read all of it in its own step before running any of it',
+    'never run it in the real checkout',
+    'stop, reset or wipe the user\'s running services'])
+    assert.equal(text.includes(part), true, part);
+});
+
+// A worker's copy is temporary (the user prunes it), and services a worker starts in it are its own to stop (found
+// live: a stopped stack from a worker's copy was left behind). The orchestrator makes sure.
+test('the orders say a worker\'s copy is temporary, and that a worker\'s services are stopped', () => {
+  const read = file => fs.readFileSync(new URL(file, import.meta.url), 'utf8').replaceAll("\\'", "'");
+  const orders = read('../src/reload.js'), contract = read('../src/scheduler.js');
+  for (const part of ['A worker\'s copy is temporary: the user removes copies with /prune', 'goes into the checkout',
+    'make sure a worker that started services in its copy stopped them', 'stop what is still running'])
+    assert.equal(orders.includes(part), true, part);
+  assert.equal(contract.includes('Services you start in your copy (a stack, containers, a server) you stop before you end'), true);
+  assert.equal(contract.match(/STOP_SERVICES,/g)?.length, 2, 'both worker contracts carry it');
 });

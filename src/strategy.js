@@ -1,5 +1,4 @@
-// Phase 8 — pluggable orchestration strategy (CONTRACT.md, docs/local-orchestration.md
-// "Phase 8"). A strategy is a plain object of pure, synchronous decision functions the
+// Phase 8 — pluggable orchestration strategy. A strategy is a plain object of pure, synchronous decision functions the
 // scheduler (CORE) calls at fixed points; each hook returns a declared intent the CORE
 // executes. Strategies never journal, launch, or touch budgets directly — see CONTRACT §0.
 //
@@ -40,7 +39,7 @@ const still = findings => (findings.length ? `found: ${findings.map(finding => S
 
 const sentBack = (task, api) => Boolean(api.lastRework?.(task)) || api.roundsUsed(task) >= api.roundsCap(task);
 
-// A task's check that failed decides before any review (Daniel, 2026-09-28): the work goes back once
+// A task's check that failed decides before any review (2026-09-28): the work goes back once
 // with what the check printed; if it still fails, the work is kept and handed to the orchestrator,
 // never put in the checkout. Null when the task names no check, or it passed.
 function failedCheckIntent(task, api) {
@@ -52,7 +51,7 @@ function failedCheckIntent(task, api) {
   return {action: 'rework', findings: [checkFinding(check)]};
 }
 
-// CONTRACT.md §2. Single reviewer, quorum 1, prelaunch never reworks (any non-accept/non-unreadable
+// Single reviewer, quorum 1, prelaunch never reworks (any non-accept/non-unreadable
 // verdict rejects); completion sends the work back at most once and otherwise accepts it with advice.
 const afterReworkAdvice = (findings = [], checks = null) => `Accepted after its one rework round; the review still ${findings.length ? `found: ${findings.join('; ')}` : 'did not accept it'}${checks?.length ? ` (${checks.join(', ')})` : ''}. Decide whether a follow-up task is needed.`;
 
@@ -91,12 +90,12 @@ export const defaultStrategy = {
     // orchestrator gets what the reviewer said and picks the way forward with the tools it has.
     if (v.verdict === 'unreadable') {
       const said = String(v.excerpt ?? '').trim();
-      return {action: 'escalate', reason: 'review_unreadable', text: `${v.launchFailed ? 'The review could not start.' : 'The review ended without a verdict bounce could read.'} Decide: accept the work (task.accepted with what you checked), send it back (task.rework with what to fix), or check it another way — another reviewer, a probe, or yourself.${said ? ` The reviewer said: ${said.slice(-600)}` : ' The reviewer said nothing.'}`};
+      return {action: 'escalate', reason: 'review_unreadable', text: `${v.launchFailed ? 'The review could not start.' : 'The review ended without a verdict bounce could read.'} Decide: accept the work (task.accepted with what you checked), send it back (task.rework with what to fix), or check it another way — another reviewer, an analyst, or yourself.${said ? ` The reviewer said: ${said.slice(-600)}` : ' The reviewer said nothing.'}`};
     }
     const findings = v.findings ?? v.questions ?? [];
     // A worker cannot rework away what it already reported as left: when the only findings are that the
     // report names remaining work and that acceptance is not met, and the worker's report says what
-    // remains, the task is accepted and the orchestrator decides the follow-up. Found live (ACE d1bc0206,
+    // remains, the task is accepted and the orchestrator decides the follow-up. Found live (session d1bc0206,
     // f17544d3): a live proof that also found two product bugs was sent back for them and then failed.
     const remaining = String(api.remainingOf?.(task) ?? '').trim();
     const fired = Array.isArray(v.fired) ? v.fired : [];
@@ -113,7 +112,7 @@ export const defaultStrategy = {
   onTerminal() { return {submit: []}; },
 };
 
-// CONTRACT.md §3 — a completion (or prelaunch) review in the row's config is never launched;
+// A completion (or prelaunch) review in the row's config is never launched;
 // every completed task is accepted by the strategy itself, with no reviewer in the loop.
 export const noReviewStrategy = {
   onSubmitted(task, view, api) {
@@ -127,7 +126,7 @@ export const noReviewStrategy = {
   onTerminal() { return {submit: []}; },
 };
 
-// CONTRACT.md §3 — n reviewers must accept before task.accepted; any reject routes to
+// N reviewers must accept before task.accepted; any reject routes to
 // reject/rework as today, a reject taking precedence over a rework among the reported verdicts.
 export function quorumStrategy(n) {
   return {

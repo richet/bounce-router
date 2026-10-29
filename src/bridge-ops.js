@@ -1,4 +1,4 @@
-// The agent-facing interface (docs/plans/bridge-interface.md). Bounce speaks to the agents it runs through
+// The agent-facing interface. Bounce speaks to the agents it runs through
 // exactly these verbs; every transport — the shell bridge (src/bridge.js), the MCP server (src/mcp.js) — is
 // a skin that translates argv or a tool call into one of them and its result back out. A transport holds no
 // default, no limit, no policy and no error text: a capability a transport needs is a verb here first.
@@ -148,9 +148,9 @@ export function createOps({env = process.env, connect = connectBus, clock = () =
   return {
     submit: event => withClient(false, async client => ({ok: true, row: await client.publish(event)})),
     report: payload => withClient(true, async client => ({ok: true, row: await client.report(payload)})),
-    // The orchestrator's own memory: one living note it rewrites each turn (docs/plans/orchestrator-memory.md).
+    // The orchestrator's own memory: one living note it rewrites each turn.
     state: text => withClient(false, async client => ({ok: true, row: await client.publish({kind: 'state', text: String(text ?? '')})})),
-    // A lesson for this project's workers (docs/plans/lessons-and-sweep.md): the bus keeps the file and refuses in plain words.
+    // A lesson for this project's workers: the bus keeps the file and refuses in plain words.
     retire: ({worker, handoff, ask = false}) => withClient(false, async client => ({ok: true, row: await client.publish({kind: 'worker.retire', worker: String(worker ?? ''), ...(handoff ? {handoff: String(handoff)} : {}), ...(ask ? {ask: true} : {})})})),
     compact: ({worker}) => withClient(false, async client => ({ok: true, row: await client.publish({kind: 'worker.compact', worker: String(worker ?? '')})})),
     lesson: ({agent, text}) => withClient(false, async client => ({ok: true, row: await client.publish({kind: 'lesson.learned', agent: String(agent ?? 'all'), text: String(text ?? '')})})),

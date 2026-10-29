@@ -67,8 +67,10 @@ test('publish of a non-live kind lands in the journal file with a seq', () => {
   assert.equal(fs.readFileSync(session.file, 'utf8').split('\n').filter(Boolean).length, before + 1);
 });
 
-test('LIVE_KINDS is exactly the four live kinds', () => {
-  assert.deepEqual([...LIVE_KINDS].sort(), ['progress', 'task.activity', 'tool.finished', 'tool.started']);
+// `delta` joined 2026-10-21 (interactive-polish step 11): a streamed fragment is shown live and journaled once,
+// assembled into an `assistant` row by Router.run.
+test('LIVE_KINDS is exactly the five live kinds', () => {
+  assert.deepEqual([...LIVE_KINDS].sort(), ['delta', 'progress', 'task.activity', 'tool.finished', 'tool.started']);
 });
 
 test('legacy journal rows without seq/from/context load, and the next append gets the right seq', () => {
@@ -114,7 +116,7 @@ test('subscriber errors are bounded so a broken subscriber cannot grow memory fo
   assert.equal(session.subscriberErrors.at(-1).row.text, '149');
 });
 
-// Found live (ACE d1bc0206): 75% of a 21 MB journal was Claude's raw stream (assistant 5.4 MB, user tool
+// Found live (session d1bc0206): 75% of a 21 MB journal was Claude's raw stream (assistant 5.4 MB, user tool
 // results 7.8 MB, thinking-token ticks 1.3 MB), each already stored as its own normalized row, and the
 // whole history then overflowed the view channel on resume. Those raw rows reach listeners live only;
 // raw rows that carry anything not stored elsewhere (rate limits, init, results, heartbeats) stay.

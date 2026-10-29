@@ -1,6 +1,7 @@
 import {doingStep} from './status.js';
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'timed_out', 'rejected', 'accepted']);
-const HIDDEN_TRANSCRIPT_KINDS = new Set(['raw', 'usage', 'checkpoint', 'task.activity']);
+// `usage` is kept: the conversation view sums it into each turn's footer (src/tui/transcript.js) and shows no row.
+const HIDDEN_TRANSCRIPT_KINDS = new Set(['raw', 'checkpoint', 'task.activity']);
 // `task.observed` is a throttled journal copy of the same live `task.activity` rows (src/scheduler.js
 // consumeWorkerEvents): a row seen live moments earlier lands again on restart replay. Only the
 // text is compared — a recent window, not the whole history, so a genuinely repeated line still shows.
@@ -104,6 +105,13 @@ export function createWorkspaceProjection({activityLimit = 400, transcriptLimit 
       if (submitted) { addTask(submitted); task = tasks.get(event.task); }
     }
     if (!task) return true;
+    // A parked task messaged live is resumed by the message (the worker process is still there): its next row of
+    // work or milestone means it runs again. Without a delivery a later row stays a late copy, and the block stands.
+    const parked = task.state === 'blocked' || task.state === 'input_required';
+    if (parked && event.kind === 'task.delivered' && event.tier === 'live') task.resuming = true;
+    if (parked && task.resuming && ['task.activity', 'task.observed', 'task.milestone'].includes(event.kind)) {
+      task.state = 'running'; delete task.resuming; delete task.reason; delete task.blocked;
+    }
     if (event.kind === 'task.activity' || event.kind === 'task.observed') {
       if (event.text) {
         const text = String(event.text).slice(0, 16000);
@@ -129,7 +137,7 @@ export function createWorkspaceProjection({activityLimit = 400, transcriptLimit 
       task.model = event.requested ?? task.model;
       if (event.attempt != null) task.attempt = event.attempt;
     }
-    if (event.kind === 'task.blocked' || event.kind === 'task.input_required') task.reason = event.reason ?? null;
+    if (event.kind === 'task.blocked' || event.kind === 'task.input_required') { task.reason = event.reason ?? null; delete task.resuming; }
     if (event.kind === 'task.started') { delete task.reason; delete task.blocked; }
     if (event.kind === 'task.milestone' || event.kind === 'task.reported' || event.kind === 'task.blocked' || event.kind === 'task.input_required') {
       task.phase = event.phase ?? task.phase;
@@ -146,6 +154,18 @@ export function createWorkspaceProjection({activityLimit = 400, transcriptLimit 
     // pane said `completed`, so nothing in the UI showed that anyone was on it.
     if (event.kind === 'review.started') { task.state = 'reviewing'; task.reviewer = event.profile ?? task.reviewer ?? null; task.updatedAt = event.time ?? task.updatedAt; return true; }
     if (event.kind === 'review.finished') { task.state = 'completed'; task.updatedAt = event.time ?? task.updatedAt; return true; }
+    // A completion with a check to run is not the end either: the check runs next (a `phase: 'check'` milestone), and
+    // a running check is work. Found live: a check ran over a minute while the UI showed no work in progress.
+    if (event.kind === 'task.completed' && submittedRows.get(task.task)?.check) {
+      if (submittedRows.get(task.task)?.review?.completion) task.underReview = true;
+      return true;
+    }
+    if (event.kind === 'task.milestone' && event.phase === 'check' && task.state === 'completed') task.state = 'checking';
+    if (event.kind === 'task.check' && task.state === 'checking') {
+      task.state = event.passed === false ? 'running' : 'completed';
+      task.updatedAt = event.time ?? task.updatedAt;
+      if (task.state === 'running' || task.underReview) return true;
+    }
     if (event.kind === 'task.recovery') task.recovery = taskText(event) || event.reason || task.recovery;
     // `completed` is not the end while a review may still send the task back: the pane leaves on
     // acceptance, failure or cancellation, or on completion with no review pending.

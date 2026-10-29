@@ -152,7 +152,7 @@ test('a copyRoot puts each working copy at <copyRoot>/<8 hex>, and its artifact 
   assert.throws(() => createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'inside', copyRoot: path.join(source, 'w')}), /outside source/);
 });
 
-// Found live (ACE 159f4746, task 92136dbf): the copy had no .git, so a worker that needed `git log` blocked
+// Found live (session 159f4746, task 92136dbf): the copy had no .git, so a worker that needed `git log` blocked
 // with "not a git repository". Each copy now gets its own clone sharing the source's objects: git works in
 // it, a commit there stays there, and only file changes are integrated.
 test('a copy of a git checkout has its own git: history and status work, and its commits never reach the source', () => {
@@ -162,7 +162,7 @@ test('a copy of a git checkout has its own git: history and status work, and its
   write(source, 'a.txt', 'dirty\n');
   const sourceHead = git(source, 'rev-parse', 'HEAD');
   const copy = createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'git'});
-  // Found live (ACE 36ecaacd, task 7bafef8e): with the user's uncommitted edits showing in `git status`, a
+  // Found live (session 36ecaacd, task 7bafef8e): with the user's uncommitted edits showing in `git status`, a
   // worker took them for its own out-of-scope changes and reverted them. The copy starts from a baseline
   // commit of the checkout as it was, so status is clean and `git diff` is only the worker's own work.
   assert.equal(git(copy.cwd, 'log', '--format=%s'), 'bounce: baseline of the checkout this copy was made from (its uncommitted changes included)\nFirst commit');
@@ -179,7 +179,7 @@ test('a copy of a git checkout has its own git: history and status work, and its
   assert.equal(fs.existsSync(path.join(plain.cwd, '.git')), false);
 });
 
-// Found live (ACE d1bc0206, task 99bd27ea): the text a review read was the first 4096 characters of
+// Found live (session d1bc0206, task 99bd27ea): the text a review read was the first 4096 characters of
 // the old file followed by the first 4096 of the new one. The worker's change sat past that point in
 // two files of 33 KB and 40 KB: of 121 lines it added, the review was shown 1.
 const longFile = change => Array.from({length: 400}, (_, index) => change(index + 1) ?? `export const line${index + 1} = ${index + 1};`).join('\n') + '\n';
@@ -254,7 +254,7 @@ test('a file that changed in the checkout since the copy says its diff is only a
   assert.equal(artifact.diff.startsWith('--- a/src/long.js\n+++ b/src/long.js\n[bounce could not read this file as it was before the change, so this is not a diff: the first 4096 characters before (-) and after (+)]\n-export const line1 = 1;\n'), true);
 });
 
-// Found live (ACE e3bd01d5): 8 of 31 reviews were refused as too long, their diffs 75,000 to 750,000
+// Found live (session e3bd01d5): 8 of 31 reviews were refused as too long, their diffs 75,000 to 750,000
 // characters of test logs under evidence/. TypeSafe: "Accuracy falls as the state grows with content
 // unrelated to the decision. Send only the fields the question needs."
 test('what a review is sent leaves out evidence and logs, and names them', () => {
@@ -265,13 +265,13 @@ test('what a review is sent leaves out evidence and logs, and names them', () =>
   write(workspace.cwd, 'evidence/p6/final-gate/test-1.log', `${'ok line\n'.repeat(500)}`);
   write(workspace.cwd, 'evidence/p6/final-gate/report.md', 'VERDICT: PASS\n');
   write(workspace.cwd, 'build/logs/run.txt', 'started\n');
-  write(workspace.cwd, 'docs/changelog.md', 'one line about logs and evidence\n');
+  write(workspace.cwd, 'notes/changelog.md', 'one line about logs and evidence\n');
 
   const artifact = captureArtifact(workspace);
   const shown = reviewDiff(artifact);
 
   assert.deepEqual(shown.split('\n').filter(line => /^(---|\+\+\+) /.test(line)), [
-    '--- /dev/null', '+++ b/docs/changelog.md',
+    '--- /dev/null', '+++ b/notes/changelog.md',
     '--- a/src/a.js', '+++ b/src/a.js',
   ]);
   assert.equal(shown.endsWith([
@@ -291,4 +291,130 @@ test('what a review is sent is the whole diff when nothing in it is evidence or 
   write(workspace.cwd, 'src/a.js', 'export const value = 2;\n');
   const artifact = captureArtifact(workspace);
   assert.equal(reviewDiff(artifact), artifact.diff);
+});
+
+// Found live (session fb6036ee, 2026-10-24): a builder compiled its binaries into the ignored dist/ and an analyst's
+// script left a __pycache__ .pyc, and the whole artifact was refused for those files alone. A binary or large file
+// the project's .gitignore ignores is left out and named; the rest integrates. One the project tracks still refuses.
+test('an ignored binary or large file is left out and named; the rest of the work integrates', t => {
+  const {source, dir} = setup(t);
+  const git = (...args) => execFileSync('git', args, {cwd: source, stdio: 'ignore'});
+  write(source, '.gitignore', 'dist/\n');
+  write(source, 'src/x.js', 'old\n');
+  git('init', '-q'); git('add', '.'); git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'base');
+  const ws = createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'ignored'});
+  write(ws.cwd, 'dist/kb', Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0, 1]));
+  write(ws.cwd, 'src/x.js', 'new\n');
+  const artifact = captureArtifact(ws);
+  assert.deepEqual(artifact.unsupported, []);
+  assert.deepEqual(artifact.leftOut, [{path: 'dist/kb', reason: 'binary'}]);
+  assert.deepEqual(artifact.changes.map(change => change.path), ['src/x.js']);
+  assert.equal(integrateArtifact({cwd: source, artifact, dir}).status, 'integrated');
+  assert.equal(fs.readFileSync(path.join(source, 'src/x.js'), 'utf8'), 'new\n');
+  assert.equal(fs.existsSync(path.join(source, 'dist')), false);
+
+  write(ws.cwd, 'tracked.bin', Buffer.from([0, 1, 2]));
+  assert.deepEqual(captureArtifact(ws).unsupported, [{path: 'tracked.bin', reason: 'binary'}], 'a binary the project would track still refuses');
+});
+
+// Found live (2026-10-26): two parallel tasks each added a line to docs/PROGRESS.md; the second was refused whole
+// ("Artifact integration conflict: docs/PROGRESS.md") and the orchestrator copied its files over by hand. A text file
+// changed on both sides is merged three ways against the copy's own baseline; only edits that overlap still conflict.
+const gitRepo = (dir, files) => {
+  for (const [name, value] of Object.entries(files)) write(dir, name, value);
+  const git = (...args) => execFileSync('git', args, {cwd: dir, stdio: 'ignore'});
+  git('init', '-q'); git('add', '-A'); git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'init');
+};
+const LOG = 'top\n\none\ntwo\nthree\nfour\nfive\nsix\n\nbottom\n';
+
+test('a text file changed in the checkout and in the copy is merged when the edits do not overlap', () => {
+  const {source, dir} = setup(test);
+  gitRepo(source, {'PROGRESS.md': LOG});
+  const copy = createAttemptWorkspace({cwd: source, dir, owns: ['PROGRESS.md'], attemptId: 'merge'});
+  write(copy.cwd, 'PROGRESS.md', LOG.replace('top\n', 'top\n- the copy\'s entry\n'));
+  write(source, 'PROGRESS.md', LOG.replace('bottom\n', 'bottom\n- the checkout\'s entry\n'));
+  const artifact = captureArtifact(copy);
+  const result = integrateArtifact({cwd: source, dir, artifact, base: copy.cwd});
+  assert.equal(result.status, 'integrated');
+  assert.deepEqual(result.merged, ['PROGRESS.md']);
+  assert.equal(fs.readFileSync(path.join(source, 'PROGRESS.md'), 'utf8'), LOG.replace('top\n', 'top\n- the copy\'s entry\n').replace('bottom\n', 'bottom\n- the checkout\'s entry\n'));
+  assert.equal(integrateArtifact({cwd: source, dir, artifact, base: copy.cwd}).status, 'integrated', 'integrating again after a restart finds it done');
+  const moved = advanceBaseline(copy, artifact, result.mergedStates);
+  assert.equal(moved.baseline['PROGRESS.md'].hash, crypto.createHash('sha256').update(fs.readFileSync(path.join(source, 'PROGRESS.md'))).digest('hex'));
+});
+
+// Found live (a session): two entries added at the same line of a project's progress log, a real conflict for a line merge, and
+// the whole task was refused. In a Markdown file, two sides that only ADDED lines keep both: the checkout's, then the copy's.
+test('two Markdown entries added at the same place both land, the checkout\'s first', () => {
+  const {source, dir} = setup(test);
+  gitRepo(source, {'PROGRESS.md': LOG});
+  const copy = createAttemptWorkspace({cwd: source, dir, owns: ['PROGRESS.md'], attemptId: 'same-place'});
+  write(copy.cwd, 'PROGRESS.md', LOG.replace('top\n', 'top\n- the copy\'s entry\n'));
+  write(source, 'PROGRESS.md', LOG.replace('top\n', 'top\n- the checkout\'s entry\n'));
+  const result = integrateArtifact({cwd: source, dir, artifact: captureArtifact(copy), base: copy.cwd});
+  assert.equal(result.status, 'integrated');
+  assert.deepEqual(result.merged, ['PROGRESS.md']);
+  assert.equal(fs.readFileSync(path.join(source, 'PROGRESS.md'), 'utf8'), LOG.replace('top\n', 'top\n- the checkout\'s entry\n- the copy\'s entry\n'));
+});
+
+test('edits that overlap, and a file with no baseline to merge against, still conflict, untouched, every file named', () => {
+  const {source, dir} = setup(test);
+  gitRepo(source, {'PROGRESS.md': LOG, 'src/a.js': 'one\n'});
+  const copy = createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'overlap'});
+  write(copy.cwd, 'PROGRESS.md', LOG.replace('one\n', 'one, as the copy has it\n'));
+  write(source, 'PROGRESS.md', LOG.replace('one\n', 'one, as the checkout has it\n'));
+  write(copy.cwd, 'src/a.js', 'two\n');
+  write(source, 'src/a.js', 'three\n');
+  const refused = integrateArtifact({cwd: source, dir, artifact: captureArtifact(copy), base: copy.cwd});
+  assert.equal(refused.status, 'conflict');
+  assert.deepEqual(refused.paths, ['PROGRESS.md', 'src/a.js']);
+  assert.equal(fs.readFileSync(path.join(source, 'PROGRESS.md'), 'utf8'), LOG.replace('one\n', 'one, as the checkout has it\n'));
+  write(source, 'src/a.js', 'one\n');
+  write(source, 'PROGRESS.md', LOG.replace('top\n', 'top\n- the checkout\'s entry\n'));
+  const other = createAttemptWorkspace({cwd: source, dir, owns: ['PROGRESS.md'], attemptId: 'nobase'});
+  write(other.cwd, 'PROGRESS.md', fs.readFileSync(path.join(source, 'PROGRESS.md'), 'utf8').replace('bottom\n', 'bottom\n- mine\n'));
+  write(source, 'PROGRESS.md', LOG);
+  assert.equal(integrateArtifact({cwd: source, dir, artifact: captureArtifact(other)}).status, 'conflict', 'no copy to read the baseline from');
+});
+
+// The live case exactly: docs/ is a repository of its own, ignored by the project's, so the copy's baseline commit has
+// no docs/PROGRESS.md to merge against. The copy keeps such a text file's content by hash when it is made.
+test('a text file outside the baseline commit (a nested, ignored repository) is merged from the content the copy kept', () => {
+  const {source, dir} = setup(test);
+  gitRepo(source, {'.gitignore': 'docs/\n', 'src/a.js': 'a\n'});
+  gitRepo(path.join(source, 'docs'), {'PROGRESS.md': LOG});
+  const copy = createAttemptWorkspace({cwd: source, dir, owns: ['docs/PROGRESS.md'], attemptId: 'nested'});
+  write(copy.cwd, 'docs/PROGRESS.md', LOG.replace('top\n', 'top\n- step 11\n'));
+  write(source, 'docs/PROGRESS.md', LOG.replace('bottom\n', 'bottom\n- step 10\n'));
+  const result = integrateArtifact({cwd: source, dir, artifact: captureArtifact(copy), base: copy.cwd});
+  assert.equal(result.status, 'integrated');
+  assert.equal(fs.readFileSync(path.join(source, 'docs/PROGRESS.md'), 'utf8'), LOG.replace('top\n', 'top\n- step 11\n').replace('bottom\n', 'bottom\n- step 10\n'));
+});
+
+// Found live (a session): two tasks were refused with a conflict whose copy's change was already in the checkout: a
+// worker's three ignore lines the checkout had also appended at the same place (among more), and a test file where
+// the checkout had the copy's same edits and a longer block appended where the copy appended its own. Taking the
+// checkout loses nothing; a different edit of the same line still conflicts.
+test('a copy whose change the checkout already holds integrates as the checkout, and a different edit of the line still conflicts', () => {
+  const {source, dir} = setup(test);
+  const IGNORE = 'node_modules\n.git\ndb\n';
+  const SPEC = 'a\nb\nc\nd\nend\n';
+  gitRepo(source, {'.dockerignore': IGNORE, 'spec.ts': SPEC, 'TABLE.md': '| x | 1 |\n| y | 2 |\n'});
+  const copy = createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'contained'});
+  write(copy.cwd, '.dockerignore', `${IGNORE}\n!db/\n!db/migrations/\n`);
+  write(source, '.dockerignore', `${IGNORE.replace('db\n', 'db/*\n')}\nexports\n!db/\n!db/migrations/\n# deploy\n`);
+  write(copy.cwd, 'spec.ts', SPEC.replace('b\n', 'B\n').replace('end\n', 'end\nnew 1\nnew 2\n'));
+  write(source, 'spec.ts', SPEC.replace('b\n', 'B\n').replace('end\n', 'end\nnew 1\nnew 2\nnew 3\n'));
+  const artifact = captureArtifact(copy);
+  const result = integrateArtifact({cwd: source, dir, artifact, base: copy.cwd});
+  assert.equal(result.status, 'integrated', JSON.stringify(result.paths));
+  assert.deepEqual(result.merged.sort(), ['.dockerignore', 'spec.ts']);
+  assert.equal(fs.readFileSync(path.join(source, 'spec.ts'), 'utf8'), SPEC.replace('b\n', 'B\n').replace('end\n', 'end\nnew 1\nnew 2\nnew 3\n'));
+
+  const row = createAttemptWorkspace({cwd: source, dir, owns: ['TABLE.md'], attemptId: 'row'});
+  write(row.cwd, 'TABLE.md', '| x | 1, as the copy has it |\n| y | 2 |\n');
+  write(source, 'TABLE.md', '| x | 1, as the checkout has it |\n| y | 2 |\n');
+  assert.equal(integrateArtifact({cwd: source, dir, artifact: captureArtifact(row), base: row.cwd}).status, 'conflict');
+  write(row.cwd, 'TABLE.md', '| y | 2 |\n');
+  assert.equal(integrateArtifact({cwd: source, dir, artifact: captureArtifact(row), base: row.cwd}).status, 'conflict', 'a deletion of a row the checkout changed is not held by it');
 });

@@ -4,16 +4,19 @@ import {resolveExecutable} from './executable.js';
 import {createMainClient} from './main-client.js';
 import {createInkTerminal} from './tui/ink-terminal.js';
 import {workspaceColumns} from './tui/Workspace.js';
-import {doingNow} from './tui/status.js';
+import {doingNow, isWorking} from './tui/status.js';
 import {suggestionFrom, lastAnswer} from './tui/suggestion.js';
 import {headerProvider, chooseModel, chooseOrder} from './cli-view.js';
-import {backspace, clampCursor, deleteForward, deleteWordBackward, deleteWordForward, insertText, moveCursor, moveLineEnd, moveLineStart, moveVertical, moveWord} from './tui/editor.js';
+import {backspace, clampCursor, createUndo, deleteForward, deleteWordBackward, deleteWordForward, insertText, killLineEnd, killWordBackward, moveCursor, moveLineEnd, moveLineStart, moveVertical, moveWord} from './tui/editor.js';
+import {collapsePaste, expandPastes} from './tui/pastes.js';
+import {createPromptHistory} from './prompt-history.js';
 import {inputDisposition} from './commands.js';
-import {commands as ownCommands, completions, typedCommand, inputLayout, windowAround, modelRows, checklistRows} from './terminal.js';
+import {commands as ownCommands, completions, mentionAt, typedCommand, inputLayout, wordRows, windowAround, modelRows, checklistRows} from './terminal.js';
+import {matchFiles, workspaceFiles} from './tui/files.js';
 import {modelCatalog, modelEntries, catalogNotes} from './models.js';
 import {discoverLocalModels, switchLocal} from './local-models.js';
 import {readMachine, resourceReport, createResources} from './resources.js';
-import {taskView, taskList} from './task-view.js';
+import {taskView, taskList, taskByRef} from './task-view.js';
 import {configCommand, SETTINGS, settingsEntries, nextValue, filterEntries} from './settings-command.js';
 import {sessionStats, formatStats, compareStats, taskLines} from './stats.js';
 import {rosterLines} from './workers.js';
@@ -24,11 +27,13 @@ import {activateLocalProfiles} from './local-activation.js';
 import {jevCommand} from './jev-command.js';
 import {jevSidebarLabel} from './jev.js';
 import {rolesFor, agentStore, agentsCommand, agentTable, handAIsToJev} from './agents.js';
+import {bindingsCommand, bindingUpdatesNotice, bindingUpdates, bindingsFile, readBindings} from './bindings.js';
 import {createInterface} from 'node:readline';
+import {listCopies, copyTable, chooseCopies, removeCopies} from './prune.js';
 import stringWidth from 'string-width';
 import {clean, createFormatter, createWorkSummary, workReview, withAsides, continueMain} from './format.js';
 import {validateOrchestration} from './profiles.js';
-import {loadQuota, recordQuota, refreshQuota, quotaSnapshot, quotaShort, quotaPanel, modelPanel, quotaReport, quotaUnavailable, usageOrder} from './quota.js';
+import {loadQuota, recordQuota, refreshQuota, quotaSnapshot, quotaShort, quotaPanel, quotaStrip, modelPanel, quotaReport, quotaUnavailable, usageOrder} from './quota.js';
 import {skillsCommand, syncSkills, inspectSkills, skillsChanged, importCandidates, importSelected, importSummary, importOrigin, syncSummary, skillAreas} from './skills.js';
 import {expandVendorCommand, findVendorCommand, vendorCommandRows} from './vendor-commands.js';
 import fs from 'node:fs';
@@ -37,9 +42,11 @@ import path from 'node:path';
 import {spawn, spawnSync} from 'node:child_process';
 import {randomUUID} from 'node:crypto';
 
-import {parseArgs} from 'node:util';
+import {parseArgs, isDeepStrictEqual} from 'node:util';
 import {Session, Router, config, saveJSON, dataRoot} from './core.js';
 import * as reducers from './reducers.js';
+import {pendingMainActions} from './continuations.js';
+import {handoffBlock} from './main-service.js';
 import {providers, runProcess} from './providers.js';
 import {projectRoot, fingerprint, validate, supervise, pidAlive} from './reload.js';
 import {listSessions, resolveSessionRef, sessionsTable, sessionAge} from './sessions.js';
@@ -49,6 +56,7 @@ import {createRemoteSession} from './remote.js';
 import {version, checkUpdate, globalInstall, installUpdate} from './update.js';
 import {helpText, helpRows} from './help.js';
 import {codexHome} from './codex-home.js';
+import {copyToClipboard} from './clipboard.js';
 
 // Every Codex process bounce starts — workers, the orchestrator, one-off calls, quota and catalog
 // queries, `bounce login codex` — inherits bounce's own Codex home, never the desktop app's ~/.codex.
@@ -71,7 +79,7 @@ async function main() {
     image: {type: 'string', multiple: true}, cwd: {type: 'string'}, resume: {type: 'string'}, provider: {type: 'string'}, model: {type: 'string'},
     mode: {type: 'string'}, json: {type: 'boolean'}, verify: {type: 'boolean'}, help: {type: 'boolean', short: 'h'}, version: {type: 'boolean', short: 'v'},
     check: {type: 'boolean'}, scope: {type: 'string'}, force: {type: 'boolean'}, list: {type: 'boolean'}, all: {type: 'boolean'}, session: {type: 'string'}, report: {type: 'boolean'},
-    save: {type: 'boolean'}, 'allow-network': {type: 'boolean'}, tasks: {type: 'boolean'}, against: {type: 'string'},
+    save: {type: 'boolean'}, fix: {type: 'boolean'}, 'allow-network': {type: 'boolean'}, tasks: {type: 'boolean'}, against: {type: 'string'}, control: {type: 'boolean'},
   }});
   if (values.help) return console.log(helpText(process.stdout.columns || 100));
   if (values.version) return console.log(`bounce ${version}`);
@@ -100,7 +108,7 @@ async function main() {
       const lines = createInterface({input: process.stdin, output: process.stdout, terminal: Boolean(process.stdin.isTTY && process.stdout.isTTY)});
       const iterator = lines[Symbol.asyncIterator]();
       try {
-        await runLocalSetup({settings: materialiseRoster(settings), cwd, roles, agentsDir: agentStore(root),
+        await runLocalSetup({settings: materialiseRoster(settings), root, cwd, roles,
           ask: async question => {process.stdout.write(question); const answer = await iterator.next(); return answer.done ? null : answer.value;},
           write: text => console.log(text),
           save: next => {
@@ -130,9 +138,10 @@ async function main() {
       const status = await gatherLocalStatus({settings, verify: values.verify, model: positionals[2],
         executables: settings.executables ?? {}, roles});
       if (values.json) return console.log(JSON.stringify(status, null, 2));
+      const {teamHeader} = await import('./agents.js');
       console.log(formatLocalStatus(status, {
         verifyHint: 'run `bounce local --verify` to prove the bridge with a one-line test turn',
-        setupHint: 'run `bounce local setup`'}).join('\n'));
+        setupHint: 'run `bounce local setup`', teamHeader: teamHeader(roles, {root, cwd})}).join('\n'));
       if (status.problem) process.exitCode = 1;
       return;
     }
@@ -184,6 +193,25 @@ async function main() {
     if (values.json) return console.log(JSON.stringify({machine, fleet}, null, 2));
     return console.log(resourceReport({machine, fleet, busy: []}));
   }
+  if (positionals[0] === 'prune') {
+    const copies = listCopies({root});
+    if (values.json) return console.log(JSON.stringify(copies, null, 2));
+    console.log(copyTable(copies));
+    if (!copies.some(copy => !copy.live)) return;
+    if (!process.stdin.isTTY) return console.log('\nRun bounce prune in a terminal to choose which to remove.');
+    const prompt = createInterface({input: process.stdin, output: process.stdout});
+    let chosen = null;
+    while (chosen === null) {
+      const answer = await new Promise(resolve => prompt.question('\nRemove which? y = all, n = none, or numbers (1,3-5): ', resolve));
+      chosen = chooseCopies(answer, copies);
+      if (chosen === null) console.log('Answer y, n, or numbers from the list.');
+    }
+    prompt.close();
+    const {removed, failed} = await removeCopies(chosen);
+    console.log(`Removed ${removed.length} ${removed.length === 1 ? 'copy' : 'copies'}.${copies.some(copy => copy.live) ? ' Copies of running tasks were kept.' : ''}`);
+    for (const {copy, error} of failed) console.log(`Could not remove ${copy.name}: ${error}`);
+    return;
+  }
   if (positionals[0] === 'quota') {
     const store = await refreshQuota(settings, {root, cwd});
     // Every vendor the config can spend on: the validated roster, so a vendor reached only
@@ -210,15 +238,20 @@ async function main() {
     }
     return console.log(values.json ? JSON.stringify(report, null, 2) : text);
   }
+  if (positionals[0] === 'bindings') {
+    const catalogs = positionals[1] === 'update' ? await modelCatalog(settings, {maxAge: 0}) : [];
+    const {text, report} = bindingsCommand(positionals.slice(1), {root, cwd, catalogs, save: values.save});
+    return console.log(values.json ? JSON.stringify(report, null, 2) : text);
+  }
   if (positionals[0] === 'skills') {
     const options = {root, scope: values.scope || settings.skills.scope, cwd, base: process.cwd()};
     const {text, report} = skillsCommand([...positionals.slice(1), ...(values.force ? ['--force'] : []), ...(values.list ? ['--list'] : [])], options);
     return console.log(values.json ? JSON.stringify(report ?? inspectSkills(options), null, 2) : text);
   }
-  // CONTRACT.md #5 bullet 4: the built-in A/B, legacy CLI path, no daemon. Unknown session/task
+  // The built-in A/B, legacy CLI path, no daemon. Unknown session/task
   // is a thrown Error, which the top-level .catch prints to stderr and exits 1 (same convention
   // as every other legacy command's error here, e.g. Session's own "Session not found").
-  // Registering that server with the agents, so nobody edits a config by hand (Daniel: "let bounce do it").
+  // Registering that server with the agents, so nobody edits a config by hand (the user: "let bounce do it").
   if (positionals[0] === 'mcp' && ['install', 'uninstall'].includes(positionals[1])) {
     const {withCodexEntry, withoutCodexEntry} = await import('./mcp-install.js');
     const installing = positionals[1] === 'install';
@@ -241,8 +274,16 @@ async function main() {
     said.push(`claude: ${claude.error ? `not installed here (${claude.error.code})` : claude.status === 0 ? (installing ? 'registered' : 'removed') : (claude.stderr || claude.stdout || 'refused').trim().split('\n')[0]}`);
     return console.log(said.join('\n'));
   }
-  // The agent-facing interface over MCP (docs/plans/bridge-interface.md): the same verbs and views the
+  // The agent-facing interface over MCP: the same verbs and views the
   // bridge and these commands use, as typed tools, so an orchestrator stops shelling and parsing.
+  // The user's side (src/mcp-control.js): send the orchestrator a message as if typed in its view.
+  if (positionals[0] === 'mcp-serve' && values.control) {
+    const {createControlServer, insideBounce} = await import('./mcp-control.js');
+    const {serveStdio} = await import('./mcp.js');
+    const {connectSession} = await import('./send.js');
+    serveStdio(createControlServer({sessions: () => listSessions(root), connect: id => connectSession(root, id), events: id => new Session(process.cwd(), {root, id}).events, version, inside: insideBounce(process.env)}));
+    return new Promise(() => {});
+  }
   if (positionals[0] === 'mcp-serve') {
     const {createOps, sessionBinding} = await import('./bridge-ops.js');
     const {createMcpServer, serveStdio} = await import('./mcp.js');
@@ -276,14 +317,14 @@ async function main() {
     const target = new Session(process.cwd(), {root, id});
     const journal = path.join(root, 'sessions', id, 'journal.jsonl');
     if (positionals[1]) {
-      const view = taskView(target.events, positionals[1], {journal, report: Boolean(values.report)});
+      const view = taskView(target.events, taskByRef(reducers.tasks(target.events), positionals[1]), {journal, report: Boolean(values.report)});
       if (!view) throw new Error(`Unknown task: ${positionals[1]}`);
       return console.log(values.json ? JSON.stringify(view, null, 2) : formatTaskView(view));
     }
     const rows = taskList(target.events, {all: Boolean(values.all)});
     return console.log(values.json ? JSON.stringify(rows, null, 2) : formatTaskList(rows));
   }
-  // bounce stats [--session REF] [--json] [--tasks] [--against REF] (docs/plans/analytics.md): what a session
+  // bounce stats [--session REF] [--json] [--tasks] [--against REF]: what a session
   // cost and what it got, from its journal alone.
   if (positionals[0] === 'stats') {
     const ref = values.session || positionals[1] || listSessions(root).find(row => row.live)?.id || listSessions(root)[0]?.id;
@@ -324,6 +365,17 @@ async function main() {
         child.once('close', code => {clearTimeout(timer); console.log(`${provider} (${resolveExecutable(provider, settings.executables[provider])}): ${code === 0 ? clean(out.trim()) : 'not available'} · ${quotaShort(quotas[provider]) || quotas[provider]?.error || quotaUnavailable(provider)}`); resolve();});
       });
     }
+    // Local workers run through opencode, whose 1.x and 2.x are driven differently: say which one
+    // bounce found and whether it can drive it; --fix installs a verified one for bounce alone.
+    const {opencodeVersion, opencodeStatus, fixOpencode, FIX_VERSION} = await import('./opencode-version.js');
+    const opencode = resolveExecutable('opencode', settings.executables.opencode);
+    const status = opencodeStatus(opencodeVersion(opencode));
+    console.log(`opencode (${opencode}): ${status.text}`);
+    if (!status.ok && values.fix) {
+      console.log(`Installing opencode ${FIX_VERSION} for bounce…`);
+      const fixed = fixOpencode({root});
+      console.log(`opencode (${fixed.binary}): ${opencodeStatus(opencodeVersion(fixed.binary)).text} · saved as executables.opencode`);
+    } else if (!status.ok) console.log(`  bounce doctor --fix installs opencode ${FIX_VERSION} under ${path.join(root, 'opencode')} and points bounce at it; your own opencode is left alone`);
     return;
   }
   if (positionals.length && !['run', 'dev'].includes(positionals[0])) throw new Error('Unknown command. Use --help.');
@@ -341,6 +393,7 @@ async function main() {
     migratedPolicies.length ? `Local models now load on demand (${migratedPolicies.map(name => name.split('.')[1]).join(', ')}: the old loaded-only default was dropped).` : '',
   ].filter(Boolean).join(' ');
   let skillNotice = '';
+  let pruneListed = null; // the copies /prune last listed, which its numbers refer to
   if (settings.skills.autoSync) {
     try { if (skillsChanged(syncSkills({root, scope: settings.skills.scope, cwd}))) skillNotice = 'Skills installed to your agents.'; }
     catch (error) { skillNotice = `Skills not synced: ${error.message}`; }
@@ -360,6 +413,8 @@ async function main() {
   // The main profile selects the initial provider/model/mode. Keep legacy order available
   // for daemon failover when the profile has no explicit fallback list.
   const orchestrating = process.env.BOUNCE_ROLE === 'orchestrator' && !!process.env.BOUNCE_ORCHESTRATOR_PROFILE;
+  // Classic draws inline unless `inline` is off; the orchestrator never does.
+  const inlineView = !orchestrating && settings.inline !== false;
   if (orchestrating) {
     const profile = JSON.parse(process.env.BOUNCE_ORCHESTRATOR_PROFILE);
     settings.order = positionals[0] === 'run' ? [profile.adapter]
@@ -407,8 +462,15 @@ async function main() {
     process.on('SIGINT', cancel); process.on('SIGTERM', cancel);
     const typed = positionals.slice(1).join(' ');
     const expanded = typed.startsWith('/') ? expandVendorCommand(typed, {root, cwd: session.cwd}) : null;
-    try { const result = await router.run(orchestratorBrief + (expanded?.prompt ?? typed), values.image || [], expanded ? {typed} : {}); process.exitCode = result === 'completed' ? 0 : result === 'cancelled' ? 130 : 1; }
-    finally { session.unlock(); process.off('SIGINT', cancel); process.off('SIGTERM', cancel); }
+    try {
+      let result = await router.run(orchestratorBrief + (expanded?.prompt ?? typed), values.image || [], expanded ? {typed} : {});
+      // Orchestrated, the first turn usually only dispatches: the job goes on until no outcome is left to hand over.
+      const carried = orchestrating && result === 'completed' ? await carryJob({session, turn: text => router.run(orchestratorBrief + text)}) : null;
+      if (carried) result = carried.status;
+      if (carried?.waiting.length) console.log(`[router:waiting] ${carried.waiting.map(t => `${t.id.slice(0, 8)} (${t.profile ?? 'task'})`).join(', ')} need${carried.waiting.length === 1 ? 's' : ''} your answer: bounce --resume ${session.id.slice(0, 8)}`);
+      process.exitCode = carried?.waiting.length ? 2 : result === 'completed' ? 0 : result === 'cancelled' ? 130 : 1;
+    }
+    finally { router.close?.(); session.unlock(); process.off('SIGINT', cancel); process.off('SIGTERM', cancel); }
     // `run` is always this process's whole job, and under the supervisor's daemon
     // apparatus this session is a RemoteSession that keeps the IPC channel actively
     // ref'd (createRemoteSession sends/receives on it): without an explicit exit the
@@ -449,7 +511,7 @@ async function main() {
     if (busy) throw new Error('Live steering requires an orchestrator session');
     asides.push(text);
     session.append({kind: 'aside', text});
-    notice = `Saved aside for the next orchestrator prompt · ${asides.length} pending`;
+    notice = `Saved aside for the next ${orchestration.operation === 'orchestrator' ? 'orchestrator prompt' : 'turn'} · ${asides.length} pending`;
   }
   // The agent workspace is TUI-local: one focusable pane for the orchestrator and one per worker.
   // Its selection is never journaled and never changes task/model lifecycle state.
@@ -484,7 +546,7 @@ async function main() {
   let activityTimer, activityStarted = 0, progress = '', busySince = null;
   const activity = () => `${['◐', '◓', '◑', '◒'][Math.floor((Date.now() - activityStarted) / 150) % 4]} Working · ${Math.floor((Date.now() - activityStarted) / 1000)}s`;
   let loadedFingerprint = fingerprint();
-  let completionIndex = 0, menuDismissed = false, copyPaused = false;
+  let completionIndex = 0, menuDismissed = false;
   // On by default: the wheel scrolls the transcript, which is what a scroll gesture means here.
   // F3 hands the mouse back to the terminal for drag-selection and link clicks.
   let mouseScroll = true;
@@ -509,10 +571,35 @@ async function main() {
     return vendorCache.rows;
   };
   const vendorCommand = name => !!findVendorCommand(name, vendorOptions());
-  const suggestions = () => menuDismissed ? [] : completions(input, vendorRows);
-  const acceptCompletion = () => {const options = suggestions(); if (options.length) {input = '/' + options[completionIndex % options.length][0] + ' '; inputCursor = input.length; completionIndex = 0; menuDismissed = false; return true;} return false;};
-  let notice = [restarted?.updateNotice, migrationNotice, skillNotice, 'Ready. Mouse wheel scrolls the transcript · Option-drag selects text (F3 turns the wheel off) · F2 pause for copying · /help'].filter(Boolean).join(' ');
-  const history = session.events.filter(e => e.kind === 'user').map(e => e.typed ?? e.text);
+  // The menu under the draft: workspace files while the caret is in an @mention, else slash commands.
+  const suggestions = () => {
+    if (menuDismissed || textPrompt) return [];
+    const mention = mentionAt(input, inputCursor);
+    if (mention) return matchFiles(workspaceFiles(session.cwd), mention.query).map(file => [file, '', 'file']);
+    return completions(input, vendorRows);
+  };
+  const acceptCompletion = () => {
+    const options = suggestions();
+    if (!options.length) return false;
+    const [name, , kind] = options[completionIndex % options.length];
+    const mention = kind === 'file' ? mentionAt(input, inputCursor) : null;
+    if (mention) { input = `${input.slice(0, mention.start)}@${name} ${input.slice(mention.end)}`; inputCursor = mention.start + name.length + 2; }
+    else { input = '/' + name + ' '; inputCursor = input.length; }
+    completionIndex = 0; menuDismissed = false; return true;
+  };
+  let notice = [restarted?.updateNotice, migrationNotice, skillNotice, 'Ready. Drag to select and copy · the wheel scrolls what is under it · /help'].filter(Boolean).join(' ');
+  // ↑ and Ctrl+R walk what was typed in this workspace before, across sessions (src/prompt-history.js), then this
+  // session's own prompts; each prompt once, at its latest place.
+  const promptHistory = createPromptHistory({root, cwd: session.cwd});
+  const typedHere = session.events.filter(e => e.kind === 'user').map(e => e.typed ?? e.text);
+  const history = [...promptHistory.entries(), ...typedHere].filter((entry, index, all) => all.lastIndexOf(entry) === index);
+  const remember = text => { const at = history.lastIndexOf(text); if (at >= 0) history.splice(at, 1); history.push(text); promptHistory.add(text); historyIndex = -1; };
+  // The draft's own memory: undo, the last killed text for Ctrl+Y, large pastes behind their placeholders, a
+  // reverse search in progress, and when Esc and Ctrl+C were last pressed (a second press within the window acts).
+  const undo = createUndo();
+  const pastes = new Map();
+  let killed = '', reverseSearch = null, lastEscape = 0, lastCtrlC = 0;
+  const DOUBLE_PRESS_MS = 2000, DOUBLE_ESCAPE_MS = 500, DRAFT_CLEARED = 'Draft cleared · Ctrl+_ brings it back';
   // What the next turn runs on: the orchestrator profile in orchestrator mode, else the active agent.
   const selected = () => headerProvider({settings, orchestration, active: session.active}).provider;
   const setupDefaults = {};
@@ -532,7 +619,8 @@ async function main() {
     const current = () => fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
     const baseline = current();
     const initial = materialiseRoster(config(root));
-    const view = createLocalSetupView({settings: initial, cwd: session.cwd, loadedOnly, roles, agentsDir: agentStore(root),
+    const before = rolesFor(root, {cwd: session.cwd});
+    const view = createLocalSetupView({settings: initial, root, cwd: session.cwd, loadedOnly, roles: before,
       onChange: render,
       save: async next => {
         if (current() !== baseline) throw new Error('Configuration changed during setup; nothing saved. Rerun /local setup.');
@@ -546,10 +634,12 @@ async function main() {
           if (Object.hasOwn(next, key)) setupDefaults[key] = next[key];
         }
       }});
-    // Agent files written by setup are activated once the wizard has finished writing them (they
-    // land after `save`), so the roster the orchestrator reads is the one the user just chose.
+    // Setup writes models.yaml, bindings.yml and agent files after `save`; once it has, the agents
+    // whose chain they changed are swapped into the session, so the roster read is the one just chosen.
     const activateAgents = async () => {
-      const agents = view.state.result?.agents ?? [];
+      const after = rolesFor(root, {cwd: session.cwd});
+      const agents = [...after.values()].filter(role => !role.error && !isDeepStrictEqual(
+        [role.models, role.chainSettings, role.policy], [before.get(role.name)?.models, before.get(role.name)?.chainSettings, before.get(role.name)?.policy])).map(role => role.name);
       if (!agents.length) return '';
       try { await activateLocalProfiles(session, agents); return `agents ${agents.join(', ')} active in this session`; }
       catch (error) { return `agents saved but not live: ${error.message}`; }
@@ -587,7 +677,7 @@ async function main() {
   }
   // /config's panel (src/settings-command.js): the rows are the settings, Enter flips a boolean, cycles a choice or
   // asks for a value, `u` returns a setting to its default, every change saved and validated on the spot.
-  // Daniel, 2026-10-01: a listing is not what other harnesses do; a panel is.
+  // 2026-10-01: a listing is not what other harnesses do; a panel is.
   function openConfigPanel(index = 0, notes = [], filter = '') {
     const all = settingsEntries(root);
     const entries = filterEntries(all, filter);
@@ -702,7 +792,7 @@ async function main() {
         session.append({kind: 'note', text: `Unsent draft for ${previous}:\n${unsent}`});
       }
     }
-    const {content: width} = workspaceColumns(process.stdout.columns || 80, {sidebar: settings.sidebar});
+    const {content: width} = workspaceColumns(process.stdout.columns || 80, {sidebar: settings.sidebar, inline: inlineView});
     const terminalRows = process.stdout.rows || 24;
     const headerRows = 1;
     const target = textPrompt ? `${textPrompt.label} › ` : localSetup ? 'setup › ' : agentsOpen ? `${inputTarget()} › ` : '';
@@ -726,9 +816,9 @@ async function main() {
       menu.push(['\u2191/\u2193 choose \u00b7 Enter resume \u00b7 Esc cancel', style.muted]);
     } else if (picker?.kind === 'config') {
       const selected = picker.entries[picker.index];
-      const explain = selected ? inputLayout(`${selected.key}: ${selected.meta.help}`, width - 2, 4).rows.map(row => `  ${row}`) : ['  No setting matches that filter · Backspace to widen it'];
+      const explain = selected ? wordRows(`${selected.key}: ${selected.meta.help}`, width - 2).slice(0, 4).map(row => `  ${row}`) : ['  No setting matches that filter · Backspace to widen it'];
       const {start, end} = windowAround(picker.entries.length, picker.index, Math.max(1, menuBudget - 3 - picker.notes.length - explain.length));
-      menu.push([`Settings · ${path.join(root, 'config.json')} · what the file does not set is a default${picker.filter ? ` · filter: ${picker.filter}` : ' · type to filter'}`, style.title]);
+      menu.push([`Settings${picker.filter ? ` · filter: ${picker.filter}` : ' · type to filter'} · ${path.join(root, 'config.json')} · what the file does not set is a default`, style.title]);
       for (let i = start; i < end; i++) menu.push([`${i === picker.index ? '\u203a' : ' '} ${picker.entries[i].label}`, i === picker.index ? style.selected : picker.entries[i].set ? style.result : plain]);
       for (const row of explain) menu.push([row, style.muted]);
       for (const note of picker.notes) menu.push([note, style.diagnostic]);
@@ -747,12 +837,13 @@ async function main() {
     } else if (options.length) {
       completionIndex = Math.min(completionIndex, options.length - 1);
       const start = Math.max(0, completionIndex - 3);
-      for (let i = start; i < Math.min(options.length, start + 5); i++) menu.push([`${i === completionIndex ? '›' : ' '} /${options[i][0]}  ${options[i][1]}`, i === completionIndex ? style.selected : style.muted]);
-      menu.push(['↑/↓ choose · Tab completes · Enter runs · Esc dismiss', style.muted]);
+      const files = options[0][2] === 'file';
+      for (let i = start; i < Math.min(options.length, start + 5); i++) menu.push([files ? `${i === completionIndex ? '›' : ' '} @${options[i][0]}` : `${i === completionIndex ? '›' : ' '} /${options[i][0]}  ${options[i][1]}`, i === completionIndex ? style.selected : style.muted]);
+      menu.push([files ? `↑/↓ choose · Tab or Enter inserts the path · Esc dismiss${options.length >= 50 ? ' · type more to narrow' : ''}` : '↑/↓ choose · Tab completes · Enter runs · Esc dismiss', style.muted]);
     } else if (localSetup) {
       const state = localSetup.state;
-      const question = inputLayout(state.question || 'Working… slash commands remain available', width, 3).rows;
-      const history = state.lines.flatMap(line => inputLayout(line, width, 100).rows);
+      const question = wordRows(state.question || 'Working… slash commands remain available', width).slice(-3);
+      const history = state.lines.flatMap(line => wordRows(line, width).slice(-100));
       const available = Math.max(0, Math.min(10, menuBudget - question.length - 2));
       menu.push([`Local setup · ${localSetup.loadedOnly ? 'currently loaded models' : 'auto-discovery'}`, style.title]);
       localSetup.scroll = Math.min(localSetup.scroll ?? 0, Math.max(0, history.length - available));
@@ -771,7 +862,7 @@ async function main() {
       main: {...session.main, text: progress || notice, operation: orchestration.operation, startedAt: (busySince = busy ? busySince || new Date().toISOString() : null),
         doing: busy ? doingNow(session.events.slice(-400), {tasks: reducers.tasks(session.events)}) : null},
       now: Date.now(),
-      notice: localSetup?.state.question || notice, paused: copyPaused, mouseScroll,
+      notice: localSetup?.state.question || notice, mouseScroll,
       menu: menu.map(([text, paint]) => paint(clean(text))),
       metadata: {
         ...headerProvider({settings, orchestration, active: session.active}), mode: settings.mode,
@@ -790,7 +881,9 @@ async function main() {
           const quotaLines = quotaPanel(quotas, quotaOrder(), {
             width: 28, now: Date.now(), rows: Math.max(4, sidebarRows - (modelLines.length ? modelLines.length + 1 : 0)), cooldowns: router.cooldowns, paint,
           });
-          return {quotaLines, modelLines};
+          // Where the sidebar is not drawn (inline, or a terminal too narrow for it), the box beside the prompt says it.
+          const usageLines = quotaStrip(quotas, quotaOrder(), {now: Date.now(), cooldowns: router.cooldowns, paint});
+          return {quotaLines, modelLines, usageLines};
         })(),
       },
     });
@@ -883,7 +976,7 @@ async function main() {
     try { await session.flush?.(); } catch {}
     process.exit(75);
   }
-  const quit = (detach = false) => { leave(); session.unlock(); void (async () => {
+  const quit = (detach = false) => { leave(); terminal?.unmount({scrollback: true}); if (!detach && process.stdout.isTTY) process.stdout.write(`\x1b[2mResume: bounce --resume ${session.id.slice(0, 8)}\x1b[22m\n`); router.close?.(); session.unlock(); void (async () => {
     try { await session.flush?.(); } catch {}
     if (!detach && process.env.BOUNCE_PERSISTENT_VIEW === '1') {
       await new Promise(resolve => process.send({type: 'control', action: 'quit'}, resolve));
@@ -898,16 +991,17 @@ async function main() {
     try {
       if (parsedCommand) {
         const {command, parts, arg} = parsedCommand;
+        notice = ''; // a command answers for itself: the last one's notice does not stand under it
         if (command === 'details') {
           if (!['', 'on', 'off'].includes(arg)) throw new Error('Use /details [on|off]');
           details = arg ? arg === 'on' : !details;
           scroll = 0;
-          notice = details ? 'Details expanded · /details to fold · PgUp/PgDn scroll' : 'Details folded · /details to expand';
+          notice = details ? `Details expanded · /details to fold${pageHint()}` : 'Details folded · /details to expand';
           render();
           return;
         }
         if (command === 'local') {
-          if (arg === 'cancel') {cancelLocalSetup(); return;}
+          if (arg === 'cancel') { if (!localSetup) throw new Error('No local setup is running'); cancelLocalSetup(); return; }
           if (arg === 'on' || arg === 'off') {
             // The switch, in `/jev on|off`'s words. Saved, then the agents that can still be played are
             // re-read into this session, so it applies to the next task without a restart.
@@ -922,6 +1016,7 @@ async function main() {
             return;
           }
           if (arg === 'activate' || arg.startsWith('activate ')) {
+            if (orchestration.operation !== 'orchestrator') throw new Error('/local activate re-reads agents into a running orchestrator · this session is classic');
             const saved = config(root);
             const requested = arg.slice('activate'.length).trim();
             const names = requested ? [requested] : [...rolesFor(root, {cwd: session.cwd}).values()].filter(role => !role.error && role.name !== saved.orchestrator).map(role => role.name);
@@ -991,7 +1086,7 @@ async function main() {
         if (command === 'review') {
           session.append({kind: 'review', text: workReview(workSummary(session.events))});
           scroll = 0;
-          notice = 'Work review · PgUp/PgDn scroll through all items';
+          notice = `Work review${pageHint(' through all items')}`;
           return;
         }
         if (command === 'provider') {
@@ -999,6 +1094,7 @@ async function main() {
           router.select(arg); settings.order = [arg, ...settings.order.filter(p => p !== arg)]; save();
         } else if (command === 'model') {
           if (!arg || arg === 'refresh') { await openModelPicker(arg === 'refresh'); return; }
+          if (selected() === 'opencode' && arg !== 'default' && !arg.includes('/')) throw new Error('OpenCode runs a local model, named <endpoint>/<id> like lmstudio/qwen3 · /model lists them');
           const chosen = chooseModel(settings, orchestration, {provider: selected(), model: arg === 'default' ? '' : arg});
           refreshOrchestration(); save();
           session.append({kind: 'status', text: orchestration.operation === 'orchestrator'
@@ -1012,7 +1108,7 @@ async function main() {
         } else if (command === 'stop') {
           if (orchestration.operation !== 'orchestrator') throw new Error('/stop is only available in orchestrator mode');
           if (!process.send) throw new Error('/stop needs the orchestrator daemon (run bounce with an orchestrator config)');
-          const task = arg.trim();
+          const task = arg.trim() ? taskByRef(reducers.tasks(session.events), arg.trim()) : '';
           process.send({type: 'control', action: task ? 'cancel' : 'stop', task: task || undefined});
           session.append({kind: 'status', text: task ? `Requested cancel of task ${task.slice(0, 8)}` : 'Requested stop of every running task'});
         } else if (command === 'unblock') {
@@ -1022,8 +1118,9 @@ async function main() {
           render(); return;
         } else if (command === 'msg') {
           if (orchestration.operation !== 'orchestrator') throw new Error('/msg is only available in orchestrator mode');
-          const [task, ...rest] = arg.split(/\s+/); const text = rest.join(' ');
-          if (!task || !text) throw new Error('Use /msg <task> <text>');
+          const [ref, ...rest] = arg.split(/\s+/); const text = rest.join(' ');
+          if (!ref || !text) throw new Error('Use /msg <task> <text>');
+          const task = taskByRef(reducers.tasks(session.events), ref);
           session.append({kind: 'message', to: `worker:${task}`, text});
           session.append({kind: 'status', text: `Message queued for worker ${task.slice(0, 8)}`});
         } else if (command === 'order') {
@@ -1051,11 +1148,23 @@ async function main() {
         } else if (command === 'sidebar') {
           if (!['', 'on', 'off'].includes(arg)) throw new Error('Use /sidebar [on|off]');
           settings.sidebar = arg ? arg === 'on' : !settings.sidebar; save();
-          notice = settings.sidebar
+          notice = inlineView ? `Usage box ${settings.sidebar ? 'shown beside the prompt' : 'hidden'} · the full sidebar is in the full-screen view (orchestrator, or /config inline false)` : settings.sidebar
             ? `Sidebar shown${(process.stdout.columns || 80) < 100 ? ' once the terminal is 100 columns wide' : ''} · /sidebar to hide`
             : 'Sidebar hidden · /sidebar to show';
           render();
           return;
+        } else if (command === 'prune') {
+          // The list comes first; numbers refer to the list last shown, so a copy made meanwhile is never picked by them.
+          if (!arg || !pruneListed) {
+            pruneListed = listCopies({root});
+            session.append({kind: 'status', text: `${copyTable(pruneListed)}${pruneListed.some(copy => !copy.live) ? '\n\nRemove with /prune all, or /prune and the numbers (1,3-5). Copies of running tasks are kept.' : ''}`});
+            if (!arg) return;
+          }
+          const chosen = chooseCopies(arg, pruneListed);
+          if (chosen === null) throw new Error('Use /prune to list, then /prune all, /prune none, or /prune 1,3-5');
+          const {removed, failed} = await removeCopies(chosen);
+          pruneListed = null;
+          session.append({kind: 'status', text: `Removed ${removed.length} ${removed.length === 1 ? 'copy' : 'copies'}.${failed.map(({copy, error}) => ` Could not remove ${copy.name}: ${error}.`).join('')}`});
         } else if (command === 'quota') {
           await refreshQuota(settings, {root, store: quotas, cwd: session.cwd});
           session.append({kind: 'quota', text: quotaReport(quotas, quotaOrder())});
@@ -1073,7 +1182,7 @@ async function main() {
           if (Object.keys(setupDefaults).length) {await switchSession(null); return;}
           const next = new Session(session.cwd, {root}); next.lock(); session.unlock(); session = next;
           terminal.reset(session.events);
-          router = new Router(session, settings, routerOptions); session.onEvent = scheduleRender; scroll = 0;
+          router.close?.(); router = new Router(session, settings, routerOptions); session.onEvent = scheduleRender; scroll = 0;
         } else if (command === 'login') {
           // Validate before the screen flips, so a typo never drops the user out of the TUI.
           const provider = arg || selected();
@@ -1095,7 +1204,7 @@ async function main() {
           const rows = Object.values(reducers.tasks(session.events));
           // `view: 'tasks'` lets the transcript fold repeated /tasks output to its latest copy.
           session.append({kind: 'status', view: 'tasks', text: rows.length ? rows.map(task => `${task.profile} ${task.id.slice(0, 8)} · ${task.state}${task.blocker || task.error || task.summary ? ` · ${task.blocker || task.error || task.summary}` : ''}`).join('\n') : 'No tasks in this session'});
-          notice = 'Task states saved in transcript · PgUp/PgDn scroll';
+          notice = `Task states saved in transcript${pageHint()}`;
         } else if (command === 'rename') {
           const name = arg.trim();
           if (!name) throw new Error('Use /rename <name>');
@@ -1103,7 +1212,8 @@ async function main() {
           notice = `Session renamed to "${name}"`;
         } else if (command === 'sessions') {
           const rows = listSessions(root).filter(r => r.cwd === session.cwd).slice(0, 20);
-          session.append({kind: 'status', text: rows.length ? sessionsTable(rows).join('\n') : 'No sessions in this workspace'});
+          if (!rows.length) throw new Error('No sessions in this workspace');
+          session.append({kind: 'sessions', text: sessionsTable(rows).join('\n')});
         } else if (command === 'resume') {
           if (arg.trim()) { await switchSession(resolveSessionRef(root, arg.trim())); return; }
           const rows = listSessions(root).filter(r => r.cwd === session.cwd && r.id !== session.id).slice(0, 30);
@@ -1137,10 +1247,7 @@ async function main() {
             agentsOpen = true; changePane('orchestrator');
             notice = 'Focused orchestrator pane'; return;
           }
-          const matches = Object.keys(known).filter(id => id.startsWith(arg));
-          if (matches.length > 1 && !known[arg]) throw new Error('Task prefix is ambiguous');
-          const task = known[arg] ? arg : matches[0];
-          if (!task) { session.append({kind: 'status', text: 'no such task'}); return; }
+          const task = taskByRef(known, arg);
           if (reducers.TERMINAL.has(known[task].state)) throw new Error('This task has finished · its outcome is in the transcript');
           agentsOpen = true; changePane(terminal.snapshot().panes.find(pane => pane.task === task)?.id ?? `worker:${task}`);
           notice = `Focused ${task.slice(0, 8)} · typing messages this worker · Tab changes pane`;
@@ -1152,10 +1259,16 @@ async function main() {
           // session/event, so nothing that folds session.events (scheduleRender, any bus
           // subscriber) could reach it.
           const decision = continueMain(orchestration.profiles, arg);
-          if (!decision.ok) { session.append({kind: 'status', text: decision.error}); return; }
+          if (!decision.ok) {
+            const names = Object.keys(orchestration.profiles ?? {});
+            if (!names.length) throw new Error('/continue needs the orchestrator: /operation orchestrator');
+            throw new Error(`${arg ? `No profile ${arg}` : 'Use /continue PROFILE'} · one of: ${names.join(', ')}`);
+          }
           const profile = orchestration.profiles[decision.profile];
           settings.order = [profile.adapter, ...settings.order.filter(p => p !== profile.adapter)];
-          settings.models[profile.adapter] = profile.model; router.select(profile.adapter); save();
+          // A profile that names no model runs on the one already chosen for its adapter; it never erases it.
+          if (profile.model) settings.models[profile.adapter] = profile.model;
+          router.select(profile.adapter); save();
           scroll = 0;
           notice = 'Running · Esc or Ctrl+C cancels the agent process group';
           render();
@@ -1168,12 +1281,12 @@ async function main() {
       } else if (agentsOpen && selectedWorker()) {
         // A selected worker pane is an explicit message target, never a main model turn.
         const task = selectedWorker();
-        history.push(text); historyIndex = -1; scroll = 0;
+        remember(text); scroll = 0;
         if (reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) throw new Error('This worker has finished · Tab selects the orchestrator');
         session.append({kind: 'message', to: `worker:${task}`, text: expandVendorCommand(text, vendorOptions())?.prompt ?? text});
         notice = `Message queued for worker ${task.slice(0, 8)}`;
       } else {
-        history.push(text); historyIndex = -1; scroll = 0;
+        remember(text); scroll = 0;
         const expanded = text.startsWith('/') ? expandVendorCommand(text, vendorOptions()) : null;
         notice = expanded ? `Running /${expanded.name} (${expanded.origin}) · Esc or Ctrl+C cancels the agent process group` : 'Running · Esc or Ctrl+C cancels the agent process group';
         render(); const result = await router.run((remoteMain ? '' : orchestratorBrief) + withAsides(expanded?.prompt ?? text, asides.splice(0)), [], expanded ? {typed: text} : {});
@@ -1203,28 +1316,26 @@ async function main() {
       }
     }
   }
-  // A terminal reports either the whole mouse or none of it: wheel scrolling and native
-  // click-drag selection cannot both be live. Rather than let a click do nothing, answer it
-  // with the three ways to select text.
-  const selectionHint = 'Drag-select needs the mouse back · hold Option (Shift in most terminals) to select now · F3 turns wheel scrolling off · F2 pauses so copied lines carry the transcript alone';
   function handleKey(str, key = {}) {
     if (suspended) return;
-    if (key.name === 'f2') {
-      copyPaused = !copyPaused;
-      render();
-      return;
-    }
-    if (copyPaused && !(key.ctrl && key.name === 'c')) return;
     if (localSetup && !picker && (key.name === 'escape' || (key.ctrl && key.name === 'c'))) {cancelLocalSetup(); return;}
     if (key.name === 'f3') {
       mouseScroll = !mouseScroll;
 
       notice = mouseScroll
-        ? 'Mouse scrolling on · Option-drag (Shift-drag elsewhere) still selects · F3 restores plain drag-select and link clicks'
-        : 'Mouse scrolling off · Drag to select text / click links · PgUp/PgDn scroll · F3 restores the wheel';
+        ? 'Mouse on · drag selects and copies · the wheel scrolls what is under it'
+        : 'Mouse off · the terminal selects and opens links itself · PgUp/PgDn scroll · F3 turns the mouse back on';
       render(); return;
     }
-    if (key.ctrl && key.name === 'c') { if (busy) {void Promise.resolve(router.cancel()).catch(error => { notice = error.message; render(); }); notice = 'Cancelling…'; render();} else quit(); return; }
+    // Ctrl+C: a running turn is cancelled; else a draft is cleared (Ctrl+_ brings it back); else a second press
+    // within two seconds quits, so one stray press never ends the session.
+    if (key.ctrl && key.name === 'c') {
+      if (busy) {void Promise.resolve(router.cancel()).catch(error => { notice = error.message; render(); }); notice = 'Cancelling…'; render(); return;}
+      if (reverseSearch) { input = reverseSearch.input; inputCursor = reverseSearch.cursor; reverseSearch = null; render(); return; }
+      if (input && !picker && !textPrompt) { undo.push({input, cursor: inputCursor}); input = ''; inputCursor = 0; lastCtrlC = 0; notice = DRAFT_CLEARED; render(); return; }
+      if (Date.now() - lastCtrlC < DOUBLE_PRESS_MS) { quit(); return; }
+      lastCtrlC = Date.now(); notice = 'Ctrl+C again to quit'; render(); return;
+    }
     if (key.ctrl && key.name === 'o') { if (picker?.kind === 'operation') picker = null; else openOperationPicker(); render(); return; }
     if (key.name === 'pageup') {if (localSetup) localSetup.scroll = (localSetup.scroll ?? 0) + 8; else scroll += 8; render(); return;}
     if (key.name === 'pagedown') {if (localSetup) localSetup.scroll = Math.max(0, (localSetup.scroll ?? 0) - 8); else scroll = Math.max(0, scroll - 8); render(); return;}
@@ -1270,10 +1381,35 @@ async function main() {
       else if (str && !key.ctrl && !key.meta && !['left', 'right', 'up', 'down', 'home', 'end', 'delete', 'tab'].includes(key.name)) ({input, cursor: inputCursor} = insertText(input, inputCursor, clean(str).replace(/\s/g, '')));
       render(); return;
     }
+    // Ctrl+R: search what was typed before, newest first; typing narrows it, Ctrl+R again goes older, Enter keeps
+    // the match in the draft, Esc puts the draft back as it was.
+    if (reverseSearch) {
+      const matches = () => promptHistory.search(reverseSearch.query).concat(history.filter(entry => !promptHistory.entries().includes(entry) && entry.toLowerCase().includes(reverseSearch.query.toLowerCase())).reverse());
+      const show = () => { const found = matches(); const match = found[Math.min(reverseSearch.index, found.length - 1)]; input = match ?? reverseSearch.input; inputCursor = input.length; notice = `Search history: ${reverseSearch.query}${found.length ? ` · ${Math.min(reverseSearch.index, found.length - 1) + 1} of ${found.length}` : ' · no match'} · Ctrl+R older · Enter keeps · Esc cancels`; };
+      if (key.name === 'escape' || (key.ctrl && key.name === 'g')) { input = reverseSearch.input; inputCursor = reverseSearch.cursor; reverseSearch = null; notice = ''; render(); return; }
+      if (key.name === 'return') { reverseSearch = null; notice = ''; render(); return; }
+      if (key.ctrl && key.name === 'r') reverseSearch.index++;
+      else if (key.name === 'backspace') { reverseSearch.query = reverseSearch.query.slice(0, -1); reverseSearch.index = 0; }
+      else if (str && !key.ctrl && !key.meta && str >= ' ') { reverseSearch.query += str; reverseSearch.index = 0; }
+      else { reverseSearch = null; notice = ''; }
+      if (reverseSearch) show();
+      render(); return;
+    }
+    if (key.ctrl && key.name === 'r' && !picker) { reverseSearch = {query: '', index: 0, input, cursor: inputCursor}; notice = 'Search history: type to search · Ctrl+R older · Enter keeps · Esc cancels'; render(); return; }
+    if (str === '\x1f') { const previous = undo.pop(); if (previous) { ({input, cursor: inputCursor} = previous); if (notice === DRAFT_CLEARED) notice = ''; } else notice = 'Nothing to undo'; render(); return; }
+    if (key.ctrl && (key.name === 'w' || key.name === 'k')) {
+      undo.push({input, cursor: inputCursor});
+      const result = key.name === 'w' ? killWordBackward(input, inputCursor) : killLineEnd(input, inputCursor);
+      ({input, cursor: inputCursor} = result); if (result.killed) killed = result.killed;
+      completionIndex = 0; menuDismissed = false; render(); return;
+    }
+    if (key.ctrl && key.name === 'y') { if (killed) { undo.push({input, cursor: inputCursor}); ({input, cursor: inputCursor} = insertText(input, inputCursor, killed)); } render(); return; }
     if (key.name === 'escape' && agentsOpen && !input) {agentsOpen = false; changePane('orchestrator'); notice = 'Agent workspace closed'; render(); return;}
     if (key.name === 'escape' && busy) {void Promise.resolve(router.cancel()).catch(error => { notice = error.message; render(); }); return;}
     // Enter alone submits; Shift+Enter — or any other modifier, or Ctrl+J — drops down a line.
     if (key.name === 'enter' || (key.name === 'return' && (key.meta || key.ctrl || key.shift))) {({input, cursor: inputCursor} = insertText(input, inputCursor, '\n')); menuDismissed = true; render(); return;}
+    // A backslash before the caret and Enter is a newline too, for terminals that send no modifier with Enter.
+    if (key.name === 'return' && inputCursor > 0 && input[inputCursor - 1] === '\\') { input = input.slice(0, inputCursor - 1) + '\n' + input.slice(inputCursor); menuDismissed = true; render(); return; }
     const options = suggestions();
     if (options.length && ['up', 'down'].includes(key.name)) {completionIndex = (completionIndex + (key.name === 'up' ? -1 : 1) + options.length) % options.length; render(); return;}
     if (suggestion && !input && key.name === 'tab') { input = suggestion; inputCursor = input.length; suggestion = null; render(); return; }
@@ -1293,8 +1429,13 @@ async function main() {
     }
     // Enter only completes a half-typed command; a complete one falls through and is run.
     if (options.length && key.name === 'return' && !typedCommand(input, vendorRows)) {acceptCompletion(); render(); return;}
-    if (key.name === 'escape') {menuDismissed = true; render(); return;}
-    const beforeInput = input;
+    if (key.name === 'escape') {
+      // Esc closes the menu; Esc twice clears the draft (Ctrl+_ brings it back).
+      if (input && Date.now() - lastEscape < DOUBLE_ESCAPE_MS) { undo.push({input, cursor: inputCursor}); input = ''; inputCursor = 0; lastEscape = 0; notice = DRAFT_CLEARED; }
+      else lastEscape = Date.now();
+      menuDismissed = true; render(); return;
+    }
+    const beforeInput = input, beforeCursor = inputCursor;
     verticalColumn = null;
     if (key.name === 'return') {
       if (localSetup && !input.trim().startsWith('/')) {
@@ -1302,7 +1443,7 @@ async function main() {
         else notice = 'Setup is working · keep editing, use a slash command, or Esc to cancel setup';
         render(); return;
       }
-      const text = input.trim(); input = ''; inputCursor = 0;
+      const text = expandPastes(input, pastes).trim(); input = ''; inputCursor = 0; pastes.clear();
       if (text) {
         const decision = inputDisposition(text, {busy, vendorCommand});
         if (agentsOpen && selectedWorker() && decision.kind === 'prompt') {
@@ -1339,10 +1480,15 @@ async function main() {
     else if (key.name === 'backspace') ({input, cursor: inputCursor} = (key.ctrl || key.meta) ? deleteWordBackward(input, inputCursor) : backspace(input, inputCursor));
     else if (key.name === 'delete') ({input, cursor: inputCursor} = (key.ctrl || key.meta) ? deleteWordForward(input, inputCursor) : deleteForward(input, inputCursor));
     else if (key.ctrl && key.name === 'u') { input = ''; inputCursor = 0; }
-    else if (key.name === 'tab') {const i = settings.order.indexOf(selected()); router.select(settings.order[(i + 1) % settings.order.length]);}
+    // Tab with nothing to complete does nothing: it used to switch the provider without a word (/order does that).
+    else if (key.name === 'tab') {}
     else if (key.name === 'up' && !input.includes('\n')) {
       const ownQueued = remoteMain && !input ? reducers.queuedPrompts(session.events) : [];
-      if (ownQueued.length) {
+      if (!remoteMain && !input && pendingTurns.length) {
+        // Classic keeps its queue here: ↑ on an empty draft takes the newest queued prompt back, as the hint says.
+        input = pendingTurns.pop(); inputCursor = input.length;
+        notice = pendingTurns.length ? `Pulled back for editing · ${pendingTurns.length} still queued` : 'Pulled back for editing · Enter queues it again';
+      } else if (ownQueued.length) {
         // Like Claude Code: Up on an empty input pulls the most recent still-queued prompt back
         // for editing instead of recalling history. This only withdraws a queued prompt; it never
         // starts a turn, so it needs no new submission call site (CONTRACT U5a).
@@ -1357,30 +1503,52 @@ async function main() {
       }
     }
     else if (key.name === 'down' && !input.includes('\n')) {if (!localSetup) {historyIndex = Math.max(-1, historyIndex - 1); input = historyIndex < 0 ? '' : history[history.length - 1 - historyIndex]; inputCursor = input.length;}}
-    else if (str && !key.ctrl && !key.meta && !['left','right','home','end','delete','escape'].includes(key.name)) ({input, cursor: inputCursor} = insertText(input, inputCursor, clean(str).replace(/\n/g, ' ')));
-    if (input !== beforeInput) {completionIndex = 0; menuDismissed = false;}
+    else if (str && !key.ctrl && !key.meta && !['left','right','home','end','delete','escape'].includes(key.name)) { if (notice === DRAFT_CLEARED) notice = ''; ({input, cursor: inputCursor} = insertText(input, inputCursor, clean(str).replace(/\n/g, ' '))); }
+    if (input !== beforeInput) {completionIndex = 0; menuDismissed = false; if (key.name !== 'return' && !['up', 'down'].includes(key.name)) undo.push({input: beforeInput, cursor: beforeCursor});}
     render();
   }
   terminal = createInkTerminal({
     history: () => session.events,
     stdin: process.stdin, stdout: process.stdout, onKeypress: handleKey,
     onPaste: text => {
-      if (suspended || copyPaused || picker) return;
-      ({input, cursor: inputCursor} = insertText(input, inputCursor, clean(text))); completionIndex = 0; menuDismissed = false; render();
+      if (suspended || picker) return;
+      undo.push({input, cursor: inputCursor});
+      ({input, cursor: inputCursor} = insertText(input, inputCursor, textPrompt ? clean(text) : collapsePaste(clean(text), pastes))); completionIndex = 0; menuDismissed = false; render();
     },
     onScrollClamp: (id, value) => {
       if (id === (agentsOpen ? selectedAgentPane : 'orchestrator')) scroll = value;
       const saved = paneInputs.get(id);
       if (saved) paneInputs.set(id, {...saved, scroll: value});
     },
-    onScroll: amount => { if (!copyPaused) { scroll = Math.max(0, scroll + amount); render(); } },
-    onPress: () => { if (suspended || copyPaused || !mouseScroll || notice === selectionHint) return; notice = selectionHint; render(); },
+    // The wheel scrolls the region under the pointer: the focused one as before, another pane without focusing it
+    // (its scroll is kept with its draft), the sidebar not at all.
+    onScroll: (amount, region) => {
+      if (region === 'sidebar') return;
+      const focused = agentsOpen ? selectedAgentPane : 'orchestrator';
+      if (!region || region === focused || !agentsOpen) scroll = Math.max(0, scroll + amount);
+      else {
+        const saved = paneInputs.get(region) ?? {input: '', inputCursor: 0, scroll: 0};
+        paneInputs.set(region, {...saved, scroll: Math.max(0, (saved.scroll ?? 0) + amount)});
+      }
+      render();
+    },
+    onCopy: text => {
+      void copyToClipboard(text, {write: chunk => terminal.write(chunk)}).then(({lines}) => {
+        notice = `Copied ${lines} line${lines === 1 ? '' : 's'}`;
+        render();
+      }).catch(error => { notice = `Copy failed: ${error.message}`; render(); });
+    },
     onResize: render,
   });
   for (const event of session.events) terminal.ingest(event);
-  await terminal.mount({mouseScroll});
+  // Classic draws inline: history in the terminal's own scrollback, only the turn in flight and the prompt redrawn
+  //. The orchestrator keeps the full screen for its panes.
+  // Inline, the terminal's own scrollback is what scrolls: bounce's PgUp/PgDn has nothing to move.
+  function pageHint(what = '') { return inlineView ? '' : ` · PgUp/PgDn scroll${what}`; }
+  if (inlineView) notice = notice.replace('Drag to select and copy · the wheel scrolls what is under it', 'Your terminal scrolls, searches and selects the conversation');
+  await terminal.mount({mouseScroll, inline: inlineView});
 
-  // Found live (ACE d1bc0206): the daemon died and this view kept its last state — the orchestrator
+  // Found live (session d1bc0206): the daemon died and this view kept its last state — the orchestrator
   // and every worker "working" — for four more hours. A lost daemon is said plainly, once, and the
   // view stops ticking as if anything were still running.
   let daemonLostAt = null;
@@ -1398,10 +1566,19 @@ async function main() {
   // unref'd so it never keeps the process alive, and render() is a no-op while suspended.
   if (orchestration.operation === 'orchestrator') {
     let beat = 0;
-    const t = setInterval(() => { const working = !daemonLostAt && (busy || (terminal?.snapshot().panes ?? []).some(pane => pane.state === 'running')); if (working || ++beat % 4 === 0) render(); }, 250);
+    const t = setInterval(() => { const working = !daemonLostAt && (busy || (terminal?.snapshot().panes ?? []).some(pane => isWorking(pane.state))); if (working || ++beat % 4 === 0) render(); }, 250);
     t.unref?.();
   }
   void refreshQuota(settings, {root, store: quotas, cwd: session.cwd}).then(render, () => {});
+  // A vendor shipping a newer release of a model the bindings name (terra 5.6 → 6.1) is said once on open; the
+  // file changes only through bounce bindings update --save. The ready notice is replaced only if still showing.
+  const opening = notice;
+  void (async () => {
+    const inUse = bindingsFile(root, session.cwd);
+    if (!inUse) return;
+    const hint = bindingUpdatesNotice(bindingUpdates(readBindings(inUse.file).agents, await modelCatalog(settings)));
+    if (hint && notice === opening) { notice = hint; render(); }
+  })().catch(() => {});
   // Nothing else refreshes the sidebar while the TUI sits idle between turns: without this, a
   // reading shown on open just grows stale until the next turn or /quota. Checked once a minute,
   // unref'd so it never keeps the process alive.
@@ -1423,6 +1600,33 @@ async function main() {
     }).catch(() => {});
   }
 }
+// An orchestrated `bounce run` is one process with no main service to wake it (src/reload.js hosts that for the view
+// only), so it carries the job itself, as the service does: what the orchestrator already waited on in its turn is
+// handed; when its tasks have ended or wait on the user, any outcome it has not seen goes to it in one more turn.
+// Found by the integration run 2026-10-21: the job stopped at its first dispatch and slugify was never fixed.
+const MAX_HANDOFF_TURNS = 20;
+async function carryJob({session, turn, pollMs = 500}) {
+  const hand = (actions, from) => { for (const action of actions) session.append({kind: 'main.disposition', actionId: action.actionId, outcomeSeq: action.outcomeSeq, task: action.task, disposition: 'reported', from: 'main', text: `handed to the orchestrator (${from})`}); };
+  let status = 'completed', since = 0;
+  for (let round = 0; round <= MAX_HANDOFF_TURNS; round++) {
+    const served = new Set(session.events.filter(e => e.kind === 'wait.served' && e.seq > since).map(e => e.served));
+    hand(pendingMainActions(session.events).filter(action => served.has(action.outcomeSeq)), 'its own wait');
+    // Its tasks run on in the daemon: wait until each has ended or waits on the user.
+    for (;;) {
+      const open = Object.values(reducers.tasks(session.events)).filter(t => !reducers.TERMINAL.has(t.state) && !['blocked', 'input_required'].includes(t.state));
+      if (!open.length) break;
+      await new Promise(resolve => setTimeout(resolve, pollMs));
+    }
+    const pending = pendingMainActions(session.events);
+    const waiting = Object.values(reducers.tasks(session.events)).filter(t => t.state === 'input_required');
+    if (!pending.length || round === MAX_HANDOFF_TURNS) return {status, waiting};
+    since = session.events.at(-1)?.seq ?? since;
+    hand(pending, 'a handoff turn');
+    status = await turn(handoffBlock(session, pending.map(action => action.row)));
+    if (status !== 'completed') return {status, waiting};
+  }
+  return {status, waiting: []};
+}
 // publish/wait are one-process bridge commands for workers: handled here, before any
 // session/config machinery, so they never spawn a supervisor and never read config.json.
 async function runBridge() {
@@ -1442,6 +1646,6 @@ const [bridgeCmd] = process.argv.slice(2);
   console.error(`bounce: ${error.message}`);
   process.exitCode = 1;
   // A detached daemon that fails to start must not linger holding the session lock with its bus
-  // open (found live, ACE d1bc0206: every later resume then failed too). Its log keeps the error.
+  // open (found live, session d1bc0206: every later resume then failed too). Its log keeps the error.
   if (process.env.BOUNCE_DETACHED === '1') process.exit(1);
 });

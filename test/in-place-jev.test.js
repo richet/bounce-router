@@ -1,4 +1,4 @@
-// Phase 2b (docs/plans/in-place-tasks.md §2): Jev's risk check for an in-place task — a Choice
+// Phase 2b: Jev's risk check for an in-place task — a Choice
 // over {authorized, exceeds, unrelated} given the cited user message first, the other user
 // messages since the last in-place task, and the orders. Confident exceeds/unrelated refuses;
 // unconfident/off/unavailable falls back to the structural check (the task runs) with a

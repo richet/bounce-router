@@ -1,4 +1,4 @@
-// CONTRACT.md §6: Phase 5 watchdog acceptance — deterministic escalation ladder under an
+// Phase 5 watchdog acceptance — deterministic escalation ladder under an
 // injected clock, atomic reservations/release, and the spend fold. Composed real scheduler +
 // reducers + fake adapters, exactly like test/scheduler.test.js and test/policy.test.js. No real
 // timers: `watchdog.interval: null` on every scheduler here, `tick()` driven by hand against a

@@ -10,7 +10,7 @@ const jsonCandidates = text => {
   return [source, ...fenced];
 };
 
-// Some local models (qwen via OpenCode, ACE session d1bc0206) write their report tool call as
+// Some local models (qwen via OpenCode, session d1bc0206) write their report tool call as
 // text in the chat template's own markup instead of calling the tool:
 // `<parameter=summary>\n…\n</parameter>` pairs inside `<function=…>` / `<tool_call>` tags, often
 // with the opening cut off. The pairs are the report the worker meant to send.
@@ -90,7 +90,7 @@ const BLOCKED_STATUS = statusLine('blocked');
 const FAILED_STATUS = statusLine('failed|fail');
 
 // For a worker whose job is a verdict (a reviewer), FAIL is its result, not its status: the review
-// succeeded. Found live (ACE e3bd01d5, 2026-09-30): a review ending "**FAIL** — 3 blockers" was
+// succeeded. Found live (session e3bd01d5, 2026-09-30): a review ending "**FAIL** — 3 blockers" was
 // journaled as the reviewer having failed. "Blocked:" about the reviewing itself still counts.
 function synthesizedOutcome(text, {verdict = false} = {}) {
   if (BLOCKED_STATUS.test(text)) return {outcome: 'blocked', rule: 'status_blocked'};

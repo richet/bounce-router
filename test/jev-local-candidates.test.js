@@ -1,9 +1,9 @@
-// Local models as candidates for an `auto` agent's AI (docs/plans/jev-agents-routing.md, Phase 3).
+// Local models as candidates for an `auto` agent's AI.
 // A local model only ever exists as an agent's backend, so it is a candidate for the AI of a JOB —
-// never for a plain `auto` task. Loaded models are preferred; a model that is not loaded is offered
-// only when the agent's own `models:` list names it (found live 2026-09-22: the 27B reviewer model had
-// been unloaded, so Jev saw no `strongest` local at all and sent every review to the cloud). Offering
-// every downloaded model instead would put a 139B nobody asked for in the running. They are only supplied while `/local` is on, and then a local model of the
+// never for a plain `auto` task. Only the models the agent's own `models:` list names are offered, loaded or
+// not (found live 2026-09-22: the 27B reviewer model had been unloaded, so Jev saw no `strongest` local at all
+// and sent every review to the cloud; 2026-10-25: `auto` picks within the list, never beyond it, so a
+// loaded model nobody named is not offered either). Loaded ones rank first. They are only supplied while `/local` is on, and then a local model of the
 // needed tier runs first: it costs nothing. Tiers do the mixing — cheap work local, the rest cloud.
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -23,21 +23,22 @@ import {hostless} from './helpers/local-fakes.js';
 const model = (id, extra = {}) => ({id, ref: `lmstudio/${id}`, type: 'llm', tools: true, ready: true, instances: [{id: `${id}@live`, context: 65536}], context: 65536, ...extra});
 const catalogs = models => [{provider: 'local', backend: 'lmstudio', endpoint: 'lmstudio', models}];
 const onDisk = {ready: false, instances: [], context: 131072};
-const cache = {'lmstudio/dense-27b': {tier: 'strongest', capabilities: 'Careful reviewer; slow.'}};
+// Pinned by hand: since 2026-10-22 the only way a local model's tier is not the default (an agent's guess is not read).
+const cache = {'lmstudio/dense-27b': {tier: 'strongest', capabilities: 'Careful reviewer; slow.', by: 'you'}};
 
-test('candidates: every tool-capable model, loaded or not, described by its note or conservatively', () => {
+test('candidates: every tool-capable model, loaded or not, described by its pinned note or by what LM Studio reports', () => {
   const mixed = catalogs([model('coder-30b'), model('dense-27b', {instances: [{id: 'dense', context: 32768}]}), model('big-disk', onDisk), model('no-tools', {tools: false}), {id: 'embed', type: 'embedding', ready: true, instances: []}]);
   assert.deepEqual(localCandidates(mixed, cache), [
-    {name: 'lmstudio/coder-30b', endpoint: 'lmstudio', model: 'coder-30b', loaded: true, size: null, context: 65536, tier: 'cheapest', capabilities: 'unknown local model: single-file reading only'},
+    {name: 'lmstudio/coder-30b', endpoint: 'lmstudio', model: 'coder-30b', loaded: true, size: null, context: 65536, tier: 'cheapest', capabilities: 'local model on lmstudio · context 64k · runs on this machine at no cost, one turn at a time, slower than a cloud model'},
     {name: 'lmstudio/dense-27b', endpoint: 'lmstudio', model: 'dense-27b', loaded: true, size: null, context: 32768, tier: 'strongest', capabilities: 'Careful reviewer; slow.'},
-    {name: 'lmstudio/big-disk', endpoint: 'lmstudio', model: 'big-disk', loaded: false, size: null, context: 131072, tier: 'cheapest', capabilities: 'unknown local model: single-file reading only'}]);
+    {name: 'lmstudio/big-disk', endpoint: 'lmstudio', model: 'big-disk', loaded: false, size: null, context: 131072, tier: 'cheapest', capabilities: 'local model on lmstudio · context 128k · runs on this machine at no cost, one turn at a time, slower than a cloud model'}]);
   assert.deepEqual(localCandidates(catalogs([model('big-disk', onDisk), model('no-tools', {tools: false})]), cache).map(item => [item.name, item.loaded]), [['lmstudio/big-disk', false]]);
   assert.deepEqual(localCandidates([], cache), []);
 });
 
 const settings = {operation: 'orchestrator', orchestrator: 'main', mode: 'yolo', order: ['claude'], models: {}, local: {enabled: true},
   profiles: {main: {adapter: 'claude', model: 'opus'}, sonnet: {adapter: 'claude', model: 'sonnet', tier: 'strongest'}, haiku: {adapter: 'claude', model: 'haiku', tier: 'cheapest'}}};
-const roles = new Map([['reviewer', {...agentMetadata('---\nname: reviewer\ndescription: Reads for defects.\npolicy: read-only\nmodels: [auto, claude/sonnet]\n---\nYou are the reviewer.\n'), source: 'user', file: '/x/reviewer.md'}]]);
+const roles = new Map([['reviewer', {...agentMetadata('---\nname: reviewer\ndescription: Reads for defects.\npolicy: read-only\nmodels: [auto, claude/sonnet, lmstudio/dense-27b]\n---\nYou are the reviewer.\n'), source: 'user', file: '/x/reviewer.md'}]]);
 const table = () => validateOrchestration(settings, undefined, {roles}).profiles;
 const locals = localCandidates(catalogs([model('coder-30b'), model('dense-27b')]), cache);
 const tier = (choice, confidence) => ({tier: {choice, confidence, probabilities: {[choice]: confidence}}});
@@ -45,9 +46,10 @@ const tier = (choice, confidence) => ({tier: {choice, confidence, probabilities:
 test('the AI question offers the local models beside the profiles; a plain `auto` task never sees them', () => {
   const profiles = table();
   const questions = aiQuestions(profiles, {}, profiles.reviewer, locals);
-  assert.equal(questions.profile.criteria['lmstudio/dense-27b'], 'local model lmstudio/dense-27b · runs on this machine at no cost · context 64k · tier strongest: independent review, ambiguous or cross-cutting debugging, security-sensitive work · capabilities: Careful reviewer; slow.');
+  assert.equal(questions.profile.criteria['lmstudio/dense-27b'], 'local model lmstudio/dense-27b · runs on this machine at no cost · context 64k · tier strongest: reviewing a security-sensitive or cross-cutting change, ambiguous or cross-cutting debugging, security-sensitive work · capabilities: Careful reviewer; slow.');
   const cold = localCandidates(catalogs([model('big-disk', onDisk)]), {});
-  assert.equal(aiQuestions(profiles, {}, profiles.reviewer, cold).profile.criteria['lmstudio/big-disk'], undefined, 'this reviewer does not name it and it is not loaded: not offered');
+  assert.equal(aiQuestions(profiles, {}, profiles.reviewer, cold).profile.criteria['lmstudio/big-disk'], undefined, 'this reviewer does not name it: not offered');
+  assert.equal(questions.profile.criteria['lmstudio/coder-30b'], undefined, 'loaded, but this reviewer does not name it: not offered');
   const {main, haiku} = profiles;
   assert.deepEqual(aiQuestions({main, haiku}, {}, null, locals).tier.criteria, {cheapest: TIER_HINT.cheapest, strongest: TIER_HINT.strongest}, 'a tier only a local model has is offered too');
   assert.equal(Object.keys(routingQuestions(profiles).profile.criteria).some(name => name.startsWith('lmstudio/')), false);
@@ -89,7 +91,7 @@ test('scheduler: Jev\'s local pick runs the job through opencode on that model, 
   const launched = [];
   const worker = (name, script) => { const inner = fakeAdapter(script); return {...inner, launch: async args => { launched.push([name, args.profile.model, args.profile.role, args.profile.policy]); return inner.launch(args); }}; };
   const jev = createJevDecisions({readSettings: () => ({enabled: true, routing: true}), order: () => ['claude'], locals: async () => locals,
-    adapter: {ask: async () => ({answers: tier('strongest', 0.9), model: 'jev-1.13.0', latencyMs: 4})}});
+    adapter: {ask: async () => ({answers: {hardest: {noul: 0.9}, small_fix: {noul: 0.1}, long_context: {noul: 0.1}}, model: 'jev-1.13.0', latencyMs: 4})}});
   const localResolver = {resolve: async ({profile}) => ({...profile, providerID: 'lmstudio', opencodeConfig: {}}), configure() {}};
   const scheduler = createScheduler({...hostless, session, profiles: table(), jev, localResolver, gitHead: () => null, adapters: {
     opencode: worker('opencode', () => [{kind: 'result', status: 'failed', recoverable: true, text: 'endpoint down'}]),
@@ -103,7 +105,7 @@ test('scheduler: Jev\'s local pick runs the job through opencode on that model, 
   assert.deepEqual(launched, [['opencode', 'dense-27b', 'reviewer', 'read-only'], ['claude', 'sonnet', 'reviewer', 'read-only']]);
   const routed = session.events.find(e => e.kind === 'jev.routed');
   assert.deepEqual([routed.chosen, routed.ai, routed.local, routed.tier], ['reviewer@lmstudio/dense-27b', 'lmstudio/dense-27b', {endpoint: 'lmstudio', model: 'dense-27b'}, 'strongest']);
-  assert.equal(routed.text, 'Routed reviewer → lmstudio/dense-27b (AI chosen by Jev: tier strongest, confidence 0.90)');
+  assert.equal(routed.text, 'Routed reviewer → lmstudio/dense-27b (Jev: tier strongest from hardest 0.90, small fix 0.10, long context 0.10; a free local model)');
 });
 
 test('between local models of one tier, the one the agent\'s own list names plays it — a reviewer keeps its reviewer model', () => {
@@ -120,17 +122,31 @@ test('between local models of one tier, the one the agent\'s own list names play
 
 // Found live: the reviewer's own model (the 27B, tier strongest) had been
 // unloaded, the only loaded local was tier mid, and all three reviews went to the cloud. A model the
-// agent's file names is offered even when it is not loaded — loaded ones still rank first, and a model
-// nobody named stays out until it is loaded, so the machine's big models are never picked by surprise.
+// agent's file names is offered even when it is not loaded, and a model nobody named stays out, loaded or not,
+// so the machine's big models are never picked by surprise.
 test('an unloaded local model is offered when the agent names it, and never when nobody does', () => {
-  const named = new Map([['reviewer', {...agentMetadata('---\nname: reviewer\ndescription: Reads for defects.\npolicy: probe\nmodels: [auto, lmstudio/dense-27b, claude/sonnet]\n---\nYou review.\n'), source: 'user', file: '/x/reviewer.md'}]]);
+  const named = new Map([['reviewer', {...agentMetadata('---\nname: reviewer\ndescription: Reads for defects.\npolicy: write\nmodels: [auto, lmstudio/dense-27b, claude/sonnet]\n---\nYou review.\n'), source: 'user', file: '/x/reviewer.md'}]]);
   const profiles = validateOrchestration(settings, undefined, {roles: named}).profiles;
   const cold = localCandidates(catalogs([model('coder-30b'), model('dense-27b', {...onDisk, size: 16 * 1024 ** 3}), model('huge-139b', {...onDisk, ref: 'lmstudio/huge-139b'})]), {...cache, 'lmstudio/huge-139b': {tier: 'strongest', capabilities: 'Very large.'}});
   const options = {profiles, notes: {}, locals: cold, head: profiles.reviewer, confidence: 0.8};
   assert.deepEqual(Object.keys(aiQuestions(profiles, {}, profiles.reviewer, cold).profile.criteria).filter(k => k.startsWith('lmstudio/')).sort(),
-    ['lmstudio/coder-30b', 'lmstudio/dense-27b'], 'the loaded one and the one the reviewer names; not the 139B nobody named');
+    ['lmstudio/dense-27b'], 'the one the reviewer names; not the loaded coder nor the 139B nobody named');
   assert.deepEqual(decideAI(tier('strongest', 0.95), options), {ai: 'lmstudio/dense-27b', local: {endpoint: 'lmstudio', model: 'dense-27b'}, tier: 'strongest', reason: null, confidence: 0.95, probabilities: {strongest: 0.95}});
   // what choosing it costs is part of what Jev is told: its memory, and the load
   assert.match(aiQuestions(profiles, {}, profiles.reviewer, cold).profile.criteria['lmstudio/dense-27b'],
     /^local model lmstudio\/dense-27b · runs on this machine at no cost · 16\.0 GB of memory · not loaded: choosing it costs a model load first · /);
+});
+
+// 2026-10-22: "incertidumbre/no determinismo es un nono". Found by the integration runs: a cloud agent wrote the
+// local model's tier from its name, "cheapest" in eight runs and "mid" in two, and Jev's routing flipped from all-cloud
+// to all-local with the same setup. What routing reads about a local model is now fixed: the tier pinned by hand, else
+// cheapest, and capabilities from what LM Studio reports — never an agent's description.
+test('what routing reads about a local model is the same whatever an agent wrote about it', () => {
+  const fleet = catalogs([model('dense-27b', {instances: [{id: 'dense', context: 32768}]})]);
+  const described = tier => ({'lmstudio/dense-27b': {tier, capabilities: `An agent's guess: ${tier}.`, by: 'claude/opus'}});
+  const one = localCandidates(fleet, described('cheapest')), two = localCandidates(fleet, described('mid'));
+  assert.deepEqual(one, two);
+  assert.deepEqual(one.map(item => [item.tier, item.capabilities]), [['cheapest', 'local model on lmstudio · context 32k · runs on this machine at no cost, one turn at a time, slower than a cloud model']]);
+  const pinned = localCandidates(fleet, {'lmstudio/dense-27b': {tier: 'mid', capabilities: 'Careful reader.', by: 'you'}});
+  assert.deepEqual(pinned.map(item => [item.tier, item.capabilities]), [['mid', 'Careful reader.']], 'a tier pinned by hand stands');
 });

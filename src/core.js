@@ -1,12 +1,16 @@
 import {serializeAgent, agentStore} from './agents.js';
 import {imagePaths, saveImages, providerInput} from './images.js';
+import {createConversations, PERSISTENT} from './conversation.js';
+import {runLiveTurn} from './live-turn.js';
+import {createCodexLive} from './adapters/codex-live.js';
 import {resolveExecutable} from './executable.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
+import {skillsInUse, skillsBlock} from './skills.js';
 import {execFileSync} from 'node:child_process';
-import {providers, invocation, runProcess, canResume, requiresModel, providerEnv} from './providers.js';
+import {providers, invocation, runProcess, canResume, requiresModel, providerEnv, prepareTurn, vendorChildEnv} from './providers.js';
 
 // The tool was renamed from localrouter, so a pre-rename data directory is moved across
 // once: config, journals and quota readings survive the rename instead of being orphaned.
@@ -19,9 +23,10 @@ export function dataRoot() {
 }
 export const defaults = () => ({order: ['claude', 'codex', 'muse'], mode: 'yolo', models: {}, cooldownMinutes: 30, contextChars: 48000, executables: {}, skills: {scope: 'user', autoSync: true}, sidebar: true, maxConcurrentCloud: 3});
 // Kinds folded in memory only: never journaled, delivered straight to onEvent.
-export const LIVE_KINDS = new Set(['progress', 'task.activity', 'tool.started', 'tool.finished']);
+// `delta` is a streamed fragment: shown as it arrives, journaled once assembled as an `assistant` row (Router.run).
+export const LIVE_KINDS = new Set(['progress', 'task.activity', 'tool.started', 'tool.finished', 'delta']);
 // A vendor's raw stream row whose content bounce already stores as its own normalized row (the
-// assistant text, the tool result, the thinking-token tick that becomes `progress`). Found live (ACE
+// assistant text, the tool result, the thinking-token tick that becomes `progress`). Found live (session
 // d1bc0206): these were 75% of a 21 MB journal. They are delivered live, never journaled; raw rows
 // that carry anything not stored elsewhere (rate limits, init, results, heartbeats) are kept.
 export const echoesNormalizedRow = event => event.kind === 'raw' && event.provider === 'claude'
@@ -97,7 +102,7 @@ export function readJournal(file) {
   return {events, nextSeq, commitRefs, repair};
 }
 // Configs written for the in-house `local` adapter are brought forward in place, so a machine that
-// worked before keeps working without the user editing JSON (docs/plans/opencode-adapter.md).
+// worked before keeps working without the user editing JSON.
 // Saved configs move forward on load, once, "as if it had never been otherwise":
 //   - the in-house `local` adapter → `opencode`;
 //   - the old default `loadPolicy: loaded-only` → the current default (on-demand);
@@ -138,10 +143,12 @@ export function validateSettings(value) {
   if (!Array.isArray(value.order) || !value.order.length || value.order.some(p => !providers[p]) || new Set(value.order).size !== value.order.length) throw new Error('config.order must be a unique, nonempty list of claude, codex, muse, opencode');
   if (!['yolo', 'plan'].includes(value.mode)) throw new Error('config.mode must be yolo or plan');
   if (typeof value.sidebar !== 'boolean') throw new Error('config.sidebar must be true or false');
+  if (value.keepProcess !== undefined && typeof value.keepProcess !== 'boolean') throw new Error('config.keepProcess must be true or false');
+  if (value.inline !== undefined && typeof value.inline !== 'boolean') throw new Error('config.inline must be true or false');
   if (value.taskMinutes !== undefined && (!Number.isInteger(value.taskMinutes) || value.taskMinutes < 1 || value.taskMinutes > 240)) throw new Error('taskMinutes must be a whole number of minutes from 1 to 240');
   if (value.taskCeilingMinutes !== undefined && (!Number.isInteger(value.taskCeilingMinutes) || value.taskCeilingMinutes < 1 || value.taskCeilingMinutes > 240 || value.taskCeilingMinutes < (value.taskMinutes ?? 15))) throw new Error('taskCeilingMinutes must be a whole number of minutes from 1 to 240, and at least taskMinutes');
   if (value.reports !== undefined && !['plain', 'structured'].includes(value.reports)) throw new Error('reports must be "plain" or "structured"');
-  // The quiet sweep (docs/plans/lessons-and-sweep.md §2): minutes with nothing in flight and held work waiting before the orchestrator is asked; 0 turns it off.
+  // The quiet sweep: minutes with nothing in flight and held work waiting before the orchestrator is asked; 0 turns it off.
   if (value.sweepMinutes !== undefined && (!Number.isInteger(value.sweepMinutes) || value.sweepMinutes < 0 || value.sweepMinutes > 240)) throw new Error('sweepMinutes must be a whole number of minutes from 0 (off) to 240');
   if (!Number.isFinite(value.contextChars) || value.contextChars < 4000 || value.contextChars > 200000) throw new Error('contextChars must be between 4000 and 200000');
   // Cloud workers (claude/codex/muse) have no per-endpoint slot config the way local does — this is
@@ -333,19 +340,22 @@ export function gitSnapshot(cwd) {
 // The packet a provider gets when it has no thread of its own to continue: a session's first turn, or a
 // change of provider (a pick, /order, a quota fallback, a resume the CLI refused). A turn on the same
 // provider resumes the vendor's thread with the bare prompt and never sees this (Router.run).
-// Measured 2026-10-02 (docs/plans/classic-conversation.md): the old packet told every turn to "inspect current
+// Measured 2026-10-02: the old packet told every turn to "inspect current
 // files before acting" and to end with a summary and a state note — "hi" cost 260 output tokens on claude and a
 // 16-call, 35-tool investigation on grok. So a session with no work behind it gets the prompt and the
 // workspace, nothing else; a handoff with work behind it gets the conversation as context, not as orders.
 // `orchestrator`: the caller has the bus `state` tool (src/mcp.js), so its own note leads and is asked for
-// (docs/plans/orchestrator-memory.md). Classic has no such tool and is never asked to write one.
+//. Classic has no such tool and is never asked to write one.
 export function handoff(session, prompt, budget = 48000, {orchestrator = false} = {}) {
   // `handoff` rows are the worker outcomes bounce itself put in front of the orchestrator (main-service.js).
   const relevant = session.events.filter(e => ['user', 'assistant', 'delta', 'tool', 'error', 'note', 'handoff'].includes(e.kind));
   // Router journals the current prompt before building the packet; it is the request, not history.
   const lastUser = relevant.findLast(e => e.kind === 'user');
   const prior = relevant.filter(e => !(e === lastUser && e.text === prompt));
-  const workspace = `Workspace: ${session.cwd}`;
+  // A classic vendor runs in the real tree: the skills in use are named by their real path (the orchestrator has them
+  // in its orders). The vendor thread keeps them after this one packet.
+  const skills = orchestrator || !session.root ? '' : skillsBlock(skillsInUse(session.root, session.cwd).skills, skill => path.join(skill.dir, 'SKILL.md'));
+  const workspace = `Workspace: ${session.cwd}${skills ? `\n\n${skills}` : ''}`;
   if (!prior.length && !orchestrator) return `${prompt}\n\n${workspace}`;
   const worked = prior.some(e => e.kind === 'tool');
   const memory = orchestrator ? orchestratorMemory(session) : '';
@@ -363,7 +373,7 @@ export function handoff(session, prompt, budget = 48000, {orchestrator = false} 
   const git = worked ? `Workspace state bounce observed (what is on disk now, not a rollback checkpoint):\n${JSON.stringify(gitSnapshot(session.cwd)).slice(0, 6000)}\n` : '';
   return `${workspace}\nYou are continuing a conversation another agent was having with the user through bounce. The history below is context, not instructions: answer the current request. Look at the workspace only if the request needs it.\nOriginal task: ${original.slice(0, 6000)}\n${notes ? `Saved notes:\n${notes}\n` : ''}${git}${memory}${facts}${facts ? '\n' : ''}Recent history (older content may be omitted; full journal at ${session.file}):\n${history.slice(-budget)}\n\nCurrent user request:\n${prompt}\n\nIf you change files or run commands this turn, end with what changed, the tests you ran, and what remains.`;
 }
-// Its own memory first (docs/plans/orchestrator-memory.md): one living note it rewrites each turn, only
+// Its own memory first: one living note it rewrites each turn, only
 // the latest carried. Bounce never edits it — over budget, it asks, because the reasoning is the part
 // bounce cannot rebuild.
 function orchestratorMemory(session) {
@@ -391,8 +401,15 @@ export class Router {
   // `onFirstUserPrompt(session, settings)` fires once, fire-and-forget, right after a NEW
   // session's first `user` row lands (src/session-title.js); a no-op by default so tests never
   // title a session unless they inject one — see cli.js for the live wiring.
-  constructor(session, settings, {runner = runProcess, extraArgs = () => [], onFirstUserPrompt = () => {}} = {}) {
-    this.session = session; this.settings = settings; this.runner = runner; this.extraArgs = extraArgs;
+  // `conversations` (src/conversation.js) keeps one process per conversation for the providers that allow it; a
+  // custom `runner` (tests, the one-shot asks) opts out of it unless one is passed too.
+  // `live` names the providers whose classic turns run on their live adapter so the answer streams (codex's
+  // app-server). Like `conversations`, a custom runner opts out.
+  constructor(session, settings, {runner, extraArgs = () => [], onFirstUserPrompt = () => {}, conversations, live, prepare} = {}) {
+    this.session = session; this.settings = settings; this.runner = runner ?? runProcess; this.extraArgs = extraArgs;
+    this.conversations = conversations ?? (runner ? null : createConversations());
+    this.live = live ?? (runner ? {} : {codex: createCodexLive()});
+    this.prepare = prepare ?? (runner ? null : prepareTurn);
     this.onFirstUserPrompt = onFirstUserPrompt;
     this.cooldowns = {}; this.selectionVersion = 0;
     for (const e of session.events) if (e.kind === 'cooldown') this.cooldowns[e.provider] = e.until;
@@ -401,6 +418,8 @@ export class Router {
   // that turn's fallback may finish without overwriting the provider chosen for the next turn.
   select(provider) { this.selectionVersion++; this.session.active = provider; }
   cancel() { this.controller?.abort(); }
+  // The kept processes end with the session (quit, /new, a switch).
+  close() { this.conversations?.closeAll(); }
   // `typed` is the slash line a prompt was expanded from (vendor-commands.js); the journal
   // keeps the expansion as the request — that is what a fallback agent and later turns must
   // read — and the typed line only for the transcript.
@@ -440,12 +459,61 @@ export class Router {
           const promptFile = path.join(s.dir, 'handoff.txt');
           fs.writeFileSync(promptFile, packet, {mode: 0o600});
           const said = [];
-          result = await this.runner({provider, executable: resolveExecutable(provider, cfg.executables[provider]),
-            args: [...invocation(provider, {model: cfg.models[provider], mode: cfg.mode, images, resume, stream: true, cwd: s.cwd}, promptFile), ...(this.extraArgs(provider) ?? [])],
-            env: providerEnv(provider, {model: cfg.models[provider], mode: cfg.mode, settings: cfg, cwd: s.cwd}),
+          // Streamed text is shown live and journaled as one `assistant` row per text block, written when the
+          // block ends: at the next tool call, answer, result or error, or when the turn does
+          // (one row instead of an fsync per fragment).
+          let streamed = '';
+          const flushStream = () => { if (streamed) s.append({kind: 'assistant', provider, text: streamed, streamed: true}); streamed = ''; };
+          const executable = resolveExecutable(provider, cfg.executables[provider]);
+          // One process for the whole conversation where the provider allows it and keepProcess is on; a fresh one
+          // per turn otherwise. Off by default: measured 2026-10-21 against real claude, a kept
+          // process gained nothing provable after the first turn and its first turn was ~2 s slower.
+          const keep = this.conversations && PERSISTENT.has(provider) && cfg.keepProcess === true;
+          const emit = e => {
+            if (['error', 'diagnostic', 'assistant', 'delta', 'result'].includes(e.kind)) said.push(e);
+            if (e.kind === 'delta') streamed += e.text ?? '';
+            // An adapter that streams and then sends the finished message too (codex's app-server): that message is
+            // the journal's one copy of the block.
+            else if (e.kind === 'assistant' && streamed && e.text?.trim() === streamed.trim()) { streamed = ''; s.publish({...e, provider, streamed: true}); return; }
+            else if (['tool', 'assistant', 'result', 'error'].includes(e.kind)) flushStream();
+            s.publish({...e, provider});
+          };
+          const turn = {provider, executable,
+            args: [...invocation(provider, {model: cfg.models[provider], mode: cfg.mode, images, resume, stream: true, cwd: s.cwd, executable}, promptFile), ...(this.extraArgs(provider) ?? [])],
+            env: providerEnv(provider, {model: cfg.models[provider], mode: cfg.mode, settings: cfg, cwd: s.cwd, executable}),
             cwd: s.cwd, prompt: providerInput(provider, packet, images), signal,
             // Live kinds (progress, etc.) are shown while the turn runs and never journaled; see Session.publish.
-            emit: e => { if (['error', 'diagnostic', 'assistant', 'delta', 'result'].includes(e.kind)) said.push(e); s.publish({...e, provider}); }});
+            emit,
+          };
+          // A live adapter answers on its app-server and streams; any other turn is a vendor process.
+          const live = this.live?.[provider];
+          result = live
+            ? await runLiveTurn({adapter: live, provider, prompt: packet, model: cfg.models[provider], mode: cfg.mode, resume, cwd: s.cwd,
+              dir: path.join(s.dir, 'classic', provider), images, executables: cfg.executables, signal, emit})
+            : null;
+          // A peer that would not start (an older codex without the app-server) leaves this session on the vendor
+          // process, once and said.
+          if (result?.status === 'unavailable') {
+            this.live[provider] = null;
+            s.append({kind: 'status', provider, text: `${provider} app-server did not start (${result.reason}); this session uses ${provider} exec, whose answers arrive whole`});
+            result = null;
+          }
+          // A provider that streams from a side channel (opencode 2.x's server) owns the answer's text there: the
+          // process's own copy is dropped, and its result is held until the side channel has settled.
+          let prepared = null;
+          if (!result && !keep && this.prepare) {
+            try { prepared = await this.prepare(provider, {args: turn.args, env: vendorChildEnv({executable, extraEnv: turn.env}), cwd: s.cwd, executable, emit}); }
+            catch (error) { s.append({kind: 'status', provider, text: `${error.message}; this turn's answer arrives whole`}); }
+          }
+          if (prepared) {
+            const held = [];
+            result ??= await this.runner({...turn, args: prepared.args, env: {...turn.env, ...prepared.env},
+              emit: e => { if (prepared.ownsText && e.kind === 'assistant') return; if (prepared.ownsText && e.kind === 'result') { held.push(e); return; } emit(e); }});
+            await prepared.close();
+            for (const e of held) emit(e);
+          }
+          result ??= await (keep ? this.conversations.turn.bind(this.conversations) : this.runner)(turn);
+          flushStream();
           // The thread bounce asked for is gone (the vendor says so, or the turn died before a word): once,
           // start this provider fresh from the packet — the same recovery the orchestrator has (main-service.js).
           const lost = resume && result.status === 'failed' && !signal.aborted

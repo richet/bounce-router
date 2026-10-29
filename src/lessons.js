@@ -1,5 +1,5 @@
 // Lessons: one line per correction, written by the orchestrator, read by every later worker of that job
-// in this project (docs/plans/lessons-and-sweep.md §1; Daniel, 2026-10-01). Found live, the week before:
+// in this project (2026-10-01). Found live, the week before:
 // evidence saved outside the working copy, checks that only looked for a file, a builder that thought
 // itself to death — each a lesson the orchestrator had in hand when it corrected the work, and each one
 // reached the agent files only through a person reading journals. The file is plain markdown in the

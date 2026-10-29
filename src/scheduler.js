@@ -8,10 +8,12 @@ import {createAttemptWorkspace, captureArtifact, integrateArtifact, advanceBasel
 import * as reducers from './reducers.js';
 import {takeCheckpoint, sameTree} from './checkpoint.js';
 import {POLICY_RANK, effectivePolicy, LOCAL_ADAPTERS, playedBy, READ_ONLY_ROLES as READONLY_ROLES} from './profiles.js';
+import {modelVersion} from './bindings.js';
 import {defaultStrategy} from './strategy.js';
 import {reportEvent, validateReport, remainingWork} from './reporting.js';
 import {inspectFinalReport, synthesizeReport, synthesizeReportFromChanges, FINAL_REPORT_INSTRUCTION} from './final-report.js';
 import {lessonsBlock} from './lessons.js';
+import {skillsInUse, skillsBlock} from './skills.js';
 import {workersView, idleWorkerOf, nextWorkerName, pendingHandoffFor} from './workers.js';
 import {actionState, createActionRunner, requestAction} from './orchestration.js';
 import {normalizeLocalSettings} from './local-models.js';
@@ -23,13 +25,15 @@ import {discoverLocalModels} from './local-models.js';
 import {createMachineSlots} from './machine-slots.js';
 import {runCheck, validCheck, weakCheck, CHECK_TIMEOUT_MS} from './task-check.js';
 import {seenRun, checkPassed, weakCheckNotice, NO_RUN, NO_RUN_AFTER_CHANGE} from './command-output.js';
-import {routingFallback} from './jev.js';
+import {routingFallback, PROFILE_TIERS} from './jev.js';
 import {validOwns} from './owned-paths.js';
 import {execFileSync} from 'node:child_process';
 import {parseVerdict} from './verdict.js';
 const processAlive = pid => { try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } };
 
-const FALLBACK_REASONS = new Set(['limited', 'missing', 'backend_unavailable', 'watchdog', 'local_unavailable', 'worker_runtime', 'incomplete_report']);
+const FALLBACK_REASONS = new Set(['limited', 'missing', 'backend_unavailable', 'watchdog', 'local_unavailable', 'local_busy', 'worker_runtime', 'incomplete_report']);
+// How long a task waits for a busy local slot before falling to the next AI of its chain (local.endpoints.<name>.queueSeconds).
+const LOCAL_QUEUE_SECONDS = 60;
 const RISKS = new Set(['boundary', 'process-model', 'logic', 'extraction']);
 const SIZE_FIELDS = ['lines', 'probes', 'minutes'];
 // Silence is five minutes, not two: at two the alarm fired on every test run and corrected itself
@@ -49,7 +53,7 @@ const CALL_MEMORY = 200; // tool calls remembered per running task, to tell new 
 // A worker's own step cap (e.g. OpenCode's per-turn maxSteps) ending a turn is not the task ending:
 // while it is still producing new, non-repeated tool calls, bounce resumes the same worker instead
 // of treating a synthesized "steps reached" report as the final answer. Bounded the same way a
-// lease ceiling is, so a genuinely stuck local worker still stops (docs/plans/step-renewal.md).
+// lease ceiling is, so a genuinely stuck local worker still stops.
 const STEP_RENEWAL_LIMIT = 3;
 const TIERS = new Set(['live', 'next-turn', 'queued']);
 // The depends_on hold/fail decision (which dependency states fail a dependent outright vs.
@@ -77,10 +81,12 @@ const reportInstruction = profile => reportsByTool(profile)
 // the CLI (observed: `bounce`/`bounce --help` probes costing minutes per task). Every field a
 // report can carry is named here once, so the first report is the right one.
 // How a worker ends when no fixed format is asked of it (config.json `reports`, "plain" by default since
-// 2026-09-29): its own words are its report. Found live (ACE e3bd01d5): of 67 reports in the fixed format
+// 2026-09-29): its own words are its report. Found live (session e3bd01d5): of 67 reports in the fixed format
 // 18 were rejected as invalid and 19 rewritten by bounce. To be measured on real sessions against Jev's
 // ranking of wrong work; `reports: "structured"` brings the fixed format back.
 const PLAIN_ENDING = 'End your last turn with a plain answer in your own words: what you did, each check you ran with the last lines it printed, and what is left of this assignment. No JSON and no report call for the end. If you could not finish, begin the answer with "Blocked:" or "Failed:" and say why.';
+// A worker's copy is removed later (src/prune.js); what it started there is not.
+const STOP_SERVICES = 'Services you start in your copy (a stack, containers, a server) you stop before you end, and your answer names the command that stopped them: your copy is removed later, and what you leave running is not.';
 const plainContract = profile => [
   `To report progress, ${reportInstruction(profile)} using your scoped report endpoint (it is the only bounce command you need; \`bounce\` alone starts nothing useful here).`,
   'A progress report is a JSON object with op ("milestone" | "blocked" | "input_required"), phase ("inspect" | "plan" | "implement" | "test" | "verify" | "review" | "document" | "done"),',
@@ -89,6 +95,7 @@ const plainContract = profile => [
   'You run headless, as one turn: ending your turn ends your process, and nothing re-invokes you. Never background a command, set a',
   'monitor, or stop to "pick up when it finishes" — run long commands (deploys, test suites) in the foreground with a generous timeout,',
   'then give your answer in this same turn. Work you leave running when you stop is orphaned.',
+  STOP_SERVICES,
   `Example: ${reportsByTool(profile) ? 'bounce_report ' : "bounce report --report '"}{"op":"milestone","phase":"inspect","text":"Read the three files the orders name","next":"Implement the helper","evidence":["src/a.js"]}${reportsByTool(profile) ? '' : "'"}`,
   PLAIN_ENDING,
 ].join('\n');
@@ -104,6 +111,7 @@ const reportContract = profile => [
   'You run headless, as one turn: ending your turn ends your process, and nothing re-invokes you. Never background a command, set a',
   'monitor, or stop to "pick up when it finishes" — run long commands (deploys, test suites) in the foreground with a generous timeout,',
   'then send the final report in this same turn. Work you leave running when you stop is orphaned and the task is failed as unreported.',
+  STOP_SERVICES,
   `Example: ${reportsByTool(profile) ? 'bounce_report ' : "bounce report --report '"}{"op":"milestone","phase":"inspect","text":"Read the three files the orders name","next":"Implement the helper","evidence":["src/a.js"]}${reportsByTool(profile) ? '' : "'"}`,
 ].join('\n');
 
@@ -163,9 +171,18 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   const contractFor = profile => (plainAnswers ? plainContract(profile) : reportContract(profile));
   const endingLine = plainAnswers ? PLAIN_ENDING : LOCAL_REPORT_LINE;
   const slotWaiters = new Set();
+  const localQueuedAt = new Map(); // task -> when it first waited for a local slot
+  const onEndpoint = (p, endpoint) => Boolean(p) && LOCAL_ADAPTERS.has(p.adapter) && (p.endpoint ?? 'lmstudio') === endpoint;
+  // Every profile down a profile's fallback links, in order, each once.
+  const chainAfter = profile => {
+    const out = [], seen = new Set();
+    const walk = names => { for (const name of names ?? []) { if (seen.has(name) || !profiles[name]) continue; seen.add(name); out.push(name); walk(profiles[name].fallback); } };
+    walk(profile?.fallback);
+    return out;
+  };
   const OBSERVED_RUNS = 8;
   const observedRuns = new Map(); // task -> what bounce saw its current attempt run
-  // In-place tasks (docs/plans/in-place-tasks.md): at most one running, and never alongside a
+  // In-place tasks: at most one running, and never alongside a
   // mid-flight integration of any task's — `inPlaceWaiters` holds tasks parked on that lock,
   // exactly like `slotWaiters` parks tasks on a full local endpoint.
   const inPlaceWaiters = new Set();
@@ -236,10 +253,42 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const policies = adapters[selectedAdapter]?.capabilities?.().executionPolicies;
     if (Array.isArray(policies) && !policies.includes(effectivePolicy(profiles[agent] ?? {}))) return null;
     const name = `${agent}@${ai}`;
-    if (profiles[agent]?.auto === true && (local || profiles[ai])) profiles[name] = playedBy(profiles[agent], ai, profiles[ai], local);
+    if (profiles[agent]?.auto === true && (local || profiles[ai])) profiles[name] = {...playedBy(profiles[agent], ai, profiles[ai], local), routed: true};
     return profiles[name] ? name : null;
   };
-  for (const e of session.events) if (e.kind === 'jev.routed' && e.agent && e.ai) compose(e.agent, e.ai, e.local ?? null);
+  for (const e of session.events) if ((e.kind === 'jev.routed' || e.kind === 'review.routed') && e.agent && e.ai) compose(e.agent, e.ai, e.local ?? null);
+  // A profile is an agent's, a model is an AI: an agent on an AI someone named is `agent@provider:model`, composed the
+  // way Jev's picks are (playedBy: the agent's prompt, policy and chain, the AI's adapter and model). Its name is all it
+  // takes to rebuild it, so a restart composes it again from the rows that name it.
+  const PINNED = /^([^@:]+)@([a-z0-9][a-z0-9_-]*):(.+)$/;
+  const pinnedName = (agent, ref) => `${agent}@${ref.replace('/', ':')}`;
+  const localEndpoints = () => {
+    let configured = {};
+    try { configured = normalizeLocalSettings(localSettings).endpoints; } catch {}
+    return new Set([...Object.keys(configured), ...Object.values(profiles).filter(p => p.backend).map(p => p.endpoint)]);
+  };
+  function pin(agent, ref) {
+    const head = profiles[agent];
+    if (!head?.derived || head.agent?.name !== agent || head.ai) return null;
+    const cut = ref.indexOf('/');
+    if (cut < 1) return null;
+    const provider = ref.slice(0, cut), model = ref.slice(cut + 1);
+    const local = localEndpoints().has(provider) ? {endpoint: provider, model} : null;
+    const adapter = local ? 'opencode' : provider;
+    if (!adapters[adapter]) return null;
+    const policies = adapters[adapter].capabilities?.().executionPolicies;
+    if (Array.isArray(policies) && !policies.includes(effectivePolicy(head))) return null;
+    const name = pinnedName(agent, ref);
+    // The AI was named, so nothing falls under it: a run that cannot finish goes back to the orchestrator, never down
+    // the agent's own chain to an AI nobody asked for.
+    // The agent's own settings for that AI (its binding's sampling) come along when the AI is on its list.
+    const own = local && Object.values(profiles).find(p => p.derived && !p.ai && p.agent?.name === agent && p.backend && `${p.endpoint}/${p.model}` === ref && p.localOptions);
+    if (!profiles[name]) profiles[name] = {...playedBy(head, ref, {adapter, model}, local), ...(own ? {localOptions: own.localOptions} : {}), fallback: [], pinned: true};
+    return name;
+  }
+  const ensurePinned = name => { const match = typeof name === 'string' && !profiles[name] ? PINNED.exec(name) : null; if (match) pin(match[1], `${match[2]}/${match[3]}`); };
+  const reviewNames = review => [review?.prelaunch, review?.completion].flatMap(value => Array.isArray(value) ? value : [value]).filter(name => typeof name === 'string');
+  for (const e of session.events) if (e.kind === 'task.submitted') [e.profile, ...reviewNames(e.review)].forEach(ensurePinned);
   // Jev's diff base (`head` on the first task.started) is recorded only for a task a
   // decision-model (typesafe) reviewer will judge — the `jev` critic prepare() names when Jev
   // review is on. Otherwise the row carries no `head` and no git call is made, so with Jev
@@ -358,7 +407,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
 
   // The machine gate, last before the launch: another bounce process (another home, a benchmark) may
   // be running a local worker on the same server, which this process cannot see in its own journal.
-  // Found live (ACE d1bc0206): two of them queued inside LM Studio and one read as "stalled for 604 s".
+  // Found live (session d1bc0206): two of them queued inside LM Studio and one read as "stalled for 604 s".
   // The task waits here, says once who has the model, and is bounded by its own deadline like the
   // rest of the admission.
   async function admitMachine({profile, key, task, attempt, context, signal}) {
@@ -474,19 +523,18 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
 
   // Progress in that turn: the same repeat check leaseDecision uses for a lease renewal (new tool
   // calls, not just the same ones already made before this turn started), scoped here to the calls
-  // made since the attempt's own task.started rather than a lease boundary.
+  // made since the attempt's own task.started (by journal order) rather than a lease boundary.
   function stepTurnProgressed(task, attempt) {
     const started = session.events.findLast(e => e.kind === 'task.started' && e.task === task && e.attempt === attempt);
     if (!started) return false;
-    const sinceAt = Date.parse(started.time);
     const calls = toolCalls.get(task) ?? [];
-    const inTurn = calls.filter(c => c.at > sinceAt);
-    const before = calls.filter(c => c.at <= sinceAt);
+    const inTurn = calls.filter(c => c.seq >= started.seq);
+    const before = calls.filter(c => c.seq < started.seq);
     if (!inTurn.length) return false;
     return before.length === 0 || inTurn.some(c => c.change) || !inTurn.every(c => before.some(b => b.call === c.call));
   }
 
-  // The step-budget renewal (docs/plans/step-renewal.md): a worker whose turn ended only because it
+  // The step-budget renewal: a worker whose turn ended only because it
   // hit its own step cap, and was still making progress, is resumed on the SAME native session with
   // a short "keep going" message instead of having its cap-truncated answer treated as final. Bounded
   // exactly like a lease: at most STEP_RENEWAL_LIMIT times, and never past the task's own deadline —
@@ -511,7 +559,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const final = session.events.findLast(e => e.kind === 'task.reported' && e.task === task && e.attempt === attempt);
     if (!final) return false;
     // "Done, but X remains" completes: the work is kept and reviewed like any other, and X reaches
-    // the orchestrator as a follow-up. Found live (ACE d1bc0206): blocking it threw away finished work
+    // the orchestrator as a follow-up. Found live (session d1bc0206): blocking it threw away finished work
     // whose "remaining" was another task's job (router wiring, a live check), and it was redone on Opus.
     // A worker that only ran out of steps is continued first.
     if (final.outcome === 'completed' && remainingWork(final.remaining)) {
@@ -526,10 +574,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   }
 
   // Session effective policy: the user session is write-privileged; only its mode narrows it
-  // (docs/local-orchestration.md "Permissions", CONTRACT.md §1).
+  //.
   const sessionEffective = sessionMode === 'plan' ? 'plan' : 'yolo';
 
-  // The pre-launch policy check (CONTRACT.md §3), shared by every path that launches a profile
+  // The pre-launch policy check, shared by every path that launches a profile
   // (the worker's own launch and a prelaunch review's launch): ratchet-down first (never more
   // privileged than the session), then per-provider support (`unsupported` over downgrade — an
   // adapter that declares no executionPolicies is unconstrained, so bare test fakes keep
@@ -561,11 +609,41 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const byNeed = Array.isArray(requires) && requires.includes('write') ? 'builder' : ['reviewer', 'critic', 'verifier'].includes(role) ? 'reviewer' : 'analyst';
     return [byName, heads.includes(role) ? role : null, byNeed].find(name => name && heads.includes(name) && fits(name)) ?? heads.find(fits) ?? null;
   }
+  // An AI by the name a person uses: a family (sol, terra, opus, qwen) — the newest of it the agent lists, else the newest
+  // the roster runs —, a provider/model ref, or a roster profile's name. `listed` says whether the agent's own list has it.
+  const REVIEW_ROLES = new Set(['reviewer', 'critic', 'verifier']);
+  const isModelProfile = p => Boolean(p) && !p.derived && p.model !== undefined && p.role !== 'orchestrator' && p.adapter !== 'typesafe' && !REVIEW_ROLES.has(p.role) && !READONLY_ROLES.has(p.role);
+  const refOf = p => p.backend ? `${p.endpoint}/${p.model}` : `${p.adapter}/${p.model}`;
+  const familyOf = (ref, word) => ref.slice(ref.indexOf('/') + 1).toLowerCase().split(/[-_./:[\]]/).some(token => token === word || (token.startsWith(word) && /^\d/.test(token.slice(word.length))));
+  const versionOf = ref => modelVersion(ref.slice(ref.indexOf('/') + 1))?.version ?? [];
+  const newestFirst = (a, b) => { const x = versionOf(a), y = versionOf(b); for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] ?? 0) !== (y[i] ?? 0)) return (y[i] ?? 0) - (x[i] ?? 0); return 0; };
+  function resolveModel(agent, wanted) {
+    const word = String(wanted ?? '').trim();
+    if (!word) return null;
+    const listed = Object.values(profiles).filter(p => p.derived && p.agent?.name === agent && !p.ai && p.model).map(refOf);
+    const roster = Object.values(profiles).filter(p => p.model && !p.ai && (isModelProfile(p) || (p.derived && p.agent))).map(refOf);
+    const found = ref => ({ref, listed: listed.includes(ref)});
+    if (word.includes('/')) return found(word);
+    if (isModelProfile(profiles[word])) return found(refOf(profiles[word]));
+    const alias = aliasProfile(word, agent);
+    if (alias) return found(refOf(alias));
+    const family = word.toLowerCase();
+    const own = [...new Set(listed.filter(ref => familyOf(ref, family)))].sort(newestFirst);
+    if (own.length) return found(own[0]);
+    const other = [...new Set(roster.filter(ref => familyOf(ref, family)))].sort(newestFirst);
+    return other.length ? found(other[0]) : null;
+  }
+  const agentOf = name => profiles[name]?.agent?.name ?? null;
+  // A name from the bindings (models.yaml) for an AI: the agent's own entry first, else any agent's.
+  const aliasProfile = (word, agent = null) => { const named = Object.values(profiles).filter(p => p.derived && !p.ai && p.alias === word); return named.find(p => p.agent?.name === agent) ?? named[0] ?? null; };
+  const reviewAgent = () => agentHeads().find(name => REVIEW_ROLES.has(profiles[name].role)) ?? null;
   // Corrections, not refusals, wherever the intent of a submission is clear (2026-09-27: refusals cost whole
   // orchestrator turns). Each is said in `corrections` on the journaled row and as a task.corrected row.
   function correct(spec) {
     const corrections = [];
-    // Found live (ACE d1bc0206): 11 of 23 first attempts named `build_claude` (Opus) directly, skipping the
+    // `agent@provider:model` is composed from its name the first time it is given, not only once a row has used it.
+    ensurePinned(spec.profile);
+    // Found live (session d1bc0206): 11 of 23 first attempts named `build_claude` (Opus) directly, skipping the
     // builder agent's own order (local, then Sonnet, then Opus). A first attempt from the orchestrator runs
     // as the matching agent; a profile is for a retry, or for an AI the user asked for (`userAsked: true`).
     const named = profiles[spec.profile];
@@ -576,6 +654,64 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         corrections.push(`profile: ${spec.profile} is one AI; a first attempt runs as the ${agent} agent, which tries its own AIs lightest first (name an AI only for a retry, or add userAsked: true when the user asked for it)`);
         spec = {...spec, profile: agent};
       }
+    }
+    // An AI named where the agent goes (`profile: codex_61_sol`) plays the agent the task is, never instead of it: the
+    // agent of the task a retry continues, else the one its orders match.
+    if (isModelProfile(profiles[spec.profile]) && profiles[spec.profile].model && spec.from === 'orchestrator' && agentHeads().length) {
+      const agent = agentOf(rawSubmittedRow(spec.retryOf ?? spec.replaces)?.profile) ?? matchingAgent(spec);
+      const ref = refOf(profiles[spec.profile]);
+      const name = agent && pin(agent, ref);
+      if (name) {
+        corrections.push(`profile: ${spec.profile} is an AI, not an agent: it runs as the ${agent} agent on ${ref} (profile names the agent, model the AI)`);
+        spec = {...spec, profile: name};
+      }
+    }
+    // A binding's name for an AI given as the profile (`profile: qwen3.8_builder_2`) is the same case.
+    const alias = !profiles[spec.profile] && spec.from === 'orchestrator' && typeof spec.profile === 'string' ? aliasProfile(spec.profile) : null;
+    if (alias) {
+      const agent = agentOf(rawSubmittedRow(spec.retryOf ?? spec.replaces)?.profile) ?? matchingAgent({...spec, profile: undefined}) ?? alias.agent.name;
+      const ref = refOf(aliasProfile(spec.profile, agent));
+      const name = pin(agent, ref);
+      if (name) {
+        corrections.push(`profile: ${spec.profile} is an AI (a name in the bindings), not an agent: it runs as the ${agent} agent on ${ref} (profile names the agent, model the AI)`);
+        spec = {...spec, profile: name};
+      }
+    }
+    if (spec.model !== undefined) {
+      ensurePinned(spec.profile);
+      const agent = agentOf(spec.profile) ?? matchingAgent({...spec, profile: undefined});
+      const found = agent ? resolveModel(agent, spec.model) : null;
+      const name = found && pin(agent, found.ref);
+      if (!name) return {...spec, modelProblem: `model: no AI named ${JSON.stringify(spec.model)} here${agent ? ` for the ${agent} agent` : ''}; name a family (sol, terra, opus, qwen) or a provider/model ref`};
+      if (!found.listed) corrections.push(`model: ${found.ref} is not on the ${agent}'s list; it plays the ${agent} because it was named`);
+      spec = {...spec, profile: name};
+    }
+    // Only a review agent reviews. A stage may name the reviewer with its AI ({profile: "reviewer", model: "sol"}); an
+    // AI or a non-review agent named as the reviewer becomes the review agent, on that AI when one was named.
+    if (spec.review && typeof spec.review === 'object' && !Array.isArray(spec.review)) {
+      const review = {...spec.review};
+      for (const stage of ['prelaunch', 'completion']) {
+        if (review[stage] === undefined) continue;
+        const one = value => {
+          const given = value && typeof value === 'object' && !Array.isArray(value) ? value : {profile: value};
+          if (typeof given.profile !== 'string') return value;
+          ensurePinned(given.profile);
+          const named = profiles[given.profile];
+          const reviews = named && (named.adapter === 'typesafe' || REVIEW_ROLES.has(named.role) || READONLY_ROLES.has(named.role));
+          if (reviews && given.model === undefined) return given.profile;
+          const agent = reviews && named.derived ? agentOf(given.profile) : reviews ? null : reviewAgent();
+          if (!agent) return reviews ? given.profile : value;
+          const found = given.model !== undefined ? resolveModel(agent, given.model) : isModelProfile(named) ? {ref: refOf(named), listed: true} : null;
+          if (given.model !== undefined && !found) return value;
+          const name = found ? pin(agent, found.ref) : agent;
+          if (!name) return value;
+          if (isModelProfile(named)) corrections.push(`review.${stage}: ${given.profile} is an AI, not an agent: the ${agent} agent reviews on ${found.ref}`);
+          else if (!reviews) corrections.push(`review.${stage}: ${given.profile} is not a review agent: the ${agent} agent reviews${found ? ` on ${found.ref}` : ''}`);
+          return name;
+        };
+        review[stage] = Array.isArray(review[stage]) ? review[stage].map(one) : one(review[stage]);
+      }
+      spec = {...spec, review};
     }
     if (spec.profile !== AUTO_PROFILE && !profiles[spec.profile]) {
       const agent = matchingAgent(spec);
@@ -605,9 +741,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       const previous = session.events.filter(e => e.kind === 'task.submitted' && e.jobId === spec.jobId);
       if (previous.length && !spec.replaces && !spec.retryOf) return 'job already exists; use retryOf';
     }
+    if (spec.modelProblem) return spec.modelProblem;
+    ensurePinned(spec.profile);
     if (spec.profile === AUTO_PROFILE ? !routingFallback(profiles) : !profiles[spec.profile]) return `profile: ${JSON.stringify(spec.profile ?? null)} is not a profile or agent here; send one of ${JSON.stringify(Object.keys(profiles).filter(name => profiles[name].role !== 'orchestrator' && profiles[name].adapter !== 'typesafe'))}`;
     if (spec.inPlace !== undefined) {
-      // Structural check (docs/plans/in-place-tasks.md §1, always): the cited row must exist and
+      // Structural check (always): the cited row must exist and
       // be a `user` row — only the keyboard path writes those, and bus.js already refuses `user`
       // from a peer, so a row that IS one was typed by the person, not asserted by any AI.
       const cited = inPlaceCitation(spec.inPlace);
@@ -629,6 +767,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (spec.checkpoint != null && typeof spec.checkpoint !== 'object') return 'checkpoint';
     if (spec.check !== undefined && spec.check !== null && !validCheck(spec.check)) return 'check';
     if (spec.risk !== undefined && !RISKS.has(spec.risk)) return 'risk';
+    if (spec.tier !== undefined && !PROFILE_TIERS.includes(spec.tier)) return 'tier';
     if (spec.owns !== undefined && !validOwns(spec.owns)) return 'owns';
     if (spec.size !== undefined && SIZE_FIELDS.some(field => !isNonNegativeInt(spec.size[field]))) return 'size';
     if (spec.depends_on !== undefined) {
@@ -647,9 +786,12 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         const names = Array.isArray(name) ? name : [name];
         if (!names.length) return 'review';
         for (const n of names) {
+          ensurePinned(n);
           const p = profiles[n];
-          // A reviewer is whoever cannot change anything: by declared policy, not by the label it wears.
-          if (!p || !(['read-only', 'probe'].includes(effectivePolicy(p)) || READONLY_ROLES.has(p.role))) return 'review';
+          // Only a review agent reviews (restored 2026-10-26, by role rather than policy: reviewer agents may run
+          // commands). Without it a builder profile reviewed, rebuilt the work it was judging and gave no verdict. A
+          // roster with no agents at all has only profiles, and any of them may review, as before agents existed.
+          if (!p || (agentHeads().length && !(p.adapter === 'typesafe' || REVIEW_ROLES.has(p.role) || READONLY_ROLES.has(p.role)))) return 'review';
         }
       }
     }
@@ -690,6 +832,14 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       ...(original ? {replaces: predecessor, retryOf: predecessor, parent: original.parent ?? null,
         deadline: original.deadline, requires: original.requires ?? spec.requires, budget: undefined, owns: spec.owns ?? original.owns, review: original.review ?? undefined,
         depends_on: original.depends_on ?? []} : {})};
+    // A review agent's verdict is the task's result: nothing reviews a review (found live: Jev read a FAIL verdict as
+    // unmet acceptance and escalated it to another review).
+    if (REVIEW_ROLES.has(profiles[spec.profile]?.role)) {
+      if (!spec.review?.completion) return spec;
+      const {completion: _completion, ...review} = spec.review;
+      return {...spec, review: Object.keys(review).length ? review : undefined,
+        corrections: [...(spec.corrections ?? []), `review.completion: dropped; ${spec.profile} is a review task, and its verdict is the result: nothing reviews a review`]};
+    }
     const reviewer = jev && profiles[jev.reviewer];
     if (!reviewer || reviewer.adapter !== 'typesafe' || !READONLY_ROLES.has(reviewer.role) || strategy !== defaultStrategy) return spec;
     if (spec.review?.completion) return spec;
@@ -698,7 +848,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (spec.inPlace !== undefined) return spec;
     let settings;
     try { settings = jev.settings(); } catch { return spec; }
-    if (!settings?.enabled || !settings.review) return spec;
+    if (!settings?.enabled) return spec;
+    // Review off keeps the slot when the team has a reviewer agent: changed work goes to that agent without a Jev
+    // call, and a report that changed nothing is not reviewed (handleCompleted, 2026-10-25).
+    if (!settings.review && !escalationReviewer({lean: REVIEW_OFF, reviewers: [jev.reviewer], profiles, changes: null})) return spec;
     return {...spec, review: {...(spec.review ?? {}), completion: jev.reviewer}};
   }
 
@@ -726,10 +879,12 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       size: spec.size ?? {lines: 0, probes: 0, minutes: 0},
       depends_on: spec.depends_on ?? [],
       review: spec.review ?? null,
+      ...(spec.model !== undefined ? {model: spec.model} : {}),
       steps: spec.steps ?? null,
       ...(spec.check ? {check: spec.check} : {}),
       ...(spec.owns ? {owns: spec.owns} : {}),
       ...(spec.inPlace ? {inPlace: spec.inPlace} : {}),
+      ...(spec.tier ? {tier: spec.tier} : {}),
       jobId: spec.jobId, retryOf: spec.retryOf,
       ...(spec.continues ? {continues: spec.continues} : {}),
       ...(spec.worker ? {worker: spec.worker} : {}),
@@ -777,7 +932,6 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     : error.code === 'limited' ? {reason: 'limited', text: error.message}
     : {reason: 'error', text: error.message};
 
-  const probeOrders = workspace => `Run commands in your current disposable workspace (${workspace.cwd}). Tests may write caches and output here; none of these changes are integrated into the source. Do not edit source files to make checks pass. Source checkout: ${workspace.source}. The copy has its own Git: its first commit is the checkout as copied, so git status and git diff there show only changes made in the copy. Report observed commands and results.`;
   // An isolated write worker works in a copy; orders that name the real checkout by absolute path would
   // send it there (observed live: a heredoc appended to the real file, the copy stayed unchanged and
   // review saw an empty diff). Paths into the checkout are rewritten to the copy.
@@ -792,7 +946,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (typeof adapters[profile.adapter]?.resume !== 'function') return {reason: `${profile.adapter} cannot resume a session`};
     return {native: {provider: nativeRow.provider, sessionId: nativeRow.sessionId}, worker: session.events.findLast(e => e.kind === 'task.launch.requested' && e.task === row.continues && e.worker)?.worker ?? null};
   };
-  // Standing workers (docs/plans/standing-workers.md §1): a task with no `continues` goes to its agent's idle
+  // The size of the worker's context after its last call, as the adapter measured it: a turn's usage sums every
+  // call (session fb6036ee: 481k of usage for a 43k context). The row's own `context` is the session's id.
+  const contextUsedOf = event => (Number.isInteger(event.context?.used) ? {contextUsed: event.context.used} : {});
+  // Standing workers: a task with no `continues` goes to its agent's idle
   // standing worker by itself; a named `worker` goes to that one if it is idle. A busy or retired one is not
   // continued — the task starts a fresh worker and the row says so — so parallel work stays parallel.
   const assignWorker = spec => {
@@ -812,7 +969,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const idle = idleWorkerOf(session.events, spec.profile);
     return idle ? {...spec, continues: idle.lastTask, worker: idle.name} : spec;
   };
-  // One turn on a standing worker's own session that is not a task (docs/plans/standing-workers.md §3):
+  // One turn on a standing worker's own session that is not a task:
   // read-only, in the checkout, its answer returned. Used to compact a worker and to ask it for a handoff.
   const HANDOFF_ASK = 'You are being retired; a new worker takes over your job in this project. Write the handoff it should read first: what you did and where it is, what you learned about this project that is not written down, what is unfinished, and what to watch out for. Plain text, under 300 words. Change nothing.';
   async function workerSideTurn(found, message, {cap = 180_000} = {}) {
@@ -857,12 +1014,16 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     }
     return append({kind: 'worker.retired', worker, profile: found.profile, by, ...(text ? {handoff: text} : {}), ...(ask ? {asked: true} : {}), ...(context ? {context} : {})});
   }
-  // The agent prompt plus the project's lessons for its job, when there are any and the profile has a job.
-  const withLessons = profile => {
+  // The agent prompt plus the project's lessons for its job and the index of the skills in use, when there are any and
+  // the profile has a job. A skill is named by its path in the checkout, which the copy rewrites to its own (the copy
+  // carries the skills); an in-place worker reads the user's skills where they are.
+  const withLessons = (profile, row = {}) => {
     if (!profile.agent?.prompt || !profile.role) return profile;
-    const block = lessonsBlock(session.cwd, profile.role);
-    if (!block || profile.agent.prompt.includes(block)) return profile;
-    return {...profile, agent: {...profile.agent, prompt: `${profile.agent.prompt}\n\n${block}`}};
+    const inUse = skillsInUse(session.root, session.cwd);
+    const fileOf = skill => row.inPlace && inUse.source !== 'project' ? path.join(skill.dir, 'SKILL.md') : path.join(session.cwd, '.bounce', 'skills', skill.name, 'SKILL.md');
+    const blocks = [lessonsBlock(session.cwd, profile.role), skillsBlock(inUse.skills, fileOf)].filter(block => block && !profile.agent.prompt.includes(block));
+    if (!blocks.length) return profile;
+    return {...profile, agent: {...profile.agent, prompt: [profile.agent.prompt, ...blocks].join('\n\n')}};
   };
   const toWorkingCopy = (text, workspace) => {
     const source = fs.realpathSync(session.cwd);
@@ -890,16 +1051,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return workspace;
   }
   function workspaceFor(task, profile, attempt) {
-    if (effectivePolicy(profile) !== 'probe' && POLICY_RANK[effectivePolicy(profile)] < POLICY_RANK.write) return null;
+    if (POLICY_RANK[effectivePolicy(profile)] < POLICY_RANK.write) return null;
     const prior = existingWorkspace(task);
-    const sameKind = prior && Boolean(prior.disposable) === (effectivePolicy(profile) === 'probe');
-    // A task never turns its own throwaway copy into one that is integrated, or the reverse. A retry
-    // on another AI is another task: when its kind differs from its predecessor's, it gets a copy of
-    // its own. Found on the real path (2026-09-28): a review retried on a cloud profile after the local
-    // reviewer gave no answer was refused here before it started.
-    const own = workspaces.has(task) || session.events.some(e => e.kind === 'task.workspace' && e.task === task);
-    if (prior && !sameKind && own) throw new Error('workspace policy changed; submit a new scoped task');
-    if (prior && sameKind) {
+    if (prior) {
       workspaces.set(task, prior); return {...prior, attemptId: `${task}-${attempt}`};
     }
     const relative = path.relative(fs.realpathSync(session.cwd), fs.realpathSync(session.dir));
@@ -909,11 +1063,20 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // owns is a hint for the worker and the orchestrator, not a fence any more (2026-09-29): every
     // working copy owns everything, so any change the worker makes is part of its artifact; what
     // actually protects the checkout is integrateArtifact's conflict check against the real file.
-    const workspace = createAttemptWorkspace({cwd: session.cwd, dir, owns: ['**'], attemptId: `${task}-${attempt}`, disposable: effectivePolicy(profile) === 'probe',
+    const workspace = createAttemptWorkspace({cwd: session.cwd, dir, owns: ['**'], attemptId: `${task}-${attempt}`, skills: skillsInUse(session.root, session.cwd).skills,
       ...(nested ? {} : {copyRoot: path.join(session.root, 'w')})});
     workspaces.set(task, workspace);
-    append({kind: 'task.workspace', task, attempt, purpose: workspace.disposable ? 'probe' : 'publish', cwd: workspace.cwd, metadata: path.join(workspace.cwd, '.attempt-workspace.json'), baselineHash: workspace.baselineHash});
+    append({kind: 'task.workspace', task, attempt, purpose: 'publish', cwd: workspace.cwd, metadata: path.join(workspace.cwd, '.attempt-workspace.json'), baselineHash: workspace.baselineHash});
     return workspace;
+  }
+  // The files a task's artifact changed; null when unknown (no artifact, or it cannot be read).
+  function changesOf(task) {
+    try { return artifactFor(task)?.artifact?.changes ?? null; } catch { return null; }
+  }
+  // Jev's first-pass review is off and these reviewers are only Jev: nothing asks Jev (2026-10-25).
+  function jevReviewOff(reviewers) {
+    if (!reviewers?.length || !reviewers.every(name => profiles[name]?.adapter === 'typesafe')) return false;
+    try { const settings = jev?.settings(); return Boolean(settings?.enabled && !settings.review); } catch { return false; }
   }
   function artifactFor(task) {
     const row = session.events.findLast(e => e.kind === 'task.artifact' && e.task === task);
@@ -992,7 +1155,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       return;
     }
     const maximumPolicy = POLICY_RANK[effectivePolicy(profiles[view[lineageRoot].profile])];
-    const next = (profile.fallback ?? []).find(name => !tried.has(name) && profiles[name]
+    // A busy local slot: the next AI down the whole chain that is not on that endpoint (a Jev-routed job's first link
+    // is the agent's own head, often the same local model).
+    const busyEndpoint = row.reason === 'local_busy' ? (profile.endpoint ?? 'lmstudio') : null;
+    const next = (busyEndpoint ? chainAfter(profile) : profile.fallback ?? []).find(name => !tried.has(name) && profiles[name]
+      && !(busyEndpoint && onEndpoint(profiles[name], busyEndpoint))
       && profiles[name].role !== 'orchestrator'
       && POLICY_RANK[effectivePolicy(profiles[name])] <= maximumPolicy && !policyRefusal(profiles[name])
       && !missingCapabilities(profiles[name], submittedRow(row.task)?.requires).length);
@@ -1063,7 +1230,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     }
   }
 
-  // STRATEGY (CONTRACT.md §2 onCompleted): fires on every task.completed row (even a second/
+  // STRATEGY: fires on every task.completed row (even a second/
   // later one on the same task). `defaultStrategy` reproduces the exact pre-Phase-8 condition
   // (only a row whose review.completion is set ever entered a completion review) via its own
   // onCompleted hook — the CORE here just executes whatever intent comes back.
@@ -1103,8 +1270,13 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const view = reducers.tasks(session.events);
     const hook = invokeHook(() => strategy.onCompleted(task, view, api), task, context);
     if (!hook.ok) return;
-    const intent = hook.intent;
+    let intent = hook.intent;
     if (intent === 'none') return;
+    // Only work known to have changed files goes to the reviewer agent; anything else (a read-only task has no
+    // artifact) is accepted, as an unsure Jev accepts a report that changed nothing. Unverified changes still
+    // take the review path, whose verdict strategy holds them for the orchestrator.
+    if (intent?.action === 'review' && jevReviewOff(intent.reviewers) && !api.unverifiedChanges(task)
+      && !(changesOf(task)?.length && escalationReviewer({lean: REVIEW_OFF, reviewers: intent.reviewers, profiles, changes: changesOf(task)}))) intent = {action: 'accept'};
     // A check that failed: the work goes back once, or is held for the orchestrator.
     if (intent && typeof intent === 'object' && (intent.action === 'rework' || intent.action === 'escalate')) {
       if (!['completed', 'reviewing'].includes(view[task]?.state)) return;
@@ -1133,7 +1305,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     append({kind: 'task.failed', task, reason: 'strategy', text: 'malformed onCompleted intent', context});
   }
 
-  // STRATEGY (CONTRACT.md §1 onTerminal): fires after a task actually leaves the tree for good
+  // STRATEGY: fires after a task actually leaves the tree for good
   // (accepted/failed/cancelled/timed_out/rejected — NOT a bare `completed`, which may still be
   // heading into review). Held-task re-evaluation is CORE and always runs regardless of what
   // the strategy decides; the strategy only adds an optional next-wave fan-out.
@@ -1187,7 +1359,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
           case 'milestone': append({kind: 'task.milestone', task, text: event.text, evidence: event.evidence, from, context}); break;
           case 'blocked': append({kind: 'task.blocked', task, reason: 'worker_blocked', text: event.text, from, context}); break;
           case 'diagnostic': append({kind: 'task.diagnostic', task, text: String(event.text ?? '').slice(0, 2000), ...(event.reason ? {reason: event.reason} : {}), ...(event.phase ? {phase: event.phase} : {}), ...(event.toolsDisabled ? {toolsDisabled: true} : {}), from, context}); break;
-          case 'usage': append({kind: 'task.usage', task, usage: event.usage, from, context}); break;
+          case 'usage': append({kind: 'task.usage', task, usage: event.usage, ...contextUsedOf(event), from, context}); break;
           case 'native': append({kind: 'peer.native', from, provider: event.provider, sessionId: event.sessionId, ...(event.cwd ? {cwd: event.cwd} : {}), context}); break;
           case 'jev': append({kind: `jev.${event.name}`, ...(event.data ?? {}), text: event.text, task, from, context}); break;
           case 'result':
@@ -1213,11 +1385,12 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
             if (session.events.some(e => e.kind === 'task.attempt.ended' && e.task === task && e.attempt === endedAttempt)) return;
             append({kind: 'task.attempt.ended', task, attempt: endedAttempt, verifiedTermination: true, from, context});
             let artifact = null;
-            if (owned && !owned.disposable) {
+            if (owned) {
               artifact = captureArtifact(owned);
               append({kind: 'task.artifact', task, attempt: reducers.tasks(session.events)[task]?.attempt,
                 artifactId: artifact.id, digest: artifact.digest, resultHash: artifact.resultHash,
-                file: path.join(owned.dir, 'artifacts', `${artifact.id}.json`), dir: owned.dir, cwd: owned.cwd, from, context});
+                file: path.join(owned.dir, 'artifacts', `${artifact.id}.json`), dir: owned.dir, cwd: owned.cwd,
+                ...(artifact.leftOut?.length ? {leftOut: artifact.leftOut, text: `Left out, ignored by the project: ${artifact.leftOut.map(entry => `${entry.path} (${entry.reason})`).join(', ')}`} : {}), from, context});
               if (artifact.unsupported.length) {
                 append({kind: 'task.blocked', task, reason: 'artifact_unsupported',
                   text: `Isolated artifact cannot be integrated: ${JSON.stringify(artifact.unsupported)}`, from, context});
@@ -1270,7 +1443,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
               // An adapter marks a failure of its RUNTIME (process died, endpoint down, step cap, no answer) as
               // recoverable. Work is never thrown away (2026-09-27): a step-capped worker still progressing is
               // continued first; then an attempt that changed files or said something ends completed, its
-              // report synthesized from what it produced. Found live (ACE d1bc0206): local builders did real
+              // report synthesized from what it produced. Found live (session d1bc0206): local builders did real
               // work, then their turn ended without an answer, and the draft was discarded to a cloud fallback.
               // Only an attempt that produced nothing — or a vendor/limit error — fails (and falls back).
               const attempt = reducers.tasks(session.events)[task]?.attempt ?? null;
@@ -1317,7 +1490,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // that ends after a cancel) can journal the task's end in between.
   const producedWork = (answer, artifact) => Boolean(String(answer ?? '').trim() || artifact?.changes?.length);
   // A report bounce has to write has no evidence of the worker's own: it carries what bounce saw the
-  // worker run instead (Daniel, 2026-09-28: only when the report is missing or wrongly built). Found
+  // worker run instead (2026-09-28: only when the report is missing or wrongly built). Found
   // live: 45 of 86 local attempts answered in plain text, and the review of such a report could only
   // object that nothing backed it.
   function withObserved(task, synthesis) {
@@ -1423,8 +1596,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // OpenCode runs the worker AS its role agent (system prompt, step cap); every other adapter
       // gets the role's prompt ahead of the orders instead, so the role means the same thing whoever
       // answers the dispatch.
-      // The project's lessons for this job ride with the agent prompt (docs/plans/lessons-and-sweep.md).
-      profile = withLessons(profile);
+      // The project's lessons for this job ride with the agent prompt.
+      profile = withLessons(profile, row);
       const roleLead = profile.agent?.prompt && profile.adapter !== 'opencode' ? `${profile.agent.prompt}\n\n---\n\n` : '';
       // Prefer the acknowledged report endpoint, including OpenCode's dedicated MCP tool.
       // Final-answer parsing remains a compatibility path for workers without a grant.
@@ -1432,15 +1605,14 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       let workerOrders = canReport ? `${roleLead}${row.orders}\n\n${contractFor(profile)}`
         : LOCAL_ADAPTERS.has(profile.adapter) ? `${roleLead}${row.orders}\n\n${endingLine}` : `${roleLead}${row.orders}`;
       // An in-place task's worker runs directly in session.cwd: no attempt workspace
-      // (docs/plans/in-place-tasks.md §3) — `owned` stays null, so the ordinary
+      // — `owned` stays null, so the ordinary
       // cwd/orders fallbacks below already do the right thing with no further branching.
       owned = row.inPlace ? null : workspaceFor(task, profile, attempt);
-      if (owned?.disposable) profile = {...profile, probeSource: fs.realpathSync(session.cwd)};
       // OpenCode takes the agent text as its system prompt, apart from the orders (found live: an agent
       // file naming the checkout sent a local worker to write there); it points into the copy too.
       if (owned && profile.agent?.prompt) profile = {...profile, agent: {...profile.agent, prompt: toWorkingCopy(profile.agent.prompt, owned)}};
-      const orders = owned?.disposable ? `${workerOrders}\n\n${probeOrders(owned)}` : owned ? inWorkingCopy(workerOrders, owned) : workerOrders;
-      // A continuation (docs/plans/standing-workers.md step 2): the earlier task's worker is resumed into
+      const orders = owned ? inWorkingCopy(workerOrders, owned) : workerOrders;
+      // A continuation: the earlier task's worker is resumed into
       // this task's own copy and told where it is, instead of a stranger being launched. Probed with the
       // real CLIs (2026-10-01): OpenCode, Claude and Codex all edit the new copy once told.
       const continuation = row.continues ? continuationOf(row, profile) : null;
@@ -1525,7 +1697,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       : continueMessage !== null
         ? [continueMessage, ...pending.map(m => m.text)].join('\n')
         // A worker whose report bounce had to write is told that, not that "its report" lacks something:
-        // found live (ACE d1bc0206, 99bd27ea), a worker stopped mid-fix was sent findings about a report
+        // found live (session d1bc0206, 99bd27ea), a worker stopped mid-fix was sent findings about a report
         // it never wrote.
         : reportByBounce(task)
           ? [`Rework round ${round}. Your last turn ended without your final report, so bounce wrote one from what it saw you do.`,
@@ -1541,18 +1713,16 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         ({profile, adapter} = admission);
       }
       // An in-place task's worker runs directly in session.cwd: no attempt workspace
-      // (docs/plans/in-place-tasks.md §3) — `owned` stays null, so the ordinary
+      // — `owned` stays null, so the ordinary
       // cwd/orders fallbacks below already do the right thing with no further branching.
       owned = row.inPlace ? null : workspaceFor(task, profile, attempt);
-      if (owned?.disposable) profile = {...profile, probeSource: fs.realpathSync(session.cwd)};
       // OpenCode takes the agent text as its system prompt, apart from the orders (found live: an agent
       // file naming the checkout sent a local worker to write there); it points into the copy too.
       if (owned && profile.agent?.prompt) profile = {...profile, agent: {...profile.agent, prompt: toWorkingCopy(profile.agent.prompt, owned)}};
-      profile = withLessons(profile);
+      profile = withLessons(profile, row);
       if (owned && profile.agent?.prompt) profile = {...profile, agent: {...profile.agent, prompt: toWorkingCopy(profile.agent.prompt, owned)}};
       append({kind: 'task.launch.requested', task, attempt, executionKey: `${task}:${attempt}`, resumed: true, context});
-      if (owned?.disposable) message = `${message}\n\n${probeOrders(owned)}`;
-      else if (owned) message = inWorkingCopy(message, owned);
+      if (owned) message = inWorkingCopy(message, owned);
       // A reportOnly turn asks in plain words on purpose (requestPlainAnswer): the JSON schema
       // reminder below is for every OTHER resume, never appended onto that one turn back.
       handle = await adapter.resume({peer: workerFrom(task), profile, native, message: reportOnly ? message : reportEnv ? `${message}\n\n${contractFor(profile)}` : LOCAL_ADAPTERS.has(profile.adapter) ? `${message}\n\n${endingLine}` : message, cwd: owned?.cwd ?? session.cwd, dir, checkpoint: row.checkpoint,
@@ -1576,6 +1746,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // task's next AI is tried. It used to be a bare `error`, which no fallback follows (found live:
       // a codex thread/resume timed out after a Jev rework and the session stopped).
       if (reportOnly) { await repairUnavailable(task, error.message, context); return; }
+      // The worker the resume was for may still be live (found live: a worker blocked mid-turn kept its thread, the
+      // resume was refused as a second writer, and the first worker ran on for ten minutes after the task failed).
+      const live = handles.get(task);
+      if (live?.handle) { try { await live.adapter.cancel(live.handle); } catch {} }
       append({kind: 'task.failed', task, ...startFailure(error), from: workerFrom(task), context});
       return;
     }
@@ -1662,7 +1836,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     }
   }
 
-  // A review worker: read-only, never journals task.activity's siblings as anything but
+  // A review worker: never journals task.activity's siblings as anything but
   // live activity, never emits task.completed/task.failed — only review.started/finished,
   // ending in a verdict the caller (prelaunch/completion policy) acts on. The handle lives in
   // its own `reviews` map (A3, separate from a worker's `handles`) for the window between
@@ -1674,7 +1848,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     let admission;
     const launchState = {task, peer, pending: true, requestedAt: clock()};
     reviews.set(peer, launchState);
-    let handle, owned = null;
+    let handle;
     try {
       if (LOCAL_ADAPTERS.has(profile.adapter)) {
         reviews.set(peer, launchState);
@@ -1683,18 +1857,15 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       }
       const captured = artifactFor(task);
       const workerProfile = profiles[submittedRow(task)?.profile];
-      const reportOnly = stage === 'completion' && workerProfile && POLICY_RANK[effectivePolicy(workerProfile)] < POLICY_RANK.write;
-      const reviewState = captured ? {orders: review.orders, report: review.report, diff: reviewDiff(captured.artifact), files: captured.artifact.files, baseHead: captured.artifact.baselineHash}
+      // An analysis is graded on its report: a task that declared it needs no write and changed nothing
+      // has no diff worth reviewing, even when the agent that ran it could have written. A task that
+      // declared nothing (the legacy form) is not assumed to be one.
+      const requires = submittedRow(task)?.requires;
+      const analysis = Boolean(captured) && !captured.artifact.changes.length && Array.isArray(requires) && !requires.includes('write');
+      const reportOnly = stage === 'completion' && ((workerProfile && POLICY_RANK[effectivePolicy(workerProfile)] < POLICY_RANK.write) || analysis);
+      const reviewState = captured && !analysis ? {orders: review.orders, report: review.report, diff: reviewDiff(captured.artifact), files: captured.artifact.files, baseHead: captured.artifact.baselineHash}
         : reportOnly ? {kind: 'report', orders: review.orders, report: review.report, diff: '', files: [], baseHead: null} : null;
-      if (effectivePolicy(profile) === 'probe') {
-        const source = captured?.row.cwd ?? session.cwd;
-        const probeDir = path.join(os.tmpdir(), 'bounce-review-workspaces', session.id, task);
-        fs.mkdirSync(probeDir, {recursive: true, mode: 0o700});
-        owned = createAttemptWorkspace({cwd: source, dir: probeDir, owns: ['**'], attemptId: `review-${stage}-${round}`, disposable: true});
-        profile = {...profile, probeSource: fs.realpathSync(source)};
-        orders = `${orders}\n\n${probeOrders(owned)}`;
-      }
-      handle = await adapter.launch({peer, profile, orders, cwd: owned?.cwd ?? captured?.row.cwd ?? session.cwd, dir, task, attempt: round, context, signal: admission?.signal, review, reviewState});
+      handle = await adapter.launch({peer, profile, orders, cwd: captured?.row.cwd ?? session.cwd, dir, task, attempt: round, context, signal: admission?.signal, review, reviewState});
       if (closed) { await adapter.cancel(handle); releaseReview(peer, launchState, context); return {verdict: 'unreadable', cancelled: true}; }
       if (launchState.cancelReason) {
         const stopped = await adapter.cancel(handle);
@@ -1726,7 +1897,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         if (closed) return {verdict: 'unreadable', cancelled: true};
         switch (event.kind) {
           case 'milestone': append({kind: 'task.milestone', task, text: event.text, evidence: event.evidence, from: peer, context}); break;
-          case 'usage': append({kind: 'task.usage', task, usage: event.usage, from: peer, context}); break;
+          case 'usage': append({kind: 'task.usage', task, usage: event.usage, ...contextUsedOf(event), from: peer, context}); break;
           case 'raw': append({kind: 'raw', raw: event.raw ?? null, provider: profile.adapter, task, from: peer, context}); break;
           case 'model': append({kind: 'model', model: String(event.model), provider: profile.adapter, task, from: peer, context}); break;
           case 'native': append({kind: 'peer.native', from: peer, provider: event.provider, sessionId: event.sessionId, ...(event.cwd ? {cwd: event.cwd} : {}), context}); break;
@@ -1765,7 +1936,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     append({kind: 'task.blocked', task, text: 'root budget exhausted', context});
   }
 
-  // CONTRACT.md §1: the read-only helper set every strategy hook receives as its third
+  // The read-only helper set every strategy hook receives as its third
   // argument. `roundsCap` is a small addition beyond the literal list in CONTRACT §1 — it is
   // what lets defaultStrategy's onReviewVerdict reproduce today's per-root `budget.rounds`
   // override (P4/policy.test.js) rather than only the scheduler's own `limits.rounds` default;
@@ -1869,13 +2040,65 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return check?.passed ? [...(Array.isArray(evidence) ? evidence : []), checkPassed(check)] : evidence;
   };
 
-  async function runReviewers({task, stage, round, reviewers, row, context, root, reserveFirst, note = null}) {
+  // What decides between peers, read at the moment of a launch: cooldowns, and whether a local model's slot is free here.
+  const routingLoad = () => ({cooldowns: reducers.cooldowns(session.events, clock()), now: clock(),
+    localFree: (endpoint, model) => localRunning(endpoint) < localSlots(endpoint) && localRunning(endpoint, model) < modelSlots(endpoint)});
+
+  // A review on an agent whose list opens with `auto` is routed the way a dispatch is: Jev picks the AI among the ones
+  // the list names (found live: every review ran on the list's first AI, because only a dispatch ever asked). The pick
+  // is review.routed — never jev.routed, which is the task's own profile — and a restart reuses it for the same slot.
+  // A review runs on a local model only when one was named for it (found live: reviews escalated to the reviewer agent
+  // ran on its list's first AI, the local qwen, for minutes on the user's GPU with no verdict bounce could read): Jev
+  // picks among the cloud AIs, and a list that opens with a local model gives its first cloud AI instead.
+  const firstCloud = agent => {
+    const seen = new Set();
+    for (const queue = [agent]; queue.length;) {
+      const name = queue.shift();
+      if (seen.has(name) || !profiles[name]) continue;
+      seen.add(name);
+      if (!profiles[name].backend && adapters[profiles[name].adapter]) return name;
+      queue.push(...(profiles[name].fallback ?? []));
+    }
+    return null;
+  };
+  async function routeReview(slot) {
+    const {task, stage, round, agent, peer, context} = slot;
+    const earlier = session.events.findLast(e => e.kind === 'review.routed' && e.task === task && e.stage === stage && e.round === round && e.peer === peer);
+    if (earlier) return earlier.chosen && profiles[earlier.chosen] ? earlier.chosen : agent;
+    const name = await jevReview(slot);
+    if (name !== agent || !profiles[name]?.backend || profiles[name].pinned) return name;
+    const cloud = firstCloud(agent);
+    if (!cloud || cloud === name) return name;
+    append({kind: 'review.routed', task, stage, round, peer, chosen: cloud, agent, ai: null, fallback: true, reason: 'local_unnamed',
+      text: `Routed the review: ${agent} → ${cloud} (a review runs on a local model only when one is named for it)`, context});
+    return cloud;
+  }
+  async function jevReview({task, stage, round, agent, peer, row, context}) {
+    if (profiles[agent]?.auto !== true || !jev?.routeAI) return agent;
+    let decision;
+    try { decision = await jev.routeAI({task, orders: row.orders, profiles, head: profiles[agent], tier: row.tier ?? null, load: routingLoad, local: false}); }
+    catch { decision = null; }
+    const played = decision?.ai ? compose(agent, decision.ai, decision.local ?? null) : null;
+    if (!decision?.asked) return agent;
+    const described = decision.description ? Object.entries(decision.description).filter(([, value]) => value !== null).map(([name, value]) => `${name.replace('_', ' ')} ${Number(value).toFixed(2)}`).join(', ') : '';
+    append({kind: 'review.routed', task, stage, round, peer, chosen: played ?? agent, agent, ai: played ? decision.ai : null, fallback: !played, reason: played ? null : decision.reason ?? 'unavailable',
+      ...(played && decision.tier ? {tier: decision.tier} : {}), ...(played && decision.local ? {local: decision.local} : {}),
+      ...(decision.description ? {description: decision.description} : {}), ...(decision.candidates ? {candidates: decision.candidates} : {}),
+      text: played ? `Routed the review: ${agent} → ${decision.ai} (${described ? `Jev: tier ${decision.tier} from ${described}` : `Jev${decision.tier ? `: tier ${decision.tier}` : ''}`}; ${decision.why ?? 'first fitting'})`
+        : `Routed the review: ${agent} → its own models (fallback: ${decision.reason ?? 'unavailable'})`, context});
+    return played ?? agent;
+  }
+
+  async function runReviewers({task, stage, round, reviewers, row, context, root, reserveFirst, note = null, slot = null, route = true}) {
     const verdicts = [];
     for (let i = 0; i < reviewers.length; i++) {
-      const profileName = reviewers[i];
-      const reviewProfile = profiles[profileName];
+      let profileName = reviewers[i];
+      ensurePinned(profileName);
+      let reviewProfile = profiles[profileName];
       const candidate = candidateResult(session.events, task);
-      const peer = reviewers.length === 1 ? reviewFrom(task) : `${reviewFrom(task)}:${i}`;
+      // `slot` names a second review of the same candidate (an unsure Jev handing over), so the first one's finished
+      // verdict is not found again and reused for it.
+      const peer = `${reviewers.length === 1 ? reviewFrom(task) : `${reviewFrom(task)}:${i}`}${slot ? `:${slot}` : ''}`;
       const retryBoundary = session.events.findLast(e => e.task === task && e.kind === 'review.reasked'
         && e.stage === stage && e.candidateSeq === candidate?.seq)?.seq ?? 0;
       // A completed review is durable work too. Reuse only this candidate's current review
@@ -1888,7 +2111,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         verdicts.push(verdict.verdict === recovered.verdict ? verdict : {verdict: recovered.verdict});
         continue;
       }
-      // A review profile is a profile too (CONTRACT.md §3): the same shared check runs before
+      if (route) { profileName = await routeReview({task, stage, round, agent: profileName, peer, row, context}); reviewProfile = profiles[profileName]; }
+      // A review profile is a profile too: the same shared check runs before
       // its launch. The first reviewer's refusal handling differs by stage (matches pre-Phase-8
       // behavior exactly): prelaunch (`reserveFirst: false`) releases its already-made shared
       // reservation and fails the task outright; completion (`reserveFirst: true`) has reserved
@@ -1935,9 +2159,13 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       const single = reviewers.length === 1;
       const dir = path.join(session.dir, 'tasks', task, single ? `review-${stage}-${round}` : `review-${stage}-${round}-${i}`);
       fs.mkdirSync(dir, {recursive: true, mode: 0o700});
-      const orders = stage === 'completion'
+      // A review agent leads with its own instructions the way a worker does (OpenCode runs it as the agent instead):
+      // without them a cloud reviewer reads the builder's orders as its own and does the work again.
+      const lead = withLessons(reviewProfile, row).agent?.prompt;
+      const roleLead = lead && reviewProfile.adapter !== 'opencode' && reviewProfile.adapter !== 'typesafe' ? `${lead}\n\n---\n\n` : '';
+      const orders = roleLead + (stage === 'completion'
         ? (reviewProfile.role === 'verifier' ? row.steps : `${row.orders}\n\n--- worker report ---\n${reducers.tasks(session.events)[task]?.summary ?? ''}`)
-        : row.orders;
+        : row.orders);
       // What a decision-model reviewer (typesafe) judges: the raw orders, the worker's final
       // report and the tree's HEAD when the lineage's first worker started — the diff base.
       const reported = session.events.findLast(e => e.kind === 'task.reported' && e.task === task);
@@ -1997,6 +2225,27 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
 
   const VERDICT_ACTIONS = new Set(['accept', 'reject', 'rework', 'escalate', 'fail', 'rereview']);
 
+  // A reviewer agent that ended without a verdict bounce could read hands the review to the next AI in its own chain
+  // (reviewer~2, then reviewer~3), the way a builder that cannot finish does; only the last one's goes to the
+  // orchestrator. Found live (2026-10-25): the local reviewer ended three reviews out of three with no verdict,
+  // and each went to the orchestrator, which accepted the work unreviewed.
+  async function reviewDownChain({task, round, reviewer, verdicts, row, context, root, note, stale}) {
+    const head = profiles[reviewer];
+    if (verdicts.length !== 1 || !head || head.adapter === 'typesafe') return verdicts;
+    let from = reviewer;
+    for (const next of head.fallback ?? []) {
+      if (verdicts[0].verdict !== 'unreadable' || verdicts[0].cancelled) break;
+      const profile = profiles[next];
+      if (!profile || profile.role === 'orchestrator' || profile.adapter === 'typesafe' || policyRefusal(profile)) continue;
+      append({kind: 'review.escalated', task, to: next, from: 'bounce', text: `The ${profiles[from].role ?? from} ended without a verdict bounce could read: ${next} reviews it`, context});
+      const nextVerdicts = await runReviewers({task, stage: 'completion', round, reviewers: [next], row, context, root, reserveFirst: false, slot: `fallback:${next}`, note, route: false});
+      if (!nextVerdicts || stale()) return null;
+      verdicts = nextVerdicts;
+      from = next;
+    }
+    return verdicts;
+  }
+
   async function runCompletionReview(task, reviewIntent, {note = null} = {}) {
     const view = reducers.tasks(session.events);
     const t = view[task];
@@ -2012,12 +2261,29 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     }
 
     const candidate = candidateResult(session.events, task);
-    const verdicts = await runReviewers({task, stage: 'completion', round, reviewers, row, context, root, reserveFirst: true, note});
+    let verdicts = jevReviewOff(reviewers) ? [REVIEW_OFF] : await runReviewers({task, stage: 'completion', round, reviewers, row, context, root, reserveFirst: true, note});
     if (!verdicts) return;
     // Same guard as the prelaunch path: a review that finishes after the task left `reviewing`
     // for an unrelated reason journals its verdict but drives no accept/reject/rework (A3).
-    if (closed || reducers.tasks(session.events)[task]?.state !== 'reviewing') return;
-    if (candidate && (candidateResult(session.events, task)?.digest !== candidate.digest || candidateResult(session.events, task)?.seq !== candidate.seq)) return;
+    const stale = () => closed || reducers.tasks(session.events)[task]?.state !== 'reviewing'
+      || (candidate && (candidateResult(session.events, task)?.digest !== candidate.digest || candidateResult(session.events, task)?.seq !== candidate.seq));
+    if (stale()) return;
+    // An unsure Jev (a lean below its bar) does not decide on its own when the team has a reviewer agent: the agent
+    // reviews, told what Jev leaned, and its verdict decides. Found by the integration runs 2026-10-21/22: 4 of 5
+    // Jev reviews were below the bar and the work was accepted unread.
+    const lean = verdicts[0];
+    const agentReviewer = escalationReviewer({lean, reviewers, profiles, changes: changesOf(task)});
+    if (agentReviewer) {
+      const off = lean.reason === REVIEW_OFF.reason;
+      const leaned = off ? "Jev's first-pass review is off" : `Jev leaned ${lean.choice} below its bar (confidence ${Number(lean.confidence ?? 0).toFixed(2)} of ${lean.threshold})`;
+      append({kind: 'review.escalated', task, to: agentReviewer, from: 'bounce', text: `${leaned}: the ${profiles[agentReviewer].role ?? agentReviewer} agent reviews it`, context});
+      const agentVerdicts = await runReviewers({task, stage: 'completion', round, reviewers: [agentReviewer], row, context, root, reserveFirst: false, slot: 'escalated',
+        note: off ? note : [note, `${leaned}${lean.findings?.length ? `, flagging: ${lean.findings.join('; ')}` : ''}. Review the change yourself; that lean is not a verdict.`].filter(Boolean).join('\n\n')});
+      if (!agentVerdicts || stale()) return;
+      verdicts = agentVerdicts;
+    }
+    verdicts = await reviewDownChain({task, round, reviewer: agentReviewer ?? reviewers[0], verdicts, row, context, root, note, stale});
+    if (!verdicts) return;
 
     const hook = invokeHook(() => strategy.onReviewVerdict(task, verdicts, reducers.tasks(session.events), api), task, context);
     if (!hook.ok) return;
@@ -2054,7 +2320,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       return;
     }
     // The ceiling is the only limit on how long ONE task may be given: the deadline is a lease,
-    // renewed while the worker makes progress (docs/plans/task-leases.md). Found live: a 15-minute cap
+    // renewed while the worker makes progress. Found live: a 15-minute cap
     // killed every local reviewer mid-review, and the orchestrator answered by shrinking the next one.
     if ((limits.minutes !== undefined || limits.ceiling !== undefined) && Number.isFinite(row.deadline) && row.deadline > ceilingMs) {
       append({kind: 'task.failed', task, reason: 'size', text: `a ${Math.ceil(row.deadline / 60000)}-minute task exceeds the ${ceilingMs / 60000}-minute ceiling: give it at most ${ceilingMs / 60000} minutes; bounce renews its lease while it makes progress`, context});
@@ -2063,7 +2329,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // The same job, failed the same way this many times, is a loop: bounce stops rather than running it
     // again, and says what to change. Found live: ten identical reviewer tasks, each killed at the ceiling.
     // An attempt of a job is a task, not a start: a rework round, a step renewal or a resume is the same
-    // task continuing, capped by its own limits. Found live (ACE d1bc0206): one rework plus one retry used
+    // task continuing, capped by its own limits. Found live (session d1bc0206): one rework plus one retry used
     // up a job, and a completed, evidence-backed result was failed "attempt allowance exhausted".
     const jobTasks = new Set(session.events.filter(e => e.kind === 'task.started' && e.purpose !== 'report' && e.jobId === row.jobId && e.task !== task).map(e => e.task));
     if (row.jobId && jobTasks.size >= (suppliedLimits.attempts ?? 3)) {
@@ -2123,15 +2389,20 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       routing.add(task);
       const agent = row.profile;
       let decision;
-      try { decision = await jev.routeAI({task, orders: row.orders, profiles, head: profiles[agent]}); }
+      try { decision = await jev.routeAI({task, orders: row.orders, profiles, head: profiles[agent], tier: row.tier ?? null, load: routingLoad}); }
       finally { routing.delete(task); }
       if (reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) return;
       const played = decision?.ai ? compose(agent, decision.ai, decision.local ?? null) : null;
       // Jev off asks nothing and journals nothing: the journal is what it was without `auto`.
       if (decision?.asked) {
+        // The row says why on its own: Jev's description of the task, the tier it gives, and each candidate's fate.
+        const described = decision.description ? Object.entries(decision.description).filter(([, value]) => value !== null).map(([name, value]) => `${name.replace('_', ' ')} ${Number(value).toFixed(2)}`).join(', ') : '';
         append({kind: 'jev.routed', task, chosen: played ?? agent, agent, ai: played ? decision.ai : null, via: 'agent-auto', probabilities: decision.probabilities ?? {}, confidence: decision.confidence ?? 0, fallback: !played, reason: played ? null : decision.reason ?? 'unavailable', model: decision.model ?? null,
           ...(played && decision.tier ? {tier: decision.tier} : {}), ...(played && decision.local ? {local: decision.local} : {}),
-          text: played ? `Routed ${agent} → ${decision.ai} (AI chosen by Jev${decision.tier ? `: tier ${decision.tier}` : ''}, confidence ${Number(decision.confidence ?? 0).toFixed(2)})` : `Routed ${agent} → its own models (fallback: ${decision.reason ?? 'unavailable'})`, context});
+          ...(decision.description ? {description: decision.description} : {}), ...(decision.candidates ? {candidates: decision.candidates} : {}),
+          ...(decision.tierBy ? {tierBy: decision.tierBy} : {}),
+          text: played ? `Routed ${agent} → ${decision.ai} (${decision.tierBy === 'orchestrator' ? `tier ${decision.tier} asked by the orchestrator; ${described ? `Jev: ${described}` : 'Jev gave no description'}; ${decision.why ?? 'first fitting'}`
+            : decision.description ? `Jev: tier ${decision.tier} from ${described}; ${decision.why ?? 'first fitting'}` : `AI chosen by Jev${decision.tier ? `: tier ${decision.tier}` : ''}, confidence ${Number(decision.confidence ?? 0).toFixed(2)}`})` : `Routed ${agent} → its own models (fallback: ${decision.reason ?? 'unavailable'})`, context});
         row = submittedRow(task);
       }
     }
@@ -2165,11 +2436,24 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       const full = running >= slots ? `Waiting for a local slot on ${endpoint}: ${running} of ${slots} in use`
         : onModel >= perModel ? `Waiting for a local slot on ${endpoint} for ${profile.model}: ${onModel} of ${perModel} in use` : null;
       if (full) {
-        if (!slotWaiters.has(task)) append({kind: 'task.milestone', task, phase: 'queued', text: full, next: 'dispatch when a local turn ends', context});
+        // Another AI in the chain that is not this busy endpoint: the wait is capped, then the task moves to it.
+        const elsewhere = chainAfter(profile).some(name => !onEndpoint(profiles[name], endpoint));
+        const capMs = (localEndpoint(endpoint).queueSeconds ?? LOCAL_QUEUE_SECONDS) * 1000;
+        if (!localQueuedAt.has(task)) localQueuedAt.set(task, clock());
+        const waited = clock() - localQueuedAt.get(task);
+        if (elsewhere && waited >= capMs) {
+          slotWaiters.delete(task); localQueuedAt.delete(task);
+          append({kind: 'task.failed', task, reason: 'local_busy', text: `Waited ${Math.round(waited / 1000)} s for a local slot on ${endpoint} (${running} of ${slots} in use); moving to the next AI in its chain`, context});
+          return;
+        }
+        if (!slotWaiters.has(task)) {
+          append({kind: 'task.milestone', task, phase: 'queued', text: full, next: elsewhere ? `dispatch when a local turn ends, or on the next AI after ${Math.round(capMs / 1000)} s` : 'dispatch when a local turn ends', context});
+          if (elsewhere) setTimeout(() => { const again = submittedRow(task); if (again && slotWaiters.has(task)) requestDispatch(again, `local-wait:${task}`); }, capMs + 50).unref?.();
+        }
         slotWaiters.add(task);
         return;
       }
-      slotWaiters.delete(task);
+      slotWaiters.delete(task); localQueuedAt.delete(task);
     }
     if (CLOUD_ADAPTERS.has(profile.adapter)) {
       const running = cloudRunning();
@@ -2209,7 +2493,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
           text: `Jev in-place risk check unavailable (${judged.reason ?? 'unconfident'}); the structural check alone authorized this task`, context});
       }
     }
-    // STRATEGY (CONTRACT.md §0/§1): the depends_on hold/fail decision and the prelaunch-review
+    // STRATEGY: the depends_on hold/fail decision and the prelaunch-review
     // decision both come from onSubmitted now — the CORE only executes the returned intent, it
     // never re-derives the decision itself. `defaultStrategy.onSubmitted` reproduces exactly
     // the depends_on/review logic that lived here before Phase 8.
@@ -2381,7 +2665,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     append({kind: 'policy.escalated', task: r.task, reason: 'blocked', text: blocker, to, context: row?.context});
   }
 
-  // A lease end (docs/plans/task-leases.md). The deadline is not a kill: a worker that made progress
+  // A lease end. The deadline is not a kill: a worker that made progress
   // in this lease, is not repeating itself and that Jev (when present) does not judge stuck gets
   // another lease; otherwise, or at the ceiling, it is asked for its conclusion, and only a worker
   // that gives none within concludeGrace is cancelled. Nothing here needs Jev.
@@ -2532,9 +2816,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       if (r.verdicts.includes('blocked')) { await handleBlocked(r); continue; }
       if (r.verdicts.includes('deadline')) { await handleLeaseEnd(r, now); continue; }
       // A task waiting for its turn (the local model, memory) has no worker to be silent: found live
-      // (ACE e3bd01d5), two tasks sent back by their check were cancelled as silent while they waited
+      // (session e3bd01d5), two tasks sent back by their check were cancelled as silent while they waited
       // for the local model, and redone on a cloud fallback.
-      if (launchingAttempts.get(r.task)?.phase === 'admission') continue;
+      // Its review waits the same way (session fb6036ee, 39e4fed3): a finished builder was cancelled as silent while its
+      // review waited for the local model, and redone on a fallback.
+      if (launchingAttempts.get(r.task)?.phase === 'admission' || [...reviews.values()].some(entry => entry.task === r.task && entry.pending && entry.phase === 'admission')) continue;
       for (const reason of ['silent', 'stalled']) if (r.verdicts.includes(reason)) await handleSignature(r, reason, now);
     }
   }
@@ -2562,16 +2848,18 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         const {artifactId, file, dir, continuation} = action.payload;
         const artifact = JSON.parse(fs.readFileSync(file, 'utf8'));
         if (artifact.id !== artifactId) throw new Error('artifact identity mismatch');
-        const result = integrateArtifact({cwd: session.cwd, artifact, dir});
+        const copy = session.events.findLast(e => e.kind === 'task.artifact' && e.task === action.task)?.cwd ?? null;
+        const result = integrateArtifact({cwd: session.cwd, artifact, dir, base: copy});
         if (result.status !== 'integrated') {
-          append({kind: 'task.blocked', task: action.task, reason: `integration_${result.status}`, text: `Artifact integration ${result.status}${result.path ? `: ${result.path}` : ''}; isolated work preserved`, artifactId});
+          append({kind: 'task.blocked', task: action.task, reason: `integration_${result.status}`, text: `Artifact integration ${result.status}${result.paths?.length ? `: ${result.paths.join(', ')}` : result.path ? `: ${result.path}` : ''}; isolated work preserved`, ...(result.paths ? {paths: result.paths} : {}), artifactId});
           return;
         }
-        if (!session.events.some(e => e.kind === 'task.integrated' && e.task === action.task && e.artifactId === artifactId)) append({kind: 'task.integrated', task: action.task, artifactId, resultHash: artifact.resultHash});
+        if (!session.events.some(e => e.kind === 'task.integrated' && e.task === action.task && e.artifactId === artifactId)) append({kind: 'task.integrated', task: action.task, artifactId, resultHash: artifact.resultHash,
+          ...(result.merged ? {merged: result.merged, text: `Merged with what the checkout changed meanwhile: ${result.merged.join(', ')}`} : {})});
         // A follow-up (retryOf) reusing this same workspace diffs against what's now in the
         // checkout, not the pre-integration copy it started from — see advanceBaseline.
         const workspace = existingWorkspace(action.task);
-        if (workspace && !workspace.disposable) workspaces.set(action.task, advanceBaseline(workspace, artifact));
+        if (workspace) workspaces.set(action.task, advanceBaseline(workspace, artifact, result.mergedStates));
         append(continuation);
       } catch (error) {
         append({kind: 'task.blocked', task: action.task, reason: 'integration_interrupted', text: `Artifact integration interrupted: ${error.message}; durable manifest retained for restart recovery`});
@@ -2663,7 +2951,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       requestDispatch(row);
     }
     if (row.kind === 'task.completed') {
-      // STRATEGY (CONTRACT.md §2 onCompleted): a second (and later) task.completed on the same
+      // STRATEGY: a second (and later) task.completed on the same
       // task re-enters review exactly the same way — the hook and runCompletionReview both
       // read state fresh off the log every time.
       requestAction(session, {actionId: `completion:${row.task}:${reducers.tasks(session.events)[row.task]?.attempt ?? 0}`, type: 'completion', task: row.task});
@@ -2695,7 +2983,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       activity.set(row.task, {at, expectUntil});
       if (typeof row.call === 'string') {
         const calls = toolCalls.get(row.task) ?? [];
-        calls.push({at, call: row.call, change: row.change === true});
+        // `seq`: the last journaled row when the call came in, so a turn's calls are told from earlier
+        // ones by order rather than by a millisecond clock its first call can share with task.started.
+        calls.push({at, seq: session.events.at(-1)?.seq ?? 0, call: row.call, change: row.change === true});
         toolCalls.set(row.task, calls.slice(-CALL_MEMORY));
       }
     }
@@ -2729,7 +3019,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       text: 'Worker exit was verified, but no durable outcome was recorded; inspect preserved work and submit an explicit retry'});
   }
   // A worker whose process was recorded (task.started pid) and is gone ended with the daemon that
-  // ran it: cancelled as lost, never a fallback, so it does not hold the orchestrator. Found live (ACE
+  // ran it: cancelled as lost, never a fallback, so it does not hold the orchestrator. Found live (session
   // d1bc0206): two such workers, dead for hours, kept every orchestrator turn refused.
   const workerGone = task => { const pid = session.events.findLast(e => e.task === task && e.kind === 'task.started')?.pid; return Number.isSafeInteger(pid) && !processAlive(pid) ? pid : null; };
   for (const t of Object.values(initialView)) if (!executionEnded(t.id) && (MID_FLIGHT.has(t.state) || t.state === 'queued') && (t.attempt != null || session.events.some(row => row.task === t.id && ['task.local_selected', 'task.launch.requested', 'review.started'].includes(row.kind))) && !handles.has(t.id)) {
@@ -2807,8 +3097,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       append({kind: 'task.failed', task, reason: 'attempts_exhausted', text: 'Logical job attempt allowance exhausted; retain progress and request a scope decision', context});
       return false;
     }
-    // A job's time is not shared between its attempts (Daniel, 2026-09-30): the ceiling counts from this
-    // task's own first start. Found live (ACE e3bd01d5): a retry on a slow local model ran to the ceiling,
+    // A job's time is not shared between its attempts (2026-09-30): the ceiling counts from this
+    // task's own first start. Found live (session e3bd01d5): a retry on a slow local model ran to the ceiling,
     // and the retry on Sonnet submitted right after it was refused in the same second.
     const own = starts.find(e => e.task === task);
     if (own && clock() >= Date.parse(own.time) + ceilingMs) {
@@ -2885,10 +3175,13 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         localResolver.configure(local);
       }
       // `name@ai` entries are this agent played by an AI Jev picked: they follow the new head, or go with `auto`.
-      const played = Object.entries(profiles).filter(([, profile]) => profile.agent?.name === name && profile.ai).map(([, profile]) => [profile.ai, profile.backend ? {endpoint: profile.endpoint, model: profile.model} : null]);
+      const played = Object.entries(profiles).filter(([, profile]) => profile.agent?.name === name && profile.ai && !profile.pinned).map(([, profile]) => [profile.ai, profile.backend ? {endpoint: profile.endpoint, model: profile.model} : null]);
+      // `name@provider:model` entries are this agent on an AI someone named: they follow the new head the same way.
+      const pinned = Object.keys(profiles).filter(key => profiles[key].agent?.name === name && profiles[key].pinned);
       for (const key of Object.keys(profiles)) if (profiles[key].agent?.name === name && !Object.hasOwn(chain, key)) delete profiles[key];
       Object.assign(profiles, chain);
       for (const [ai, local] of played) compose(name, ai, local);
+      for (const key of pinned) ensurePinned(key);
     },
     // The submit predicate, exposed so the bus refuses a malformed task.submitted before it is journaled.
     validate: spec => validate(spec, reducers.tasks(session.events)),
@@ -2902,4 +3195,19 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     _activitySize: () => activity.size,
     close: () => { closed = true; for (const entry of [...launchingAttempts.values(), ...reviews.values()]) entry.localController?.abort(); machineSlots.releaseAll(); effects.close(); unsubscribe(); if (watchdogInterval) clearInterval(watchdogInterval); },
   };
+}
+
+// The verdict Jev's slot gives when its first-pass review is off (src/adapters/typesafe-live.js `review_off`).
+const REVIEW_OFF = {verdict: 'unavailable', reason: 'review_off'};
+
+// Who reviews when Jev is unsure (a lean below its bar): the team's reviewer agent, for work that changed files (or
+// whose changes are not known). A report that changed nothing is not a reviewer's to grade (verification run
+// 2026-10-22: it graded the repository's known bug as the analyst's blocker), and a sure Jev, or a review that was
+// already an agent's, decides as before.
+export function escalationReviewer({lean, reviewers, profiles, changes}) {
+  const unsure = lean?.verdict === 'unavailable' && (lean.reason === REVIEW_OFF.reason || ['accept', 'rework'].includes(lean.choice) && Number.isFinite(Number(lean.threshold)));
+  if (!unsure || !reviewers.length || !reviewers.every(name => profiles[name]?.adapter === 'typesafe')) return null;
+  if (Array.isArray(changes) && !changes.length) return null;
+  const agent = profiles.reviewer;
+  return agent && agent.role !== 'orchestrator' && agent.adapter !== 'typesafe' ? 'reviewer' : null;
 }

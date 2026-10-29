@@ -14,15 +14,48 @@
 // FAKE_OC_WRITE     '<rel>:<content>[,…]' files written under --dir — the worker "edits" the real tree
 // FAKE_OC_LOG       append ARGV / CONFIG / PROMPT / ENV lines for assertions
 // FAKE_OC_READY     touch this file once signal handlers are settled (cancel tests gate on it)
+// FAKE_OC_VERSION   what `--version` prints (default 1.18.31). A 2.x version prints it the way 2.x
+//                   does (`opencode v2.0.29`) and the fake behaves as 2.x's `run` does: --dir and
+//                   --pure are unknown flags (exit 1), the directory is $PWD, bash is called shell.
+//                   `serve --stdio` is a private server as 2.x's: it prints {"url"}, answers
+//                   GET /api/mcp with the configured bounce server (behind the OPENCODE_PASSWORD), and
+//                   exits when its stdin closes; `run --server URL` asks it for bounce's status first.
+// FAKE_OC_MCP_MS    how long the served bounce server stays pending before it connects (default 50)
+// FAKE_OC_MCP_STATE what it becomes after that (default connected)
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 
 const argv = process.argv.slice(2);
+const version = process.env.FAKE_OC_VERSION ?? '1.18.31';
+const v2 = Number(version.split('.')[0]) >= 2;
+if (argv[0] === '--version') { process.stdout.write(v2 ? `opencode v${version}\n` : `${version}\n`); process.exit(0); }
+if (v2) for (const unknown of ['--dir', '--pure']) if (argv.includes(unknown)) { process.stderr.write(`ERROR  Unrecognized flag: ${unknown} in command opencode run\n`); process.exit(1); }
+if (argv[0] === 'serve') {
+  const configured = JSON.parse(process.env.OPENCODE_CONFIG_CONTENT ?? '{}').mcp?.servers ?? {};
+  const expected = `Basic ${Buffer.from(`opencode:${process.env.OPENCODE_PASSWORD}`).toString('base64')}`;
+  let booted = null;
+  const server = http.createServer((req, res) => {
+    if (req.headers.authorization !== expected) { res.writeHead(401); return res.end(); }
+    if (!req.url.startsWith('/api/mcp')) { res.writeHead(404); return res.end(); }
+    booted ??= Date.now();
+    const state = Date.now() - booted < Number(process.env.FAKE_OC_MCP_MS ?? 50) ? 'pending' : process.env.FAKE_OC_MCP_STATE ?? 'connected';
+    res.writeHead(200, {'content-type': 'application/json'});
+    res.end(JSON.stringify({location: {}, data: Object.keys(configured).map(name => ({name, status: {status: state}}))}));
+  });
+  server.listen(0, '127.0.0.1', () => {
+    if (process.env.FAKE_OC_LOG) fs.appendFileSync(process.env.FAKE_OC_LOG, `SERVE ${JSON.stringify(argv)}\n`);
+    process.stdout.write(JSON.stringify({url: `http://127.0.0.1:${server.address().port}`}) + '\n');
+  });
+  process.stdin.on('end', () => { if (process.env.FAKE_OC_LOG) fs.appendFileSync(process.env.FAKE_OC_LOG, 'SERVE_END true\n'); process.exit(0); });
+  process.stdin.resume();
+}
+const SHELL = v2 ? 'shell' : 'bash';
 const flag = name => { const i = argv.indexOf(name); return i === -1 ? null : argv[i + 1]; };
 const scenario = process.env.FAKE_OC_SCENARIO ?? 'ok';
 const log = line => { if (process.env.FAKE_OC_LOG) fs.appendFileSync(process.env.FAKE_OC_LOG, line + '\n'); };
 const sessionID = flag('-s') ?? `ses_fake_${process.pid}`;
-const dir = flag('--dir') ?? process.cwd();
+const dir = v2 ? (process.env.PWD ?? process.cwd()) : flag('--dir') ?? process.cwd();
 const usage = process.env.FAKE_OC_USAGE ? JSON.parse(process.env.FAKE_OC_USAGE) : {total: 2, input: 1, output: 1, reasoning: 0, cache: {read: 0, write: 0}};
 let seq = 0;
 const emit = (type, part) => process.stdout.write(JSON.stringify({type, timestamp: Date.now(), sessionID, part: {id: `prt_${++seq}`, messageID: 'msg_1', sessionID, ...part}}) + '\n');
@@ -32,7 +65,12 @@ if (scenario === 'stubborn') process.on('SIGTERM', () => {});
 let prompt = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', chunk => { prompt += chunk; });
-process.stdin.on('end', () => {
+if (argv[0] !== 'serve') process.stdin.on('end', async () => {
+  const server = flag('--server');
+  if (server) {
+    const listed = await fetch(`${server}/api/mcp`, {headers: {authorization: `Basic ${Buffer.from(`opencode:${process.env.OPENCODE_PASSWORD}`).toString('base64')}`}}).then(res => res.json());
+    log(`RUN_SAW ${JSON.stringify(listed.data.find(item => item.name === 'bounce')?.status?.status ?? 'absent')}`);
+  }
   log(`ARGV ${JSON.stringify(argv)}`);
   log(`CONFIG ${process.env.OPENCODE_CONFIG_CONTENT ?? 'null'}`);
   log(`PROMPT ${JSON.stringify(prompt)}`);
@@ -66,7 +104,7 @@ process.stdin.on('end', () => {
     emit('step_finish', {type: 'step-finish', reason: 'stop', tokens: usage});
     return process.exit(0);
   }
-  // FAKE_OC_SCENARIO=capsilent: the real shape of a step cap (observed live, ACE 43387649, opencode with
+  // FAKE_OC_SCENARIO=capsilent: the real shape of a step cap (observed live, session 43387649, opencode with
   // maxSteps 60): FAKE_OC_STEPS tool steps, the last step's text titled by the model itself, exit 0 —
   // and NO runtime notice in the stream. Only the step count says the cap was hit.
   if (scenario === 'capsilent') {
@@ -93,6 +131,16 @@ process.stdin.on('end', () => {
   // FAKE_OC_SCENARIO=opener-then-silence: says one sentence, does tool work, then the turn ends with
   // no text after the last tool call — the shape of a worker that went quiet (observed live: that
   // opener became the task's completion).
+  // FAKE_OC_SCENARIO=leaked-call: the shape observed live (qwen3.8-27b on LM Studio, 1 turn in 3382): tool work, then a
+  // final message that is a Qwen3-Coder tool call written as text, which the server never parsed and nothing ran.
+  if (scenario === 'leaked-call') {
+    emit('tool_use', {type: 'tool', tool: 'read', state: {status: 'completed', input: {filePath: 'a.js'}, output: 'x'}});
+    emit('step_finish', {type: 'step-finish', reason: 'tool-calls', tokens: usage});
+    emit('step_start', {type: 'step-start'});
+    emit('text', {type: 'text', text: "\n\n<tool_call>\n<function=shell>\n<parameter=command>\ndeno check src/cli/reading.ts\n</parameter>\n</function>\n</tool_call>"});
+    emit('step_finish', {type: 'step-finish', reason: 'stop', tokens: usage});
+    return process.exit(0);
+  }
   if (scenario === 'opener-then-silence') {
     emit('text', {type: 'text', text: 'I will execute this task systematically. Let me start by reading the owned files.'});
     emit('tool_use', {type: 'tool', tool: 'read', state: {status: 'completed', input: {filePath: 'a.js'}, output: 'x'}});
@@ -135,9 +183,9 @@ process.stdin.on('end', () => {
     // FAKE_OC_SCENARIO=commands: two shell commands as opencode 1.18 reports them (shape read from its
     // own store, 2026-09-28): the command, its output with terminal colours, and the exit code in metadata.
     if (scenario === 'commands') {
-      emit('tool_use', {type: 'tool', tool: 'bash', state: {status: 'completed', input: {command: 'deno test -A tests/version_test.ts 2>&1', workdir: dir},
+      emit('tool_use', {type: 'tool', tool: SHELL, state: {status: 'completed', input: {command: 'deno test -A tests/version_test.ts 2>&1', workdir: dir},
         output: '\u001b[0m\u001b[32mok\u001b[0m | 1 passed | 0 failed \u001b[0m\u001b[38;5;245m(3ms)\u001b[0m\n\n', metadata: {exit: 0, truncated: false}}});
-      emit('tool_use', {type: 'tool', tool: 'bash', state: {status: 'completed', input: {command: 'deno lint'},
+      emit('tool_use', {type: 'tool', tool: SHELL, state: {status: 'completed', input: {command: 'deno lint'},
         output: `${'x'.repeat(5000)}\nerror: Found 2 problems\n`, metadata: {exit: 1, truncated: false}}});
     }
     if (scenario === 'denied') emit('tool_use', {type: 'tool', tool: 'read', state: {status: 'error', input: {filePath: '/etc/hosts'}, error: 'The user rejected permission to use this specific tool call.'}});

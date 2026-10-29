@@ -1,4 +1,4 @@
-// Tier first (docs/plans/jev-agents-routing.md, Phase 2b). Measured live: over eleven look-alike
+// Tier first. Measured live: over eleven look-alike
 // profiles Jev's choice never reached 0.8 (0.15–0.66), while the three-way tier question was right
 // 5/5 at 0.60–1.00. So Jev picks the TIER, and bounce takes the first fitting profile of that tier
 // in the provider order — inside a tier the AIs are near-equal, which is not a decision for a model.
@@ -28,7 +28,9 @@ test('the threshold for a tier is 0.6, and the tier question offers only the tie
   assert.equal(JEV_TIER_CONFIDENCE, 0.6);
   const questions = routingQuestions(roster, notes);
   assert.deepEqual(Object.keys(questions), ['tier', 'profile', 'needs_write', 'needs_shell']);
-  assert.deepEqual(questions.tier.criteria, TIER_HINT);
+  // An advisor is never a routing answer, so the tier question never offers it.
+  const {advisor, ...routed} = TIER_HINT;
+  assert.deepEqual(questions.tier.criteria, routed);
   assert.equal(questions.tier.instructions.question, 'Which tier of AI do these orders need?');
   const {main, scout, haiku, jev} = roster;
   assert.deepEqual(routingQuestions({main, scout, haiku, jev}).tier.criteria, {cheapest: TIER_HINT.cheapest});

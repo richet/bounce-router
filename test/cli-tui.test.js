@@ -13,14 +13,14 @@ import http from 'node:http';
 // Shared by the queued-prompt tests below: spins up the same fake daemon/child pairing as the
 // test above, but exposes `listeners`/`calls` so a test can drive an attached (daemon-started)
 // turn directly and inspect what the view sends back through main.run.
-async function harness(t, {run} = {}) {
+async function harness(t, {run, models = {}} = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-tui-cli-'));
   let catalogResponse;
   const catalogServer = http.createServer((request, response) => {catalogResponse = response;});
   await new Promise(resolve => catalogServer.listen(0, '127.0.0.1', resolve));
   t.after(() => {catalogResponse?.end('{"models":[]}'); catalogServer.closeAllConnections(); catalogServer.close();});
   const settings = {
-    operation: 'orchestrator', orchestrator: 'main', mode: 'plan', order: ['codex'], models: {},
+    operation: 'orchestrator', orchestrator: 'main', mode: 'plan', order: ['codex'], models,
     profiles: {main: {adapter: 'codex'}, build: {adapter: 'codex'}},
     local: {endpoints: {lmstudio: {backend: 'lmstudio', url: `http://127.0.0.1:${catalogServer.address().port}`}}},
     executables: {codex: '/nonexistent/bounce-test-codex', claude: '/nonexistent/bounce-test-claude'},
@@ -64,7 +64,7 @@ async function harness(t, {run} = {}) {
     }
   }
   await waitFor(() => output.includes('Ready.'));
-  return {session, listeners, calls, child, waitFor, output: () => output};
+  return {root, session, listeners, calls, child, waitFor, output: () => output};
 }
 
 test('CLI commands and live steering work while the daemon main turn is held', {timeout: 15000}, async t => {
@@ -391,7 +391,7 @@ test('Up on an empty input withdraws this view\'s own queued prompt for editing;
   assert.equal(calls.at(-1)[1].text, 'queued reply text');
 });
 
-// Found live (ACE d1bc0206): the daemon died at 08:14 and the TUI kept showing the orchestrator and
+// Found live (session d1bc0206): the daemon died at 08:14 and the TUI kept showing the orchestrator and
 // its workers as working for four more hours. A lost daemon now says so, with how to restart it.
 test('a daemon that disconnects is shown as stopped, with the command to resume the session', {timeout: 15000}, async t => {
   const {session, listeners, waitFor, output} = await harness(t);
@@ -400,3 +400,13 @@ test('a daemon that disconnects is shown as stopped, with the command to resume 
   const flat = output().replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/[\s│]+/g, ' ');
   assert.match(flat, new RegExp(`bounce stopped at \\d\\d:\\d\\d, nothing is running · quit, then: bounce --resume ${session.id.slice(0, 8)}`));
 });
+
+// Found in the real-console pass 2026-10-21: `/continue main` on a profile that names no model saved models.<adapter>
+// as "", so the model the user had chosen (sonnet) was gone from config.json and from the status line.
+test('/continue on a profile with no model of its own keeps the model the user chose', {timeout: 15000}, async t => {
+  const {root, calls, child, waitFor} = await harness(t, {models: {codex: 'gpt-6-sol'}});
+  child.stdin.write('/continue main\r');
+  await waitFor(() => calls.some(([kind]) => kind === 'run'));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'config.json'), 'utf8')).models.codex, 'gpt-6-sol');
+});
+

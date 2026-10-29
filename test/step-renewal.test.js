@@ -1,4 +1,4 @@
-// Step-budget renewal (found live, ACE session 159f4746, task 43387649): a local OpenCode worker
+// Step-budget renewal (found live, session 159f4746, task 43387649): a local OpenCode worker
 // made steady progress for 8 minutes, then hit its own step cap (opencode's `maxSteps`, distinct
 // from bounce's own lease). The adapter already asks the same session once, tools off, for its
 // answer (opencode-live.js) — but that answer, synthesized from a truncated "Maximum Steps

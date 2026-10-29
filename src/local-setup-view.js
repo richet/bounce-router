@@ -91,7 +91,9 @@ export async function gatherLocalStatus({settings, verify = false, model: reques
     let model = requested;
     if (!model) {
       try {
-        model = pick({local, catalogs, profile: {backend: 'lmstudio', endpoint: 'lmstudio'}, requirements: {tools: true, context: 3072}}).instance;
+        // A loaded instance, else the model itself: on-demand, the test turn loads it (LM Studio unloads idle models).
+        const resolved = pick({local, catalogs, profile: {backend: 'lmstudio', endpoint: 'lmstudio'}, requirements: {tools: true, context: 3072}});
+        model = resolved.instance ?? resolved.model;
       } catch (error) {
         problem = {stage: 'model', text: `No loaded model satisfies a worker's requirements (${error.message}).`,
           next: 'Load a tool-capable model with at least 3k context in LM Studio, then try again.'};
@@ -112,7 +114,13 @@ export async function gatherLocalStatus({settings, verify = false, model: reques
   // Agents and who may play them. Derived the way the daemon derives it, so this view and the roster
   // cannot disagree; a backend that was skipped says why, which is what makes "why isn't builder using
   // my local model?" answerable.
-  const roleTable = roles?.size && settings.operation === 'orchestrator' ? (await import('./agents.js')).agentTable(roles, settings) : [];
+  const roleTable = roles?.size ? (await import('./agents.js')).agentTable(roles, settings) : [];
+  // A local model a chain names that LM Studio does not have (another machine's model): said, not hidden.
+  const has = new Set(catalogs.flatMap(catalog => (catalog.models ?? []).map(item => `${catalog.endpoint}/${item.id}`)));
+  for (const row of roleTable) for (const backend of row.backends ?? []) {
+    const named = /^(\S+\/\S+) \(via opencode\)$/.exec(backend)?.[1];
+    if (named && !named.endsWith('/auto') && catalogs.some(catalog => !catalog.error) && !has.has(named)) row.skipped.push(`${named}: LM Studio here does not have this model; the chain falls to the next AI`);
+  }
   // A "local worker" is an agent with a local AI in its chain — read off the same table.
   const workers = roleTable.filter(row => !row.error).flatMap(row => row.backends.filter(ref => ref.endsWith('(via opencode)')).slice(0, 1).map(ref => ({name: row.name, model: ref.replace(' (via opencode)', ''), policy: row.policy})));
   // What each endpoint is set to run at once, so the status can say what raising it costs.
@@ -123,7 +131,7 @@ export async function gatherLocalStatus({settings, verify = false, model: reques
   return {catalogs, binary, installed, workers, loaded: loaded.length, bridge: verified, problem, note, roles: roleTable, concurrency, maxConcurrentCloud};
 }
 
-export function formatLocalStatus({catalogs, binary, installed = true, workers, bridge, problem, note, roles = [], concurrency = [], maxConcurrentCloud}, {verifyHint, setupHint} = {}) {
+export function formatLocalStatus({catalogs, binary, installed = true, workers, bridge, problem, note, roles = [], concurrency = [], maxConcurrentCloud}, {verifyHint, setupHint, teamHeader = null} = {}) {
   const lines = [];
   // One GPU serves every local worker: running more at once gets no more work done, it only makes each
   // task wait longer — and a task that waits longer is a task that dies on its lease. Measured at a 95K
@@ -158,7 +166,7 @@ export function formatLocalStatus({catalogs, binary, installed = true, workers, 
   if (bridge?.worker.ready) lines.push(`  bridge verified · ${bridge.model} replied`);
   else if (!problem && verifyHint) lines.push(`  ${verifyHint}`);
   if (roles.length) {
-    lines.push('', 'Agents (skill agent-orchestrator, then ~/.bounce/agents, then .bounce/agents):');
+    lines.push('', ...(teamHeader ?? ['Agents:']));
     lines.push(...formatAgentTable(roles));
   }
   lines.push('', workers.length

@@ -88,7 +88,8 @@ test('client: maps the request (Bearer key, state/model/questions) and the respo
   const calls = [];
   const fetchImpl = async (url, options) => { calls.push({url, options}); return okResponse({model: 'jev-1.13.0', answers: {q: {type: 'noul', noul: 0.9}}, usage: {input_tokens: 12, output_tokens: 1}}); };
   let now = 100;
-  const client = createJevClient({fetchImpl, readKey: () => ({key: 'k-1234', source: 'env'}), clock: () => (now += 50)});
+  // One call's transport (samples: 1); the majority of three is its own test below.
+  const client = createJevClient({fetchImpl, readKey: () => ({key: 'k-1234', source: 'env'}), clock: () => (now += 50), samples: 1});
   const result = await client.ask({state: {orders: 'x'}, questions: {q: {type: 'noul', instructions: 'Is this a test?'}}, model: 'jev-1.13.0'});
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, JEV_ENDPOINT);
@@ -115,7 +116,7 @@ test('client: no key rejects before any request; 4xx/5xx reject with an http cod
 test('client: retries once on 429/529 honouring retry-after, then gives up', async () => {
   const sleeps = [];
   let attempts = 0;
-  const flaky = createJevClient({
+  const flaky = createJevClient({samples: 1,
     fetchImpl: async () => (++attempts === 1 ? okResponse({}, {status: 429, headers: {'retry-after': '3'}}) : okResponse({answers: {}})),
     readKey: () => ({key: 'k', source: 'env'}), sleep: async ms => { sleeps.push(ms); },
   });
@@ -124,7 +125,7 @@ test('client: retries once on 429/529 honouring retry-after, then gives up', asy
   assert.deepEqual(sleeps, [3000]);
   assert.equal(attempts, 2);
   attempts = 0;
-  const overloaded = createJevClient({fetchImpl: async () => { attempts++; return okResponse({}, {status: 529}); }, readKey: () => ({key: 'k', source: 'env'}), sleep: async () => {}});
+  const overloaded = createJevClient({samples: 1, fetchImpl: async () => { attempts++; return okResponse({}, {status: 529}); }, readKey: () => ({key: 'k', source: 'env'}), sleep: async () => {}});
   await assert.rejects(overloaded.ask({state: 's', questions: {}}), error => error.code === 'http_529');
   assert.equal(attempts, 2);
 });
@@ -330,4 +331,30 @@ test('the seven findings are worked out in code from those answers and from what
   assert.deepEqual(decide({orders_need_changes: 0.2}, {diff: '', test_output: []}).fired, []);
   assert.deepEqual(decide({changes_outside_scope: 0.6, changes_forbidden_file: 0.6}, withDiff).fired, ['outside_scope', 'forbidden_files']);
   assert.deepEqual(decide({changes_outside_scope: 0.6}, withDiff).findings, [VERDICT_CHECKS.outside_scope.fix]);
+});
+
+// 2026-10-22: "incertidumbre/no determinismo es un nono". Measured: the same TypeSafe request, byte for byte,
+// answered tier mid at 0.76–0.80 and once chose claude_haiku over claude_sonnet; the API refuses temperature and seed.
+// So bounce asks three times, takes the majority (median confidence), and remembers the answer for that exact request.
+test('Jev answers are the majority of three, and the same request always gets the same answer', async t => {
+  const {createJevClient} = await import('../src/jev.js');
+  const answer = (choice, confidence, noul) => ({answers: {profile: {type: 'choice', choice, confidence, probabilities: {[choice]: confidence}}, gap: {type: 'noul', noul}}, model: 'jev-1.13.0'});
+  const replies = [answer('claude_sonnet', 0.76, 0.2), answer('claude_haiku', 0.26, 0.9), answer('claude_sonnet', 0.80, 0.3)];
+  let calls = 0;
+  const fetchImpl = async () => { const body = replies[calls++ % replies.length]; return {ok: true, status: 200, json: async () => body, headers: {get: () => null}}; };
+  const memoFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-jev-memo-')), 'jev-memo.json');
+  t.after(() => fs.rmSync(path.dirname(memoFile), {recursive: true, force: true}));
+  const client = createJevClient({fetchImpl, readKey: () => ({key: 'k'}), samples: 3, memoFile});
+  const ask = () => client.ask({state: {orders: 'x'}, questions: {profile: {type: 'choice'}}, model: 'jev-1.13.0'});
+  const first = await ask();
+  assert.equal(calls, 3);
+  assert.equal(first.answers.profile.choice, 'claude_sonnet');
+  assert.equal(first.answers.profile.confidence, 0.78);
+  assert.equal(first.answers.gap.noul, 0.3, 'a yes/no answer is the median of the three');
+  const again = await ask();
+  assert.equal(calls, 3, 'the same request is not asked again');
+  assert.deepEqual(again.answers, first.answers);
+  const fresh = createJevClient({fetchImpl, readKey: () => ({key: 'k'}), samples: 3, memoFile});
+  assert.deepEqual((await fresh.ask({state: {orders: 'x'}, questions: {profile: {type: 'choice'}}, model: 'jev-1.13.0'})).answers, first.answers, 'remembered across processes');
+  assert.equal(calls, 3);
 });

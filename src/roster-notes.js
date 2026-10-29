@@ -14,7 +14,7 @@ import {PROFILE_TIERS, TIER_HINT, routable} from './jev.js';
 import {LOCAL_ADAPTERS} from './profiles.js';
 import {invocation, runProcess} from './providers.js';
 import {resolveExecutable} from './executable.js';
-import {CATALOG_SOURCE, catalogNote} from './model-catalog.js';
+import {CATALOG_SOURCE, catalogNote, cloudTier} from './model-catalog.js';
 
 export const NOTES_FILE = 'roster-notes.json';
 export const SETUP_TIMEOUT_MS = 120_000;
@@ -51,6 +51,10 @@ const rosterEntries = profiles => Object.entries(profiles ?? {}).filter(routable
 // comes first so a cached agent answer never shadows what bounce knows, and so no agent turn
 // is spent on a model already described.
 const noteFor = (key, cache) => catalogNote(key) ?? cache[key] ?? null;
+// What routing reads: the shipped catalog, else a tier pinned by hand (/jev roster set). An agent's description is a
+// guess that changes from one asking to the next (integration runs 2026-10-22: the same local model "cheapest" eight
+// times, "mid" twice, and routing flipped with it) — it is shown, never routed on.
+export const routingNote = (key, cache) => catalogNote(key) ?? (cache[key]?.by === 'you' ? cache[key] : null);
 
 // Per routable profile: the tier and capabilities the router will see and where each came
 // from — `config` (the profile declares it), `catalog` (bounce ships the note), the agent that
@@ -58,8 +62,8 @@ const noteFor = (key, cache) => catalogNote(key) ?? cache[key] ?? null;
 export function effectiveNotes(profiles = {}, cache = {}) {
   return Object.fromEntries(rosterEntries(profiles).map(([name, p]) => {
     const key = modelKey(p);
-    const note = noteFor(key, cache) ?? {};
-    const tier = p.tier ?? (PROFILE_TIERS.includes(note.tier) ? note.tier : null);
+    const note = routingNote(key, cache) ?? {};
+    const tier = p.tier ?? (PROFILE_TIERS.includes(note.tier) ? note.tier : cloudTier(key));
     const capabilities = p.capabilities ?? (typeof note.capabilities === 'string' && note.capabilities ? note.capabilities : null);
     const source = p.capabilities ? 'config' : !capabilities ? null : catalogNote(key) ? CATALOG_SOURCE : note.by ?? 'notes';
     return [name, {model: key, tier, capabilities, source}];
@@ -202,7 +206,10 @@ export function createRosterSetup({root = dataRoot(), profiles = {}, agent = nul
         try { known = await catalogs(); } catch {}
         const reference = [...new Map(Object.values(effectiveNotes(profiles, cache)).filter(note => note.tier).map(note => [note.model, note.tier]))];
         const written = await describeModels({models, agent, catalogs: Array.isArray(known) ? known : [], reference, root, executables, run, timeoutMs, clock});
-        writeRosterNotes({...readRosterNotes(root), ...written}, root);
+        // A tier pinned by hand (/jev roster set) stands: the description keeps the person's tier.
+        const current = readRosterNotes(root);
+        for (const [key, note] of Object.entries(written)) if (current[key]?.by === 'you') written[key] = {...note, tier: current[key].tier, by: 'you'};
+        writeRosterNotes({...current, ...written}, root);
         failed = false;
         const roster = effectiveNotes(profiles, readRosterNotes(root));
         const by = Object.values(written)[0].by;
@@ -224,5 +231,7 @@ export function createRosterSetup({root = dataRoot(), profiles = {}, agent = nul
 export function rosterLines(profiles = {}, cache = {}) {
   const roster = effectiveNotes(profiles, cache);
   if (!Object.keys(roster).length) return ['No worker profiles to route between'];
-  return Object.entries(roster).map(([name, n]) => `${name} → ${n.model}${n.tier ? ` · tier ${n.tier}` : ''}${n.capabilities ? ` · ${n.capabilities}` : ' · not described yet'}${n.source ? ` (${n.source === 'config' || n.source === CATALOG_SOURCE ? n.source : `by ${n.source}`})` : ''}`);
+  // What routing reads, then — apart, and said to be unused — what an agent wrote about a model nobody rated.
+  const guess = n => { const note = cache[n.model]; return !n.tier && note?.by && note.by !== 'you' ? ` · not rated (${note.by} guessed ${note.tier ?? 'no tier'}: ${note.capabilities}; not routed on — /jev roster set ${n.model} TIER)` : ''; };
+  return Object.entries(roster).map(([name, n]) => `${name} → ${n.model}${n.tier ? ` · tier ${n.tier}` : ''}${n.capabilities ? ` · ${n.capabilities}` : guess(n) || ' · not rated'}${n.source ? ` (${n.source === 'config' || n.source === CATALOG_SOURCE ? n.source : `by ${n.source}`})` : ''}`);
 }

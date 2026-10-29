@@ -402,7 +402,7 @@ test('D3 --detach returns immediately with an id; attach streams then exits when
   await waitFor(() => fs.existsSync(path.join(dir, 'daemon.json')));
   const info = JSON.parse(fs.readFileSync(path.join(dir, 'daemon.json'), 'utf8'));
   assert.ok(pidAlive(info.pid), 'daemon pid must be alive right after detach');
-  // Found live (ACE d1bc0206): the daemon died with stdio 'ignore' and left no trace of why.
+  // Found live (session d1bc0206): the daemon died with stdio 'ignore' and left no trace of why.
   assert.equal(fs.existsSync(path.join(dir, 'daemon.log')), true, 'the detached daemon writes its output to daemon.log');
 
   const attachChild = spawn(process.execPath, [cliPath, 'attach', id, '--json'], {env: bounceEnv(root), stdio: ['ignore', 'pipe', 'pipe']});
@@ -694,16 +694,16 @@ test('O2 orchestrator single-provider: the orchestrator submits over the bridge,
   assert.equal(orders.includes('Do not edit the repository yourself and do not read bounce\'s own source'), false);
   // A retry may name its own next profile (item 3).
   assert.equal(orders.includes('After a failed attempt, you may name the next profile for the retry yourself and say why'), true);
-  // Found live (ACE d1bc0206): with names only, the orchestrator took `build_claude` for "the Claude
+  // Found live (session d1bc0206): with names only, the orchestrator took `build_claude` for "the Claude
   // builder" and ran a routine retry on Opus. Each profile now shows its model, and the retry rule
   // says to pick the lightest AI that fits.
-  // Decided by Daniel on 2026-09-30: a failed local attempt is retried on the agent's own next AI first (a
+  // Decided on 2026-09-30: a failed local attempt is retried on the agent's own next AI first (a
   // second local model, then Sonnet); the chain lines name those profiles so the retry can submit them.
-  // docs/plans/lessons-and-sweep.md §1: the orders say when and how a lesson is recorded.
+  // The orders say when and how a lesson is recorded.
   assert.equal(orders.includes('Lessons: when a task redid work that had been accepted, or a check failed twice, the handoff asks whether there is a lesson.'), true);
   assert.equal(orders.includes('Retry first on the agent\'s own next AI: submit the name after the arrow in its chain above (builder~2, then builder~3) with retryOf; it is the lightest AI that has not tried the task. Name a cloud AI yourself only when the cause needs a stronger tier: a mid-tier model (e.g. Sonnet) for routine implementation a local worker could not finish'), true);
   assert.match(orders, /Worker profiles \(one AI each\): .*build_claude \(opus\[1m\]\)/);
-  // Found across ACE 159f4746 and d1bc0206: most first attempts ended with the worker blocking itself on
+  // Found across session 159f4746 and d1bc0206: most first attempts ended with the worker blocking itself on
   // a one-line change outside its owned paths, or on live proof its own orders forbade.
   assert.equal(orders.includes('Owned paths are where a chunk\'s work lands, not a fence'), true);
   assert.equal(orders.includes('Acceptance must be reachable with the authority you grant'), true);
@@ -993,7 +993,7 @@ test('a crash that escapes the daemon is journaled as daemon.crashed with its st
   assert.deepEqual(exits, [70, 70]);
 });
 
-// Found live (ACE d1bc0206): a daemon that failed to start held the session lock for half an hour and
+// Found live (session d1bc0206): a daemon that failed to start held the session lock for half an hour and
 // every resume failed behind it. Only this session's own daemon, alive past the margin with no
 // daemon.json of its own, is stopped; anything else holding the lock is left alone.
 test('a resume stops this session\'s stuck daemon that holds the lock, and leaves any other holder alone', async t => {
@@ -1010,4 +1010,21 @@ test('a resume stops this session\'s stuck daemon that holds the lock, and leave
   assert.equal(pidAlive(stuck.pid), true);
   assert.equal(await releaseStuckDaemon(dir, 'sess-1', {inspect: own, sleep}), stuck.pid);
   await waitFor(() => !pidAlive(stuck.pid));
+});
+
+// Found by the integration run 2026-10-21: an orchestrated `bounce run`
+// was its first turn only, so an orchestrator that dispatched and ended its turn — as real ones do — never heard back
+// and the job stopped there. The run now hands the outcome over in one more turn, then ends.
+test('O11 an orchestrated run that dispatches without waiting is handed its worker\'s outcome in one more turn', async t => {
+  const root = tmpRoot('bounce-o11-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  writeOrchestratorConfig(root, {profiles: {main: {adapter: 'codex'}, build: {adapter: 'codex'}}});
+  const session = await runOrchestratorSession(root, {adapters: {codex: completingAdapter()}, env: {FAKE_ORCH_NOWAIT: '1'}});
+  const submitted = session.events.find(e => e.kind === 'task.submitted');
+  assert.equal(session.events.some(e => e.kind === 'task.completed' && e.task === submitted.task), true);
+  const users = session.events.filter(e => e.kind === 'user');
+  assert.equal(users.length, 2, 'the prompt, then one handoff turn');
+  assert.match(users[1].text, /Worker outcomes not yet handed to you/);
+  assert.equal(session.events.some(e => e.kind === 'assistant' && e.text === `handed: - task ${submitted.task} · profile build · task.completed`), true);
+  assert.deepEqual(session.events.filter(e => e.kind === 'main.disposition').map(e => e.task), [submitted.task]);
 });

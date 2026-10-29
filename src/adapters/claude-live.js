@@ -7,7 +7,7 @@ import {spawnLive, vendorEnv, verifiedCancel, appendPending, readPending, takePe
 
 const WRITE_WAIT = 2000; // how long a live push waits for the turn to take the message
 
-// CONTRACT.md #5: live adapters yield usage already normalized to {input, cache_read,
+// Live adapters yield usage already normalized to {input, cache_read,
 // cache_write, output} — only the keys the vendor actually reported, integers — so
 // reducers.spend never has to know a vendor's field names. claude: input_tokens→input,
 // cache_read_input_tokens→cache_read, cache_creation_input_tokens→cache_write,

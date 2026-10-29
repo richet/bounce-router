@@ -1,4 +1,4 @@
-// Task leases (docs/plans/task-leases.md). Found live: every reviewer on the
+// Task leases. Found live: every reviewer on the
 // local 27B was killed by its deadline while still working — its last step 11 to 84 s before the
 // kill — and the orchestrator answered each kill by shrinking the next deadline. A deadline is now a
 // lease: renewed while the worker makes progress, up to a ceiling; a worker that stops making

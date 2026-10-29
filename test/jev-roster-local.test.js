@@ -18,7 +18,7 @@ test('the describing prompt shows what is already rated, so a new model is place
   assert.equal(setupPrompt([{key: 'claude/x', adapter: 'claude', model: 'x'}], []).includes('Already rated'), false);
 });
 
-test('/jev roster lists the local models beside the profiles, and refresh has the agent describe them', async t => {
+test('/jev roster lists the local models beside the profiles; refresh shows an agent\'s guess, which routing does not read', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-roster-local-')));
   t.after(() => fs.rmSync(root, {recursive: true, force: true}));
   const settings = {operation: 'orchestrator', order: ['claude'], mode: 'yolo', models: {}, profiles: {main: {adapter: 'claude'}}, jev: {enabled: true}};
@@ -27,18 +27,36 @@ test('/jev roster lists the local models beside the profiles, and refresh has th
   const run = (line, extra = {}) => jevCommand(line.split(/\s+/).filter(Boolean), {root, cwd: root, settings, save: () => {}, env: {}, discover, run: answering(answer, calls), ...extra});
 
   const before = (await run('roster')).text.split('\n');
-  assert.equal(before.includes('  lmstudio/coder-30b-a3b → local · loaded · 32k · tier cheapest · not described yet: unknown local model: single-file reading only'), true);
-  assert.equal(before.at(-1), '2 models not described yet: bounce describes them when routing is on and the daemon starts, or on /jev roster refresh');
+  assert.equal(before.includes('  lmstudio/coder-30b-a3b → local · loaded · 32k · tier cheapest (default; /jev roster set pins one) · local model on lmstudio · context 32k · runs on this machine at no cost, one turn at a time, slower than a cloud model'), true, before.join('\n'));
+  assert.equal(before.at(-1), '2 models not rated: routing sees adapter/model/role/policy for them; /jev roster set MODEL TIER rates one, /jev roster refresh shows what an agent would guess');
 
   const refreshed = (await run('roster refresh')).text.split('\n');
   assert.equal(calls.length, 1);
   assert.match(fs.readFileSync(calls[0].promptFile ?? path.join(root, 'roster-setup', 'prompt.txt'), 'utf8'), /Already rated, for scale[\s\S]*- lmstudio\/dense-27b: a local model served through LM Studio/);
   assert.deepEqual(Object.fromEntries(Object.entries(readRosterNotes(root)).filter(([key]) => key.startsWith('lmstudio/')).map(([key, note]) => [key, note.tier])), {'lmstudio/coder-30b-a3b': 'cheapest', 'lmstudio/dense-27b': 'mid'});
-  assert.equal(refreshed.includes('lmstudio/dense-27b → local · loaded · 256k · tier mid · Dense 27B: careful reader, slow. (claude)'), true);
+  // The guess is kept and shown, apart; the tier routing reads stays the default (2026-10-22: no agent guess routes).
+  assert.equal(refreshed.includes('lmstudio/dense-27b → local · loaded · 256k · tier cheapest (default; /jev roster set pins one) · local model on lmstudio · context 256k · runs on this machine at no cost, one turn at a time, slower than a cloud model · claude guessed mid, not routed on'), true, refreshed.join('\n'));
 
   // local models off: they are not in the roster at all, and LM Studio is not asked
   settings.local = {enabled: false};
   let asked = 0;
   const off = (await run('roster', {discover: async () => { asked++; return []; }})).text;
   assert.deepEqual([off.includes('lmstudio/'), asked], [false, 0]);
+});
+
+// Found by the integration run 2026-10-21: a local model's tier is written by a cloud agent from its name ("I don't
+// recognise this exact release") and nothing could correct it. `/jev roster set` pins it, and says who did.
+test('/jev roster set pins a model\'s tier by hand, keeps its capabilities, and refuses what is not a tier', async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-roster-set-')));
+  const settings = {operation: 'orchestrator', order: ['claude'], mode: 'yolo', models: {}, profiles: {main: {adapter: 'claude'}}, jev: {enabled: true}};
+  const answer = JSON.stringify({'lmstudio/coder-30b-a3b': {tier: 'cheapest', capabilities: 'Fast MoE coder.'}, 'lmstudio/dense-27b': {tier: 'cheapest', capabilities: 'Dense 27B: careful reader, slow.'}});
+  const run = line => jevCommand(line.split(/\s+/).filter(Boolean), {root, cwd: root, settings, save: () => {}, env: {}, discover, run: answering(answer)});
+  await run('roster refresh');
+  const set = await run('roster set lmstudio/dense-27b mid');
+  assert.equal(set.text, 'lmstudio/dense-27b → tier mid · pinned by you; /jev roster refresh keeps it');
+  assert.deepEqual(readRosterNotes(root)['lmstudio/dense-27b'], {tier: 'mid', capabilities: 'Dense 27B: careful reader, slow.', by: 'you'});
+  await assert.rejects(run('roster set lmstudio/dense-27b huge'), {message: 'Use /jev roster set MODEL cheapest|mid|strongest|advisor'});
+  await run('roster refresh');
+  assert.equal(readRosterNotes(root)['lmstudio/dense-27b'].tier, 'mid', 'a refresh does not undo a hand-pinned tier');
+  fs.rmSync(root, {recursive: true, force: true});
 });

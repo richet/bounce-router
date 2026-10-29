@@ -1,4 +1,4 @@
-// Found live (ACE d1bc0206): 11 of 23 first attempts named `build_claude` (Opus) directly, skipping the
+// Found live (session d1bc0206): 11 of 23 first attempts named `build_claude` (Opus) directly, skipping the
 // builder agent's own order (local, then Sonnet, then Opus), although the orders already said not to.
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -28,9 +28,10 @@ test('a first attempt from the orchestrator that names a cloud profile runs as t
   assert.deepEqual(corrected.corrections, ['profile: build_claude is one AI; a first attempt runs as the builder agent, which tries its own AIs lightest first (name an AI only for a retry, or add userAsked: true when the user asked for it)']);
   assert.deepEqual(session.events.filter(e => e.kind === 'task.corrected').map(e => [e.task, e.text]), [[corrected.task, corrected.corrections[0]]]);
   assert.equal(scheduler.prepare({...base, profile: 'builder'}).profile, 'builder');
-  assert.equal(scheduler.prepare({...base, profile: 'build_claude', userAsked: true}).profile, 'build_claude');
+  // 2026-10-26: an AI the user asked for, or a retry's next AI, plays the agent; it never runs as the job on its own.
+  assert.equal(scheduler.prepare({...base, profile: 'build_claude', userAsked: true}).profile, 'builder@claude:opus[1m]');
   assert.equal(scheduler.prepare({...base, profile: 'build_claude', from: 'user'}).profile, 'build_claude', 'the user may name any profile');
-  assert.equal(scheduler.prepare({...base, profile: 'build_claude', retryOf: corrected.task}).profile, 'build_claude', 'a retry may name the next AI');
+  assert.equal(scheduler.prepare({...base, profile: 'build_claude', retryOf: corrected.task}).profile, 'builder@claude:opus[1m]', 'a retry may name the next AI, for the same agent');
 });
 
 test('an unknown profile runs as the agent it names, and invalid owns entries are dropped, each with a note', t => {

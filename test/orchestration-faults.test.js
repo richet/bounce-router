@@ -50,7 +50,7 @@ test('a cancellation wins a simultaneous successful result', {timeout: 3000}, as
   assert.deepEqual(session.events.filter(e => e.task === 'work' && ['task.completed', 'task.accepted', 'task.cancelled'].includes(e.kind)).map(e => e.kind), ['task.cancelled']);
 });
 
-// Reversed 2026-09-27 (ACE d1bc0206): a rework round counted as an attempt of its job, so one rework plus
+// Reversed 2026-09-27 (session d1bc0206): a rework round counted as an attempt of its job, so one rework plus
 // one retry exhausted the job and a completed, evidence-backed result was failed. A rework round is the same
 // task continuing (capped by rounds); only a new task is another attempt of its job.
 test('a rework round is not a new attempt of its job; a new task past the job allowance is refused', {timeout: 3000}, async t => {
@@ -127,7 +127,7 @@ test('reconciliation completes a crash-interrupted two-file integration without 
   assert.equal(restarted.events.some(e => e.kind === 'task.blocked' && e.task === 'writer' && e.reason === 'orphaned'), false);
 });
 
-// Decided by Daniel on 2026-09-30, from ACE e3bd01d5: a retry on a slow local model ran 47 minutes to the
+// Decided on 2026-09-30, from session e3bd01d5: a retry on a slow local model ran 47 minutes to the
 // ceiling, and the retry on Sonnet submitted right after it failed in the same second, "Logical job
 // ceiling exhausted", because the ceiling counted from the job's first start. A job's time is not shared
 // between its attempts: each task's ceiling counts from its own start. The attempt allowance still is.

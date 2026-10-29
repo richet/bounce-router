@@ -167,7 +167,7 @@ test('S3b a recoverable failure falls back to the next profile in the chain; any
 // The worker's changes are its answer. When a write worker's turn ends with no answer text at all
 // but its isolated workspace captured real changes, those changes are the outcome: the scheduler
 // synthesizes a completed report from the artifact instead of failing the task and falling back to
-// the next AI in the chain, which would otherwise discard a working draft (found live, ACE session
+// the next AI in the chain, which would otherwise discard a working draft (found live, session
 // d1bc0206: two local qwen builders did real work, then answered nothing on their last turn).
 test('a recoverable failure with no answer text but captured file changes completes via synthesis, not fallback', async t => {
   const {session} = setup(t);
@@ -214,7 +214,7 @@ test('a recoverable failure after the worker said something completes from what 
 });
 
 // A step-capped worker that was still making progress is continued on its own session first
-// (docs/plans/step-renewal.md) — before its partial answer is taken as the result.
+// — before its partial answer is taken as the result.
 test('a step-capped runtime failure while progressing renews the worker\'s steps before anything is synthesized', async t => {
   const {session} = setup(t);
   let turn = 0;

@@ -1,5 +1,5 @@
 // The local model server is one machine's resource, not one bounce home's: every bounce process of
-// this user, whatever its BOUNCE_HOME, shares these slots. Found live (ACE d1bc0206, 2026-09-28): a
+// this user, whatever its BOUNCE_HOME, shares these slots. Found live (session d1bc0206, 2026-09-28): a
 // second bounce started with another home queued its worker inside LM Studio behind the first one's
 // builder, which then read as "stalled for 604 s". A slot is a file naming its holder; it is taken by
 // an exclusive link (complete content or nothing), and a slot whose holder process is gone is free.

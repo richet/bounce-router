@@ -1,10 +1,9 @@
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {resolveExecutable} from '../executable.js';
 import {spawnLive, vendorEnv, verifiedCancel, appendPending, readPending, takePending, TEXT_MAX, SPEAKER, classifyText, createAnswer, concludeAsk, reportGrant, peerTask} from './live-common.js';
 import {outputTail} from '../command-output.js';
+import {opencodeVersion, VERIFIED} from '../opencode-version.js';
+import {serveForTurn} from '../opencode-server.js';
 
 // The OpenCode peer, driven the way claude and codex are: one `opencode run` process per turn, in
 // the user's own tree. The prompt goes in on stdin, JSON event lines come out on stdout, the
@@ -12,11 +11,26 @@ import {outputTail} from '../command-output.js';
 // Bounce's only local-specific work is configuration: which model, and how OpenCode reaches it
 // (`profile.opencodeConfig`, built by src/local-opencode-config.js).
 //
-// Measured against opencode 1.18.31 (docs/plans/local-design-v2.md §1): `run --format json` exits by
+// Measured against opencode 1.18.31: `run --format json` exits by
 // itself; every line carries `sessionID`; `step_finish` carries the tokens; and with nobody to
 // answer, a permission ask (e.g. a path outside --dir) is REJECTED by opencode itself — so there is
 // no server, port, password, SSE stream, permission responder, poll, deadline or reap here.
+//
+// opencode 2.x (read from the 2.0.29 source, then run live) keeps that shape — one `run` per turn,
+// the same event names and token fields, stdin, OPENCODE_CONFIG_CONTENT — but `run` talks to a server:
+// `--standalone` makes it a private one that inherits this env and ends with the turn (without it,
+// `run` attaches to the user's shared background service, which never sees our config). There is no
+// --dir (the directory is $PWD, which wins over the spawn cwd) and no --pure. Its config has its own
+// shape (nativeConfig, opencode-common.js) and its tools other names: bash is shell, task is subagent.
 const RUN_ARGS = ['run', '--pure', '--format', 'json'];
+const RUN_ARGS_V2 = ['run', '--standalone', '--format', 'json'];
+// 2.x lists an MCP server's tools only once it has connected ("reads report what is connected now",
+// 2.0.29 core/src/mcp/index.ts), and a turn's first step does not wait for it: observed live, every
+// worker's first request went out without bounce_report, and an analyst that saw no report tool on
+// step one wrote its own client for the report socket. So a worker with a report grant gets a server
+// bounce starts itself (`serve --stdio`, what --standalone runs), and its turn starts only once the
+// server says bounce is no longer pending — or after MCP_READY_MS, when it runs without the tool.
+const MCP_READY_MS = 20_000;
 const DEFAULT_AGENT = 'bounce-worker';
 const DEFAULT_STEPS = 30;
 // Observed live on a 4B and a 27B model alike: a worker that cannot do what it was asked re-reads
@@ -30,12 +44,14 @@ const COMMAND_MAX = 1000;
 // session with every tool off and a two-step cap: state your conclusion from what you have. An
 // answer is the task's result (still reviewed like any other); silence leaves the failure as it was.
 const CONCLUDE_STEPS = 2;
-// Why a turn ended with nothing from the worker. One path, one prompt (docs/plans/answer-contract.md).
+// Why a turn ended with nothing from the worker. One path, one prompt.
 const CAP_PROMPT = concludeAsk('your step budget is spent');
 const CONCLUDE_PROMPT = concludeAsk('you repeated the same call with nothing new');
 const SILENT_PROMPT = concludeAsk('your turn ended without an answer');
+const LEAKED_PROMPT = concludeAsk('your last message was a tool call written as text, so it never ran');
 const READS = new Set(['read', 'grep']); // listing files (glob) is not reading material
-const CHANGES = new Set(['write', 'edit', 'apply_patch', 'bash']);
+const CHANGES = new Set(['write', 'edit', 'apply_patch', 'bash', 'patch', 'shell']);
+const SHELL = new Set(['bash', 'shell']);
 // Observed live (qwen3-coder-30b-a3b via LM Studio): the model answers, but every step is reported as
 // finishing for `tool-calls` even when it called none, so opencode keeps looping on empty steps until
 // the step cap. A step with no tool call and no new text is empty; this many in a row ends the turn —
@@ -49,53 +65,37 @@ const HEARTBEAT_MS = 30_000;
 const STEP_BEAT_CAP_MS = 15 * 60_000;
 // A conclusion turn (tools off, CONCLUDE_STEPS-capped, asked once for the worker's answer) has no
 // step-time bound of its own: a reasoning model can spend minutes generating on a single step,
-// still within its 2-step cap (observed live, ACE session d1bc0206: 6.5 minutes producing nothing).
+// still within its 2-step cap (observed live, session d1bc0206: 6.5 minutes producing nothing).
 // CONCLUDE_TIMEOUT_MS bounds the whole conclusion turn by wall clock; past it the turn is cancelled
 // and treated exactly like a conclusion that said nothing.
 const CONCLUDE_TIMEOUT_MS = 90_000;
 const BEAT = Symbol('beat');
 
-// toolsFor and mapUsage live in opencode-common.js (shared with the classic adapter) and are re-exported.
-export {toolsFor, mapUsage} from './opencode-common.js';
-import {toolsFor, mapUsage, READ_TOOLS, WRITE_TOOLS, NEVER_TOOLS} from './opencode-common.js';
+// toolsFor, mapUsage and nativeConfig live in opencode-common.js (shared with the classic adapter) and are re-exported.
+export {toolsFor, mapUsage, nativeConfig} from './opencode-common.js';
+import {toolsFor, mapUsage, nativeConfig, READ_TOOLS, WRITE_TOOLS, NEVER_TOOLS} from './opencode-common.js';
 
-// The OS-level fence for a probe worker (docs/plans/probing-reviewer.md): macOS sandbox-exec around the
-// whole opencode process. Writes are refused everywhere except the temp dirs and opencode's own state,
-// and refused in the project even when it sits under a temp dir (the last matching rule wins). The
-// network reaches only localhost: the model endpoint and opencode's own in-process server. A Unix
-// socket (Docker's) is not a network address and stays refused.
-
-export function probeSandbox(cwd, home = os.homedir(), probeSource = null, reportSocket = null) {
-  const q = p => JSON.stringify(String(p));
-  const isolated = fs.realpathSync(cwd);
-  const source = probeSource === null ? null : fs.realpathSync(probeSource);
-  // macOS resolves /tmp to /private/tmp before evaluating a Unix-socket literal.
-  const socket = reportSocket === null ? null : (() => {
-    try { return fs.realpathSync(reportSocket); }
-    catch { return path.join(fs.realpathSync(path.dirname(reportSocket)), path.basename(reportSocket)); }
-  })();
-  if (source && (source === isolated || source.startsWith(`${isolated}${path.sep}`) || isolated.startsWith(`${source}${path.sep}`))) throw new Error('probeSource must be separate from cwd');
-  const writable = ['/private/tmp', '/private/var/folders', `${home}/.local/share/opencode`, `${home}/.local/state/opencode`, `${home}/.cache/opencode`, `${home}/.config/opencode`, ...(source ? [isolated] : [])];
-  return ['(version 1)', '(allow default)', '(deny file-write*)',
-    `(allow file-write* ${writable.map(p => `(subpath ${q(p)})`).join(' ')} (literal "/dev/null") (literal "/dev/zero") (subpath "/dev/fd") (regex #"^/dev/tty") (regex #"^/dev/ptmx"))`,
-    `(deny file-write* (subpath ${q(source ?? isolated)}))`,
-    '(deny network*)', '(allow network* (local ip "localhost:*"))', '(allow network-outbound (remote ip "localhost:*"))',
-    ...(socket ? [`(allow network-outbound (literal ${q(socket)}))`] : [])].join('');
-}
-// Everything this adapter takes on faith from the opencode binary, in one place, so a test can hold
-// the installed binary to it (test/opencode-contract.test.js). Verified against 1.18.31 — a version
-// not listed here has not been checked, and the test says so rather than letting it run unexamined.
+// Everything this adapter takes on faith from the opencode binary, in one place and per major, so a
+// test can hold the installed binary to it (test/opencode-contract.test.js). Verified against the
+// versions in src/opencode-version.js — another version has not been checked, and the test says so
+// rather than letting it run unexamined.
 export const CONTRACT = {
-  versions: ['1.18.31'],
-  literals: ['run [message..]', 'raw JSON events', 'agent to use', 'session id to continue', 'directory to run in',
-    'run without external plugins', 'OPENCODE_CONFIG_CONTENT', 'OPENCODE_DISABLE_AUTOUPDATE', 'OPENCODE_DISABLE_DEFAULT_PLUGINS',
-    'OPENCODE_DISABLE_PROJECT_CONFIG', 'OPENCODE_DISABLE_CLAUDE_CODE', 'OPENCODE_DISABLE_CLAUDE_CODE_PROMPT',
-    'OPENCODE_DISABLE_CLAUDE_CODE_SKILLS', 'OPENCODE_DISABLE_EXTERNAL_SKILLS', 'step_start', 'step_finish', 'tool_use', 'auto-rejecting', 'maxSteps', 'external_directory',
-    ...WRITE_TOOLS.filter(tool => tool.length > 4), ...NEVER_TOOLS.filter(tool => tool.length > 6)],
+  versions: VERIFIED,
+  literals: {
+    1: ['run [message..]', 'raw JSON events', 'agent to use', 'session id to continue', 'directory to run in',
+      'run without external plugins', 'OPENCODE_CONFIG_CONTENT', 'OPENCODE_DISABLE_AUTOUPDATE', 'OPENCODE_DISABLE_DEFAULT_PLUGINS',
+      'OPENCODE_DISABLE_PROJECT_CONFIG', 'OPENCODE_DISABLE_CLAUDE_CODE', 'OPENCODE_DISABLE_CLAUDE_CODE_PROMPT',
+      'OPENCODE_DISABLE_CLAUDE_CODE_SKILLS', 'OPENCODE_DISABLE_EXTERNAL_SKILLS', 'step_start', 'step_finish', 'tool_use', 'auto-rejecting', 'maxSteps', 'external_directory',
+      ...WRITE_TOOLS.filter(tool => tool.length > 4), ...NEVER_TOOLS.filter(tool => tool.length > 6)],
+    2: ['Run with a private server instead of the background service', 'Session ID to continue', 'Agent to use', 'Output format',
+      'OPENCODE_CONFIG_CONTENT', 'OPENCODE_DISABLE_PROJECT_CONFIG', 'step_start', 'step_finish', 'tool_use', 'auto-rejecting',
+      'external_directory', 'maxTokensField', 'codemode', 'reasoningEffort', 'permissions', '@opencode/ai/providers/openai-compatible',
+      'opencode.provider.lmstudio', 'opencode.config.compatibility', 'subagent', 'websearch', 'webfetch'],
+  },
 };
 
 const effectiveTier = (profile = {}) =>
-  profile.policy === 'read-only' ? 'read-only' : profile.policy === 'probe' ? 'probe' : profile.mode === 'plan' ? 'plan' : profile.policy === 'write' ? 'write' : 'yolo';
+  profile.policy === 'read-only' ? 'read-only' : profile.mode === 'plan' ? 'plan' : profile.policy === 'write' ? 'write' : 'yolo';
 
 
 // A local model needs no vendor credential, so none reaches it: opencode would otherwise pick up
@@ -104,10 +104,10 @@ const CREDENTIAL = /(_API_KEY|_AUTH_TOKEN|_ACCESS_TOKEN|_SECRET|_SECRET_KEY)$|^(
 export const scrubCredentials = (env, keep = []) =>
   Object.fromEntries(Object.entries(env).filter(([key]) => keep.includes(key) || !CREDENTIAL.test(key)));
 
-export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HEARTBEAT_MS, stepBeatCapMs = STEP_BEAT_CAP_MS, concludeTimeoutMs = CONCLUDE_TIMEOUT_MS} = {}) {
+export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HEARTBEAT_MS, stepBeatCapMs = STEP_BEAT_CAP_MS, concludeTimeoutMs = CONCLUDE_TIMEOUT_MS, versionOf = opencodeVersion, fetchImpl = fetch, mcpReadyMs = MCP_READY_MS} = {}) {
   const pendingPath = dir => `${dir}/pending.jsonl`;
 
-  const start = ({peer, profile = {}, session = null, stdin, cwd, dir, conclude = false}) => {
+  const start = async ({peer, profile = {}, session = null, stdin, cwd, dir, conclude = false}) => {
     const executable = resolveExecutable('opencode', profile.executables?.opencode);
     const agent = profile.agent ?? {};
     const name = agent.name ?? DEFAULT_AGENT;
@@ -130,44 +130,55 @@ export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HE
       ...(agent.prompt ? {prompt: agent.prompt} : {}), maxSteps: conclude ? CONCLUDE_STEPS : agent.maxSteps ?? DEFAULT_STEPS,
       tools: {...(conclude ? Object.fromEntries(Object.keys(toolsFor(effectiveTier(profile))).map(tool => [tool, false])) : toolsFor(effectiveTier(profile))), ...reportTool}}}};
     const model = profile.providerID && profile.model ? ['-m', `${profile.providerID}/${profile.model}`] : [];
-    const args = [...RUN_ARGS, '--agent', name, ...model, '--dir', cwd, ...(session ? ['-s', session] : [])];
+    // A binary whose version cannot be read is driven as 1.x: if it is not there at all, the spawn
+    // below reports it missing, as it always has.
+    const v2 = (versionOf(executable).major ?? 1) >= 2;
     const keep = profile.apiKeyEnv ? [profile.apiKeyEnv] : [];
     const env = {...scrubCredentials(vendorEnv(process.env, profile.orchestratorEnv), keep),
-      OPENCODE_CONFIG_CONTENT: JSON.stringify(config), OPENCODE_DISABLE_AUTOUPDATE: '1',
+      OPENCODE_CONFIG_CONTENT: JSON.stringify(v2 ? nativeConfig(config) : config), OPENCODE_DISABLE_AUTOUPDATE: '1',
       OPENCODE_DISABLE_DEFAULT_PLUGINS: '1', OPENCODE_DISABLE_PROJECT_CONFIG: '1',
       // opencode otherwise loads the USER'S Claude Code setup into the worker: ~/.claude/CLAUDE.md as
       // prompt and ~/.claude/skills. Observed live on two different models: a CLAUDE.md that says
       // "rules: @~/.claude/WORKFLOW.md" sent the worker to read a file outside the project, opencode
       // rejected it and ended the turn. A worker's instructions are its agent file and its orders.
       OPENCODE_DISABLE_CLAUDE_CODE: '1', OPENCODE_DISABLE_CLAUDE_CODE_PROMPT: '1', OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: '1',
-      OPENCODE_DISABLE_EXTERNAL_SKILLS: '1'};
-    // Only a probe (read-only checks) runs sandboxed, as Codex's probes do. A write worker has the same
-    // freedom as a Claude or Codex one (user, 2026-09-27: "there's no difference between any").
-    const fence = effectiveTier(profile) === 'probe' ? probeSandbox(cwd, os.homedir(), profile.probeSource ?? null, grant?.BOUNCE_REPORT_BUS) : null;
-    const spawned = fence ? {executable: '/usr/bin/sandbox-exec', args: ['-p', fence, executable, ...args]} : {executable, args};
-    const live = spawnLive({...spawned, cwd, env, stdin, ...(spawn ? {spawn} : {})});
-    return {live, child: live.child, pid: live.child.pid, args: spawned.args, dir, cwd, sessionId: session, tools: config.agent[name].tools, agent: name, peer, profile, conclude};
+      OPENCODE_DISABLE_EXTERNAL_SKILLS: '1',
+      // 2.x runs where $PWD says, not where it was spawned: an inherited PWD would be bounce's own.
+      ...(v2 ? {PWD: cwd} : {})};
+    // On 2.x a turn with a report tool waits for it on a server of its own (serveForTurn); any other
+    // 2.x turn needs nothing to be ready first, so --standalone starts and stops its server for it.
+    const served = v2 && grant ? await serveForTurn({executable, cwd, env, ...(spawn ? {spawn} : {}), fetchImpl, mcpMs: mcpReadyMs}) : null;
+    const args = !v2 ? [...RUN_ARGS, '--agent', name, ...model, '--dir', cwd, ...(session ? ['-s', session] : [])]
+      : [...(served ? ['run', '--server', served.url, '--format', 'json'] : RUN_ARGS_V2), '--agent', name, ...model, ...(session ? ['-s', session] : [])];
+    // A write worker has the same freedom as a Claude or Codex one (user, 2026-09-27: "there's no
+    // difference between any").
+    const live = spawnLive({executable, args, cwd, env: served ? {...env, OPENCODE_PASSWORD: served.password} : env, stdin, ...(spawn ? {spawn} : {})});
+    // The turn ending, however it ends (exit, kill, failure to spawn), ends its server.
+    if (served) { live.child.once('close', served.stop); live.child.once('error', served.stop); }
+    return {live, child: live.child, pid: live.child.pid, args, dir, cwd, sessionId: session, tools: config.agent[name].tools, agent: name, peer, profile, conclude,
+      ...(served?.notice ? {notice: served.notice} : {})};
   };
 
   return {
     name: 'opencode',
 
     async launch({peer, profile, orders = '', cwd, dir}) {
-      return start({peer, profile, stdin: String(orders), cwd, dir});
+      return await start({peer, profile, stdin: String(orders), cwd, dir});
     },
 
     async resume({peer, profile, native = {}, message = '', cwd, dir}) {
       const texts = takePending(pendingPath(dir));
-      return start({peer, profile, session: native?.sessionId ?? null, stdin: [...texts, String(message)].join('\n'), cwd, dir});
+      return await start({peer, profile, session: native?.sessionId ?? null, stdin: [...texts, String(message)].join('\n'), cwd, dir});
     },
 
     // Never throws: every terminal condition of the process becomes an event and ends the stream.
     async *events(handle) {
+      if (handle.notice) yield {kind: 'diagnostic', text: handle.notice};
       let announced = false, lastError = null, tail = '', refused = null;
       const answer = createAnswer();
       const repeats = new Map();
       let stepActed = false, emptySteps = 0, concluded = false, reads = 0, stalled = false, capped = false, stepsDone = 0;
-      // Found live (ACE 43387649): at maxSteps opencode ends the turn with no notice in the stream, so the
+      // Found live (session 43387649): at maxSteps opencode ends the turn with no notice in the stream, so the
       // finished-step count against the turn's own budget is what says the cap was hit.
       const stepBudget = handle.conclude ? null : handle.profile?.agent?.maxSteps ?? DEFAULT_STEPS;
       // `stepActed` is per step and resets at every step boundary; `didWork` never resets — it answers
@@ -205,17 +216,19 @@ export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HE
           // A clean turn that did work and said nothing after its last tool call has no answer — and that
           // is itself the reason to ask for one. Found live: both local-worker failures were
           // this shape, 6 and 14 minutes of work thrown away without the question ever being put.
-          const unanswered = event.code === 0 && answer.value === null && didWork;
-          const ask = reportedFinal ? null : handle.concludeWith ?? (capped ? CAP_PROMPT : stalled && reads > 0 ? CONCLUDE_PROMPT : unanswered ? SILENT_PROMPT : null);
+          const leaked = event.code === 0 && answer.value === null && answer.leaked;
+          const unanswered = event.code === 0 && answer.value === null && (didWork || leaked);
+          const ask = reportedFinal ? null : handle.concludeWith ?? (capped ? CAP_PROMPT : stalled && reads > 0 ? CONCLUDE_PROMPT : leaked ? LEAKED_PROMPT : unanswered ? SILENT_PROMPT : null);
           if (ask !== null && !handle.conclude && handle.sessionId) {
             const reason = handle.concludeWith !== undefined ? 'watchdog'
-              : capped ? 'step_cap' : stalled ? 'repeated_tools' : 'missing_answer';
+              : capped ? 'step_cap' : stalled ? 'repeated_tools' : leaked ? 'leaked_tool_call' : 'missing_answer';
             const text = handle.concludeWith !== undefined ? `asked, tools off, for its conclusion: ${ask}`
               : capped ? 'opencode stopped at its step cap; asked once, tools off, for its answer'
+              : leaked && !stalled ? 'its last message was a tool call written as text, so it never ran; asked once, tools off, for its answer'
               : unanswered && !stalled ? 'the turn ended without an answer; asked once, tools off, for it'
               : `stalled after reading ${reads} file${reads === 1 ? '' : 's'}; asked once, tools off, for its conclusion`;
             yield {kind: 'diagnostic', text, reason, phase: 'conclusion', toolsDisabled: true};
-            const again = start({peer: handle.peer, profile: handle.profile, session: handle.sessionId, stdin: ask, cwd: handle.cwd, dir: handle.dir, conclude: true});
+            const again = await start({peer: handle.peer, profile: handle.profile, session: handle.sessionId, stdin: ask, cwd: handle.cwd, dir: handle.dir, conclude: true});
             handle.child = again.child; handle.pid = again.pid; // cancel() must reach the turn that is running now
             let concludedAnswer = null;
             const boundTimer = setTimeout(() => { void verifiedCancel(again.child, {kill}); }, concludeTimeoutMs);
@@ -226,6 +239,7 @@ export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HE
             yield {kind: 'diagnostic', text: 'the conclusion turn gave no answer'};
             if (capped && !lastError) lastError = 'step cap reached without an answer';
           }
+          if ((event.code === 0 || concluded) && leaked && !lastError) lastError = 'no answer: the worker wrote a tool call as text instead of calling the tool, so it never ran';
           if ((event.code === 0 || concluded) && answer.spoken !== null && !lastError && answer.value === null) lastError = 'no answer: the worker said nothing after its last tool call';
           if (event.code === 0 && reportedFinal) yield {kind: 'result', status: 'completed', text: answer.value ?? 'Final report submitted via bounce_report'};
           else if ((event.code === 0 || concluded) && answer.value !== null && !lastError) yield {kind: 'result', status: 'completed', text: answer.value};
@@ -263,7 +277,7 @@ export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HE
             ...(status === 'completed' || status === 'error' ? {call: `${part.tool ?? 'tool'} ${target}`.slice(0, 300), change: CHANGES.has(part.tool)} : {})};
           // A finished shell command, as bounce saw it: what ran, how it ended, the end of what it printed.
           // It is the evidence of a report bounce has to write itself (src/scheduler.js observedEvidence).
-          if (part.tool === 'bash' && (status === 'completed' || status === 'error') && typeof input.command === 'string') {
+          if (SHELL.has(part.tool) && (status === 'completed' || status === 'error') && typeof input.command === 'string') {
             yield {kind: 'command', command: input.command.slice(0, COMMAND_MAX), exit: Number.isInteger(part.state?.metadata?.exit) ? part.state.metadata.exit : null,
               output: outputTail(part.state?.output ?? part.state?.error ?? '')};
           }
@@ -337,7 +351,7 @@ export function createOpencodeLive({kill = process.kill, spawn, heartbeatMs = HE
 
     capabilities() {
       // commands: every shell command the worker runs is passed on (a `command` event).
-      return {live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'], executionPolicies: ['read-only', 'probe', 'plan', 'write', 'yolo'], quota: 'stream', commands: true};
+      return {live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'], executionPolicies: ['read-only', 'plan', 'write', 'yolo'], quota: 'stream', commands: true};
     },
 
     pending: dir => readPending(pendingPath(dir)),

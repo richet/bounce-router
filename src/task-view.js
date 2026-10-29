@@ -1,4 +1,4 @@
-// What a task is doing and what it has produced, in a screenful (docs/plans/bridge-interface.md).
+// What a task is doing and what it has produced, in a screenful.
 // Found live: with no read verb, the orchestrator ran `tail -n 20` on its own journal and
 // 143 KB of raw JSON went into the chat, the journal and its own next context packet. These views are the
 // answer to that question, bounded by construction: capped lists with a count of the rest, cut text, and a
@@ -11,6 +11,12 @@ export const MILESTONES_SHOWN = 3;
 const TITLE_MAX = 200, TEXT_MAX = 400, SUMMARY_MAX = 1200;
 
 const cut = (value, max) => { const text = String(value ?? '').replace(/\s+/g, ' ').trim(); return text.length > max ? `${text.slice(0, max - 1)}…` : text; };
+// Orders cut in words, not just "…". Found live (2026-10-25): the orchestrator retried a task with orders copied
+// from this view, and the new builder got the first 400 characters and answered "I have no orders".
+const ordersLine = (task, orders) => {
+  const text = String(orders ?? '').replace(/\s+/g, ' ').trim();
+  return text.length > TEXT_MAX ? `${cut(text, TEXT_MAX)} (cut at ${TEXT_MAX} of ${String(orders).length} characters: task_get with full: true, or bounce task ${task.slice(0, 8)} --report, has them whole)` : text;
+};
 const minutes = ms => `${Math.round(ms / 60000)} min`;
 const rowsOf = (events, task, kind) => events.filter(e => e.kind === kind && e.task === task);
 const lastOf = (events, task, kind) => rowsOf(events, task, kind).at(-1) ?? null;
@@ -80,7 +86,7 @@ export function taskView(events, task, {now = Date.now(), journal = null, report
     : mine.find(event => event.kind === 'task.output' && event.seq === invalid.outputSeq) ?? lastOf(events, task, 'task.output');
   const reviewGate = gateView(events, task, result);
   const seqs = mine.map(e => e.seq).filter(Number.isFinite);
-  // §8 (docs/plans/in-place-tasks.md): the task ran in the real checkout, so the view names
+  //: the task ran in the real checkout, so the view names
   // what consent authorized that — the cited user message (first 80 chars) and Jev's verdict
   // when there was one, exactly as bounce shows any other decision.
   const inPlaceRow = submitted?.inPlace ? submitted : null;
@@ -94,7 +100,7 @@ export function taskView(events, task, {now = Date.now(), journal = null, report
   } : null;
   return {
     task, state: state.state, profile: state.profile ?? null, ai: started?.requested ?? null,
-    orders: cut(submitted?.orders, TEXT_MAX),
+    orders: ordersLine(task, submitted?.orders),
     inPlace,
     elapsed: started ? minutes(now - Date.parse(started.time)) : null,
     lease: leaseRow ? {renewals: leaseRow.renewals, minutes: Math.round(leaseRow.leaseMs / 60000)} : null,
@@ -109,6 +115,7 @@ export function taskView(events, task, {now = Date.now(), journal = null, report
     summary: cut(terminal?.summary ?? terminal?.text ?? state.summary, SUMMARY_MAX) || null,
     // Whole and unreflowed when asked for: a verdict's last line is where it puts its conclusion.
     ...(report ? {
+      fullOrders: submitted?.orders ?? null,
       report: result ? JSON.stringify(result.report) : (terminal?.summary ?? terminal?.text ?? state.summary ?? null),
       candidateReport: result?.report ?? null,
       rawOutput: output?.text ?? null,
@@ -128,7 +135,7 @@ export function taskView(events, task, {now = Date.now(), journal = null, report
     } : null,
     reason: terminal?.reason ?? null,
     blocker: blocked ? cut(blocked.text, TEXT_MAX) : null,
-    artifact: lastOf(events, task, 'artifact.captured')?.artifact ?? (artifact ? {id: artifact.artifactId, digest: artifact.digest, resultHash: artifact.resultHash} : null),
+    artifact: lastOf(events, task, 'artifact.captured')?.artifact ?? (artifact ? {id: artifact.artifactId, digest: artifact.digest, resultHash: artifact.resultHash, ...(artifact.leftOut ? {leftOut: artifact.leftOut} : {})} : null),
     integration: lastOf(events, task, 'artifact.integrated')?.status ?? (integrated ? 'integrated' : null),
     // The raw material, named — never carried. Whoever wants it reads it themselves.
     journal: journal ? {path: journal, task, fromSeq: seqs.length ? Math.min(...seqs) : null, toSeq: seqs.length ? Math.max(...seqs) : null} : null,
@@ -151,4 +158,13 @@ export function taskList(events, {now = Date.now(), all = false} = {}) {
         doing: cut(last?.text, TITLE_MAX) || null,
         findings: rowsOf(events, task, 'task.finding').length};
     });
+}
+
+// A task as a person names it: its full id or a unique prefix (the view shows eight characters).
+export function taskByRef(tasks, ref) {
+  if (tasks[ref]) return ref;
+  const matches = Object.keys(tasks).filter(id => id.startsWith(ref));
+  if (matches.length === 1) return matches[0];
+  if (!matches.length) throw new Error(`No task ${ref} in this session`);
+  throw new Error(`Task ${ref} is ambiguous: ${matches.map(id => id.slice(0, 8)).join(', ')}`);
 }

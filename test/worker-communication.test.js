@@ -189,7 +189,7 @@ for (const nothing of ['None.', 'N/A', 'nothing', '-', 'None — all three steps
   assert.equal((await byTool.terminal).kind, 'task.completed');
 });
 
-// Reversed 2026-09-26 (ACE d1bc0206): named remaining work no longer blocks the task and discards its
+// Reversed 2026-09-26 (session d1bc0206): named remaining work no longer blocks the task and discards its
 // work; the task completes and carries the remaining work to the orchestrator as a follow-up. "None."
 // and its variants (above) still complete with nothing carried.
 for (const owed of ['Re-run the corrupt-tail probes.', 'None of the Docker probes ran.', 'None for now, but the lint step still fails.']) test(`a completed report that names unfinished work completes and carries it as a follow-up: "${owed}"`, {timeout: 3000}, async t => {

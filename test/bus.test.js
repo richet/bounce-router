@@ -584,7 +584,7 @@ test('a message to a worker needs a grant that owns that task, and the owner\'s 
   assert.equal((await connect(bus, 'user', {tasks: [], canSubmit: true}).then(async u => { t.after(() => u.close()); return u.publish({kind: 'message', to: 'orchestrator', text: 'hi'}); })).kind, 'message');
 });
 
-// Phase 4: task.accepted joins PEER_KINDS (CONTRACT.md §2 bus paragraph). Ownership follows the
+// Phase 4: task.accepted joins PEER_KINDS. Ownership follows the
 // existing task.* check; the one extra rule is the review.completion refusal below.
 test('task.accepted: a grant not owning the task is refused with -32001', async t => {
   const {bus} = await setup(t);
@@ -797,7 +797,7 @@ test('a live main.delivery ends the orchestrator\'s pending wait with an interru
   assert.equal(await workerWait, null);
 });
 
-// docs/plans/lessons-and-sweep.md §1: the orchestrator records a lesson through the bus; the hook keeps the
+// The orchestrator records a lesson through the bus; the hook keeps the
 // project file and says in plain words why one is refused.
 test('a lesson.learned publish from the orchestrator is kept by the hook and journaled with what was kept; a refusal says why', async t => {
   const root = fs.mkdtempSync('/tmp/bb-');
@@ -824,7 +824,7 @@ test('a lesson.learned publish from the orchestrator is kept by the hook and jou
   assert.equal(session.events.filter(e => e.kind === 'lesson.learned').length, 1);
 });
 
-// docs/plans/standing-workers.md §3: the orchestrator retires a standing worker through the bus; the
+// The orchestrator retires a standing worker through the bus; the
 // scheduler's reason comes back in plain words.
 test('worker.retire from the orchestrator reaches the hook; a worker may not retire anyone', async t => {
   const root = fs.mkdtempSync('/tmp/bb-');
@@ -843,7 +843,7 @@ test('worker.retire from the orchestrator reaches the hook; a worker may not ret
   await assert.rejects(worker.publish({kind: 'worker.retire', worker: 'builder#1'}), error => error.code === -32001);
 });
 
-// Found live (ACE e3bd01d5, 2026-10-01 00:31 UTC): the daemon died of `write EPIPE` at bus.js send ←
+// Found live (session e3bd01d5, 2026-10-01 00:31 UTC): the daemon died of `write EPIPE` at bus.js send ←
 // handlePublish. A peer (one of seven leftover `bounce mcp-serve` bridges) hung up while its reply was
 // in flight; `send` catches what write throws, but a socket error is an event, and the server-side socket
 // had no 'error' listener, so it became an uncaught exception and took the daemon — and the whole session

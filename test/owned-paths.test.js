@@ -65,7 +65,7 @@ test('scheduler: a retryOf submit may carry its own owns, replacing the inherite
   t.after(() => scheduler.close());
   const first = scheduler.submit({parent: null, profile: 'builder', orders: 'change src/cart.js only', owns: ['src/cart.js']});
   await waitFor(() => scheduler.tasks()[first.task]?.state === 'completed');
-  // Found live (ACE session 159f4746, task d59ce7f5): a retryOf could not widen `owns` to recover
+  // Found live (session 159f4746, task d59ce7f5): a retryOf could not widen `owns` to recover
   // a blocked attempt because prepare() always forced the original's owns onto it.
   const retry = scheduler.submit({retryOf: first.task, profile: 'builder', orders: 'change both files', owns: ['src/cart.js', 'src/setup.ts']});
   assert.deepEqual(retry.owns, ['src/cart.js', 'src/setup.ts'], 'the retry\'s own owns replaces the original, narrower list');

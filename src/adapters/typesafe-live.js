@@ -117,7 +117,7 @@ async function askVerdict({stream, client, state, profile, settings, controller}
   let result;
   try {
     // The service refuses a state over its token limit, and characters are a poor measure of tokens:
-    // found live (ACE e3bd01d5), 8 of 31 reviews were refused and the work accepted unreviewed, their
+    // found live (session e3bd01d5), 8 of 31 reviews were refused and the work accepted unreviewed, their
     // diffs long test logs. A refused review is asked again with half the diff, down to DIFF_CHARS_MIN.
     for (let shown = DIFF_CHARS, asked = state; ; ) {
       try {
@@ -147,8 +147,10 @@ async function askVerdict({stream, client, state, profile, settings, controller}
     threshold: decision.threshold, choice: decision.choice, probabilities: decision.probabilities, fired: decision.fired, leanFindings: decision.leanFindings, source: 'jev'})});
 }
 
-export function createTypesafeLive({fetchImpl, readKey, readSettings = () => readJevSettings(), git = defaultGit, clock = Date.now, timeoutMs} = {}) {
-  const client = createJevClient({...(fetchImpl ? {fetchImpl} : {}), ...(readKey ? {readKey} : {}), ...(timeoutMs ? {timeoutMs} : {}), clock});
+// `memoFile`: where Jev's answers are remembered by exact request, so the same inputs decide the same way across
+// sessions (src/jev.js createJevClient). The daemon passes <data>/jev-memo.json; tests pass nothing (memory only).
+export function createTypesafeLive({fetchImpl, readKey, readSettings = () => readJevSettings(), git = defaultGit, clock = Date.now, timeoutMs, samples, memoFile = null} = {}) {
+  const client = createJevClient({...(fetchImpl ? {fetchImpl} : {}), ...(readKey ? {readKey} : {}), ...(timeoutMs ? {timeoutMs} : {}), ...(samples ? {samples} : {}), clock, memoFile});
 
   const skipped = (stream, reason, text) => {
     stream.push({kind: 'jev', name: 'skipped', data: {reason}, text: `Jev verdict unavailable · ${text ?? reason}`});

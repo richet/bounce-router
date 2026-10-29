@@ -4,6 +4,7 @@ import {fileURLToPath} from 'node:url';
 import {createHash, randomUUID} from 'node:crypto';
 import {validateOrchestration, LOCAL_ADAPTERS} from './profiles.js';
 import {normalizeLocalSettings} from './local-models.js';
+import {applyBindings, bindingsFile, MODELS_FILE} from './bindings.js';
 
 // An agent is the job: one markdown file, frontmatter for what bounce routes on, body as the worker's
 // system prompt. The only thing that varies between the AIs that may play it is the AI — `models:`
@@ -14,11 +15,14 @@ import {normalizeLocalSettings} from './local-models.js';
 // The orchestration skill ships the defaults (analyst, builder, debugger, reviewer), so a fresh
 // install has a working team with no file on disk; nothing but `orchestrator` is built in.
 //
-// `policy` is an attribute the file opts into, not what an agent is. `maxSteps` reaches runtimes
-// that can cap steps (OpenCode). `readPaths`/`writePaths`/`commands` apply when the AI is local.
+// `policy` is an attribute the file opts into, not what an agent is: read-only, or write (the default).
+// `maxSteps` reaches runtimes that can cap steps (OpenCode). `readPaths`/`writePaths`/`commands` apply
+// when the AI is local.
 export const SKILL = 'agent-orchestrator';
 export const agentStore = root => path.join(root, 'agents');
 export const projectAgentStore = cwd => path.join(cwd, '.bounce', 'agents');
+// From the home directory, a project's .bounce is the user's own ~/.bounce: that is the user's layer, not a project.
+export const isOwnHome = (root, cwd) => Boolean(cwd) && path.resolve(cwd, '.bounce') === path.resolve(root);
 export const installedSkillAgents = root => path.join(root, 'skills', SKILL, 'team');
 const SHIPPED = fileURLToPath(new URL(`../skills/${SKILL}/team/`, import.meta.url));
 const LISTS = ['models', 'readPaths', 'writePaths', 'commands'];
@@ -26,6 +30,27 @@ export const AUTO_MODEL = 'auto';
 const MODEL_REF = /^[a-z0-9][a-z0-9_-]*\/\S+$/;
 const list = value => value.trim().replace(/^\[([\s\S]*)\]$/, '$1').split(',').map(item => item.trim().replace(/^(["'])([\s\S]*)\1$/, '$2')).filter(Boolean);
 const NAME = /^[a-z0-9][a-z0-9_-]*$/;
+// How the job wants a LOCAL model to sample: sent with each of its requests, so agents sharing one
+// loaded model each get their own. A cloud model in `models:` ignores them (same job, different
+// brain). Each key is optional; one left out falls through to the server's per-model default.
+// src/local-opencode-config.js names them on the wire.
+const number = (min, max, {integer = false, above = false} = {}) => value => {
+  const parsed = Number(value);
+  return value !== '' && Number.isFinite(parsed) && (!integer || Number.isInteger(parsed)) && (above ? parsed > min : parsed >= min) && parsed <= max ? parsed : undefined;
+};
+export const SAMPLING = {
+  thinking: {parse: value => ['on', 'off'].includes(value) ? value : undefined, rule: 'on or off'},
+  temperature: {parse: number(0, 2), rule: 'a number from 0 to 2'},
+  topP: {parse: number(0, 1, {above: true}), rule: 'a number above 0, up to 1'},
+  topK: {parse: number(0, 1000, {integer: true}), rule: 'an integer from 0 to 1000'},
+  minP: {parse: number(0, 1), rule: 'a number from 0 to 1'},
+  presencePenalty: {parse: number(-2, 2), rule: 'a number from -2 to 2'},
+  frequencyPenalty: {parse: number(-2, 2), rule: 'a number from -2 to 2'},
+  repeatPenalty: {parse: number(0, 2, {above: true}), rule: 'a number above 0, up to 2'},
+  // OpenCode never asks for more than 32000 output tokens, whatever it is told.
+  maxTokens: {parse: number(1, 32000, {integer: true}), rule: 'an integer from 1 to 32000'},
+  seed: {parse: number(0, Number.MAX_SAFE_INTEGER, {integer: true}), rule: 'a non-negative integer'},
+};
 const FRONTMATTER = /^﻿?---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/;
 
 export function agentMetadata(text) {
@@ -40,8 +65,7 @@ export function agentMetadata(text) {
   if (fields.name === 'orchestrator') throw new Error('orchestrator is reserved; it is derived from the session, never declared as a role');
   if (!fields.description) throw new Error('frontmatter needs a description');
   const policy = fields.policy ?? 'write';
-  // probe: reads and runs commands, never changes the tree (docs/plans/probing-reviewer.md).
-  if (!['read-only', 'probe', 'write'].includes(policy)) throw new Error('policy must be read-only, probe or write');
+  if (!['read-only', 'write'].includes(policy)) throw new Error('policy must be read-only or write');
   let maxSteps;
   if (fields.maxSteps !== undefined) {
     maxSteps = Number(fields.maxSteps);
@@ -60,8 +84,15 @@ export function agentMetadata(text) {
   for (const key of ['readPaths', 'writePaths', 'commands']) {
     for (const entry of lists[key] ?? []) if (entry.includes('\0') || (key !== 'commands' && (entry.startsWith('/') || entry.split('/').some(part => part === '..')))) throw new Error(`${key} must be relative workspace paths`);
   }
+  const sampling = {};
+  for (const [key, {parse, rule}] of Object.entries(SAMPLING)) {
+    if (fields[key] === undefined) continue;
+    sampling[key] = parse(fields[key]);
+    if (sampling[key] === undefined) throw new Error(`${key} must be ${rule}`);
+  }
   const prompt = text.slice(block[0].length).trim();
-  return {name: fields.name, description: fields.description, policy, ...(maxSteps ? {maxSteps} : {}), ...lists, prompt};
+  return {name: fields.name, description: fields.description, policy, ...(maxSteps ? {maxSteps} : {}), ...lists,
+    ...(Object.keys(sampling).length ? {sampling} : {}), prompt};
 }
 
 // The canonical on-disk form, used by everything that writes an agent (the bridge command, setup):
@@ -70,6 +101,7 @@ export function serializeAgent(agent) {
   const lines = ['---', `name: ${agent.name}`, `description: ${agent.description}`, `policy: ${agent.policy ?? 'write'}`];
   if (agent.maxSteps) lines.push(`maxSteps: ${agent.maxSteps}`);
   for (const key of LISTS) if (agent[key]?.length) lines.push(`${key}: [${agent[key].join(', ')}]`);
+  for (const key of Object.keys(SAMPLING)) if (agent.sampling?.[key] !== undefined) lines.push(`${key}: ${agent.sampling[key]}`);
   lines.push('---', '', (agent.prompt ?? '').trim(), '');
   return lines.join('\n');
 }
@@ -123,12 +155,22 @@ function readStore(dir, source) {
 // Three layers, later ones shadowing by name: the shipped defaults (always present, even before
 // anything is seeded — so a read path never has to write), the user's store, then the project's.
 // A file that fails to parse is reported, not hidden, so a broken role never silently falls back.
+// The team is the most specific layer that has agents, whole — the project's, else the user's, else the shipped one —
+// never a sum (2026-10-24: "los agentes no son una suma de sets si no reemplazos"; an agent from outside a
+// project joining its team unasked is "una receta para el desastre"). The installed skill's copy is the shipped team.
 export function loadAgents(root, {cwd} = {}) {
+  const project = cwd && !isOwnHome(root, cwd) ? readStore(projectAgentStore(cwd), 'project') : [];
+  const user = project.length ? [] : readStore(agentStore(root), 'user');
+  const team = project.length ? project : user.length ? user : null;
   const roles = new Map();
+  if (team) { for (const agent of team) roles.set(agent.name, agent); return roles; }
+  return shippedAgents(root, roles);
+}
+
+// The team bounce ships (the installed skill's copy shadowing it by name): the default team, and what setup offers.
+export function shippedAgents(root, roles = new Map()) {
   for (const agent of readStore(SHIPPED, 'skill')) roles.set(agent.name, agent);
   for (const agent of readStore(installedSkillAgents(root), 'installed-skill')) roles.set(agent.name, agent);
-  for (const agent of readStore(agentStore(root), 'user')) roles.set(agent.name, agent);
-  if (cwd) for (const agent of readStore(projectAgentStore(cwd), 'project')) roles.set(agent.name, agent);
   return roles;
 }
 
@@ -147,33 +189,49 @@ export function handAIsToJev(roles, {orchestrator = 'main'} = {}) {
   return changed;
 }
 
-// Roles that cannot change anything: read-only, or probe (runs commands, writes nothing).
-export const readOnlyRoles = roles => new Set([...roles.values()].filter(role => !role.error && ['read-only', 'probe'].includes(role.policy)).map(role => role.name));
+// Roles that cannot change anything.
+export const readOnlyRoles = roles => new Set([...roles.values()].filter(role => !role.error && role.policy === 'read-only').map(role => role.name));
 
 // What every entry point calls. It never writes: the shipped agents are layered in from the skill.
 export function rolesFor(root, {cwd} = {}) {
-  return loadAgents(root, {cwd});
+  return applyBindings(loadAgents(root, {cwd}), {root, cwd, sampling: SAMPLING});
 }
 
 // One row per agent: who may play it here (the derived chain, in fallback order) and which
 // backends were skipped and why. The same table backs `bounce agents`, `bounce local` and the TUI.
 export function agentTable(roles, settings) {
+  // Derived as the orchestrator would, whatever the operation: who can play an agent does not depend on whether this
+  // session dispatches it, and a classic session saying "nobody" read as a broken team.
   let view = null;
-  if (settings.operation === 'orchestrator') { try { view = validateOrchestration(settings, undefined, {roles}); } catch {} }
+  try { view = validateOrchestration({...settings, operation: 'orchestrator', orchestrator: settings.orchestrator ?? 'main'}, undefined, {roles}); } catch {}
   const ref = p => LOCAL_ADAPTERS.has(p.adapter) ? `${p.endpoint ?? 'lmstudio'}/${p.model || 'auto'} (via opencode)` : [p.adapter, p.model].filter(Boolean).join('/');
   return [...roles.values()].map(role => {
     if (role.error) return {name: role.name, error: role.error, backends: [], skipped: []};
     const chain = []; let current = view?.profiles[role.name];
     if (current?.auto) chain.push('auto (Jev)');
     while (current) { chain.push(ref(current)); current = current.fallback[0] ? view.profiles[current.fallback[0]] : null; }
-    return {name: role.name, policy: role.policy, description: role.description, source: role.source, backends: chain,
-      skipped: (view?.skipped ?? []).filter(item => item.agent === role.name).map(item => `${item.ref}: ${item.reason}`)};
+    return {name: role.name, policy: role.policy, description: role.description, source: role.source, backends: chain, ...(role.binding ? {binding: role.binding} : {}),
+      skipped: [...(role.binding?.skipped ?? []).map(item => item.reason), ...(view?.skipped ?? []).filter(item => item.agent === role.name).map(item => `${item.ref}: ${item.reason}`)]};
   });
 }
 
+// Where an agent's chain came from: an entry of the bindings in use, or the profile's own models: (legacy).
+const chainSource = binding => !binding ? ''
+  : binding.source === 'profile' ? ' · models: in the profile (bounce local setup moves it)'
+  : ` · bindings: ${binding.from}`;
 export const formatAgentTable = rows => rows.map(row => row.error
   ? `  ${row.name} · INVALID: ${row.error}`
-  : [`  ${row.name} · ${row.policy} · ${row.source} · ${row.backends.length ? row.backends.join(', ') : 'nobody can play it here'}`, ...row.skipped.map(why => `      skipped ${why}`)].join('\n'));
+  : [`  ${row.name} · ${row.policy} · ${row.source} · ${row.backends.length ? row.backends.join(', ') : 'nobody can play it here'}${chainSource(row.binding)}`, ...row.skipped.map(why => `      skipped ${why}`)].join('\n'));
+
+// Which team, bindings and models files are in use: one of each, the most specific that exists.
+export function teamHeader(roles, {root, cwd} = {}) {
+  const layer = [...roles.values()][0]?.source;
+  const team = layer === 'project' ? `this project's (${projectAgentStore(cwd)})` : layer === 'user' ? `yours (${agentStore(root)})` : 'the one bounce ships';
+  const inUse = bindingsFile(root, cwd);
+  const bindings = !inUse ? 'none: each agent\'s own models:, else the default chain' : `${inUse.source === 'project' ? 'this project\'s' : 'yours'} (${inUse.file})`;
+  const models = path.join(root, MODELS_FILE);
+  return [`Team: ${team}`, `Bindings: ${bindings}`, `Models: ${fs.existsSync(models) ? models : `none yet (${models}; bounce local setup writes it)`}`];
+}
 
 // `bounce agents`: how an agent file gets defined without anyone learning the format by hand.
 // The orchestrator (or the user) pipes markdown in; it lands only if it parses, names a provider
@@ -184,8 +242,9 @@ export function agentsCommand(words, {root, cwd, settings, scope = 'user', input
   const roles = loadAgents(root, {cwd});
   const dir = scope === 'project' ? projectAgentStore(cwd) : agentStore(root);
   if (action === 'list') {
-    const rows = agentTable(roles, settings);
-    return {text: ['Agents (skill agent-orchestrator, then ~/.bounce/agents, then .bounce/agents):', ...formatAgentTable(rows)].join('\n'), report: rows};
+    const team = rolesFor(root, {cwd});
+    const rows = agentTable(team, settings);
+    return {text: [...teamHeader(team, {root, cwd}), ...formatAgentTable(rows)].join('\n'), report: rows};
   }
   if (!['show', 'remove', 'set'].includes(action)) throw new Error('Use agents list, agents show NAME, agents set NAME [--scope user|project] [--force] (markdown on stdin), or agents remove NAME');
   if (!name) throw new Error(`Use agents ${action} NAME`);

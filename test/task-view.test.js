@@ -1,4 +1,4 @@
-// The read the orchestrator never had (docs/plans/bridge-interface.md). Found live: with
+// The read the orchestrator never had. Found live: with
 // no way to ask "what did this task produce", it ran `tail -n 20 journal.jsonl` and 143 KB of raw JSON went
 // into the chat. These views answer the same question in a screenful, and hand back a POINTER to the journal
 // instead of its contents. Pure: events in, view out — the same fold the TUI renders from.
@@ -228,4 +228,32 @@ test('malformed worker output remains durable and is available only through the 
   assert.deepEqual(full.invalidReport, {outputSeq: 3, diagnostic: 'malformed_json: Expected \, or ]', report: null});
   assert.match(formatTaskView(full), /unvalidated raw output \(malformed_json: Expected , or \]\):/);
   assert.match(formatTaskView(full), /evidence 1099/);
+});
+
+// Found in the real-console pass 2026-10-21: /stop and /msg passed the 8-character id the view shows straight to the
+// scheduler, which knows tasks by their full id, so the cancel and the message reached no one while the view said
+// they had been requested.
+test('a task reference is a full id or a unique prefix of one; anything else is refused with the reason', async () => {
+  const {taskByRef} = await import('../src/task-view.js');
+  const tasks = {'1e940e8b-aaaa': {state: 'running'}, '165aacdf-bbbb': {state: 'running'}, '165aaxxx-cccc': {state: 'completed'}};
+  assert.equal(taskByRef(tasks, '1e940e8b'), '1e940e8b-aaaa');
+  assert.equal(taskByRef(tasks, '165aacdf-bbbb'), '165aacdf-bbbb');
+  assert.throws(() => taskByRef(tasks, 'zzzz9999'), {message: 'No task zzzz9999 in this session'});
+  assert.throws(() => taskByRef(tasks, '165aa'), {message: 'Task 165aa is ambiguous: 165aacdf, 165aaxxx'});
+});
+
+// Found live (2026-10-25): the orchestrator retried a task by copying its orders from `bounce task --json`,
+// which held the first 400 characters ending in "…", and the new builder answered "I have no orders". A cut says
+// so in words, and the orders arrive whole beside the report when asked for.
+test('orders cut in the view say where to get them whole, and arrive whole on request', () => {
+  const orders = `BEFORE WRITING ANY CODE, read these skills. ${'item detail '.repeat(80)}END-OF-ORDERS`;
+  const events = [
+    at(1, {kind: 'task.submitted', seq: 1, task: 'w2', profile: 'builder', orders, deadline: 900000}),
+    at(2, {kind: 'task.started', seq: 2, task: 'w2', requested: 'qwen3.8-27b'}),
+  ];
+  const now = Date.parse('2026-09-22T20:10:00.000Z');
+  const bounded = taskView(events, 'w2', {now});
+  assert.match(bounded.orders, new RegExp(`… \\(cut at 400 of ${orders.length} characters: task_get with full: true, or bounce task w2 --report, has them whole\\)$`));
+  assert.equal(taskView(events, 'w2', {now, report: true}).fullOrders, orders);
+  assert.equal(taskView([at(1, {kind: 'task.submitted', seq: 1, task: 's', profile: 'builder', orders: 'short orders'})], 's', {now}).orders, 'short orders');
 });

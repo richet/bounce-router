@@ -1,10 +1,14 @@
-// Standing workers (docs/plans/standing-workers.md §1, Daniel, 2026-10-01): a worker is a session per agent
+// Standing workers (2026-10-01): a worker is a session per agent
 // that outlives its tasks. Nothing is stored for it beyond the journal: a fresh launch names a worker on its
 // `task.launch.requested` row (`builder#1`), a continuation carries the name of the worker it resumed, and
 // `worker.retired` ends one. This view folds those rows into who exists, what each has done, and who is idle.
 import {tasks, TERMINAL} from './reducers.js';
 
 export const workerName = (profile, n) => `${profile}#${n}`;
+
+// Past this context an idle worker is not continued by itself: every call re-reads the earlier tasks
+// (2026-10-25; a project's builder#2 grew to 224k over 7 tasks). Naming the worker still continues it.
+export const WORKER_CONTEXT_CAP = 150_000;
 
 // name -> {name, profile, tasks: [ids in order], lastTask, state: 'busy' | 'idle' | 'retired', retired: row | null, sessionId}
 export function workersView(events) {
@@ -28,15 +32,18 @@ export function workersView(events) {
     const ended = w.state === 'idle' ? events.findLast(e => e.task === w.lastTask && ['task.accepted', 'task.failed', 'task.cancelled', 'task.completed', 'task.deadline'].includes(e.kind)) : null;
     w.lastEnded = ended?.time ?? null;
     w.lastEndedSeq = ended?.seq ?? 0;
-    const usage = events.filter(e => e.kind === 'task.usage' && e.task === w.lastTask).at(-1)?.usage;
-    w.lastContext = usage ? (usage.input ?? 0) + (usage.cache_read ?? 0) : null;
+    // The last call's size when the adapter measured it; otherwise the usage itself (one call per row for OpenCode;
+    // a Claude row from before contextUsed was journaled sums the turn and overstates it).
+    const row = events.filter(e => e.kind === 'task.usage' && e.task === w.lastTask).at(-1);
+    w.lastContext = Number.isInteger(row?.contextUsed) ? row.contextUsed : row?.usage ? (row.usage.input ?? 0) + (row.usage.cache_read ?? 0) : null;
+    w.overCap = (w.lastContext ?? 0) > WORKER_CONTEXT_CAP;
   }
   return workers;
 }
 
 // The idle standing worker of a profile that finished most recently, able to be continued; null when none.
 export function idleWorkerOf(events, profile) {
-  const idle = [...workersView(events).values()].filter(w => w.profile === profile && w.state === 'idle' && w.sessionId);
+  const idle = [...workersView(events).values()].filter(w => w.profile === profile && w.state === 'idle' && w.sessionId && !w.overCap);
   // journal order, not wall clock: two workers can end in the same millisecond
   idle.sort((a, b) => b.lastEndedSeq - a.lastEndedSeq);
   return idle[0] ?? null;
@@ -62,7 +69,7 @@ export function rosterLines(events, {now = Date.now()} = {}) {
     if (w.state === 'retired') continue;
     const idle = w.lastEnded ? Math.max(0, Math.round((now - Date.parse(w.lastEnded)) / 60000)) : null;
     const state = w.state === 'busy' ? `busy on ${w.lastTask}` : w.state === 'held' ? `its work on ${w.lastTask} is held` : idle !== null ? `idle ${idle} min` : 'idle';
-    lines.push(`- ${w.name} · ${w.tasks.length} task${w.tasks.length === 1 ? '' : 's'} · ${state}${w.lastContext ? ` · last context ${Math.round(w.lastContext / 1000)}k tokens` : ''}${w.sessionId ? '' : ' · no session to continue'}`);
+    lines.push(`- ${w.name} · ${w.tasks.length} task${w.tasks.length === 1 ? '' : 's'} · ${state}${w.lastContext ? ` · last context ${Math.round(w.lastContext / 1000)}k tokens${w.overCap ? `, over the ${WORKER_CONTEXT_CAP / 1000}k cap: a new task starts a fresh worker` : ''}` : ''}${w.sessionId ? '' : ' · no session to continue'}`);
   }
   return lines;
 }
