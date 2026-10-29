@@ -85,8 +85,8 @@ const reportInstruction = profile => reportsByTool(profile)
 // 18 were rejected as invalid and 19 rewritten by bounce. To be measured on real sessions against Jev's
 // ranking of wrong work; `reports: "structured"` brings the fixed format back.
 const PLAIN_ENDING = 'End your last turn with a plain answer in your own words: what you did, each check you ran with the last lines it printed, and what is left of this assignment. No JSON and no report call for the end. If you could not finish, begin the answer with "Blocked:" or "Failed:" and say why.';
-// A worker's copy is removed when its session closes (src/workspace-retention.js); what it started there is not.
-const STOP_SERVICES = 'Services you start in your copy (a stack, containers, a server) you stop before you end, and your answer names the command that stopped them: your copy is removed when the session closes, and what you leave running is not.';
+// A worker's copy is removed later (src/prune.js); what it started there is not.
+const STOP_SERVICES = 'Services you start in your copy (a stack, containers, a server) you stop before you end, and your answer names the command that stopped them: your copy is removed later, and what you leave running is not.';
 const plainContract = profile => [
   `To report progress, ${reportInstruction(profile)} using your scoped report endpoint (it is the only bounce command you need; \`bounce\` alone starts nothing useful here).`,
   'A progress report is a JSON object with op ("milestone" | "blocked" | "input_required"), phase ("inspect" | "plan" | "implement" | "test" | "verify" | "review" | "document" | "done"),',
