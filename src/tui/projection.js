@@ -1,4 +1,4 @@
-import {doingStep} from './status.js';
+import {doingStep, isWorking} from './status.js';
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'timed_out', 'rejected', 'accepted']);
 // `usage` is kept: the conversation view sums it into each turn's footer (src/tui/transcript.js) and shows no row.
 const HIDDEN_TRANSCRIPT_KINDS = new Set(['raw', 'checkpoint', 'task.activity']);
@@ -92,6 +92,8 @@ export function createWorkspaceProjection({activityLimit = 400, transcriptLimit 
       transcript.push(event);
       if (transcript.length > transcriptCap) transcript.splice(0, transcript.length - transcriptCap);
     }
+    // Found live: after the daemon died, a view kept its workers working, their quiet time counting up to 19 hours.
+    if (event.kind === 'main.disconnected') for (const task of tasks.values()) if (isWorking(task.state)) task.state = 'stopped';
     if (typeof event.task !== 'string' || !event.task) return true;
     if (event.kind === 'task.submitted') {
       if (!tasks.has(event.task)) addTask(event);

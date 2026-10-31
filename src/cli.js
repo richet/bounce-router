@@ -599,7 +599,7 @@ async function main() {
   const undo = createUndo();
   const pastes = new Map();
   let killed = '', reverseSearch = null, lastEscape = 0, lastCtrlC = 0;
-  const DOUBLE_PRESS_MS = 2000, DOUBLE_ESCAPE_MS = 500, DRAFT_CLEARED = 'Draft cleared · Ctrl+_ brings it back';
+  const DOUBLE_PRESS_MS = 2000, QUIT_FLUSH_MS = 2000, DOUBLE_ESCAPE_MS = 500, DRAFT_CLEARED = 'Draft cleared · Ctrl+_ brings it back';
   // What the next turn runs on: the orchestrator profile in orchestrator mode, else the active agent.
   const selected = () => headerProvider({settings, orchestration, active: session.active}).provider;
   const setupDefaults = {};
@@ -780,6 +780,7 @@ async function main() {
     const pane = terminal?.snapshot().panes.find(row => row.task === task);
     return `${pane?.profile ?? 'worker'} ${task.slice(0, 8)}`;
   };
+  let daemonNotice = null; // what a lost daemon left to say: it stays, whatever the turn it cut short says after it
   function render() {
     if (suspended || !terminal) return;
     if (agentsOpen && !paneIds().includes(selectedAgentPane)) {
@@ -859,10 +860,10 @@ async function main() {
       paneScrolls: {...Object.fromEntries([...paneInputs].map(([id, value]) => [id, value.scroll])), [selectedAgentPane]: scroll},
       // When this turn began, so the header and the rail can say how long the main worker has been at it.
       // What the main worker is doing right now — thinking, a command, or a wait on a task — from the tail of the journal.
-      main: {...session.main, text: progress || notice, operation: orchestration.operation, startedAt: (busySince = busy ? busySince || new Date().toISOString() : null),
+      main: {...session.main, text: daemonNotice ?? (progress || notice), operation: orchestration.operation, startedAt: (busySince = busy ? busySince || new Date().toISOString() : null),
         doing: busy ? doingNow(session.events.slice(-400), {tasks: reducers.tasks(session.events)}) : null},
       now: Date.now(),
-      notice: localSetup?.state.question || notice, mouseScroll,
+      notice: daemonNotice ?? (localSetup?.state.question || notice), mouseScroll,
       menu: menu.map(([text, paint]) => paint(clean(text))),
       metadata: {
         ...headerProvider({settings, orchestration, active: session.active}), mode: settings.mode,
@@ -977,7 +978,8 @@ async function main() {
     process.exit(75);
   }
   const quit = (detach = false) => { leave(); terminal?.unmount({scrollback: true}); if (!detach && process.stdout.isTTY) process.stdout.write(`\x1b[2mResume: bounce --resume ${session.id.slice(0, 8)}\x1b[22m\n`); router.close?.(); session.unlock(); void (async () => {
-    try { await session.flush?.(); } catch {}
+    // Bounded: a daemon that answers nothing never acknowledges, and leaving does not wait on it.
+    try { await Promise.race([session.flush?.(), new Promise(resolve => setTimeout(resolve, QUIT_FLUSH_MS))]); } catch {}
     if (!detach && process.env.BOUNCE_PERSISTENT_VIEW === '1') {
       await new Promise(resolve => process.send({type: 'control', action: 'quit'}, resolve));
     }
@@ -1318,6 +1320,8 @@ async function main() {
   }
   function handleKey(str, key = {}) {
     if (suspended) return;
+    // Nothing is left to cancel or stop with the daemon gone: Ctrl+C leaves, like any console program, whatever is open.
+    if (daemonLostAt && key.ctrl && key.name === 'c') { quit(); return; }
     if (localSetup && !picker && (key.name === 'escape' || (key.ctrl && key.name === 'c'))) {cancelLocalSetup(); return;}
     if (key.name === 'f3') {
       mouseScroll = !mouseScroll;
@@ -1328,9 +1332,14 @@ async function main() {
       render(); return;
     }
     // Ctrl+C: a running turn is cancelled; else a draft is cleared (Ctrl+_ brings it back); else a second press
-    // within two seconds quits, so one stray press never ends the session.
+    // within two seconds quits, so one stray press never ends the session. A second press quits during a turn too:
+    // found live, a daemon that answered nothing left Ctrl+C at "Cancelling…" for good.
     if (key.ctrl && key.name === 'c') {
-      if (busy) {void Promise.resolve(router.cancel()).catch(error => { notice = error.message; render(); }); notice = 'Cancelling…'; render(); return;}
+      if (busy) {
+        if (Date.now() - lastCtrlC < DOUBLE_PRESS_MS) { quit(); return; }
+        lastCtrlC = Date.now();
+        void Promise.resolve(router.cancel()).catch(error => { notice = error.message; render(); }); notice = 'Cancelling… · Ctrl+C again to quit'; render(); return;
+      }
       if (reverseSearch) { input = reverseSearch.input; inputCursor = reverseSearch.cursor; reverseSearch = null; render(); return; }
       if (input && !picker && !textPrompt) { undo.push({input, cursor: inputCursor}); input = ''; inputCursor = 0; lastCtrlC = 0; notice = DRAFT_CLEARED; render(); return; }
       if (Date.now() - lastCtrlC < DOUBLE_PRESS_MS) { quit(); return; }
@@ -1555,9 +1564,10 @@ async function main() {
   session.onEvent = event => {
     if (event?.kind === 'main.disconnected' && remoteMain && !daemonLostAt) {
       daemonLostAt = new Date();
+      busy = false;
       clearInterval(activityTimer);
       const at = daemonLostAt.toTimeString().slice(0, 5);
-      notice = `bounce stopped at ${at}, nothing is running · quit, then: bounce --resume ${session.id.slice(0, 8)}`;
+      daemonNotice = `bounce stopped at ${at}, nothing is running · Ctrl+C, then: bounce --resume ${session.id.slice(0, 8)}`;
     }
     scheduleRender(event);
   };

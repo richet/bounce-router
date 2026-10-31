@@ -40,6 +40,9 @@ function assertNoSymlink(root, rel) {
 // A skill bounce wrote into a copy carries this file; the manifest never sees it, so it is never integrated back.
 const GENERATED = '.bounce-generated';
 const NATIVE_SKILLS = ['.claude/skills', '.codex/skills', '.agents/skills'];
+// A preview of its own, code unit for code unit: a slice of a string is a view that keeps the whole string. Found live: each
+// baseline kept every text file of its project in the heap: 67 copies, 3970 MB of text, and a daemon died at its 4 GB limit.
+const previewOf = text => Buffer.from(text.slice(0, PREVIEW_MAX), 'utf16le').toString('utf16le');
 function manifest(root) {
   const files = {};
   const visit = (dir, prefix = '') => {
@@ -55,7 +58,7 @@ function manifest(root) {
         if (stat.size > MAX_FILE) files[rel] = {hash: fileHash(full), size: stat.size, mode: stat.mode & 0o777, unsupported: 'large'};
         else {
           const data = fs.readFileSync(full);
-          files[rel] = {hash: hash(data), size: data.length, mode: stat.mode & 0o777, binary: data.includes(0), preview: data.includes(0) ? null : data.toString('utf8').slice(0, PREVIEW_MAX)};
+          files[rel] = {hash: hash(data), size: data.length, mode: stat.mode & 0o777, binary: data.includes(0), preview: data.includes(0) ? null : previewOf(data.toString('utf8'))};
         }
       }
     }

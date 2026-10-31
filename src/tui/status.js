@@ -5,7 +5,7 @@ export const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', 
 const FRAME_MS = 120;
 // A review is a worker still working (found live: a local review ran for minutes beside a still ●).
 const WORKING = new Set(['running', 'working', 'starting', 'checking', 'reviewing']);
-const FIXED = {queued: '◌', completed: '✓', accepted: '✓', failed: '✗', cancelled: '✗', timed_out: '✗', rejected: '✗', blocked: '!', input_required: '?'};
+const FIXED = {queued: '◌', completed: '✓', accepted: '✓', failed: '✗', cancelled: '✗', timed_out: '✗', rejected: '✗', blocked: '!', input_required: '?', stopped: '■'};
 
 export const isWorking = state => WORKING.has(state);
 export const glyph = (state, now = Date.now()) => isWorking(state) ? SPINNER[Math.floor(now / FRAME_MS) % SPINNER.length] : FIXED[state] ?? '●';

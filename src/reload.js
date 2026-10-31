@@ -897,12 +897,15 @@ async function interactiveView(args, {existing, restart} = {}) {
     if (message?.type === 'switch') { switchTo = message.id; return; }
     try { channel.send(message); } catch {}
   });
+  let daemonGone = false;
   channel.on('disconnect', () => {
+    daemonGone = true;
     if (child.connected) child.send({type: 'main.event', event: {kind: 'main.disconnected', state: 'unavailable', text: 'Daemon disconnected; session journal is saved'}}, () => {});
   });
   // Detaching a view never cancels its provider. Explicit /quit is sent before the view exits.
   const code = await new Promise(resolve => { child.once('error', () => resolve(1)); child.once('close', value => resolve(value ?? 1)); });
-  if ((code === 75 && requestedRestart) || (code === 76 && switchTo) || requestedQuit) {
+  // A daemon that is gone has nothing to stop, and nobody to answer (its daemon.json stays behind after a crash).
+  if (!daemonGone && ((code === 75 && requestedRestart) || (code === 76 && switchTo) || requestedQuit)) {
     const stopped = await (quitRequest ?? requestViewControl(channel, 'quit'));
     if (stopped?.verified !== true) {
       channel.close();

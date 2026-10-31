@@ -334,13 +334,18 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         }
         return current;
       };
-      const matches = row => (outcomeWait
-        ? row.task === latestReplacement(match.task) && TASK_TERMINAL.has(row.kind)
+      // The latest replacement is looked up once per pass over the journal, never once per row of it: per row, an
+      // open wait on a ~31k-row journal cost about 15 s for every new row (found live), and the daemon answered nothing else.
+      const matcher = () => {
+        const target = outcomeWait ? latestReplacement(match.task) : null;
+        return row => (outcomeWait
+        ? row.task === target && TASK_TERMINAL.has(row.kind)
           && ![...actionState(session.events).values()].some(action => action.task === row.task && action.type === 'terminal' && ['requested', 'started'].includes(action.status))
           && !(row.kind === 'task.completed' && session.events.find(event => event.kind === 'task.submitted' && event.task === row.task)?.review?.completion)
           && Object.entries(match).every(([key, value]) => key === 'kind' || key === 'task' || row[key] === value)
         : Object.entries(match).every(([key, value]) => row[key] === value))
         && (row.seq !== undefined ? row.seq > afterSeq : afterSeq === 0);
+      };
       let settled = false;
       const cleanup = () => { clearTimeout(timer); unsubscribe(); pendingWaits.delete(cleanup); };
       const finish = row => {
@@ -361,14 +366,14 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         && {kind: 'wait.interrupted', from: 'bounce', reason: 'message', messageId: row.messageId,
           text: 'A message from the user was delivered to your turn: read it and act on it before waiting again'};
       const unsubscribe = session.subscribe(row => {
-        const outcome = outcomeWait ? session.events.findLast(matches) : matches(row) ? row : null;
+        const outcome = outcomeWait ? session.events.findLast(matcher()) : matcher()(row) ? row : null;
         if (outcome) finish(outcome);
         else { const cut = interruption(row); if (cut) finish(cut); }
       });
       const timer = setTimeout(() => finish(null), timeout);
       timer.unref?.();
       pendingWaits.add(cleanup);
-      const existing = session.events.find(matches);
+      const existing = session.events.find(matcher());
       if (existing) finish(existing);
     }
 

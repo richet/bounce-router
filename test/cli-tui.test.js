@@ -64,7 +64,7 @@ async function harness(t, {run, models = {}} = {}) {
     }
   }
   await waitFor(() => output.includes('Ready.'));
-  return {root, session, listeners, calls, child, waitFor, output: () => output};
+  return {root, session, listeners, calls, child, hosted, waitFor, output: () => output};
 }
 
 test('CLI commands and live steering work while the daemon main turn is held', {timeout: 15000}, async t => {
@@ -396,9 +396,35 @@ test('Up on an empty input withdraws this view\'s own queued prompt for editing;
 test('a daemon that disconnects is shown as stopped, with the command to resume the session', {timeout: 15000}, async t => {
   const {session, listeners, waitFor, output} = await harness(t);
   for (const fn of listeners) fn({kind: 'main.disconnected', state: 'unavailable', text: 'Daemon disconnected; session journal is saved'});
-  await waitFor(() => output().includes('bounce stopped at'));
+  await waitFor(() => output().includes(`bounce --resume ${session.id.slice(0, 8)}`));
   const flat = output().replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/[\s│]+/g, ' ');
-  assert.match(flat, new RegExp(`bounce stopped at \\d\\d:\\d\\d, nothing is running · quit, then: bounce --resume ${session.id.slice(0, 8)}`));
+  assert.match(flat, new RegExp(`bounce stopped at \\d\\d:\\d\\d, nothing is running · Ctrl\\+C, then: bounce --resume ${session.id.slice(0, 8)}`));
+});
+
+// Found live: the daemon died during a turn, and Ctrl+C only sent a cancel to nobody, press after press.
+test('with the daemon gone during a turn, one Ctrl+C leaves the view', {timeout: 15000}, async t => {
+  const {listeners, child, waitFor, output} = await harness(t);
+  child.stdin.write('work\r');
+  await waitFor(() => output().includes('Running'));
+  for (const fn of listeners) fn({kind: 'main.disconnected', state: 'unavailable', text: 'Daemon disconnected; session journal is saved'});
+  await waitFor(() => output().includes('bounce stopped at'));
+  child.stdin.write('\x03');
+  await waitFor(() => child.exitCode !== null);
+});
+
+// Found live: a daemon busy for minutes answered nothing, so Ctrl+C said "Cancelling…" for good, and leaving waited for
+// acknowledgements that never came.
+test('with a daemon that answers nothing during a turn, a second Ctrl+C leaves the view', {timeout: 15000}, async t => {
+  const {child, hosted, waitFor, output} = await harness(t);
+  child.stdin.write('work\r');
+  await waitFor(() => output().includes('Running'));
+  hosted.detach();
+  child.stdin.write('more\r');
+  await new Promise(resolve => setTimeout(resolve, 100));
+  child.stdin.write('\x03');
+  await waitFor(() => output().includes('Ctrl+C again to quit'));
+  child.stdin.write('\x03');
+  await waitFor(() => child.exitCode !== null);
 });
 
 // Found in the real-console pass 2026-10-21: `/continue main` on a profile that names no model saved models.<adapter>

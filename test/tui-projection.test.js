@@ -317,3 +317,17 @@ test('a failed check puts the task back to running; a task with no check still l
   assert.equal(projection.snapshot().panes.find(p => p.task === 'build').state, 'running');
   assert.deepEqual(projection.paneIds(), ['orchestrator', 'worker:build']);
 });
+
+// Found live: after the daemon died, a view kept its workers "working" with their quiet time counting, up to 19 hours.
+test('a lost daemon stops every working pane, and only those', () => {
+  const projection = createWorkspaceProjection();
+  projection.ingest({kind: 'task.submitted', task: 'build', profile: 'b', seq: 1});
+  projection.ingest({kind: 'task.started', task: 'build', attempt: 1, seq: 2});
+  projection.ingest({kind: 'task.submitted', task: 'done', profile: 'b', seq: 3});
+  projection.ingest({kind: 'task.started', task: 'done', attempt: 1, seq: 4});
+  projection.ingest({kind: 'task.failed', task: 'done', seq: 5});
+  projection.ingest({kind: 'main.disconnected', state: 'unavailable'});
+  const panes = Object.fromEntries(projection.snapshot().panes.filter(pane => pane.task).map(pane => [pane.task, pane.state]));
+  assert.equal(panes.build, 'stopped');
+  assert.notEqual(panes.done, 'stopped');
+});

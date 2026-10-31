@@ -1037,16 +1037,20 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const rewritten = toWorkingCopy(text, workspace);
     return `${rewritten}\n\nYour working copy is ${workspace.cwd}: it is a copy of the project, and only changes made there are your work: bounce integrates them into the original checkout (${source}) after review, so edit the copy, never the original. What your orders ask you to deliver, evidence and reports included, goes inside this copy at the path they name: a file saved anywhere else on disk is not delivered.${fs.existsSync(path.join(workspace.cwd, '.git')) ? ' It has its own git with the project\'s history: log, diff and status work, and a commit there stays in the copy — bounce integrates your file changes, not commits.' : ''}`;
   };
+  // task -> where its workspace is. Never the workspace: its baseline lists every file of the project, and a
+  // long session kept one per task for good (found live, with 67 tasks, a daemon out of memory).
   const workspaces = new Map();
-  // Shared by workspaceFor and the integrate handler: the in-memory map first (same process,
-  // possibly already advanced by a prior integration), then the persisted metadata written at
-  // creation time (restart replay reads the same file, which advanceBaseline keeps current).
+  const remember = (task, workspace) => workspaces.set(task, {cwd: workspace.cwd, metadata: path.join(workspace.cwd, '.attempt-workspace.json')});
+  // Shared by workspaceFor and the integrate handler: the persisted metadata written at creation
+  // time, which advanceBaseline keeps current, found through this map or, after a restart, the journal.
+  // Null when a copy is gone (the user pruned it).
   function existingWorkspace(task) {
-    const prior = workspaces.get(task) ?? workspaces.get(submittedRow(task)?.replaces);
-    if (prior) return prior;
-    const previous = session.events.findLast(e => e.kind === 'task.workspace' && (e.task === task || e.task === submittedRow(task)?.replaces));
+    const previous = workspaces.get(task) ?? workspaces.get(submittedRow(task)?.replaces)
+      ?? session.events.findLast(e => e.kind === 'task.workspace' && (e.task === task || e.task === submittedRow(task)?.replaces));
     if (!previous) return null;
-    const workspace = JSON.parse(fs.readFileSync(previous.metadata, 'utf8'));
+    let workspace;
+    try { workspace = JSON.parse(fs.readFileSync(previous.metadata, 'utf8')); }
+    catch (error) { if (error.code === 'ENOENT') return null; throw error; }
     workspace.cwd = previous.cwd;
     return workspace;
   }
@@ -1054,7 +1058,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (POLICY_RANK[effectivePolicy(profile)] < POLICY_RANK.write) return null;
     const prior = existingWorkspace(task);
     if (prior) {
-      workspaces.set(task, prior); return {...prior, attemptId: `${task}-${attempt}`};
+      remember(task, prior); return {...prior, attemptId: `${task}-${attempt}`};
     }
     const relative = path.relative(fs.realpathSync(session.cwd), fs.realpathSync(session.dir));
     const nested = relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
@@ -1065,7 +1069,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // actually protects the checkout is integrateArtifact's conflict check against the real file.
     const workspace = createAttemptWorkspace({cwd: session.cwd, dir, owns: ['**'], attemptId: `${task}-${attempt}`, skills: skillsInUse(session.root, session.cwd).skills,
       ...(nested ? {} : {copyRoot: path.join(session.root, 'w')})});
-    workspaces.set(task, workspace);
+    remember(task, workspace);
     append({kind: 'task.workspace', task, attempt, purpose: 'publish', cwd: workspace.cwd, metadata: path.join(workspace.cwd, '.attempt-workspace.json'), baselineHash: workspace.baselineHash});
     return workspace;
   }
@@ -2859,7 +2863,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         // A follow-up (retryOf) reusing this same workspace diffs against what's now in the
         // checkout, not the pre-integration copy it started from — see advanceBaseline.
         const workspace = existingWorkspace(action.task);
-        if (workspace) workspaces.set(action.task, advanceBaseline(workspace, artifact, result.mergedStates));
+        if (workspace) advanceBaseline(workspace, artifact, result.mergedStates);
         append(continuation);
       } catch (error) {
         append({kind: 'task.blocked', task: action.task, reason: 'integration_interrupted', text: `Artifact integration interrupted: ${error.message}; durable manifest retained for restart recovery`});

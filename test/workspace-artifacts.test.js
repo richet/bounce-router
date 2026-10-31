@@ -418,3 +418,21 @@ test('a copy whose change the checkout already holds integrates as the checkout,
   write(row.cwd, 'TABLE.md', '| y | 2 |\n');
   assert.equal(integrateArtifact({cwd: source, dir, artifact: captureArtifact(row), base: row.cwd}).status, 'conflict', 'a deletion of a row the checkout changed is not held by it');
 });
+
+// Found live: a daemon died at its 4 GB heap limit holding 67 baselines, 3970 MB of text between them. A preview cut from
+// a file's whole text is a view of that text, so each baseline kept every text file of the project in the heap.
+test('a baseline keeps the previews of its files, not their whole text', async t => {
+  const v8 = await import('node:v8'), vm = await import('node:vm');
+  v8.setFlagsFromString('--expose-gc');
+  const gc = vm.runInNewContext('gc');
+  const {source, dir} = setup(t);
+  for (let i = 0; i < 80; i++) write(source, `big-${i}.txt`, `${i}`.padEnd(256 * 1024, 'x'));
+  gc();
+  const before = process.memoryUsage().heapUsed;
+  const workspace = createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'a'});
+  gc();
+  const grown = process.memoryUsage().heapUsed - before;
+  assert.equal(Object.keys(workspace.baseline).length, 80);
+  assert.equal(workspace.baseline['big-0.txt'].preview.length, 4096);
+  assert.ok(grown < 5 * 1024 * 1024, `the baseline kept ${Math.round(grown / 1024 / 1024)} MB of 20 MB of files`);
+});

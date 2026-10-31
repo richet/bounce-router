@@ -145,3 +145,20 @@ test('a rework whose resume fails while the worker is still live stops that work
   await waitFor(() => worker.calls.cancel >= 1, 1000);
   assert.equal(worker.calls.cancel, 1, 'the live worker was stopped');
 });
+
+// Found live: the scheduler kept every task's workspace for good, and each one lists every file of the project, so a long
+// session ran out of memory. A later attempt reads the workspace from its file.
+test('a rework reads its workspace from the copy, and the scheduler holds no baseline of its own', {timeout: 5000}, async t => {
+  const {session, bus} = await setupAtGate(t);
+  const orchestrator = await connect(bus, 'orchestrator');
+  t.after(() => orchestrator.close());
+  const {cwd} = session.events.findLast(e => e.kind === 'task.workspace' && e.task === 'fix');
+  const metadata = path.join(cwd, '.attempt-workspace.json');
+  const persisted = JSON.parse(fs.readFileSync(metadata, 'utf8'));
+  persisted.baseline['only-on-disk.txt'] = {hash: 'x', size: 1, mode: 0o644, binary: false, preview: 'x'};
+  fs.writeFileSync(metadata, JSON.stringify(persisted));
+  await orchestrator.publish({kind: 'task.rework', task: 'fix', text: 'Again, with a real assertion.'});
+  const second = await waitFor(() => { const rows = session.events.filter(e => e.kind === 'task.artifact' && e.task === 'fix'); return rows.length === 2 && rows[1]; });
+  const artifact = JSON.parse(fs.readFileSync(second.file, 'utf8'));
+  assert.deepEqual(artifact.changes.map(change => [change.path, change.kind]), [['only-on-disk.txt', 'delete']]);
+});
