@@ -167,8 +167,7 @@ test('S3b a recoverable failure falls back to the next profile in the chain; any
 // The worker's changes are its answer. When a write worker's turn ends with no answer text at all
 // but its isolated workspace captured real changes, those changes are the outcome: the scheduler
 // synthesizes a completed report from the artifact instead of failing the task and falling back to
-// the next AI in the chain, which would otherwise discard a working draft (found live, ACE session
-// d1bc0206: two local qwen builders did real work, then answered nothing on their last turn).
+// the next AI in the chain, which would otherwise discard a working draft (found live: two local qwen builders did real work, then answered nothing on their last turn).
 test('a recoverable failure with no answer text but captured file changes completes via synthesis, not fallback', async t => {
   const {session} = setup(t);
   const adapter = fakeAdapter(({cwd}) => {
@@ -214,7 +213,7 @@ test('a recoverable failure after the worker said something completes from what 
 });
 
 // A step-capped worker that was still making progress is continued on its own session first
-// (docs/plans/step-renewal.md) — before its partial answer is taken as the result.
+// — before its partial answer is taken as the result.
 test('a step-capped runtime failure while progressing renews the worker\'s steps before anything is synthesized', async t => {
   const {session} = setup(t);
   let turn = 0;
@@ -291,7 +290,7 @@ test('S6 depth: grandchild exceeds depth cap of 1', async t => {
   await waitFor(() => scheduler.tasks()[grandchild.task]?.state === 'failed');
 
   assert.equal(scheduler.tasks()[grandchild.task].reason, 'depth');
-  // Observed live (3c7e7d25 seq 894/948): "use retryOf" sent the orchestrator to retry the refused task,
+  // Observed live: "use retryOf" sent the orchestrator to retry the refused task,
   // which inherits the same parent and is refused again; the refusal names what works.
   assert.equal(session.events.findLast(e => e.kind === 'task.failed' && e.task === grandchild.task).text,
     `delegation under ${child.task.slice(0, 8)} exceeds depth cap 1; continue the work with retryOf ${child.task} (its job, at an allowed depth), or submit it as a new root task (parent null, no retryOf)`);
@@ -312,7 +311,7 @@ test('a report missing a required field is refused by field name', () => {
   assert.equal(validateReport({...final, outcome: 'completed'}), null);
 });
 
-// Observed live (session 159f4746, 2 tasks): a near-miss outcome word was refused by
+// Observed live: a near-miss outcome word was refused by
 // `bounce_report`, and the worker never recovered its final report. Case-insensitive synonyms
 // canonicalize in place; an unknown word is still refused with the same message as before.
 test('a final report\'s outcome word is normalized case-insensitively before validation', () => {

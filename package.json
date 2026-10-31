@@ -37,6 +37,7 @@
     "slice-ansi": "^7.1.2",
     "string-width": "^7.2.0",
     "strip-ansi": "^7.2.0",
-    "wrap-ansi": "^9.0.2"
+    "wrap-ansi": "^9.0.2",
+    "yaml": "^2.9.1"
   }
 }

@@ -184,3 +184,24 @@ test('more than one local worker is allowed, and warned about', () => {
   const slots = formatLocalStatus({...base, concurrency: [{endpoint: 'lmstudio', maxConcurrent: 1, slotsPerModel: 3}]}, {}).join('\n');
   assert.match(slots, /3 slots/, 'slots per model are the same trade');
 });
+
+// Reported by a live session 2026-10-22: with the operation on classic, `bounce local` said "No agent has a local
+// model yet" while `bounce agents list` showed the local model in four agents' chains.
+test('local status lists the agents a local model may play whatever the operation', async () => {
+  const classic = {...statusSettings, operation: 'classic'};
+  const status = await gatherLocalStatus({settings: classic, discover: async () => statusCatalogs, roles: statusRoles});
+  assert.deepEqual(status.workers.map(worker => worker.name), ['scout', 'writer']);
+});
+
+// Reported by a live session 2026-10-22: with nothing loaded (LM Studio unloads idle models), `bounce local --verify`
+// ran no test turn and printed the hint to run itself. An on-demand model is verified by its id; the turn loads it.
+test('verify with nothing loaded proves the bridge on a model that loads on demand', async () => {
+  const unloaded = [{endpoint: 'lmstudio', models: [{id: 'on-disk', ref: 'lmstudio/on-disk', ready: false, tools: true, capabilitySource: 'server', context: 8192, instances: []}]}];
+  const asked = [];
+  const status = await gatherLocalStatus({settings: {...statusSettings, local: {endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234', loadPolicy: 'on-demand'}}}}, verify: true,
+    discover: async () => unloaded, resolve: () => ({model: 'on-disk', instance: null, ref: 'lmstudio/on-disk'}),
+    bridge: async ({model}) => { asked.push(model); return {worker: {ready: true}, config: {}}; }, roles: statusRoles});
+  assert.deepEqual(asked, ['on-disk']);
+  assert.equal(status.problem, null);
+  assert.equal(status.bridge.worker.ready, true);
+});

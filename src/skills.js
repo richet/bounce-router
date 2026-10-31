@@ -74,12 +74,36 @@ export function readSkill(dir) {
   } catch (error) { return {name, dir, error: error.code === 'ENOENT' ? 'no SKILL.md' : error.message}; }
 }
 export function listSkills(root) {
-  const store = skillStore(root);
+  return readStore(skillStore(root));
+}
+function readStore(store) {
   if (!fs.existsSync(store)) return [];
   return fs.readdirSync(store, {withFileTypes: true})
     .filter(entry => entry.isDirectory() && !entry.name.startsWith('.'))
     .map(entry => readSkill(path.join(store, entry.name)))
     .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// A project's own skills, committed beside its agents. Bounce reaches every provider through them: a model reads a skill
+// as a file from an index in its prompt, so local models get the same skills as cloud ones, with no vendor feature on.
+export const projectSkillStore = cwd => path.join(cwd, '.bounce', 'skills');
+
+// The skills in use, one layer whole like the team: the project's when it has any, else the user's own. Never summed
+// (2026-10-24: a project's workers get no instructions from outside it unasked), and never bounce's bundled
+// skills, which are its own machinery (the orchestrator's skill reaches it by path in its orders).
+export function skillsInUse(root, cwd) {
+  const ownHome = cwd && path.resolve(cwd, '.bounce') === path.resolve(root);
+  const project = cwd && !ownHome ? readStore(projectSkillStore(cwd)).filter(skill => !skill.error) : [];
+  if (project.length) return {source: 'project', skills: project};
+  const user = listSkills(root).filter(skill => !skill.error && !marker(skill.dir)?.bundled);
+  return {source: user.length ? 'user' : null, skills: user};
+}
+
+// One line per skill, for a prompt: its name, when to use it, and the file to read. Empty when there is none.
+export function skillsBlock(skills, fileOf) {
+  if (!skills.length) return '';
+  return ['Skills for this project: when the task matches one, read its file first and follow it.',
+    ...skills.map(skill => `- ${skill.name} — ${skill.description} — ${fileOf(skill)}`)].join('\n');
 }
 
 const marker = dir => { try { const value = JSON.parse(fs.readFileSync(path.join(dir, MARKER), 'utf8')); return typeof value?.hash === 'string' ? value : null; } catch { return null; } };
@@ -359,6 +383,13 @@ export function skillsSummary(root, options) {
 }
 
 // One command surface for the TUI and the headless CLI, so both accept the same words.
+// Which skills the models get, named first in the listing: one layer, the project's .bounce/skills when it has any.
+function inUseLine(root, cwd) {
+  const {source, skills} = skillsInUse(root, cwd);
+  if (!source) return 'Models get: no skills (put one in .bounce/skills/<name>/SKILL.md in the project, or in your own store)';
+  return `Models get: ${source === 'project' ? `this project's (${projectSkillStore(cwd)})` : `yours (${skillStore(root)})`}: ${skills.map(skill => skill.name).join(', ')}`;
+}
+
 export function skillsCommand(words, options) {
   const [action = 'list', ...rest] = words.filter(Boolean);
   const force = rest.includes('--force');
@@ -368,7 +399,7 @@ export function skillsCommand(words, options) {
     const report = syncSkills(options);
     return {text: [text, syncSummary(report)].filter(Boolean).join('\n'), report};
   };
-  if (action === 'list') return {text: skillsSummary(root, options)};
+  if (action === 'list') return {text: [inUseLine(root, options.cwd), skillsSummary(root, options)].join('\n')};
   if (action === 'sync') return sync('');
   if (action === 'clear') { const report = clearSkills(options); return {text: summarize(report, ['removed']) || 'Nothing installed by bounce to remove.', report}; }
   if (action === 'reset') {

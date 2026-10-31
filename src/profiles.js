@@ -1,9 +1,8 @@
-// The persisted shape of `operation` and profile tables (docs/local-orchestration.md,
-// "Operation modes", D2): validated once, opt-in, and legacy configs untouched by construction.
+// The persisted shape of `operation` and profile tables: validated once, opt-in, and legacy configs untouched by construction.
 // Phase 8 §4: the role vocabulary is free-form (any non-empty label); `orchestrator` stays
 // reserved (derived from `settings.orchestrator`, never declared). READ_ONLY_ROLES is now only
 // a back-compat DEFAULT for `policy` on these historically-read-only labels — the read-only/
-// write ratchet itself keys on `policy`, never on the label (CONTRACT.md §4).
+// write ratchet itself keys on `policy`, never on the label.
 import {defaultStrategy, noReviewStrategy, quorumStrategy} from './strategy.js';
 import {normalizeLocalSettings} from './local-models.js';
 import {PROFILE_TIERS} from './jev.js';
@@ -24,13 +23,10 @@ function resolveStrategy(spec) {
   throw new Error('strategy must be default, no-review, or quorum:<n>');
 }
 
-// Phase 7 execution-policy ladder (docs/local-orchestration.md "Permissions", CONTRACT.md §1):
+// Phase 7 execution-policy ladder:
 // least to most privileged. `write` exists for adapters to declare and future profiles to
 // request; no current bounce profile produces it.
-export const POLICY_RANK = {'read-only': 0, probe: 1, plan: 2, write: 3, yolo: 4};
-// Who can enforce `probe` (run commands, write nothing): codex's read-only sandbox, and a local worker
-// run under sandbox-exec. claude and muse cannot run commands without also being able to write.
-export const PROBE_ADAPTERS = new Set(['codex', 'opencode']);
+export const POLICY_RANK = {'read-only': 0, plan: 1, write: 2, yolo: 3};
 
 // The shipped worker roster: one builder per model the cloud vendors expose in the `/model`
 // picker, each described in src/model-catalog.js so `profile: "auto"` can route between them
@@ -50,6 +46,8 @@ export function starterProfiles(settings = {}) {
     build_claude: {adapter: 'claude', model: 'opus[1m]', fallback: ['build', 'claude_fable']},
     claude_fable: {adapter: 'claude', model: 'claude-fable-5-1[1m]', fallback: ['build_claude', 'build']},
     // mid
+    codex_61_sol: {adapter: 'codex', model: 'gpt-6.1-sol', fallback: ['claude_sonnet', 'codex_6_sol']},
+    codex_6_sol: {adapter: 'codex', model: 'gpt-6-sol', fallback: ['claude_sonnet', 'codex_61_sol']},
     codex_sol: {adapter: 'codex', model: 'gpt-5.6-sol', fallback: ['claude_sonnet', 'codex_terra']},
     codex_terra: {adapter: 'codex', model: 'gpt-5.6-terra', fallback: ['claude_sonnet', 'codex_sol']},
     claude_sonnet: {adapter: 'claude', model: 'sonnet', fallback: ['codex_terra', 'codex_sol']},
@@ -57,6 +55,7 @@ export function starterProfiles(settings = {}) {
     muse_spark: {adapter: 'muse', model: 'muse-spark-1.3', fallback: ['muse_spark_12', 'codex_terra', 'claude_sonnet']},
     muse_spark_12: {adapter: 'muse', model: 'muse-spark-1.2', fallback: ['muse_spark', 'codex_terra']},
     // cheapest
+    codex_6_luna: {adapter: 'codex', model: 'gpt-6-luna', fallback: ['claude_haiku', 'codex_luna']},
     codex_luna: {adapter: 'codex', model: 'gpt-5.6-luna', fallback: ['claude_haiku']},
     claude_haiku: {adapter: 'claude', model: 'haiku', fallback: ['codex_luna']},
   };
@@ -94,7 +93,6 @@ export const LOCAL_ADAPTERS = new Set(['opencode']);
 // agent as "more privileged" — observed live as a failed local task with no fallback.
 export function effectivePolicy(profile) {
   if (profile.policy === 'read-only') return 'read-only';
-  if (profile.policy === 'probe') return 'probe';
   if (profile.mode === 'plan') return 'plan';
   return 'yolo';
 }
@@ -139,8 +137,8 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
     let role = raw.role ?? 'builder';
     if (typeof role !== 'string' || !role) throw new Error(`profile ${name}: role must be a non-empty string`);
     if (name === orchestrator) role = 'orchestrator';
-    const policy = raw.policy ?? (raw.adapter === 'typesafe' || readOnly.has(role) ? 'read-only' : roles?.get(role)?.policy ?? (['analyst', 'verifier'].includes(role) ? 'probe' : 'write'));
-    if (!['write', 'read-only', 'probe'].includes(policy)) throw new Error(`profile ${name}: policy must be write, read-only or probe`);
+    const policy = raw.policy ?? (raw.adapter === 'typesafe' || readOnly.has(role) ? 'read-only' : roles?.get(role)?.policy ?? 'write');
+    if (!['write', 'read-only'].includes(policy)) throw new Error(`profile ${name}: policy must be write or read-only`);
     // A decision model (typesafe) has no tools: it can only ever be a read-only reviewer.
     if (raw.adapter === 'typesafe' && policy === 'write') throw new Error(`profile ${name}: typesafe must be read-only`);
     // A shipped fallback that points at a profile the user dropped is skipped, not an error;
@@ -155,7 +153,7 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
     const agent = roles?.get(role);
     if (agent?.error) throw new Error(`profile ${name}: role ${role} is defined by ${agent.file}, which is invalid: ${agent.error}`);
     profiles[name] = {adapter: raw.adapter, model: typeof raw.model === 'string' ? raw.model : '', mode, policy, fallback: [...fallback], role, executables: {...(settings.executables ?? {})},
-      ...(agent ? {agent: {name: agent.name, description: agent.description, policy: agent.policy, prompt: agent.prompt, ...(agent.maxSteps ? {maxSteps: agent.maxSteps} : {})}} : {})};
+      ...(agent ? {agent: {name: agent.name, description: agent.description, policy: agent.policy, prompt: agent.prompt, ...(agent.maxSteps ? {maxSteps: agent.maxSteps} : {}), ...(agent.sampling ? {sampling: agent.sampling} : {})}} : {})};
     // Optional cost tier and a sentence on what the model is good for, both read by the router
     // (src/jev.js routingQuestions) and shown in the roster; a profile without them is described
     // once by bounce itself (src/roster-notes.js). Any other value is dropped.
@@ -172,7 +170,7 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
     if (agent.error || agent.name === orchestrator) continue;
     const local = normalizeLocalSettings(settings.local);
     const isLocal = provider => Object.hasOwn(local.endpoints, provider);
-    // `auto` first in the list: Jev picks the AI at dispatch (the scheduler composes it with playedBy);
+    // `auto` first in the list: Jev picks the AI at dispatch, among the ones the list names (the scheduler composes it with playedBy);
     // the rest — or, with nothing after it, the provider order — is the chain the job falls to.
     const auto = agent.models?.[0] === 'auto';
     const listed = (agent.models ?? []).filter(ref => ref !== 'auto');
@@ -181,12 +179,11 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
         ...(local.enabled && adapterNames.includes('opencode') ? Object.keys(local.endpoints).map(endpoint => `${endpoint}/auto`) : [])];
     // `provider/default` is the provider's own default model — the written form of what an agent with
     // no `models:` gets, so setup can pin a local model first and still keep the cloud fallbacks.
-    const backends = wanted.map(ref => { const cut = ref.indexOf('/'); const model = ref.slice(cut + 1); return {provider: ref.slice(0, cut), model: model === 'default' ? '' : model, ref}; })
+    const backends = wanted.map((ref, at) => { const cut = ref.indexOf('/'); const model = ref.slice(cut + 1); return {provider: ref.slice(0, cut), model: model === 'default' ? '' : model, ref, at}; })
       .filter(({provider, ref}) => {
         // A plan session is read-only end to end: a write agent is not offered rather than refused,
         // so a fresh install (whose shipped team has write agents) still plans.
         if (settings.mode === 'plan' && (agent.policy ?? 'write') === 'write') { skipped.push({agent: agent.name, ref, reason: 'a plan session runs read-only agents only'}); return false; }
-        if (agent.policy === 'probe' && !PROBE_ADAPTERS.has(isLocal(provider) ? 'opencode' : provider)) { skipped.push({agent: agent.name, ref, reason: 'adapter cannot run isolated checks'}); return false; }
         if (isLocal(provider) && !local.enabled) { skipped.push({agent: agent.name, ref, reason: 'local models are off (/local on)'}); return false; }
         if (isLocal(provider) ? !adapterNames.includes('opencode') : !adapterNames.includes(provider)) { skipped.push({agent: agent.name, ref, reason: `no ${provider} adapter on this machine`}); return false; }
         return true;
@@ -196,24 +193,51 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
     backends.forEach(({provider, model}, index) => {
       const name = chain[index];
       const mode = settings.mode;
-      // Unsupported probe adapters were excluded above; never silently remove command tools.
       const policy = agent.policy ?? 'write';
       const base = {derived: true, adapter: isLocal(provider) ? 'opencode' : provider, model, mode, policy,
         fallback: chain.slice(index + 1, index + 2), role: agent.name, executables: {...(settings.executables ?? {})},
-        agent: {name: agent.name, description: agent.description, policy, prompt: agent.prompt, ...(agent.maxSteps ? {maxSteps: agent.maxSteps} : {})}};
+        agent: {name: agent.name, description: agent.description, policy, prompt: agent.prompt, ...(agent.maxSteps ? {maxSteps: agent.maxSteps} : {}), ...(agent.sampling && profileSamples(agent) ? {sampling: agent.sampling} : {})}};
+      // The binding's name for this AI (models.yaml), so the orchestrator can name it as the user did.
+      const alias = agent.chainAliases?.[backends[index].at];
+      if (alias) base.alias = alias;
       if (auto && index === 0) base.auto = true;
+      // `auto` alone has no list to stay within: Jev chooses from the whole roster (src/jev.js ownProfiles).
+      if (auto && index === 0 && !listed.length) base.autoAll = true;
       if (isLocal(provider)) {
-        // All a local backend adds is where its model lives; src/local-resolve.js does the rest at dispatch.
-        Object.assign(base, {backend: 'lmstudio', endpoint: provider, localOptions: {maxOutputTokens: 2048}});
+        // All a local backend adds is where its model lives and how the job samples; src/local-resolve.js does the rest at dispatch.
+        Object.assign(base, {backend: 'lmstudio', endpoint: provider, localOptions: localOptions(agent, backendSettings(agent, backends, index))});
       }
       profiles[name] = base;
     });
+  }
+
+  // A cloud model an agent's list names that no roster profile runs joins the roster under its own name, so an
+  // `auto` agent can be given it (src/jev.js ownProfiles) and roster notes describe it. 2026-10-25: the shipped
+  // roster lags the vendors' pickers — a project named codex/gpt-6.1-sol, which no shipped profile ran.
+  for (const link of Object.values(profiles).filter(p => p.derived && !p.backend && p.model)) {
+    if (Object.values(profiles).some(p => !p.derived && p.adapter === link.adapter && p.model === link.model)) continue;
+    const name = `${link.adapter}_${link.model}`.replace(/[^A-Za-z0-9_.~-]/g, '_');
+    if (!profiles[name]) profiles[name] = {adapter: link.adapter, model: link.model, mode: settings.mode, policy: 'write', fallback: [], role: 'builder', executables: {...(settings.executables ?? {})}};
   }
 
   const orchestratorAdapter = profiles[orchestrator].adapter;
   const shape = names.every(name => profiles[name].adapter === orchestratorAdapter) ? 'single-provider' : 'multi-provider';
 
   return {operation: 'orchestrator', orchestrator, profiles, shape, strict, strategy, skipped};
+}
+
+// What a local backend adds for its job: the output it needs room for (src/local-resolve.js) and how
+// it samples (src/local-opencode-config.js). Only local backends carry it, so a cloud model never does.
+// `settings` are what the backend samples with: from bindings, its alias's own (none: nothing is sent, the model's
+// settings in LM Studio decide); from a profile's legacy models:, the profile's.
+const localOptions = (agent, settings) => ({maxOutputTokens: settings?.maxTokens ?? 2048, ...(settings ? {sampling: settings} : {})});
+// The settings of a surviving backend: chainSettings is aligned with the chain bindings resolved (src/bindings.js),
+// and each backend keeps its place in that chain (`at`) through the filters above — two aliases may name one model.
+// A profile's own sampling is played only while its chain is the profile's (legacy models:, or no bindings at all).
+const profileSamples = agent => agent.binding?.source === 'profile' || !agent.binding;
+function backendSettings(agent, backends, index) {
+  if (profileSamples(agent)) return agent.sampling ?? null;
+  return agent.chainSettings?.[backends[index].at] ?? null;
 }
 
 // A job played by an AI that is not on its own list — Jev's pick for an agent whose `models:` opens
@@ -223,7 +247,7 @@ export function validateOrchestration(settings, adapterNames = ['claude', 'codex
 export function playedBy(head, aiName, ai, local = null) {
   return {derived: true, ai: aiName, adapter: local ? 'opencode' : ai.adapter, model: local ? local.model : ai.model ?? '', mode: head.mode, policy: head.policy,
     fallback: [head.agent.name], role: head.role, executables: head.executables, agent: head.agent,
-    ...(local ? {backend: 'lmstudio', endpoint: local.endpoint, localOptions: {maxOutputTokens: 2048}} : {})};
+    ...(local ? {backend: 'lmstudio', endpoint: local.endpoint, localOptions: localOptions(head.agent, head.agent?.sampling ?? null)} : {})};
 }
 
 export function profileFor(view, name) {

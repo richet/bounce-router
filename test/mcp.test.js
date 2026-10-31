@@ -1,4 +1,4 @@
-// The MCP transport (docs/plans/bridge-interface.md): the second skin over src/bridge-ops.js, so the
+// The MCP transport: the second skin over src/bridge-ops.js, so the
 // orchestrator calls typed tools instead of shelling `bounce publish` and reading its own journal with
 // `tail | jq`. It holds no policy: every call goes to a verb, every result is that verb's answer.
 // Researched first (2026-09-22): no client we serve consumes MCP resource subscriptions — Codex pulls
@@ -151,7 +151,7 @@ test('M6 task_get can be asked for the whole report, and says so in its schema',
 test('task_submit preserves the task\'s declared constraints', async () => {
   let submitted;
   const s = server({ops: {submit: async event => {submitted = event; return {ok: true, row: event};}}});
-  const constraints = {requires: ['read', 'exec'], owns: ['src/a.js'], depends_on: ['earlier'], deadline: 60000, review: {completion: 'critic'}, steps: 'node --test', risk: 'logic', size: {lines: 1, probes: 1, minutes: 1}, checkpoint: {head: 'abc'}};
+  const constraints = {requires: ['read', 'exec'], owns: ['src/a.js'], depends_on: ['earlier'], deadline: 60000, review: {completion: 'critic'}, steps: 'node --test', risk: 'logic', tier: 'strongest', model: 'sol', size: {lines: 1, probes: 1, minutes: 1}, checkpoint: {head: 'abc'}};
   await call(s, 'task_submit', {profile: 'builder', orders: 'verify', ...constraints});
   for (const [key, value] of Object.entries(constraints)) assert.deepEqual(submitted[key], value, key);
 });

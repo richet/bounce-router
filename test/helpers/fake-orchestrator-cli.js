@@ -18,6 +18,8 @@
 //                        not an admission-phase stub), then drive task.cancel through its rules:
 //                        refuse a foreign task id, cancel the running task itself with no text
 //                        (the text defaults), then refuse the same task again now that it is terminal.
+// FAKE_ORCH_NOWAIT=1     submit and end the turn without waiting, the way a real orchestrator dispatches; a turn whose
+//                        prompt hands it worker outcomes says what it was handed and submits nothing.
 import fs from 'node:fs';
 import {randomUUID} from 'node:crypto';
 
@@ -26,6 +28,8 @@ const finish = () => { console.log(JSON.stringify({type: 'turn.completed', usage
 const outcome = error => error ? `refused ${error.code}` : 'accepted';
 const attempt = (client, event) => client.publish(event).then(() => null, error => error).then(outcome);
 
+let prompt = '';
+process.stdin.on('data', chunk => { prompt += chunk; });
 process.stdin.resume(); // the router writes the prompt to stdin; consume it like a real CLI
 
 if (process.env.FAKE_ORCH_MODE) await main();
@@ -35,6 +39,13 @@ async function main() {
     say(JSON.stringify(Object.fromEntries(['BOUNCE_BUS', 'BOUNCE_BUS_TOKEN_FILE', 'BOUNCE_ROLE', 'BOUNCE_ORCHESTRATOR_PROFILE']
       .map(key => [key, process.env[key] ?? 'absent']))));
     return finish();
+  }
+  if (process.env.FAKE_ORCH_NOWAIT === '1') {
+    await new Promise(resolve => setTimeout(resolve, 100)); // the prompt is written as the process starts
+    if (prompt.includes('Worker outcomes not yet handed to you')) {
+      say(`handed: ${(prompt.match(/- task \S+ · profile \S+ · task\.\w+/g) ?? []).join('; ')}`);
+      return finish();
+    }
   }
   const {connectBus} = await import('../../src/bus.js');
   const token = fs.readFileSync(process.env.BOUNCE_BUS_TOKEN_FILE, 'utf8').trim();
@@ -67,6 +78,7 @@ async function main() {
     say(JSON.stringify({foreign, mine, again}));
   }
 
+  if (process.env.FAKE_ORCH_NOWAIT === '1') { say(`dispatched ${task}`); try { await client.close(); } catch {} return finish(); }
   // A wait on a task outcome answers on ANY terminal row (P15); read the kind, as a real
   // orchestrator must. FAKE_ORCH_HOLD_MS keeps the turn open afterwards for probes that need the
   // daemon (and its grants) alive while they publish.

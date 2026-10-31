@@ -1,4 +1,4 @@
-// OpenCode as a classic provider (docs/plans/classic-conversation.md §4): the one-shot adapter that lets a
+// OpenCode as a classic provider: the one-shot adapter that lets a
 // local LM Studio model be the agent answering the conversation, ordered and picked like claude or codex.
 import './helpers/env.js';
 import test from 'node:test';
@@ -13,6 +13,10 @@ import {queryCatalog, modelEntries, catalogNotes} from '../src/models.js';
 import {Session, Router, defaults, validateSettings} from '../src/core.js';
 
 const settings = {local: {endpoints: {lmstudio: {backend: 'lmstudio', url: 'http://127.0.0.1:1234', contextTokens: 131072}}}};
+// Which opencode is installed must not decide these tests: each binary name answers its own major.
+const realVersionOf = opencode.versionOf;
+opencode.versionOf = executable => (executable === 'opencode-v2' ? {version: '2.0.29', major: 2} : {version: '1.18.31', major: 1});
+test.after(() => { opencode.versionOf = realVersionOf; });
 
 test('opencode is a classic provider: registered, resumable, needs a model, result is the exit', () => {
   assert.equal(adapters.opencode, opencode);
@@ -47,6 +51,20 @@ test('the env carries the OpenCode config: the endpoint as a provider, one agent
   assert.deepEqual([plan.agent.bounce.tools.read, plan.agent.bounce.tools.edit, plan.agent.bounce.tools.bash], [true, false, false]);
   assert.deepEqual(providerEnv('claude', {model: 'fable', mode: 'yolo', settings}), {}, 'the vendors take everything on argv');
   assert.throws(() => providerEnv('opencode', {model: 'elsewhere/m', mode: 'yolo', settings}), /Unknown local endpoint elsewhere/);
+});
+
+test('on opencode 2.x the invocation is a private server with no --dir or --pure, and the env carries 2.x\'s config and the directory as PWD', () => {
+  assert.deepEqual(invocation('opencode', {model: 'lmstudio/qwen3-coder-30b', mode: 'plan', cwd: '/w', resume: 'ses_1', executable: 'opencode-v2'}),
+    ['run', '--standalone', '--format', 'json', '--agent', 'bounce', '-m', 'lmstudio/qwen3-coder-30b', '-s', 'ses_1']);
+  const env = providerEnv('opencode', {model: 'lmstudio/qwen3-coder-30b', mode: 'plan', settings, cwd: '/w', executable: 'opencode-v2'});
+  assert.equal(env.PWD, '/w');
+  const config = JSON.parse(env.OPENCODE_CONFIG_CONTENT);
+  assert.equal(config.providers.lmstudio.settings.baseURL, 'http://127.0.0.1:1234/v1');
+  assert.equal('provider' in config, false, 'the 1.x shape is not sent to 2.x');
+  const denied = config.agents.bounce.permissions.filter(rule => rule.effect === 'deny').map(rule => rule.action);
+  for (const action of ['execute', 'edit', 'write', 'patch', 'shell', 'subagent']) assert.ok(denied.includes(action), `plan denies ${action}`);
+  assert.equal(config.agents.bounce.permissions.some(rule => rule.action === 'read'), false, 'reads stay allowed');
+  assert.equal('PWD' in providerEnv('opencode', {model: 'lmstudio/qwen3-coder-30b', mode: 'plan', settings, cwd: '/w'}), false, '1.x takes --dir');
 });
 
 test('normalize: text is the answer, tool_use the call, step_finish the tokens, sessionID the thread once', () => {
@@ -133,4 +151,12 @@ test('Router: opencode without a model is skipped with a note; with one it runs 
   await pinned.run('still you?');
   assert.deepEqual(attempts[2].args.slice(-2), ['-s', 'opencode-ses']);
   assert.equal(attempts[2].prompt, 'still you?');
+});
+
+// Found in the real-console pass 2026-10-21: an embedding model (tools unknown) was offered as a model to talk to.
+test('the picker leaves out embedding models, which cannot hold a conversation', async () => {
+  const discover = async () => [{provider: 'local', endpoint: 'lmstudio', models: [
+    {id: 'qwen3-8b', ready: true, tools: true, type: 'llm'}, {id: 'text-embedding-nomic-embed-text-v1.5', ready: null, tools: null, type: 'embedding'}], error: null}];
+  const catalog = await queryCatalog('opencode', 'opencode', {settings, discover});
+  assert.deepEqual(catalog.models.map(m => m.id), ['lmstudio/qwen3-8b']);
 });

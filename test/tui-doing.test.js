@@ -58,3 +58,17 @@ test('rendered: the header and the main worker\'s rail row say what it is doing,
   assert.equal(out.includes('⏳ waiting on 79981b05 · 6m'), true, 'the rail row under main');
   assert.equal(out.includes('⚙ bash: deno test · 10s'), true, 'the rail row under the worker');
 });
+
+// Found in the real-console pass 2026-10-21: classic has no main.started, so a new turn's "thinking" was timed from
+// the previous turn's last answer ("working 4s · … thinking · 3m").
+test('a classic turn is timed from its own prompt, not from the previous turn\'s answer', () => {
+  const events = [
+    {kind: 'user', text: 'first', time: '2026-10-21T00:00:00Z'},
+    {kind: 'assistant', from: 'main', text: 'one', time: '2026-10-21T00:00:05Z'},
+    {kind: 'turn', text: 'completed', time: '2026-10-21T00:00:06Z'},
+    {kind: 'user', text: 'second', time: '2026-10-21T00:03:00Z'},
+    {kind: 'progress', from: 'main', text: 'Thinking', time: '2026-10-21T00:03:01Z'},
+  ];
+  assert.deepEqual(doingNow(events), {what: 'thinking', since: '2026-10-21T00:03:00Z'});
+  assert.deepEqual(doingNow(events.slice(0, 3)), {what: 'idle', since: '2026-10-21T00:00:06Z'}, 'an ended turn is idle');
+});

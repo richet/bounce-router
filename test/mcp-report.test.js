@@ -8,7 +8,6 @@ import {spawn} from 'node:child_process';
 import {createReportServer} from '../src/mcp-report.js';
 import {createBus} from '../src/bus.js';
 import {Session} from '../src/core.js';
-import {probeSandbox} from '../src/adapters/opencode-live.js';
 
 const valid = {op: 'final', phase: 'done', text: 'Checked the source.', next: '',
   evidence: ['src/a.js:1'], outcome: 'blocked', summary: 'One issue remains.', remaining: 'Review needed.'};
@@ -79,8 +78,7 @@ test('report MCP refuses an absent grant before connecting', async () => {
   assert.equal(connected, false);
 });
 
-test('sandboxed report MCP reaches only its assigned real bus and acknowledges the journaled row', async t => {
-  if (process.platform !== 'darwin') return t.skip('macOS sandbox-exec only');
+test('the report MCP reaches its assigned real bus and acknowledges the journaled row', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-report-mcp-'));
   const session = new Session(root, {root});
   const bus = await createBus({session, dir: session.dir, report: ({task, attempt, report}) =>
@@ -88,7 +86,7 @@ test('sandboxed report MCP reaches only its assigned real bus and acknowledges t
   t.after(async () => { await bus.close(); fs.rmSync(root, {recursive: true, force: true}); });
   const {file} = bus.grant({peer: 'worker:t1', tasks: ['t1'], context: session.id, report: {task: 't1', attempt: 1}});
   const script = fileURLToPath(new URL('../src/mcp-report.js', import.meta.url));
-  const child = spawn('/usr/bin/sandbox-exec', ['-p', probeSandbox(root, os.homedir(), null, bus.path), process.execPath, script],
+  const child = spawn(process.execPath, [script],
     {env: {...process.env, BOUNCE_REPORT_BUS: bus.path, BOUNCE_REPORT_TOKEN_FILE: file, BOUNCE_REPORT_TASK: 't1'}});
   t.after(() => { if (child.exitCode === null) child.kill(); });
   let stderr = '';

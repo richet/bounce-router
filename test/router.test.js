@@ -307,7 +307,7 @@ test('a persisted loaded-only load policy — the old default — migrates to on
 // whole escaped-JSON orders twice — once as `Running ·` when the command started, once as the tool row when
 // it finished. The command is as unbounded as its output was.
 // The orchestrator dispatches by shelling `bounce publish --event '<json>'`, so a whole brief — kind,
-// profile and 3 KB of orders — used to land on screen as escaped JSON, twice per task (Daniel, 2026-09-22:
+// profile and 3 KB of orders — used to land on screen as escaped JSON, twice per task (2026-09-22:
 // "look at that json", "fold it too.. if I want to see it I can go to the agents view"). The orders reach
 // the worker and the journal either way; the chat says what the call was.
 test('a bounce event is folded to what it is, not the escaped JSON it was typed as', () => {
@@ -360,7 +360,7 @@ test('a tool row carries the command and a bounded head of its output, never the
   assert.equal(small.text, 'echo hi\nhi');
 });
 
-// Classic mode is a conversation (docs/plans/classic-conversation.md): the provider that answered last turn
+// Classic mode is a conversation: the provider that answered last turn
 // continues its own thread with the bare prompt; the packet is for a first turn or a change of provider.
 const threadRunner = (attempts, {native = {claude: 'claude-sid-1', codex: 'codex-tid-1'}, lost = () => false} = {}) => async options => {
   attempts.push(options);
@@ -444,4 +444,37 @@ test('claude text streams as deltas and the whole block that follows is not show
   // A message that never streamed (an unrelated session) still lands whole.
   assert.deepEqual(normalize('claude', {type: 'assistant', session_id: 'other', message: {content: [{type: 'text', text: 'plain'}]}}), [{kind: 'assistant', text: 'plain'}]);
   assert.equal(echoesNormalizedRow({kind: 'raw', provider: 'claude', raw: {type: 'stream_event'}}), true, 'the raw stream rows are display, never journal');
+});
+
+// Streamed text is shown live, journaled once.
+test('streamed deltas reach the view live but the journal keeps one assistant row per text block, in order', async t => {
+  const {session} = setup(t);
+  const seen = [];
+  session.onEvent = event => seen.push(event.kind);
+  const router = new Router(session, defaults(), {runner: async options => {
+    for (const piece of ['Hel', 'lo, ', 'world.']) options.emit({kind: 'delta', text: piece});
+    options.emit({kind: 'tool', text: 'Read: {"file_path":"a.js"}'});
+    for (const piece of ['Done', '.']) options.emit({kind: 'delta', text: piece});
+    return {status: 'completed'};
+  }});
+  assert.equal(await router.run('hi'), 'completed');
+  const journal = fs.readFileSync(path.join(session.dir, 'journal.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(journal.filter(e => e.kind === 'delta').length, 0, 'no delta row is written to disk');
+  const said = journal.filter(e => ['assistant', 'tool'].includes(e.kind)).map(e => [e.kind, e.text, e.streamed ?? false]);
+  assert.deepEqual(said, [['assistant', 'Hello, world.', true], ['tool', 'Read: {"file_path":"a.js"}', false], ['assistant', 'Done.', true]]);
+  assert.equal(seen.filter(kind => kind === 'delta').length, 5, 'every delta was delivered live');
+});
+
+test('keepProcess sends a claude turn to the kept conversation; off (the default) it runs a process per turn', async t => {
+  const {session} = setup(t);
+  const used = [];
+  const conversations = {turn: async options => { used.push(['kept', options.provider]); options.emit({kind: 'assistant', text: 'kept'}); return {status: 'completed'}; }, closeAll() { used.push(['closed']); }};
+  const runner = async options => { used.push(['spawned', options.provider]); options.emit({kind: 'assistant', text: 'fresh'}); return {status: 'completed'}; };
+  const settings = {...defaults(), order: ['claude']};
+  const router = new Router(session, settings, {runner, conversations});
+  await router.run('one');
+  settings.keepProcess = true;
+  await router.run('two');
+  router.close();
+  assert.deepEqual(used, [['spawned', 'claude'], ['kept', 'claude'], ['closed']]);
 });

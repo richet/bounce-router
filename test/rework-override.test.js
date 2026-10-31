@@ -1,4 +1,4 @@
-// Observed live (session 159f4746, task 59e7f63a, 2026-09-25): a task blocked at an UNCONFIDENT
+// Observed live: a task blocked at an UNCONFIDENT
 // review gate (gone since 2026-09-27) offered the orchestrator only one way out (task.accepted with overrides). Its attempt
 // to send the work back as a retry was refused ("review gate unresolved; preserved candidate must be
 // reviewed, not rerun"), so it accepted work it disagreed with. task.rework is the symmetric "send

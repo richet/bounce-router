@@ -108,7 +108,7 @@ test('askBtw: journals btw.asked then btw.answered via the injected ask, exactly
   assert.equal(session.events.some(e => e.kind === 'aside'), false);
 });
 
-// The coordinator's live evidence (session 159f4746, seq 3354): a /btw typed while the
+// The coordinator's live evidence: a /btw typed while the
 // orchestrator was idle and a worker task was still running went unanswered — bounce journaled
 // only `{kind: 'aside', text}`. Reproduce the same shape and prove /btw now answers it instead.
 test('askBtw: orchestrator idle with a worker running — answers via the injected ask, no aside, nothing delivered', async () => {
@@ -118,7 +118,7 @@ test('askBtw: orchestrator idle with a worker running — answers via the inject
   const settings = {orchestrator: 'main', models: {}};
   const orchestration = {operation: 'orchestrator', orchestrator: 'main', profiles: {main: {adapter: 'codex', model: ''}}};
   const ask = async ({prompt, agent}) => { assert.match(prompt, /docker\/orbstack/); assert.equal(agent.adapter, 'codex'); return {text: 'bounce runs every service in this project\'s own docker compose scope, not the default one', model: 'codex'}; };
-  await askBtw({session, settings, orchestration, ask, id: 'seq3354', question: "this is weird.. I don't see anything ace related in docker/orbstack"});
+  await askBtw({session, settings, orchestration, ask, id: 'seq3354', question: "this is weird.. I don't see anything app related in docker/orbstack"});
   assert.equal(session.events.some(e => e.kind === 'btw.asked' && e.text.includes('docker/orbstack')), true);
   assert.equal(session.events.some(e => e.kind === 'btw.answered' && e.btw === 'seq3354'), true);
   assert.equal(session.events.some(e => e.kind === 'aside'), false, 'a /btw must never fall back to saving an aside');

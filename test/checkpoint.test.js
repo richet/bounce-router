@@ -104,7 +104,7 @@ test('C4 scheduler: dispatch refuses when the tree no longer matches the submitt
   await waitFor(() => scheduler.tasks()[row.task]?.state === 'failed');
 
   assert.equal(scheduler.tasks()[row.task].reason, 'baseline');
-  // CONTRACT.md §4 (amendment A2): the reservation and the availableStarts check are one
+  // The reservation and the availableStarts check are one
   // synchronous span, before the checkpoint's own await — so a baseline refusal reserves
   // first, then releases what it never consumed.
   const kinds = session.events.filter(e => e.task === row.task).map(e => e.kind);

@@ -292,7 +292,7 @@ test('a dispatch interrupted during its checkpoint is launched once after a rest
   assert.equal(reopened.events.filter(e => e.task === row.task && e.kind === 'task.started').length, 1);
 });
 
-// Observed live (reviewer 080b39ce): a 9 KB FAIL verdict needed its report repaired, the repair was
+// Observed live: a 9 KB FAIL verdict needed its report repaired, the repair was
 // refused as "the machine is swapping", and the task failed incomplete_report. Under synthesis
 // (src/final-report.js synthesizeReport), that answer needs no repair at all: it is substantive
 // prose read directly as the worker's own verdict — no resume, no repair round, whatever else

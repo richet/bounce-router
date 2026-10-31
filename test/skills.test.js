@@ -220,7 +220,7 @@ test('import offers a list to choose from and adopts only what was selected', t 
 test('import sees a workspace\'s own .claude/skills as well as the home area, whatever scope sync installs into', t => {
   const {root, home, cwd, options} = setup(t);
   write(path.join(home, '.claude/skills/hop'), 'hop', 'Drive the dev platform');
-  write(path.join(cwd, '.claude/skills/bunny-billing'), 'bunny-billing', 'Integrate billing');
+  write(path.join(cwd, '.claude/skills/acme-billing'), 'acme-billing', 'Integrate billing');
   write(path.join(cwd, '.codex/skills/broken'), 'broken', 'x');
   fs.writeFileSync(path.join(cwd, '.codex/skills/broken/SKILL.md'), 'no frontmatter');
   // The same skill in the workspace and at home is offered once, from the workspace, since
@@ -231,20 +231,20 @@ test('import sees a workspace\'s own .claude/skills as well as the home area, wh
   // The default scope is user; a project skill still shows, labelled with where it came from.
   const found = importCandidates({...options, scope: 'user'});
   assert.deepEqual(found.filter(r => r.skill).map(r => `${r.provider}:${r.scope}:${r.skill}:${r.action}`),
-    ['claude:project:bunny-billing:new', 'claude:user:hop:new', 'codex:project:broken:invalid', 'codex:project:deploy:new']);
+    ['claude:project:acme-billing:new', 'claude:user:hop:new', 'codex:project:broken:invalid', 'codex:project:deploy:new']);
   assert.equal(found.find(r => r.skill === 'deploy').description, 'Ship the site (work)');
   const listing = skillsCommand(['import', '--list'], {...options, scope: 'user'}).text;
-  assert.match(listing, /\+ bunny-billing \(claude · project\)/);
+  assert.match(listing, /\+ acme-billing \(claude · project\)/);
   assert.match(listing, /\+ hop \(claude\)/);
   assert.match(listing, /! broken \(codex · project\)/);
 
   // Adopting it installs it wherever sync is pointed; the workspace original is not touched.
   const report = importSkills({...options, scope: 'user'});
-  assert.equal(report.find(r => r.skill === 'bunny-billing').action, 'adopted');
+  assert.equal(report.find(r => r.skill === 'acme-billing').action, 'adopted');
   syncSkills({...options, scope: 'user'});
-  assert.equal(fs.existsSync(path.join(home, '.codex/skills/bunny-billing/SKILL.md')), true);
-  assert.equal(fs.readFileSync(path.join(cwd, '.claude/skills/bunny-billing/SKILL.md'), 'utf8').includes('Integrate billing'), true);
-  assert.equal(fs.existsSync(path.join(cwd, '.claude/skills/bunny-billing/.bounce-skill.json')), false, 'the native copy gains no marker');
+  assert.equal(fs.existsSync(path.join(home, '.codex/skills/acme-billing/SKILL.md')), true);
+  assert.equal(fs.readFileSync(path.join(cwd, '.claude/skills/acme-billing/SKILL.md'), 'utf8').includes('Integrate billing'), true);
+  assert.equal(fs.existsSync(path.join(cwd, '.claude/skills/acme-billing/.bounce-skill.json')), false, 'the native copy gains no marker');
 
   // With no workspace at all, only the home area is surveyed; a provider missing both says so.
   const homeOnly = importCandidates({root, home, env: {}});

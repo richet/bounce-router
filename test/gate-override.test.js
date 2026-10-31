@@ -1,4 +1,4 @@
-// Observed live (2026-09-25, headless run c3d78789): the orchestrator accepted a builder's work over an
+// Observed live (2026-09-25): the orchestrator accepted a builder's work over an
 // unconfident review gate (task.accepted with overrides, seq 503), but the task stayed `blocked`, its
 // isolated fix was never integrated, and because the rework it then dispatched was the blocked task's
 // child, that child's own block was treated as carried by its parent and never woke the orchestrator.
@@ -60,7 +60,7 @@ test('an override accept integrates the isolated work into the checkout before t
   assert.equal(integrated >= 0 && integrated < accepted, true, 'integrated before accepted');
 });
 
-// Observed live (2026-09-25, session 159f4746 seq 277-395): the orchestrator's own override accept became
+// Observed live (2026-09-25): the orchestrator's own override accept became
 // the task's "pending outcome" and re-woke it with the same task every turn until a disposition landed.
 test('the orchestrator\'s own accept is not handed back to it as a new outcome', () => {
   let seq = 0;

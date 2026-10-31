@@ -255,7 +255,7 @@ test('classic formatter (no compact) still renders a tool row as a full block', 
   assert.ok(tool.length > 1, 'classic keeps the multi-line tool block (byte-identical path unchanged)');
 });
 
-// Daniel, 2026-09-30, reading the transcript: the wake prompt bounce types at the orchestrator
+// 2026-09-30, reading the transcript: the wake prompt bounce types at the orchestrator
 // ("Continue your orders…") and the "Orchestrator selected codex" line repeated every turn are
 // bounce talking to the orchestrator, not the conversation. The journal keeps both rows; the
 // transcript shows a route only when the AI changes, and a request row never.
@@ -282,7 +282,7 @@ test('the transcript hides the orchestrator request row and a route that repeats
   assert.equal(compact.event(handoff, 120)[0].includes('Worker outcomes not yet handed to you'), true);
 });
 
-// Daniel, 2026-10-01: a prompt typed while a turn runs was held by the view and showed nowhere until it
+// 2026-10-01: a prompt typed while a turn runs was held by the view and showed nowhere until it
 // was sent. A pending prompt is a user row marked `local`: shown where it will land, tagged queued.
 test('a prompt still queued in this view is shown as the user\'s, tagged queued', () => {
   const compact = createFormatter({color: false, compact: true});
@@ -300,4 +300,48 @@ test('a settings row renders as a block with one line per setting', () => {
   const compact = createFormatter({color: false, compact: true});
   const rows = compact.event({kind: 'settings', text: 'Settings (x/config.json; what the file does not set is a default):\n  order = ["codex"] · provider order · applies now\n  sweepMinutes = 20 (default) · quiet minutes · applies next session'}, 120);
   assert.deepEqual(rows, ['Bounce · Settings', '  Settings (x/config.json; what the file does not set is a default):', '    order = ["codex"] · provider order · applies now', '    sweepMinutes = 20 (default) · quiet minutes · applies next session', '']);
+});
+
+// The conversation shows an answer whole; folding is for worker panes.
+test('the conversation formatter shows a long code block and a table whole; the pane formatter still folds them', () => {
+  const code = Array.from({length: 40}, (_, n) => `line${n} = ${n}`).join('\n');
+  const table = ['| name | qty | price |', '|---|---|---|', ...Array.from({length: 10}, (_, n) => `| item${n} | ${n} | ${n * 100} |`)].join('\n');
+  const answer = `Here:\n\n\`\`\`js\n${code}\n\`\`\`\n\n${table}`;
+  const conversation = createFormatter({color: false, compact: true, foldAnswers: false}).event({kind: 'assistant', text: answer}, 80).join('\n');
+  assert.match(conversation, /line39 = 39/, 'the last code line is shown');
+  assert.doesNotMatch(conversation, /\+\d+ lines/);
+  assert.match(conversation, /item9\s+9\s+900/, 'the last table row, its cells in aligned columns');
+  assert.match(conversation, /name\s+qty\s+price/, 'the header row');
+  assert.doesNotMatch(conversation, /\+\d+ rows/);
+  const pane = createFormatter({color: false, compact: true}).event({kind: 'assistant', text: answer}, 80).join('\n');
+  assert.match(pane, /\+36 lines/);
+  assert.match(pane, /\+7 rows/);
+});
+
+test('a table too wide for the column shows every row as label: value lines instead of cutting it off', () => {
+  const wide = ['| a long header name | another long header | third header here |', '|---|---|---|', '| some long cell value | another long value | a third long value |', '| row two first | row two second | row two third |'].join('\n');
+  const rows = createFormatter({color: false, compact: true, foldAnswers: false}).event({kind: 'assistant', text: wide}, 60).join('\n');
+  assert.match(rows, /a long header name: some long cell value/);
+  assert.match(rows, /third header here: row two third/);
+});
+
+test('a streaming answer renders the same as the whole answer while only its last paragraph is re-rendered', () => {
+  const f = createFormatter({color: false, compact: true, foldAnswers: false});
+  const parts = ['First paragraph with **bold** text.', '```js\nconst a = 1;\n\nconst b = 2;\n```', '- one\n- two', 'Last paragraph still stream'];
+  const whole = parts.join('\n\n');
+  let rendered;
+  for (let end = 1; end <= whole.length; end += 7) rendered = f.event({kind: 'delta', text: whole.slice(0, end)}, 60);
+  rendered = f.event({kind: 'delta', text: whole}, 60);
+  assert.deepEqual(rendered, f.event({kind: 'assistant', text: whole}, 60));
+  assert.ok(f.streamStats().reused > 0, 'finished paragraphs were reused, not re-rendered');
+});
+
+// Found in the real-console pass 2026-10-21: /sessions printed its table inside an activity row, so the header sat
+// after the "Bounce · Activity" label and every row wrapped; /stats cut its first line mid-word.
+test('/sessions is a block whose table rows keep their columns, and /stats wraps its first line', () => {
+  const table = ['  NAME            AGE  MODE     ID', '● deadline-check   2s  classic  223f471c  /a/very/long/workspace/path/that/does/not/fit'];
+  const rows = plain.event({kind: 'sessions', from: 'bounce', text: table.join('\n')}, 60);
+  assert.deepEqual(rows.slice(0, 3), ['Bounce · Sessions', `  ${table[0]}`, `  ${table[1].slice(0, 58)}`]);
+  const stats = plain.event({kind: 'stats', from: 'bounce', text: 'Session 223f471c · 0.1 h from first row to last (a session resumed over days counts the gaps)\nOutcome: 0 tasks'}, 50);
+  assert.match(stats.join('\n'), /counts the gaps\)/, 'the end of the first line is there');
 });

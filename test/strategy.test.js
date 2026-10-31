@@ -1,4 +1,4 @@
-// Phase 8 — pluggable orchestration strategy (CONTRACT.md §6). S1-S6, composed real scheduler +
+// Phase 8 — pluggable orchestration strategy. S1-S6, composed real scheduler +
 // fake adapters + fake/hostile strategies, exactly like test/scheduler.test.js and
 // test/policy.test.js. S1 (decisive): the full existing suite (this repo's `npm test`) stays
 // green with defaultStrategy self-hosted and zero pre-existing expectation edits — verified

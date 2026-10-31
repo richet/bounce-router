@@ -3,6 +3,8 @@ const describe = value => typeof value === 'string' ? value : JSON.stringify(val
 const foregroundTasks = new Set();
 // Text blocks seen streaming per session, so the whole block in the following `assistant` row is skipped.
 const streamed = new Map();
+// The context each session's last request filled (input, cache and output of its latest message), for the footer.
+const lastContext = new Map();
 const contentText = value => Array.isArray(value)
   ? value.map(part => part?.type === 'text' ? part.text : part?.type === 'image' ? '[image]' : describe(part)).join('\n')
   : describe(value);
@@ -38,6 +40,10 @@ export default {
       if (event.type === 'content_block_start' && event.content_block?.type === 'text') streamed.set(key, (streamed.get(key) ?? 0) + 1);
       if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta' && event.delta.text) add('delta', event.delta.text);
     }
+    if (raw.type === 'assistant' && raw.message?.usage) {
+      const u = raw.message.usage;
+      lastContext.set(raw.session_id ?? '', (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.output_tokens ?? 0));
+    }
     if (raw.type === 'assistant') for (const block of raw.message?.content ?? []) {
       if (block.type === 'text') {
         const key = raw.session_id ?? '', pending = streamed.get(key) ?? 0;
@@ -50,7 +56,9 @@ export default {
     }
     if (raw.type === 'result') {
       if (raw.is_error) add('error', raw.errors ?? raw.result ?? raw.subtype);
-      add('usage', raw.usage ?? {}, {usage: raw.usage});
+      const window = Object.values(raw.modelUsage ?? {}).map(model => model?.contextWindow).find(Number.isInteger);
+      const used = lastContext.get(raw.session_id ?? '');
+      add('usage', raw.usage ?? {}, {usage: raw.usage, ...(window && used ? {context: {used, window}} : {})});
       add('result', raw.result ?? raw.subtype, {success: !raw.is_error});
     }
     if (raw.type === 'rate_limit_event' && raw.rate_limit_info?.status === 'rejected') add('error', 'usage limit: ' + describe(raw.rate_limit_info));

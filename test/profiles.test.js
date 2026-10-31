@@ -30,11 +30,11 @@ test('overlay: a two-profile table sits on top of the whole shipped roster, in s
   const view = validateOrchestration(settings);
   const shipped = Object.keys(starterProfiles(settings));
   assert.deepEqual(Object.keys(view.profiles), [...shipped, 'scout'], 'shipped names first, then the user\'s own');
-  assert.equal(Object.keys(view.profiles).length, 13);
+  assert.equal(Object.keys(view.profiles).length, 16);
   assert.equal(view.profiles.main.model, 'opus', 'the user\'s main');
   assert.equal(view.profiles.claude_haiku.adapter, 'claude');
   assert.deepEqual(view.profiles.build.fallback, ['build_claude', 'claude_fable'], 'shipped fallbacks are kept');
-  assert.equal(view.profiles.scout.policy, 'probe');
+  assert.equal(view.profiles.scout.policy, 'write');
   // every shipped profile is validated like a user-written one: mode, policy and role defaults
   for (const name of shipped.slice(1)) assert.deepEqual([view.profiles[name].mode, view.profiles[name].policy, view.profiles[name].role], ['yolo', 'write', 'builder'], name);
   assert.equal(routingFallback(view.profiles), 'build');
@@ -50,7 +50,7 @@ test('overlay: a user entry replaces the shipped profile of the same name outrig
   const settings = {operation: 'orchestrator', order: ['claude'], mode: 'yolo', orchestrator: 'main',
     profiles: {main: {adapter: 'claude'}, build: {adapter: 'codex', model: 'gpt-6-astra', fallback: ['build_claude']}, build_claude: {adapter: 'claude', model: 'default'}}};
   const view = validateOrchestration(settings);
-  assert.equal(Object.keys(view.profiles).length, 12);
+  assert.equal(Object.keys(view.profiles).length, 15);
   assert.equal(view.profiles.build_claude.model, 'default');
   assert.deepEqual(view.profiles.build_claude.fallback, [], 'no field-level merge: the shipped fallback is gone with the entry');
   assert.deepEqual(view.profiles.build.fallback, ['build_claude']);
@@ -69,7 +69,7 @@ test('overlay: null drops a shipped profile and prunes shipped fallbacks into it
   assert.equal(Object.hasOwn(view.profiles, 'muse_spark'), false);
   assert.equal(Object.hasOwn(view.profiles, 'never_there'), false, 'dropping a name the roster lacks is a no-op');
   assert.deepEqual(view.profiles.claude_haiku.fallback, [], 'the shipped fallback into codex_luna is dropped, not an error');
-  assert.equal(Object.keys(view.profiles).length, 9);
+  assert.equal(Object.keys(view.profiles).length, 12);
   // the routing fallback is the first writing builder that is left
   assert.equal(routingFallback(validateOrchestration({...settings, profiles: {main: {adapter: 'claude'}, build: null}}).profiles), 'build_claude');
   // a user-written fallback into a dropped profile is the user's error
@@ -143,7 +143,7 @@ test('P4 error messages, one case each', () => {
   assert.throws(() => validateOrchestration({...base, profiles: {main: {adapter: 'claude', mode: 'sideways'}}}),
     {message: 'profile main: mode must be yolo or plan'});
   assert.throws(() => validateOrchestration({...base, profiles: {main: {adapter: 'claude', policy: 'delete'}}}),
-    {message: 'profile main: policy must be write, read-only or probe'});
+    {message: 'profile main: policy must be write or read-only'});
   assert.throws(() => validateOrchestration({...base, profiles: {main: {adapter: 'claude'}, build: {adapter: 'claude', fallback: ['ghost']}}}),
     {message: 'profile build: fallback must list known profiles'});
   // Phase 8 §4: the role vocabulary is free-form now (any non-empty label except the reserved

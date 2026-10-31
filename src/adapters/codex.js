@@ -19,6 +19,9 @@ export default {
   },
   stdin: prompt => prompt,
   normalize(message) {
+    // The app-server streams the answer as it is written (measured 2026-10-21: first fragment at 3.2 s of a 7.7 s
+    // turn); `codex exec` has no such row and prints the message whole. The completed message still follows.
+    if (message.method === 'item/agentMessage/delta' && typeof message.params?.delta === 'string') return message.params.delta ? [{kind: 'delta', text: message.params.delta}] : [];
     // `codex exec` names a row `type: 'turn.completed'`; the app-server peer sends the same
     // payload as a notification `method: 'turn/completed'`. One protocol, two spellings.
     const raw = message.type === undefined && typeof message.method === 'string' ? {...message.params, type: message.method.replace('/', '.')} : message;

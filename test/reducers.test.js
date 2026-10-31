@@ -47,10 +47,10 @@ test('a fallback attempt is not stale because the task it replaced was', () => {
   assert.equal(quiet.verdicts.includes('silent'), true, 'its own 5 minutes of silence, measured from t1');
   assert.equal(quiet.lastProgressAt, t1, 'measured from its own start, not the lineage root\'s');
 
-  // A fresh attempt is owed a full lease (Daniel, 2026-09-22). Live, this fallback launched with 58 s
+  // A fresh attempt is owed a full lease (2026-09-22). Live, this fallback launched with 58 s
   // left of the lineage's lease — the predecessor had burned 14 of the 15 minutes — so it could only fail.
-  // The lease runs from THIS attempt's start. Since 2026-09-30 so does the ceiling (Daniel: a job's time
-  // is not shared between its attempts; ACE e3bd01d5 lost two Sonnet retries to a ceiling a slow local
+  // The lease runs from THIS attempt's start. Since 2026-09-30 so does the ceiling (the user: a job's time
+  // is not shared between its attempts; a session lost two Sonnet retries to a ceiling a slow local
   // retry had spent). The attempt allowance is what stops a job buying more time by failing over and over.
   assert.equal(quiet.startedAt, t1, 'elapsed and the ceiling are measured from this attempt\'s own start');
   assert.equal(quiet.ceilingAt, t1 + 3600000);
@@ -265,7 +265,8 @@ test('modelUsage: raw codex usage keys normalize, and repeat turns on the same m
     {kind: 'usage', from: 'main', provider: 'codex', usage: {input_tokens: 2000, cached_input_tokens: 0, output_tokens: 700}},
   ];
   const [row] = modelUsage(events);
-  assert.deepEqual(row, {model: 'gpt-5-codex', provider: 'codex', usage: {input: 3000, cache_read: 200, cache_write: 0, output: 1000}, tokens: 4200, turns: 2});
+  // codex's input_tokens include its cached_input_tokens: 1000 of which 200 cached is 800 uncached plus 200 cached.
+  assert.deepEqual(row, {model: 'gpt-5-codex', provider: 'codex', usage: {input: 2800, cache_read: 200, cache_write: 0, output: 1000}, tokens: 4000, turns: 2});
 });
 
 test('modelUsage: a worker task.usage row (already-normalized) attributes via its own model row, keyed by task, never crossing tasks', () => {
@@ -309,8 +310,9 @@ test('modelUsage: real codex main-session usage carries cache_write_input_tokens
     {kind: 'usage', from: 'main', provider: 'codex', usage: {input_tokens: 102543, cached_input_tokens: 85760, cache_write_input_tokens: 5000, output_tokens: 567, reasoning_output_tokens: 22}},
   ];
   const [row] = modelUsage(events);
-  assert.deepEqual(row.usage, {input: 102543, cache_read: 85760, cache_write: 5000, output: 567});
-  assert.equal(row.tokens, 102543 + 85760 + 5000 + 567);
+  // input_tokens include the cached_input_tokens (codex 0.162, measured 2026-10-21): 102543 − 85760 uncached.
+  assert.deepEqual(row.usage, {input: 16783, cache_read: 85760, cache_write: 5000, output: 567});
+  assert.equal(row.tokens, 16783 + 85760 + 5000 + 567);
 });
 
 test('modelUsage: a route.model of "default" is not a pinned model, so usage lands on "<provider> default"', () => {
@@ -335,7 +337,7 @@ test('modelUsage: unusable or empty usage rows are dropped, never crash, never r
 
 // A parked task holds no slot and has no lease: `blocked` yields only its existing ['blocked']
 // escalation verdict and `input_required` yields none at all, however long it has been parked —
-// neither can ever time out here. Found live (session 159f4746, 4 tasks): the previous lease,
+// neither can ever time out here. Found live: the previous lease,
 // measured from the moment a task parked, silently discarded a blocked worker's resumable context
 // after 60 minutes nobody was watching, even though parking is what freed its slot in the first
 // place. It stays parked until answered (a message, a task.rework, an accept) or cancelled.
@@ -360,4 +362,24 @@ test('a parked task never expires here, however long nobody answers it', () => {
   assert.deepEqual(watchdog(blocked, parkedAt + 60000, {activity: new Map(), watchdog: cfg}).find(r => r.task === 'ask').verdicts, ['blocked']);
   assert.deepEqual(watchdog(blocked, parkedAt + 36000000, {activity: new Map(), watchdog: cfg}).find(r => r.task === 'ask').verdicts, ['blocked'],
     'ten hours blocked is still just the one escalation verdict, never an expiry');
+});
+
+// Found live (a session): after a rework the check passed in 69 s and a review started, yet the task kept saying
+// "Running the task's check" for the whole review; the orchestrator found no check process and reported a hang.
+test('a task says how its check ended and who reviews it, not the check it already finished', () => {
+  const at = n => `2026-10-26T23:${String(n).padStart(2, '0')}:00.000Z`;
+  const events = [
+    {kind: 'task.submitted', task: 't', parent: null, profile: 'builder', review: {completion: 'reviewer'}, time: at(0)},
+    {kind: 'task.started', task: 't', attempt: 1, time: at(1)},
+    {kind: 'task.completed', task: 't', summary: 'done', time: at(2)},
+    {kind: 'task.milestone', task: 't', attempt: 1, phase: 'check', text: "Running the task's check: npm test", time: at(2)},
+  ];
+  assert.equal(tasks(events).t.lastMilestone.text, "Running the task's check: npm test");
+  events.push({kind: 'task.check', task: 't', attempt: 1, exit: 0, passed: true, time: at(3)});
+  assert.equal(tasks(events).t.lastMilestone.text, 'The check passed (exit 0)');
+  events.push({kind: 'review.started', task: 't', stage: 'completion', round: 1, profile: 'reviewer@codex:gpt-6.1-sol', time: at(3)});
+  assert.equal(tasks(events).t.lastMilestone.text, 'The check passed (exit 0); reviewer@codex:gpt-6.1-sol is reviewing it (round 1)');
+  events.push({kind: 'review.finished', task: 't', stage: 'completion', round: 1, verdict: 'unreadable', time: at(5)});
+  assert.equal(tasks(events).t.lastMilestone.text, 'Review round 1 ended: unreadable');
+  assert.equal(tasks([...events.slice(0, 4), {kind: 'task.check', task: 't', attempt: 1, exit: null, passed: false, timedOut: true, time: at(9)}]).t.lastMilestone.text, 'The check timed out');
 });

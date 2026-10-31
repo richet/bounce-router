@@ -7,8 +7,7 @@ export const EVIDENCE_MAX = 32;
 export const OUTCOMES = new Set(['completed', 'failed', 'blocked', 'input_required']);
 
 // A worker's outcome word missing the canonical set by a synonym, not a typo, is still a clear
-// verdict — normalize case-insensitively before refusing it. Found live (session 159f4746, 2
-// tasks): a near-miss outcome word was refused by `bounce_report`, and the worker never recovered
+// verdict — normalize case-insensitively before refusing it. Found live: a near-miss outcome word was refused by `bounce_report`, and the worker never recovered
 // its final report. Unknown words fall through unchanged, so validateReport still refuses them.
 const OUTCOME_SYNONYMS = {
   success: 'completed', succeeded: 'completed', done: 'completed', complete: 'completed', finished: 'completed',

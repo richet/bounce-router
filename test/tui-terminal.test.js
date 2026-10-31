@@ -386,3 +386,134 @@ test('worker scrollback stays put during activity and returns to live output at 
     assert.equal(visible().at(-1), 'worker-history-24');
   } finally { terminal.unmount(); }
 });
+
+// Drag selects inside the region it started in, release copies.
+async function mountedForSelection(t, initial, options = {}) {
+  const stdin = new PassThrough(), stdout = new PassThrough();
+  stdin.setRawMode = () => {};
+  stdout.columns = 120; stdout.rows = 20;
+  stdout.on('data', () => {});
+  const copied = [], scrolled = [];
+  const terminal = createInkTerminal({stdin, stdout, onKeypress() {}, onCopy: text => copied.push(text), onScroll: (amount, region) => scrolled.push([amount, region]), ...options});
+  await terminal.mount(initial);
+  t.after(() => terminal.unmount());
+  await new Promise(resolve => setTimeout(resolve, 60));
+  // The 1-based cell of `word` in the region that shows it.
+  const cellOf = word => {
+    for (const region of terminal.regions()) {
+      const shown = region.visible ?? region.rows.map((_, index) => index).slice(0, region.height);
+      const line = shown.findIndex(row => stripAnsi(String(region.rows[row])).includes(word));
+      if (line >= 0) return {region: region.id, x: region.x + stripAnsi(String(region.rows[shown[line]])).indexOf(word) + 1, y: region.y + line + 1};
+    }
+    return null;
+  };
+  const send = sequence => new Promise(resolve => { stdin.write(sequence); setTimeout(resolve, 80); });
+  return {terminal, copied, scrolled, cellOf, send};
+}
+
+test('a drag across a transcript row copies the words under it on release, and the highlight shows them', async t => {
+  const {terminal, copied, cellOf, send} = await mountedForSelection(t, {events: [{kind: 'note', id: 'n1', text: 'alpha beta gamma delta'}]});
+  const start = cellOf('beta');
+  assert.ok(start, 'the note is drawn in a region');
+  await send(`\x1b[<0;${start.x};${start.y}M\x1b[<32;${start.x + 4};${start.y}M`);
+  assert.equal(terminal.snapshot().view.selection.region, start.region);
+  assert.deepEqual(copied, [], 'nothing is copied while the button is down');
+  await send(`\x1b[<32;${start.x + 10};${start.y}M\x1b[<0;${start.x + 10};${start.y}m`);
+  assert.deepEqual(copied, ['beta gamma']);
+  assert.ok(terminal.snapshot().view.selection, 'the selection stays shown after the copy');
+  await send('x');
+  assert.equal(terminal.snapshot().view.selection, null, 'a key clears it');
+});
+
+test('a double-click copies the word; a plain click copies nothing and clears the selection', async t => {
+  const {copied, cellOf, send} = await mountedForSelection(t, {events: [{kind: 'note', id: 'n1', text: 'open src/tui/selection.js:12 now'}]});
+  const at = cellOf('selection.js');
+  await send(`\x1b[<0;${at.x};${at.y}M\x1b[<0;${at.x};${at.y}m\x1b[<0;${at.x};${at.y}M\x1b[<0;${at.x};${at.y}m`);
+  assert.deepEqual(copied, ['src/tui/selection.js:12']);
+  await new Promise(resolve => setTimeout(resolve, 450));
+  await send(`\x1b[<0;${at.x};${at.y}M\x1b[<0;${at.x};${at.y}m`);
+  assert.deepEqual(copied, ['src/tui/selection.js:12'], 'a single click copies nothing');
+});
+
+test('a drag that runs into the sidebar stays in the conversation, and the wheel names the region under it', async t => {
+  const {copied, scrolled, cellOf, send, terminal} = await mountedForSelection(t, {events: [{kind: 'note', id: 'n1', text: 'left side words'}]});
+  const at = cellOf('side');
+  const sidebar = terminal.regions().find(region => region.id === 'sidebar');
+  assert.ok(sidebar, 'a 120-column terminal shows the sidebar');
+  await send(`\x1b[<0;${at.x};${at.y}M\x1b[<32;${sidebar.x + 5};${at.y}M\x1b[<0;${sidebar.x + 5};${at.y}m`);
+  assert.deepEqual(copied, ['side words'], 'clamped to the conversation\'s right edge');
+  await send(`\x1b[<64;${sidebar.x + 2};3M\x1b[<65;${at.x};${at.y}M`);
+  assert.deepEqual(scrolled, [[3, 'sidebar'], [-3, at.region]]);
+});
+
+test('in the agent workspace a drag stays inside the worker pane it started in, and the wheel names the pane under it', async t => {
+  const {copied, scrolled, cellOf, send, terminal} = await mountedForSelection(t, {agentsOpen: true, events: [
+    {kind: 'assistant', id: 'o1', seq: 1, text: 'orchestrator words here'},
+    {kind: 'task.submitted', id: 's1', seq: 2, task: 'worker-one', profile: 'build'},
+    {kind: 'task.activity', id: 'a1', seq: 3, task: 'worker-one', text: 'worker found the bug'},
+  ]});
+  const at = cellOf('found the bug');
+  assert.equal(at?.region, 'worker:worker-one', 'the worker\'s activity is drawn in its own pane region');
+  const orchestrator = terminal.regions().find(region => region.id === 'orchestrator');
+  // Dragged leftwards across the gap into the orchestrator's pane: the selection stops at the worker pane's left
+  // edge, so it takes the start of the worker's row and nothing of the orchestrator's text beside it.
+  await send(`\x1b[<0;${at.x + 13};${at.y}M\x1b[<32;${orchestrator.x + 3};${at.y}M\x1b[<0;${orchestrator.x + 3};${at.y}m`);
+  assert.equal(copied.length, 1);
+  assert.match(copied[0], /found the bug$/);
+  assert.doesNotMatch(copied[0], /orchestrator/);
+  await send(`\x1b[<64;${at.x};${at.y}M`);
+  assert.deepEqual(scrolled, [[3, 'worker:worker-one']]);
+});
+
+test('dragging past the top of the conversation scrolls it and the selection grows with what comes into view', async t => {
+  const events = Array.from({length: 60}, (_, n) => ({kind: 'note', id: `n${n}`, text: `line-${String(n).padStart(2, '0')}`}));
+  let scroll = 0, terminal;
+  const env = await mountedForSelection(t, {events}, {onScroll: (amount, region) => {
+    if (region !== 'orchestrator') return;
+    scroll = Math.max(0, scroll + amount);
+    terminal.update({scroll});
+  }});
+  terminal = env.terminal;
+  const {copied, cellOf, send} = env;
+  const start = cellOf('line-59');
+  assert.ok(start, 'the newest line is on screen');
+  const top = terminal.regions().find(region => region.id === 'orchestrator');
+  const hiddenAtStart = top.rows.findIndex(text => stripAnsi(String(text)).includes('line-40'));
+  assert.equal(top.visible.includes(hiddenAtStart), false, 'line-40 starts off screen');
+  await send(`\x1b[<0;${start.x + 7};${start.y}M\x1b[<32;${start.x};1M`);
+  await new Promise(resolve => setTimeout(resolve, 900));
+  assert.ok(scroll > 0, 'holding the pointer above the conversation scrolled it');
+  await send(`\x1b[<0;${start.x};1m`);
+  assert.equal(copied.length, 1);
+  const lines = copied[0].split('\n').filter(line => /line-\d\d/.test(line));
+  assert.match(lines.at(-1), /Saved note  line-59$/, 'the selection still ends where the drag began');
+  assert.ok(lines.some(line => line.includes('line-40')), `rows scrolled into view are in the copy: ${lines[0]} … ${lines.at(-1)}`);
+});
+
+test('in the agent workspace, dragging to a worker pane\'s top edge scrolls that pane\'s activity and copies what came into view', async t => {
+  const events = [
+    {kind: 'task.submitted', id: 's1', seq: 1, task: 'worker-one', profile: 'build'},
+    ...Array.from({length: 40}, (_, n) => ({kind: 'task.activity', id: `a${n}`, seq: n + 2, task: 'worker-one', text: `step-${String(n).padStart(2, '0')}`})),
+  ];
+  const scrolls = {};
+  let terminal;
+  const env = await mountedForSelection(t, {agentsOpen: true, events}, {onScroll: (amount, region) => {
+    scrolls[region] = Math.max(0, (scrolls[region] ?? 0) + amount);
+    terminal.update({paneScrolls: {...scrolls}});
+  }});
+  terminal = env.terminal;
+  const {copied, cellOf, send} = env;
+  const pane = terminal.regions().find(region => region.id === 'worker:worker-one');
+  // The newest activity row is the pane's last shown line (its header repeats it as `operation: step-39`).
+  const lastLine = pane.visible.length - 1;
+  assert.match(stripAnsi(String(pane.rows[pane.visible[lastLine]])), /^● step-39$/);
+  const start = {x: pane.x + 1 + '● step-39'.length, y: pane.y + lastLine + 1};
+  await send(`\x1b[<0;${start.x};${start.y}M\x1b[<32;${start.x};${pane.y + 1}M`);
+  await new Promise(resolve => setTimeout(resolve, 600));
+  assert.ok(scrolls['worker:worker-one'] > 0, 'the pane under the drag scrolled');
+  await send(`\x1b[<0;${start.x};${pane.y + 1}m`);
+  assert.doesNotMatch(copied[0], /operation:/, 'the fixed header is not part of a drag that scrolled the activity');
+  const steps = copied[0].split('\n').map(line => /step-(\d\d)/.exec(line)?.[1]).filter(Boolean).map(Number);
+  assert.equal(steps.at(-1), 39, 'the selection still ends at the row the drag began on');
+  assert.ok(steps[0] < 39 - pane.height, `rows that were above the pane's view are copied too (from step ${steps[0]})`);
+});
