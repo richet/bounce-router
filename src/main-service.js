@@ -491,6 +491,8 @@ export function createMainService({session, adapters, profile, settings, profile
     if (params.typed !== undefined && (typeof params.typed !== 'string' || !params.typed.startsWith('/'))) return {accepted: false, reason: 'invalid_typed'};
     // `bounce send` (src/send.js): a user turn typed outside the view, marked so the journal says so.
     if (params.via !== undefined && params.via !== 'send') return {accepted: false, reason: 'invalid_via'};
+    // Who sent it, in the sender's own words: a label for `bounce lineage`, which nothing trusts for access.
+    if (params.caller !== undefined && (params.via !== 'send' || typeof params.caller !== 'string' || !params.caller.trim() || params.caller.length > 200 || /[\r\n]/.test(params.caller))) return {accepted: false, reason: 'invalid_caller'};
     if (params.routing !== undefined && (!params.routing || !Array.isArray(params.routing.order)
       || params.routing.order.some(p => !['claude', 'codex', 'muse'].includes(p))
       || !params.routing.models || typeof params.routing.models !== 'object'
@@ -514,7 +516,7 @@ export function createMainService({session, adapters, profile, settings, profile
       // row itself: a daemon restart rebuilds queuedPrompts from the journal (below), not from this
       // in-memory array, and needs enough here to call start() again unchanged.
       session.append({kind: 'user', text: params.text, queued: true, requestId: id,
-        ...(params.typed ? {typed: params.typed} : {}), ...(params.via ? {via: params.via} : {}), ...(images.length ? {images} : {}),
+        ...(params.typed ? {typed: params.typed} : {}), ...(params.via ? {via: params.via} : {}), ...(params.caller ? {caller: params.caller} : {}), ...(images.length ? {images} : {}),
         ...(params.provider ? {provider: params.provider} : {}), ...(params.model ? {model: params.model} : {}),
         ...(params.mode ? {mode: params.mode} : {}), ...(params.routing ? {routing: params.routing} : {})});
       if (isFirstPrompt) { try { onFirstUserPrompt(session, settings); } catch {} }
@@ -549,7 +551,7 @@ export function createMainService({session, adapters, profile, settings, profile
       dueAt: wake ? now() : null, ...(params.recoveryOf ? {recoveryOf: params.recoveryOf, rootRequestId: run.rootRequestId} : {})};
     const committed = [requested];
     // A dispatch drained from the queue already journaled its `user` row when it was queued.
-    if (!wake && !fromQueue) committed.unshift({kind: 'user', text: params.text, ...(params.typed ? {typed: params.typed} : {}), ...(params.via ? {via: params.via} : {}), ...(images.length ? {images} : {})});
+    if (!wake && !fromQueue) committed.unshift({kind: 'user', text: params.text, ...(params.typed ? {typed: params.typed} : {}), ...(params.via ? {via: params.via} : {}), ...(params.caller ? {caller: params.caller} : {}), ...(images.length ? {images} : {})});
     if (sweep) committed.push({kind: 'handoff', wake, sweep: true, requestId: run.id, actionIds: [], outcomeSeqs: [], tasks: held.map(t => t.id), text: `${run.outcomes}\n\n${params.text}`, from: 'bounce'});
     else if (actions.length) committed.push({kind: 'handoff', wake, requestId: run.id,
       actionIds: run.actionIds, outcomeSeqs: run.outcomeSeqs, tasks: actions.filter(action => action.task).map(action => action.task),

@@ -99,6 +99,21 @@ test('control MCP: send, then answer, reach the live session the way bounce send
   assert.equal((await call('answer', {request: 'nope'})).structuredContent.status, 'unknown');
 });
 
+test('a sender can say who it is, on bounce send and on the control MCP, and only a sent turn carries it', async t => {
+  const f = fixture(t);
+  await sendToOrchestrator(await viewOf(t, f), 'first', {caller: 'control-session-1', wait: true, timeoutMs: 5000});
+  assert.equal(f.session.events.findLast(e => e.kind === 'user').caller, 'control-session-1');
+  const {createControlServer} = await import('../src/mcp-control.js');
+  const server = await createViewServer({session: f.session, main: f.main, token: 'secret'});
+  t.after(() => server.close());
+  const control = createControlServer({sessions: () => [{id: f.session.id, name: 'webapp', cwd: '/w/webapp', live: true}], connect: () => connectView({path: server.path, token: 'secret'})});
+  await control.handle({jsonrpc: '2.0', id: 1, method: 'tools/call', params: {name: 'send', arguments: {message: 'second', caller: 'control-session-2', wait_seconds: 5}}});
+  assert.equal(f.session.events.findLast(e => e.kind === 'user').caller, 'control-session-2');
+  assert.equal((await f.main.run({text: 'typed', caller: 'someone'})).reason, 'invalid_caller');
+  assert.equal((await f.main.run({text: 'sent', via: 'send', caller: 'x'.repeat(201)})).reason, 'invalid_caller');
+  assert.equal((await f.main.run({text: 'sent', via: 'send', caller: 'two\nlines'})).reason, 'invalid_caller');
+});
+
 test('control MCP: with several live sessions, send names them instead of guessing', async () => {
   const {createControlServer} = await import('../src/mcp-control.js');
   const control = createControlServer({sessions: () => [{id: 'aaaa1111', name: 'webapp', cwd: '/w/webapp', live: true}, {id: 'bbbb2222', name: 'api', cwd: '/w/api', live: true}], connect: () => { throw new Error('never'); }});

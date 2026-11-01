@@ -50,6 +50,7 @@ import {handoffBlock} from './main-service.js';
 import {providers, runProcess} from './providers.js';
 import {projectRoot, fingerprint, validate, supervise, pidAlive} from './reload.js';
 import {listSessions, resolveSessionRef, sessionsTable, sessionAge} from './sessions.js';
+import {sessionLineage, lineageLine} from './lineage.js';
 import {titleSession, createAsk} from './session-title.js';
 import {askBtw, createBtwAsk} from './btw.js';
 import {createRemoteSession} from './remote.js';
@@ -323,6 +324,17 @@ async function main() {
     }
     const rows = taskList(target.events, {all: Boolean(values.all)});
     return console.log(values.json ? JSON.stringify(rows, null, 2) : formatTaskList(rows));
+  }
+  // bounce lineage [SESSION] [--json]: which vendor session did what, for one session or all of them.
+  if (positionals[0] === 'lineage') {
+    const ref = values.session || positionals[1];
+    for (const id of ref ? [resolveSessionRef(root, ref)] : listSessions(root).map(row => row.id)) {
+      let rows;
+      try { rows = sessionLineage(root, id); }
+      catch (error) { console.error(`bounce: lineage skipped session ${id}: ${error.message}`); continue; }
+      for (const row of rows) console.log(values.json ? JSON.stringify(row) : lineageLine(row));
+    }
+    return;
   }
   // bounce stats [--session REF] [--json] [--tasks] [--against REF]: what a session
   // cost and what it got, from its journal alone.

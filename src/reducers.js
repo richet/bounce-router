@@ -430,3 +430,12 @@ export function sessionName(events) {
   const compact = line.replace(/\s+/g, ' ');
   return compact.length > 48 ? `${compact.slice(0, 47).trimEnd()}…` : compact;
 }
+
+// The orchestrator turn running now, by its request: the journal's last turn row, unless it ended that turn.
+export function openTurnRequest(events) {
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (events[i].kind === 'main.terminal') return null;
+    if (events[i].kind === 'main.started') return events[i].requestId ?? null;
+  }
+  return null;
+}

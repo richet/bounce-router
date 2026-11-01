@@ -23,7 +23,7 @@ const TOOLS = [
   {name: 'task', description: 'One task: state, the AI playing it, its last milestones, findings, summary or review verdict. full: true adds its whole report, verdict and orders.',
     inputSchema: {type: 'object', properties: {session, task: {type: 'string', description: 'The task id or a unique prefix.'}, full: {type: 'boolean'}}, required: ['task']}},
   {name: 'send', description: 'Send the session\'s orchestrator a message as if the user typed it in its view (journaled as "via bounce send"). A busy orchestrator gets it after its current turn. Returns the request id; with wait_seconds, also the turn\'s end and the orchestrator\'s answer.',
-    inputSchema: {type: 'object', properties: {message: {type: 'string'}, session, wait_seconds: waitSeconds}, required: ['message']}},
+    inputSchema: {type: 'object', properties: {message: {type: 'string'}, session, wait_seconds: waitSeconds, caller: {type: 'string', description: 'Optional: who is sending, such as your own session id. A label, kept with the message.'}}, required: ['message']}},
   {name: 'answer', description: 'How a message sent earlier went: whether its turn ended, and the orchestrator\'s answer.',
     inputSchema: {type: 'object', properties: {request: {type: 'string', description: 'The request id `send` returned.'}, session, wait_seconds: waitSeconds}, required: ['request']}},
   {name: 'guide', description: 'How to operate a bounce session from outside it: the loop, waiting, reading status, verifying, writing to the orchestrator, and what to leave alone. Read it once before operating a session.',
@@ -82,7 +82,7 @@ export function createControlServer({sessions, connect, events = () => [], versi
       if (name === 'send') {
         if (typeof args.message !== 'string' || !args.message.trim()) return fail('send needs a `message`');
         const wait = seconds(args.wait_seconds);
-        const sent = await sendToOrchestrator(await connect(row.id), args.message, {wait: wait > 0, timeoutMs: wait * 1000});
+        const sent = await sendToOrchestrator(await connect(row.id), args.message, {wait: wait > 0, timeoutMs: wait * 1000, caller: args.caller});
         if (!sent.accepted) return fail(`the orchestrator did not take the message: ${sent.reason}`);
         const result = {session: row.id, ...sent};
         return ok(wait ? turnText(result) : `${sent.queued ? 'queued: it runs when the current turn ends' : 'sent'} · request ${sent.requestId}`, result);

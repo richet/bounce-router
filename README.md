@@ -70,6 +70,7 @@ bounce login muse
 bounce doctor                       # versions and quota; --fix installs an opencode bounce can drive if yours is missing or unsupported
 bounce models
 bounce quota
+bounce lineage [SESSION] [--json]   # which vendor session did what: each turn, task and review
 bounce prune                        # the workers' copies: last used, integrated or not; remove the ones you pick
 bounce skills
 bounce agents                       # the team: which AI plays each job
