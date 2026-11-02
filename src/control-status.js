@@ -4,6 +4,7 @@
 // message is not control without seeing what the session is doing.
 import {taskList} from './task-view.js';
 import {tasks as taskStates} from './reducers.js';
+import {ceilingAt} from './quota.js';
 
 const ANSWER_MAX = 1200, BLOCKER_MAX = 300;
 const cut = (text, max) => { const value = String(text ?? '').replace(/\s+/g, ' ').trim(); return value.length > max ? `${value.slice(0, max - 1)}…` : value; };
@@ -11,7 +12,8 @@ const cut = (text, max) => { const value = String(text ?? '').replace(/\s+/g, ' 
 const clip = (text, max) => { const value = String(text ?? '').trim(); return value.length > max ? `${value.slice(0, max - 1)}…` : value; };
 const minutesSince = (time, now) => (time ? Math.round((now - Date.parse(time)) / 60000) : null);
 
-export function orchestratorStatus(events, {now = Date.now()} = {}) {
+// `quotas` is the quota store (src/quota.js) and `quotaSettings` the user's ceilings: each live window with its ceiling.
+export function orchestratorStatus(events, {now = Date.now(), quotas = {}, quotaSettings = null} = {}) {
   const turn = events.findLast(e => ['main.started', 'main.terminal', 'main.blocked'].includes(e.kind));
   const state = turn?.kind === 'main.started' ? 'running' : turn?.kind === 'main.blocked' ? 'blocked' : 'idle';
   const failed = turn?.kind === 'main.terminal' && turn.status === 'failed' ? turn : null;
@@ -27,7 +29,10 @@ export function orchestratorStatus(events, {now = Date.now()} = {}) {
   });
   // An older journal holds a failed turn's error as an assistant row too.
   const answer = events.findLast(e => e.kind === 'assistant' && e.from === 'main' && !e.narration && e.text !== failed?.text)?.text;
-  return {orchestrator, note, tasks, blocked, lastAnswer: answer ? clip(answer, ANSWER_MAX) : null};
+  const quota = Object.entries(quotas ?? {}).flatMap(([provider, entry]) => (entry?.windows ?? [])
+    .filter(w => Number.isFinite(w.resetsAt) && w.resetsAt > now)
+    .map(w => ({provider, window: w.label, percent: w.percent, ceiling: ceilingAt(quotaSettings, provider, w, now), resetsAt: w.resetsAt})));
+  return {orchestrator, note, tasks, blocked, lastAnswer: answer ? clip(answer, ANSWER_MAX) : null, ...(quota.length ? {quota} : {})};
 }
 
 export function formatStatus(view) {
@@ -41,5 +46,6 @@ export function formatStatus(view) {
     view.tasks.length ? `Tasks:\n${view.tasks.map(t => `  ${short(t.task)} · ${t.profile ?? '?'}${t.ai ? ` on ${t.ai}` : ''} · ${t.state}${t.elapsed ? ` · ${t.elapsed}` : ''}${t.doing ? ` · ${t.doing}` : ''}`).join('\n')}` : 'Tasks: none live',
     view.blocked.length ? `Waiting on a decision:\n${view.blocked.map(b => `  ${short(b.task)} · ${b.reason ?? 'blocked'}${b.text ? ` · ${b.text}` : ''}`).join('\n')}` : null,
     view.lastAnswer ? `Last answer:\n${view.lastAnswer}` : null,
+    view.quota ? `Quota: ${view.quota.map(q => `${q.provider} ${q.window} ${q.percent}%${q.ceiling < 100 ? ` of ${q.ceiling}` : ''}, resets ${new Date(q.resetsAt).toISOString().slice(0, 16).replace('T', ' ')}Z`).join(' · ')}` : null,
   ].filter(Boolean).join('\n');
 }

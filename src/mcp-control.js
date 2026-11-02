@@ -45,7 +45,7 @@ const INSIDE = 'bounce-control is the user\'s side of a session; it does not ser
 
 // `sessions()` lists sessions as src/sessions.js does; `connect(id)` opens a view channel to that session's daemon;
 // `events(id)` reads its journal from disk (reads never go through the daemon).
-export function createControlServer({sessions, connect, events = () => [], version = '0', inside = false}) {
+export function createControlServer({sessions, connect, events = () => [], quota = () => ({}), version = '0', inside = false}) {
   function pick(ref) {
     const live = sessions().filter(row => row.live);
     if (ref) {
@@ -68,7 +68,7 @@ export function createControlServer({sessions, connect, events = () => [], versi
       const {row, error} = pick(args.session);
       if (error) return fail(error);
       const rows = events(row.id);
-      if (name === 'status') { const view = orchestratorStatus(rows); return ok(formatStatus(view), {session: row.id, ...view}); }
+      if (name === 'status') { const view = orchestratorStatus(rows, quota()); return ok(formatStatus(view), {session: row.id, ...view}); }
       if (name === 'tasks') { const list = taskList(rows, {all: args.all === true}); return ok(formatTaskList(list), {session: row.id, tasks: list}); }
       if (typeof args.task !== 'string' || !args.task) return fail('task needs the `task` id');
       let id;

@@ -70,7 +70,7 @@ test('the AI question leaves the job out of it: what each AI runs on and is good
   assert.equal(Object.hasOwn(decideRoute({...both, profile: {choice: 'build', confidence: 0.4}}, {...options, fallback: 'build'}), 'ai'), false, 'an unconfident AI answer leaves the job on its own chain');
 });
 
-// Jev describes the task; the load picks between the tier's peers. Here codex's week resets first, so codex plays it.
+// Jev describes the task; the load picks between the tier's peers. Here codex has the most room per hour before its weekly reset, so codex plays it.
 const DESCRIBED = {hardest: {noul: 0.2}, small_fix: {noul: 0.1}, long_context: {noul: 0.2}};
 const CODEX_FIRST = {codex: {windows: [{label: '7d', percent: 1, resetsAt: Date.now() + 86400000}]}, claude: {windows: [{label: '7d', percent: 14, resetsAt: Date.now() + 4 * 86400000}]}};
 function rig(t, {answer, enabled = true, codexScript = null, quotas = CODEX_FIRST}) {
@@ -81,7 +81,7 @@ function rig(t, {answer, enabled = true, codexScript = null, quotas = CODEX_FIRS
   const done = name => [{kind: 'result', status: 'completed', text: `done by ${name}`}];
   const worker = (name, script = () => done(name)) => { const inner = fakeAdapter(script); return {...inner, launch: async args => { launched.push([name, args.profile.model, args.profile.role, args.profile.policy, args.profile.agent?.name ?? null]); prompts.push(args.profile.agent?.prompt ?? null); return inner.launch(args); }}; };
   const jevSettings = {enabled, model: 'jev-1.13.0', review: false, routing: {enabled: true, default: null}, confidence: 0.8};
-  const jev = createJevDecisions({readSettings: () => jevSettings, quotas: () => quotas, adapter: {ask: async request => { asked.push(request); return {answers: answer, model: 'jev-1.13.0', latencyMs: 9}; }}});
+  const jev = createJevDecisions({readSettings: () => jevSettings, readQuota: () => ({ceiling: {}, ramp: null}), quotas: () => quotas, adapter: {ask: async request => { asked.push(request); return {answers: answer, model: 'jev-1.13.0', latencyMs: 9}; }}});
   const profiles = validateOrchestration(settings, undefined, {roles: rolesOf(NAMES_BUILD)}).profiles;
   const scheduler = createScheduler({session, adapters: {claude: worker('claude'), codex: worker('codex', codexScript ?? undefined)}, profiles, jev, gitHead: () => null});
   t.after(() => scheduler.close());
@@ -101,7 +101,7 @@ test('scheduler: a task for an `auto` agent runs the job on the AI Jev picks, an
   assert.deepEqual([routed[0].chosen, routed[0].agent, routed[0].ai, routed[0].via, routed[0].fallback, routed[0].tier], ['reviewer@build', 'reviewer', 'build', 'agent-auto', false, 'mid']);
   assert.deepEqual(routed[0].description, {hardest: 0.2, small_fix: 0.1, long_context: 0.2});
   assert.deepEqual(routed[0].candidates.map(c => [c.name, c.picked === true]), [['build', true], ['claude_sonnet', false]]);
-  assert.match(routed[0].text, /^Routed reviewer → build \(Jev: tier mid from hardest 0\.20, small fix 0\.10, long context 0\.20; its weekly window resets first \(/);
+  assert.match(routed[0].text, /^Routed reviewer → build \(Jev: tier mid from hardest 0\.20, small fix 0\.10, long context 0\.20; 99 points left of its week, 24 h before its weekly reset\)$/);
   assert.equal(scheduler.tasks()[row.task].profile, 'reviewer@build');
 });
 
@@ -115,7 +115,7 @@ test('scheduler: a tier on the task wins over Jev\'s, the row says the orchestra
   assert.deepEqual(launched, [['codex', 'gpt-6-astra', 'reviewer', 'read-only', 'reviewer']]);
   const routed = session.events.find(e => e.kind === 'jev.routed');
   assert.deepEqual([routed.tier, routed.tierBy, routed.description.hardest], ['mid', 'orchestrator', 0.9]);
-  assert.match(routed.text, /^Routed reviewer → build \(tier mid asked by the orchestrator; Jev: hardest 0\.90, small fix 0\.10, long context 0\.20; its weekly window resets first/);
+  assert.match(routed.text, /^Routed reviewer → build \(tier mid asked by the orchestrator; Jev: hardest 0\.90, small fix 0\.10, long context 0\.20; 99 points left of its week, 24 h before its weekly reset\)$/);
 });
 
 test('scheduler: with Jev off the job runs on the chain after `auto` and nothing is journaled; in doubt it does too, with the reason', async t => {

@@ -374,3 +374,38 @@ export function modelPanel(entries, {width = 28, rows = Infinity, paint} = {}) {
   }
   return built.slice(0, Math.max(0, rows));
 }
+
+// How much of a weekly window `auto` routing plans to use, from config.json `quota`: `ceiling` is a percent per
+// provider ({codex: 50}) or one for all (50); `ramp: {hours, to}` raises it in a straight line over the window's
+// last `hours` to `to`, so a week's share left near its reset goes to work. No ceiling is the whole window.
+const percentOf = value => (typeof value === 'number' && value > 0 && value <= 100 ? value : null);
+export function normalizeQuotaSettings(input) {
+  const raw = input && typeof input === 'object' ? input : {};
+  const ceiling = percentOf(raw.ceiling) !== null ? {'*': raw.ceiling}
+    : Object.fromEntries(Object.entries(raw.ceiling && typeof raw.ceiling === 'object' ? raw.ceiling : {}).filter(([, value]) => percentOf(value) !== null));
+  const hours = Number(raw.ramp?.hours);
+  const ramp = Number.isFinite(hours) && hours > 0 ? {hours, to: percentOf(raw.ramp.to) ?? 100} : null;
+  return {ceiling, ramp};
+}
+// Read at use time, like the Jev settings: an edit applies to the next pick. Unreadable reads as no ceiling.
+export function readQuotaSettings(root) {
+  try { return normalizeQuotaSettings(JSON.parse(fs.readFileSync(path.join(root, 'config.json'), 'utf8')).quota); }
+  catch { return normalizeQuotaSettings(); }
+}
+export function ceilingAt(settings, provider, window, now = Date.now()) {
+  const base = settings?.ceiling?.[provider] ?? settings?.ceiling?.['*'] ?? 100;
+  const ramp = settings?.ramp;
+  if (!ramp || !Number.isFinite(window?.resetsAt) || ramp.to <= base) return base;
+  const left = (window.resetsAt - now) / 3600000;
+  if (left >= ramp.hours) return base;
+  return Math.round(base + (ramp.to - base) * Math.min(1, 1 - Math.max(0, left) / ramp.hours));
+}
+// The weekly window's room: points left under the ceiling per hour to its reset (an hour at least, so a reset minutes
+// away does not outweigh everything). Null when there is no live weekly reading.
+export function weeklyRoom(entry, provider, settings, now = Date.now()) {
+  const window = entry?.windows?.find(w => w.label === '7d' && Number.isFinite(w.resetsAt) && w.resetsAt > now);
+  if (!window) return null;
+  const percent = Number(window.percent) || 0, ceiling = ceilingAt(settings, provider, window, now);
+  const headroom = Math.max(0, ceiling - percent), hours = (window.resetsAt - now) / 3600000;
+  return {percent, ceiling, headroom, hours, resetsAt: window.resetsAt, score: headroom / Math.max(1, hours)};
+}

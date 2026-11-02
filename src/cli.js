@@ -33,7 +33,7 @@ import {listCopies, copyTable, chooseCopies, removeCopies} from './prune.js';
 import stringWidth from 'string-width';
 import {clean, createFormatter, createWorkSummary, workReview, withAsides, continueMain} from './format.js';
 import {validateOrchestration} from './profiles.js';
-import {loadQuota, recordQuota, refreshQuota, quotaSnapshot, quotaShort, quotaPanel, quotaStrip, modelPanel, quotaReport, quotaUnavailable, usageOrder} from './quota.js';
+import {loadQuota, readQuotaSettings, recordQuota, refreshQuota, quotaSnapshot, quotaShort, quotaPanel, quotaStrip, modelPanel, quotaReport, quotaUnavailable, usageOrder} from './quota.js';
 import {skillsCommand, syncSkills, inspectSkills, skillsChanged, importCandidates, importSelected, importSummary, importOrigin, syncSummary, skillAreas} from './skills.js';
 import {expandVendorCommand, findVendorCommand, vendorCommandRows} from './vendor-commands.js';
 import fs from 'node:fs';
@@ -282,7 +282,8 @@ async function main() {
     const {createControlServer, insideBounce} = await import('./mcp-control.js');
     const {serveStdio} = await import('./mcp.js');
     const {connectSession} = await import('./send.js');
-    serveStdio(createControlServer({sessions: () => listSessions(root), connect: id => connectSession(root, id), events: id => new Session(process.cwd(), {root, id}).events, version, inside: insideBounce(process.env)}));
+    serveStdio(createControlServer({sessions: () => listSessions(root), connect: id => connectSession(root, id), events: id => new Session(process.cwd(), {root, id}).events,
+      quota: () => ({quotas: loadQuota(root), quotaSettings: readQuotaSettings(root)}), version, inside: insideBounce(process.env)}));
     return new Promise(() => {});
   }
   if (positionals[0] === 'mcp-serve') {
