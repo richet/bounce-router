@@ -160,3 +160,11 @@ test('muse run.output.delta with a run_id normalizes to only the delta event', (
 test('catalogQueries.codex.args is unchanged', () => {
   assert.deepEqual(catalogQueries.codex.args, ['app-server']);
 });
+
+test('claude: a message the CLI wrote itself is not the model speaking, and the failed result still carries it', () => {
+  const said = normalize('claude', {type: 'assistant', session_id: 's1', error: 'invalid_request', message: {model: '<synthetic>', role: 'assistant', content: [{type: 'text', text: 'Prompt is too long'}]}});
+  assert.deepEqual(said.filter(event => ['assistant', 'model'].includes(event.kind)), []);
+  const ended = normalize('claude', {type: 'result', subtype: 'success', is_error: true, session_id: 's1', result: 'Prompt is too long', terminal_reason: 'blocking_limit'});
+  assert.deepEqual(ended.filter(event => ['error', 'result'].includes(event.kind)).map(event => [event.kind, event.text]), [['error', 'Prompt is too long'], ['result', 'Prompt is too long']]);
+  assert.equal(ended.find(event => event.kind === 'result').success, false);
+});

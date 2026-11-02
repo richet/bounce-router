@@ -28,6 +28,9 @@ export default {
   },
   stdin: prompt => prompt,
   normalize(raw) {
+    // The CLI's own words in the model's place ("Prompt is too long"): nobody answered, and the failed result that
+    // follows carries them. Found live: read as an answer, it cost a typed message its retry and looked like a reply.
+    if (raw.type === 'assistant' && raw.message?.model === '<synthetic>') return [];
     const events = [];
     const add = (kind, text, extra = {}) => events.push({kind, text: describe(text), ...extra});
     const model = raw.message?.model ?? raw.model ?? raw.payload?.model ?? raw.payload?.model_id;
