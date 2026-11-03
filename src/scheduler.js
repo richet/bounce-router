@@ -2861,7 +2861,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
           return;
         }
         if (!session.events.some(e => e.kind === 'task.integrated' && e.task === action.task && e.artifactId === artifactId)) append({kind: 'task.integrated', task: action.task, artifactId, resultHash: artifact.resultHash,
-          ...(result.merged ? {merged: result.merged, text: `Merged with what the checkout changed meanwhile: ${result.merged.join(', ')}`} : {})});
+          ...(result.merged ? {merged: result.merged} : {}), ...(result.leftOut ? {leftOut: result.leftOut} : {}),
+          ...(result.merged || result.leftOut ? {text: [result.merged && `Merged with what the checkout changed meanwhile: ${result.merged.join(', ')}`,
+            result.leftOut && `Left out, ignored and not writable in the checkout: ${result.leftOut.join(', ')}`].filter(Boolean).join('; ')} : {})});
         // A follow-up (retryOf) reusing this same workspace diffs against what's now in the
         // checkout, not the pre-integration copy it started from — see advanceBaseline.
         const workspace = existingWorkspace(action.task);
