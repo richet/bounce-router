@@ -46,7 +46,7 @@ test('promptSafe flattens newlines and cuts to 1000 characters; non-strings are 
   assert.equal(promptSafe('x'.repeat(1500)).length, 1000);
   assert.equal(promptSafe(null), 'null');
 });
-test('the ACE maximum-steps notice is runtime text, never a worker answer', () => {
+test('the opencode maximum-steps notice is runtime text, never a worker answer', () => {
   assert.deepEqual(classifyText('opencode', 'Maximum steps for this agent have been reached'), {
     speaker: SPEAKER.runtime, text: 'Maximum steps for this agent have been reached',
   });

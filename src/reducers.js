@@ -53,7 +53,7 @@ export function tasks(events) {
       if (t && !TERMINAL.has(t.state) && typeof e.chosen === 'string' && e.chosen) t.profile = e.chosen;
       continue;
     }
-    if (!e.kind?.startsWith('task.')) continue;
+    if (!e.kind?.startsWith('task.') && e.kind !== 'review.started' && e.kind !== 'review.finished') continue;
     if (typeof e.task !== 'string' || !e.task) continue; // a malformed row never becomes a task
     if (e.kind === 'task.submitted') {
       const t = ensure(e.task);
@@ -92,6 +92,18 @@ export function tasks(events) {
         }
         break;
       case 'task.input_required': t.state = 'input_required'; break;
+      // bounce's own steps after the work speak through the same line: a check that ended and a review that runs
+      // never leave the task saying "Running the task's check" (found live: read as a hung check during a review).
+      case 'task.check':
+        t.checked = e.passed ? `The check passed (exit ${e.exit})` : e.timedOut ? 'The check timed out' : `The check failed (exit ${e.exit})`;
+        t.lastMilestone = {time: e.time, text: t.checked};
+        break;
+      case 'review.started':
+        t.lastMilestone = {time: e.time, text: `${t.checked ? `${t.checked}; ` : ''}${e.profile} is reviewing it (round ${e.round})`};
+        break;
+      case 'review.finished':
+        t.lastMilestone = {time: e.time, text: `Review round ${e.round} ended: ${e.verdict}`};
+        break;
       case 'task.milestone':
         if (t.state === 'waiting') priorState[e.task] = 'running';
         else if (t.state === 'blocked' || t.state === 'input_required') t.state = 'running';
@@ -242,7 +254,7 @@ export function watchdog(events, now, {activity = new Map(), watchdog: cfg} = {}
     // not a worker to watch: its process has already exited, and it holds no slot. It is never killed
     // by a lease or ceiling while parked; it stays parked until answered (a message that resumes it, a
     // task.rework, an accept) or explicitly cancelled. It used to get a lease measured from the moment
-    // it parked, ending an unanswered wait as a deadline — found live (session 159f4746, 4 tasks) that
+    // it parked, ending an unanswered wait as a deadline — found live that
     // this silently discarded a blocked worker's resumable context after 60 minutes nobody was
     // watching, even though the block itself was the very reason no slot was being spent. `blocked`
     // still yields its existing escalation verdict, once, so the owner is told; `input_required` yields
@@ -253,6 +265,9 @@ export function watchdog(events, now, {activity = new Map(), watchdog: cfg} = {}
     }
     // A completion review is a worker turn too, with its own lease from `review.started` — the worker's
     // own elapsed time is not the reviewer's budget. Found live: a 24-minute review nothing was watching.
+    // A task that has ended is never watched, even when its review never finished: found live, two
+    // tasks cancelled while their review waited for the local model were escalated every tick for four hours.
+    if (t.state !== 'completed' && TERMINAL.has(t.state)) continue;
     const activeReview = events.findLast(e => e.task === t.id && ['review.started', 'review.finished'].includes(e.kind));
     const reviewing = t.state === 'reviewing' || activeReview?.kind === 'review.started';
     if (t.state !== 'running' && !reviewing) continue;
@@ -308,7 +323,7 @@ export function attemptLease(events, task, {defaultDeadlineMs = 3600000, ceiling
   const ownStart = events.findLast(e => e.kind === 'task.started' && e.task === task);
   const start = reviewing ? review : ownStart ?? rootStart;
   if (!start) return null;
-  // The ceiling counts from this task's own first start, not the task it replaces (Daniel, 2026-09-30).
+  // The ceiling counts from this task's own first start, not the task it replaces (2026-09-30).
   const startedAt = Date.parse((ownStart ?? rootStart ?? start).time);
   const leaseFrom = Date.parse(start.time);
   const submitted = events.find(e => e.kind === 'task.submitted' && e.task === root);
@@ -343,6 +358,9 @@ export function normalizeUsage(raw) {
     const value = raw[key];
     if (Number.isFinite(value)) usage[canon] = (usage[canon] || 0) + value;
   }
+  // codex counts its cached input inside input_tokens (measured on 0.162: 15 085 input, 12 288 of them cached);
+  // claude reports input_tokens without the cache. Canonical `input` is the uncached part for both.
+  if (Number.isFinite(raw.input_tokens) && Number.isFinite(raw.cached_input_tokens)) usage.input = Math.max(0, raw.input_tokens - raw.cached_input_tokens);
   return usage;
 }
 const TOKEN_KEYS = ['input', 'cache_read', 'cache_write', 'output'];

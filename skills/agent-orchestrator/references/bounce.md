@@ -18,8 +18,7 @@ only when the user asks for that specific AI, or an agent's list is exhausted:
 - `adapter` is `claude`, `codex`, `muse`, `opencode` (a local LM Studio model) or `typesafe`. A
   `typesafe` profile is Jev, a decision model: it can only ever be a completion reviewer, never
   carry out a task.
-- `critic` profiles are read-only; `analyst` and `verifier` profiles probe (run commands in a
-  disposable workspace, never change the tree); anything else writes unless it says otherwise.
+- `critic` profiles are read-only; anything else writes unless it says otherwise.
 - The profile named by `orchestrator` is you. You cannot submit to yourself.
 - `auto` is a routing pseudo-profile: with Jev routing on it picks the fitting AI for the orders,
   otherwise it resolves to the default agent, so it never breaks a submit.

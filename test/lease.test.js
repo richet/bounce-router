@@ -1,4 +1,4 @@
-// Task leases (docs/plans/task-leases.md). Found live: every reviewer on the
+// Task leases. Found live: every reviewer on the
 // local 27B was killed by its deadline while still working — its last step 11 to 84 s before the
 // kill — and the orchestrator answered each kill by shrinking the next deadline. A deadline is now a
 // lease: renewed while the worker makes progress, up to a ceiling; a worker that stops making
@@ -242,7 +242,7 @@ test('L9 a review is leased like a turn: renewed while it works, asked to conclu
 });
 
 // L10: a blocked task holds no slot, so it is never killed by its lease/ceiling — it stays blocked
-// until answered or cancelled. Found live (session 159f4746, 4 tasks): the previous lease measured
+// until answered or cancelled. Found live: the previous lease measured
 // from the moment a task parked discarded a blocked worker's resumable context after 60 minutes
 // nobody was watching, even though the block itself was the reason no slot was being spent.
 test('L10 a blocked task is never killed by the watchdog, however long nobody answers it', async t => {

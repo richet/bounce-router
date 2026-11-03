@@ -72,16 +72,18 @@ test('TUI setup loaded stays interactive during a held main turn, saves on conse
   child.stdin.write('editable setup draft');await wait(()=>output.includes('editable setup draft'));
   child.stdin.write('\u0015/help\r');await wait(()=>session.events.some(e=>e.kind==='help'&&e.text?.includes('Agents & models')));
   slow=false;response.setHeader('content-type','application/json');response.end(payload);
-  // Setup opens on the shipped agents, one numbered pick each: analyst takes the loaded model, the rest are skipped.
-  await wait(()=>output.includes('analyst ('));await answer('1','builder (');
-  await answer('skip','debugger (');await answer('skip','reviewer (');await answer('skip','Save this configuration?');
+  // On the shipped team with no bindings yet, setup names the loaded model and asks once: the starting bindings play it.
+  await wait(()=>output.includes('Save this? [y/N]'));
   assert.equal(output.includes('unloaded-choice'),false,'`loaded` never offers a model that would have to be loaded');
-  child.stdin.write('y\r');await wait(()=>output.includes('agents analyst active in this session'));
-  assert.deepEqual(agentMetadata(fs.readFileSync(path.join(root,'agents','analyst.md'),'utf8')).models,['lmstudio/loaded','codex/default']);
+  child.stdin.write('y\r');await wait(()=>/agents [a-z, ]*analyst[a-z, ]* active in this session/.test(output));
+  assert.equal(fs.readFileSync(path.join(root,'models.yaml'),'utf8').includes('loaded: lmstudio/loaded'),true);
+  assert.equal(fs.readFileSync(path.join(root,'bindings.yml'),'utf8').includes('"*": [auto, loaded, claude/sonnet, codex]'),true);
+  assert.equal(fs.existsSync(path.join(root,'agents')),false,'the shipped team is played as it is: no agent files');
   assert.deepEqual(JSON.parse(fs.readFileSync(file)).profiles,{main:{adapter:'codex'}},'no profile is created');
   assert.equal(posts,0);assert.equal(runs,1);assert.equal(cancels,0);
-  assert.deepEqual([profiles.analyst.adapter, profiles.analyst.model, profiles.analyst.fallback], ['opencode', 'loaded', ['analyst~2']]);
-  assert.equal(profiles['analyst~2'].adapter, 'codex');
+  assert.deepEqual(rolesFor(root,{cwd:root}).get('analyst').models,['auto','lmstudio/loaded','claude/sonnet','codex/default']);
+  assert.deepEqual([profiles.analyst.adapter, profiles.analyst.model, profiles.analyst.fallback], ['opencode', 'loaded', ['analyst~2']], 'and the running session has it');
+  assert.deepEqual([profiles['analyst~2'].adapter, profiles['analyst~3'].adapter], ['claude', 'codex']);
   assert.equal(session.events.filter(row => row.kind === 'local.profiles.activated').length, 1);
   // `/local` renders the same status `bounce local` prints, into the transcript. It runs here, once
   // the fake LM Studio answers immediately and a worker exists: the status is a chain check, and an
@@ -92,9 +94,12 @@ test('TUI setup loaded stays interactive during a held main turn, saves on conse
   const localStatus=session.events.findLast(e=>e.kind==='status'&&e.text?.includes('OpenCode:'));
   assert.doesNotMatch(localStatus.text,/NOT READY/);
   assert.match(localStatus.text,/run \/local verify to prove the bridge/);
-  assert.match(localStatus.text,/Agents a local model may play: analyst \(lmstudio\/loaded, probe\)/);
-  await answer('/local setup loaded','analyst (');
+  assert.match(localStatus.text,/Agents a local model may play: analyst \(lmstudio\/loaded, write\)/);
+  // Esc while setup is still discovering cancels setup alone; the held main turn is untouched.
+  slow=true;response=null;
+  await answer('/local setup loaded','Discovering local models');await wait(()=>response);
   child.stdin.write('\u001b');await wait(()=>output.includes('Local setup cancelled'));
+  slow=false;response.setHeader('content-type','application/json');response.end(payload);
   assert.equal(cancels,0);assert.equal(runs,1);
   child.stdin.write('/model test-only\r');
   await wait(()=>JSON.parse(fs.readFileSync(file)).models.codex==='test-only');
@@ -109,7 +114,7 @@ test('TUI setup loaded stays interactive during a held main turn, saves on conse
 // worker rather than TypeError on the absent block, the saved block holds only the worker (the
 // shipped roster stays underneath it in the validated view), and a later `/model worker … --save`
 // persists into the same block.
-test('TUI setup on a config with no profiles block writes an agent file and never copies the shipped roster into the config', {timeout:20000}, async t => {
+test('TUI setup on a config with no profiles block writes the bindings and never copies the shipped roster into the config', {timeout:20000}, async t => {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'bounce-setup-tui-roster-'));
   const bin=fakeOpencodeBin(t,{model:'loaded'});
   const payload=JSON.stringify({models:[{key:'loaded-choice',type:'llm',capabilities:{trained_for_tool_use:true},loaded_instances:[{id:'loaded',config:{context_length:8192}}]}]});
@@ -135,13 +140,12 @@ test('TUI setup on a config with no profiles block writes an agent file and neve
   const wait=async(check)=>{const start=Date.now();while(!check()){if(Date.now()-start>4000)throw Error(output.slice(-4000));await new Promise(r=>setTimeout(r,10));}};
   const answer=async(text,next)=>{const offset=output.length;child.stdin.write(text+'\r');await wait(()=>output.slice(offset).includes(next));};
   await wait(()=>output.includes('Ready.'));
-  await answer('/local setup loaded','analyst (');
-  await answer('1','builder (');await answer('skip','debugger (');await answer('skip','reviewer (');await answer('skip','Save this configuration?');
-  child.stdin.write('y\r');await wait(()=>output.includes('agents analyst active in this session'));
+  await answer('/local setup loaded','Save this? [y/N]');
+  child.stdin.write('y\r');await wait(()=>/agents [a-z, ]*analyst[a-z, ]* active in this session/.test(output));
   const saved=JSON.parse(fs.readFileSync(file));
   assert.equal(saved.orchestrator,'main');
   assert.deepEqual(saved.profiles,{},'the overlay only, never a copy of the roster — and an agent is a file, not a profile');
-  assert.deepEqual(agentMetadata(fs.readFileSync(path.join(root,'agents','analyst.md'),'utf8')).models,['lmstudio/loaded','codex/default']);
+  assert.equal(fs.readFileSync(path.join(root,'bindings.yml'),'utf8').includes('"*": [auto, loaded, claude/sonnet, codex]'),true);
   const view=validateOrchestration(saved,undefined,{roles:rolesFor(root,{cwd:root})});
   assert.deepEqual(Object.keys(view.profiles).filter(name=>!view.profiles[name].derived),Object.keys(starterProfiles(settings)));
   assert.equal(view.profiles.build.adapter,'codex');

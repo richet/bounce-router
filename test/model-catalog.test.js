@@ -11,7 +11,7 @@ import {CAPABILITIES_MAX, effectiveNotes, undescribedModels, modelKey} from '../
 // and deliberately not shipped).
 const PICKER = {
   claude: ['default', 'opus[1m]', 'claude-fable-5-1[1m]', 'sonnet', 'haiku'],
-  codex: ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5'],
+  codex: ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5'],
   muse: ['muse-spark-1.3', 'muse-spark-1.3-contributor', 'muse-spark-1.2', 'muse-spark-1.2-contributor'],
 };
 
@@ -35,14 +35,16 @@ test('every picker model has a shipped note with a valid tier and a bounded, con
   assert.ok(Object.isFrozen(MODEL_CATALOG));
 });
 
-test('tiers rank each vendor\'s lineup the way the vendor does', () => {
+// 2026-10-26: a tier goes by the model's name, so peers across vendors share it: haiku/luna, sonnet/terra,
+// opus/sol, fable/astra (the advisors, for very hard work, used sparingly).
+test('tiers rank each vendor\'s lineup by model name, peers across vendors in one tier', () => {
   const tier = key => catalogNote(key).tier;
-  assert.equal(tier('claude/claude-fable-5-1[1m]'), 'strongest');
+  assert.equal(tier('claude/claude-fable-5-1[1m]'), 'advisor');
   assert.equal(tier('claude/opus[1m]'), 'strongest');
   assert.equal(tier('claude/sonnet'), 'mid');
   assert.equal(tier('claude/haiku'), 'cheapest');
-  assert.equal(tier('codex/gpt-6-astra'), 'strongest');
-  assert.equal(tier('codex/gpt-5.6-sol'), 'mid');
+  assert.equal(tier('codex/gpt-6-astra'), 'advisor');
+  assert.equal(tier('codex/gpt-5.6-sol'), 'strongest');
   assert.equal(tier('codex/gpt-5.6-terra'), 'mid');
   assert.equal(tier('codex/gpt-5.5'), 'mid');
   assert.equal(tier('codex/gpt-5.6-luna'), 'cheapest');
@@ -82,9 +84,9 @@ test('the default roster validates, routes every builder from the catalog alone,
     assert.ok(p.fallback.length, `${name} has a fallback`);
     assert.ok(p.fallback.every(f => f !== name && view.profiles[f]?.role === 'builder'));
   }
-  for (const name of ['build', 'build_claude', 'claude_fable']) {
+  for (const [name, tier] of [['build', 'advisor'], ['build_claude', 'strongest'], ['claude_fable', 'advisor']]) {
     assert.ok(view.profiles[name].fallback.some(f => view.profiles[f].adapter !== view.profiles[name].adapter), `${name} falls back across vendors`);
-    assert.equal(notes[name].tier, 'strongest');
+    assert.equal(notes[name].tier, tier);
   }
   // no `order` at all still yields a roster
   assert.equal(starterProfiles().main.adapter, 'claude');

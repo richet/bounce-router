@@ -1,6 +1,5 @@
 import {spawn as spawnProcess} from 'node:child_process';
 import fs from 'node:fs';
-import path from 'node:path';
 import codex from './codex.js';
 import {connectBus} from '../bus.js';
 import {resolveExecutable} from '../executable.js';
@@ -35,7 +34,7 @@ const REQUESTS = {
   turnInterrupt: ({threadId, turnId}) => ({method: 'turn/interrupt', params: {threadId, turnId}}),
 };
 
-// CONTRACT.md #5: same usage-mapping obligation as claude-live.js, codex's own vendor field
+// Same usage-mapping obligation as claude-live.js, codex's own vendor field
 // names — input_tokens→input, cached_input_tokens→cache_read, output_tokens→output (codex
 // reports no cache_write). The classic normalizer (src/adapters/codex.js) is unchanged.
 const USAGE_FIELDS = [['input_tokens', 'input'], ['cached_input_tokens', 'cache_read'], ['output_tokens', 'output']];
@@ -105,20 +104,12 @@ const request = (handle, {method, params}) => new Promise((resolve, reject) => {
 const ANSI = /\x1b\[[0-9;]*m/g;
 export const vendorTracing = text => /^\s*\d{4}-\d\d-\d\dT[\d:.]+Z\s+(TRACE|DEBUG|INFO|WARN|ERROR)\s+[\w]+(::[\w]+)+/.test(String(text ?? '').replace(ANSI, ''));
 
-function permissionsFor(profile = {}, peer, cwd) {
-  // probe runs commands and writes nothing: exactly what codex's read-only sandbox enforces.
-  const effective = profile.policy === 'read-only' || profile.policy === 'probe' ? 'read-only' : profile.mode === 'plan' ? 'plan' : 'yolo';
+function permissionsFor(profile = {}, peer) {
+  const effective = profile.policy === 'read-only' ? 'read-only' : profile.mode === 'plan' ? 'plan' : 'yolo';
   const dynamicTools = reportGrant(profile, peer) ? {dynamicTools: [REPORT_TOOL_SPEC]} : {};
   if (effective === 'yolo') {
     return {thread: {approvalPolicy: 'never', sandbox: 'danger-full-access', ...dynamicTools},
       turn: {approvalPolicy: 'never', sandboxPolicy: {type: 'dangerFullAccess'}}};
-  }
-  if (profile.policy === 'probe' && profile.probeSource) {
-    const isolated = fs.realpathSync(cwd);
-    const source = fs.realpathSync(profile.probeSource);
-    if (source === isolated || source.startsWith(`${isolated}${path.sep}`) || isolated.startsWith(`${source}${path.sep}`)) throw new Error('probeSource must be separate from cwd');
-    return {thread: {approvalPolicy: 'never', sandbox: 'workspace-write', ...dynamicTools},
-      turn: {approvalPolicy: 'never', sandboxPolicy: {type: 'workspaceWrite', writableRoots: [isolated], excludeSlashTmp: true, excludeTmpdirEnvVar: true}}};
   }
   return {thread: {approvalPolicy: 'on-request', sandbox: 'read-only', ...dynamicTools},
     turn: {approvalPolicy: 'on-request', sandboxPolicy: {type: 'readOnly'}}};
@@ -171,14 +162,26 @@ async function startTurn(handle, text, userImages = []) {
 
 // The vendor's own rows, with two substitutions: a thread id is the peer's native id, and a
 // turn's end is a milestone for this worker, not a result — the worker is still there.
+// One model call's tokens: input without the cached part (codex counts the cache inside its input), the thinking,
+// and the context the call filled against the model's window, for the turn footer.
+export function tokenUsageRow(params) {
+  const raw = params?.tokenUsage?.last;
+  const usage = {};
+  for (const [from, to] of [['inputTokens', 'input'], ['cachedInputTokens', 'cache_read'], ['cacheWriteInputTokens', 'cache_write'], ['outputTokens', 'output']]) {
+    if (Number.isInteger(raw?.[from])) usage[to] = raw[from];
+  }
+  if (Number.isInteger(usage.input) && Number.isInteger(usage.cache_read)) usage.input = Math.max(0, usage.input - usage.cache_read);
+  if (!Object.keys(usage).length) return null;
+  const window = params?.tokenUsage?.modelContextWindow;
+  // `usage` keeps the four counts the scheduler sums (CONTRACT §5); thinking and context travel beside it.
+  return {kind: 'usage', usage, ...(raw?.reasoningOutputTokens > 0 ? {thinking: raw.reasoningOutputTokens} : {}),
+    ...(Number.isInteger(raw?.totalTokens) && Number.isInteger(window) ? {context: {used: raw.totalTokens, window}} : {})};
+}
+
 function rows(handle, message) {
   if (message.method === 'thread/tokenUsage/updated') {
-    const raw = message.params?.tokenUsage?.last;
-    const usage = {};
-    for (const [from, to] of [['inputTokens', 'input'], ['cachedInputTokens', 'cache_read'], ['cacheWriteInputTokens', 'cache_write'], ['outputTokens', 'output']]) {
-      if (Number.isInteger(raw?.[from])) usage[to] = raw[from];
-    }
-    if (Object.keys(usage).length) handle.stream.push({kind: 'usage', usage});
+    const row = tokenUsageRow(message.params);
+    if (row) handle.stream.push(row);
     return;
   }
   for (const event of codex.normalize(message)) {
@@ -318,12 +321,8 @@ export function createCodexLive({spawn = spawnProcess, kill = process.kill, conn
     const executable = resolveExecutable('codex', profile.executables?.codex);
     // keepStdin: requests are written for the life of the peer, so the pipe is never ended early.
     const report = reportGrant(profile, peer);
-    const permissions = permissionsFor(profile, peer, cwd);
+    const permissions = permissionsFor(profile, peer);
     const env = vendorEnv(process.env, profile.orchestratorEnv);
-    if (profile.policy === 'probe' && profile.probeSource) {
-      env.TMPDIR = path.join(fs.realpathSync(cwd), '.probe-tmp');
-      fs.mkdirSync(env.TMPDIR, {recursive: true, mode: 0o700});
-    }
     // dynamicTools is negotiated through initialize.capabilities.experimentalApi. The grant itself
     // is intentionally never inherited by the child environment.
     const live = spawnLive({executable, args: ['app-server'], cwd,
@@ -353,7 +352,7 @@ export function createCodexLive({spawn = spawnProcess, kill = process.kill, conn
 
   return {
     name: 'codex',
-    capabilities: () => ({live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'], executionPolicies: ['read-only', 'probe', 'plan', 'yolo'], quota: 'query'}),
+    capabilities: () => ({live: true, resume: true, modelPin: true, policies: ['yolo', 'plan'], executionPolicies: ['read-only', 'plan', 'yolo'], quota: 'query'}),
 
     async launch({peer, profile, orders = '', cwd, dir, userImages = []}) {
       const handle = await connect({profile, peer, cwd, dir});
@@ -378,7 +377,7 @@ export function createCodexLive({spawn = spawnProcess, kill = process.kill, conn
     events: handle => handle.stream.iterator,
 
     // Codex saves every thread under ~/.codex, and the ChatGPT app lists them. Found live: a
-    // hundred bounce worker and reviewer threads in Daniel's ChatGPT history. A thread whose task has
+    // hundred bounce worker and reviewer threads in the user's ChatGPT history. A thread whose task has
     // ended is archived: out of the list, still recoverable, and unarchived if the task resumes.
     async archive({profile = {}, native = {}, cwd}) {
       if (typeof native.sessionId !== 'string' || !native.sessionId) return false;

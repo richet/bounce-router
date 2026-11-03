@@ -1,7 +1,10 @@
+import stringWidth from 'string-width';
 import {clean, createFormatter, paneGrid} from '../format.js';
 import {promptLayout} from './prompt-layout.js';
 import {agentRow, doingLine, glyph, progressRow, quietFor, rowColor, shortModel, waitingRow} from './status.js';
 import {deriveSessionName} from '../session-names.js';
+import {highlightRow, rowRange} from './selection.js';
+import {PLUMBING} from './transcript.js';
 
 // The sidebar's own session identity line: an explicit/prompt-derived name (metadata.name)
 // wins, else the id's stable memorable name. No id here — the sidebar is ~30 columns and
@@ -12,9 +15,12 @@ function sessionLine(metadata) {
 
 // The status rail is on unless switched off (`/sidebar off`), and even then only fits a terminal
 // wide enough to leave a readable conversation beside it.
-export function workspaceColumns(columns = 80, {sidebar: wanted = true} = {}) {
+// The usage box beside the prompt: a left rule, a space, and the 26 columns its widest line takes.
+const USAGE_WIDTH = 28;
+const usageWidth = (columns, usage = []) => usage?.length && columns - USAGE_WIDTH - 1 >= 60 ? USAGE_WIDTH : 0;
+export function workspaceColumns(columns = 80, {sidebar: wanted = true, inline = false} = {}) {
   const total = Math.max(20, columns);
-  const sidebar = wanted && total >= 100 ? 32 : 0;
+  const sidebar = wanted && !inline && total >= 100 ? 32 : 0; // inline (classic) draws no sidebar
   return {total, sidebar, content: total - sidebar - (sidebar ? 1 : 0)};
 }
 
@@ -51,7 +57,7 @@ function workerActivityRows(activity, width, activityFormatter) {
   for (const entry of activity) {
     const text = String((entry && typeof entry === 'object' ? entry.text : entry) ?? '');
     const source = entry && typeof entry === 'object' ? entry.source ?? null : null;
-    if (source === 'activity' && (text === '' || HEARTBEAT_RE.test(text))) continue;
+    if (source === 'activity' && (text === '' || HEARTBEAT_RE.test(text) || PLUMBING.test(text))) continue;
     const callArgs = TOOL_CALL_RE.test(text);
     const toolName = !callArgs && (source === 'tool' ? text.split(/\s+/)[0] || text
       : source === 'activity' ? TOOL_STATUS_RE.exec(text)?.[1] ?? null : null);
@@ -74,6 +80,12 @@ function workerActivityRows(activity, width, activityFormatter) {
   return blocks.flat();
 }
 
+// A row with the selected columns shown inverted (src/tui/selection.js).
+function marked(text, selection, row) {
+  const range = rowRange(selection, row);
+  return range ? highlightRow(text, range.from, range.to) : text;
+}
+
 function evidenceText(evidence) {
   if (Array.isArray(evidence)) return evidence.map(value => typeof value === 'string' ? value : JSON.stringify(value)).join(', ');
   if (evidence && typeof evidence === 'object') return JSON.stringify(evidence);
@@ -93,9 +105,9 @@ function ageText(time, now) {
 export function createWorkspace(React, Ink) {
   const {Box, Text} = Ink;
   const activityFormatter = createFormatter({compact: true});
-  function Sidebar({metadata = {}, panes, main, height, now}) {
+  function sidebarLines({metadata = {}, panes, main, now}) {
     const status = main.state ?? 'ready';
-    const lines = [
+    return [
       {text: 'BOUNCE', color: 'cyan', bold: true},
       {text: [metadata.provider ?? 'agent', metadata.mode ?? 'plan', metadata.jev].filter(Boolean).join(' · ')},
       {text: `Model: ${metadata.model || 'provider default'}`, color: 'gray'},
@@ -115,15 +127,19 @@ export function createWorkspace(React, Ink) {
       ...(status === 'working' && doingLine(main.doing, now) ? [{text: `  ${doingLine(main.doing, now, 28)}`, color: main.doing?.what === 'waiting' ? 'cyan' : 'gray'}] : []),
       ...panes.flatMap(pane => [{text: agentRow(pane, now), color: rowColor(pane, now)}, ...(pane.state === 'running' && doingLine(pane.doing, now) ? [{text: `  ${doingLine(pane.doing, now, 28)}`, color: 'gray'}] : []), ...(progressRow(pane, now) ? [{text: progressRow(pane, now), color: 'gray'}] : []), ...(waitingRow(pane) ? [{text: waitingRow(pane), color: 'gray'}] : [])]),
     ];
+  }
+  function Sidebar({lines, height, selection}) {
     return React.createElement(Box, {
       width: 32, height, flexShrink: 0, borderStyle: 'single', borderLeft: true,
       borderTop: false, borderRight: false, borderBottom: false,
       borderColor: 'gray', paddingLeft: 1, flexDirection: 'column', overflow: 'hidden',
     }, ...lines.slice(0, height).map((row, index) => React.createElement(Text, {
       key: index, color: row.color, bold: row.bold, wrap: 'truncate-end',
-    }, row.text || ' ')));
+    }, marked(row.text || ' ', selection, index))));
   }
-  function Pane({pane, selected, x, y, width, height, scroll = 0, now = Date.now(), onScrollClamp}) {
+  // What a pane shows: its title row and the rows under it, scrolled. Computed once per frame so the pane draws
+  // exactly what the selection regions say is there.
+  function paneContent(pane, {width, height, scroll = 0, now = Date.now()}) {
     const title = pane.kind === 'orchestrator' ? 'orchestrator' : `${String(pane.profile).split('@')[0]} · ${pane.task.slice(0, 8)}${pane.model ? ` · ${shortModel(pane.model)}` : ''}${pane.inPlace ? ' · in place' : ''}`;
     // A blocked/input_required pane leads with why, not with whatever prose (often stale success
     // text from an earlier milestone) happens to sit in pane.text — see src/tui/projection.js,
@@ -141,18 +157,91 @@ export function createWorkspace(React, Ink) {
     // pane's raw activity entries are wrapped here so scrolling can operate on rendered rows.
     const allRows = pane.kind === 'orchestrator' ? activity : workerActivityRows(activity, Math.max(1, width - 4), activityFormatter);
     const boundedScroll = Math.min(Math.max(0, scroll), Math.max(0, allRows.length - available));
-    React.useLayoutEffect(() => { if (scroll !== boundedScroll) onScrollClamp?.(pane.id, boundedScroll); }, [scroll, boundedScroll, pane.id, onScrollClamp]);
     const end = allRows.length - boundedScroll;
-    const activityRows = allRows.slice(Math.max(0, end - available), end);
-    const rows = [...details, ...activityRows];
-    return React.createElement(Box, {position: 'absolute', left: x, top: y, borderStyle: 'round', borderColor: selected ? 'cyan' : 'gray', width, height, paddingX: 1, flexDirection: 'column', overflow: 'hidden'},
-      React.createElement(Text, {bold: true, color: selected ? 'cyan' : undefined}, `${pane.kind === 'orchestrator' ? (selected ? '●' : '○') : glyph(pane.state, now)} ${title}`),
-      ...rows.map((text, index) => React.createElement(Text, {key: `${index}:${text}`, wrap: 'truncate-end'}, text || ' ')));
+    const start = Math.max(0, end - available);
+    const titleRow = `${pane.kind === 'orchestrator' ? null : glyph(pane.state, now)} ${title}`;
+    // `all` is every row the pane has (title, details, all activity); `visible` which of them it shows, by index.
+    const header = 1 + details.length;
+    const visible = [...Array.from({length: header}, (_, index) => index), ...Array.from({length: end - start}, (_, index) => header + start + index)];
+    return {titleRow, title, rows: [...details, ...allRows.slice(start, end)], all: [...details, ...allRows], visible, header, boundedScroll};
   }
-  function Workspace({model, transcriptRows, view, onScrollClamp}) {
+  function Pane({pane, content, selected, x, y, width, height, scroll = 0, onScrollClamp, selection}) {
+    const {boundedScroll} = content;
+    React.useLayoutEffect(() => { if (scroll !== boundedScroll) onScrollClamp?.(pane.id, boundedScroll); }, [scroll, boundedScroll, pane.id, onScrollClamp]);
+    const titleRow = pane.kind === 'orchestrator' ? `${selected ? '●' : '○'} ${content.title}` : content.titleRow;
+    return React.createElement(Box, {position: 'absolute', left: x, top: y, borderStyle: 'round', borderColor: selected ? 'cyan' : 'gray', width, height, paddingX: 1, flexDirection: 'column', overflow: 'hidden'},
+      React.createElement(Text, {bold: true, color: selected ? 'cyan' : undefined}, marked(titleRow, selection, 0)),
+      ...content.rows.map((text, index) => React.createElement(Text, {key: `${index}:${text}`, wrap: 'truncate-end'}, marked(text || ' ', selection, content.visible[index + 1]))));
+  }
+  // The main worker's status line (under the prompt box): glyph, name, model, state, how long, what it is doing;
+  // a narrow column drops the model and the doing so the state and — sidebar hidden — the AI and mode fit.
+  function statusLine({view, columns, sidebar, mainState, mainModel, working, now, where}) {
+    const main = view.main ?? {};
+    const narrow = columns < 60; // the same bound the agent panes use for a single column
+    const quiet = working && quietFor(main.startedAt, now) ? ` ${quietFor(main.startedAt, now)}` : '';
+    const doing = !narrow && working && doingLine(main.doing, now, 60) ? ` · ${doingLine(main.doing, now, 60)}` : '';
+    return `${glyph(mainState, now)} ${view.metadata?.orchestrator ?? 'main'}${!narrow && mainModel ? ` · ${mainModel}` : ''} · ${mainState}${quiet}${doing}${sidebar ? '' : ` · ${view.metadata?.provider ?? 'agent'} · ${view.metadata?.mode ?? 'READY'}`}${narrow ? '' : ` · ${where}`}`;
+  }
+  // A heading filled with ─ to exactly `columns`: a longer run would be cut by Ink, which ends a cut row with …
+  const rule = (head, columns) => head + '─'.repeat(Math.max(0, columns - stringWidth(head)));
+  // The menu, the prompt box, the notice and the status line: the bottom of both the full-screen and inline views.
+  // `usage` (quotaStrip's lines) sits beside the prompt box, as tall as it, when the sidebar is not drawn and the row
+  // leaves the prompt at least 60 columns; the menu above keeps the whole width.
+  function promptArea({view, columns, draft, menu, working, statusText, usage = []}) {
+    const box = usageWidth(columns, usage);
+    if (box) columns -= box + 1;
+    const prompt = React.createElement(Box, {key: 'prompt', height: draft.length + 3, width: columns, flexShrink: 0, flexDirection: 'column'},
+        React.createElement(Text, {color: 'cyan', wrap: 'truncate-end'}, rule(`── Message ${view.inputTarget ?? 'orchestrator'} · Enter send · Shift+Enter newline `, columns)),
+        ...draft.map((row, index) => React.createElement(Text, {key: `input:${index}`, wrap: 'truncate-end'},
+          React.createElement(Text, {color: 'cyan'}, `${index === 0 ? '❯' : ' '} `),
+          row.caret === undefined ? row.text : React.createElement(React.Fragment, null,
+            row.before, React.createElement(Text, {inverse: true}, row.atEnd ? '▏' : row.caret), row.after),
+          // The main worker's proposed next step, dim after the caret while the input is empty: Tab takes it, typing replaces it.
+          index === 0 && !view.input && view.suggestion ? React.createElement(Text, {color: 'gray'}, ` ${view.suggestion}  ⇥ Tab`) : null)),
+        React.createElement(Text, {color: 'yellow', wrap: 'truncate-end'}, (view.notice ?? '').replace(/\n/g, ' ')),
+        // The main worker's status line lives under the prompt box, not above the transcript
+        // (2026-10-01): what it is doing and for how long, and — with the sidebar hidden — which AI and mode.
+        React.createElement(Text, {bold: true, color: working ? 'yellow' : 'cyan', wrap: 'truncate-end'}, statusText));
+    return [
+      ...menu.map((item, index) => React.createElement(Box, {key: `menu:${index}`, height: 1, flexShrink: 0}, React.createElement(Text, {wrap: 'truncate-end', color: item.selected ? 'cyan' : item.muted ? 'gray' : undefined}, item.text.replace(/\n/g, ' ')))),
+      box ? React.createElement(Box, {key: 'prompt-row', flexDirection: 'row', columnGap: 1, flexShrink: 0}, prompt,
+        React.createElement(Box, {key: 'usage', width: box, height: draft.length + 3, flexDirection: 'column', overflow: 'hidden', borderStyle: 'single', borderTop: false, borderRight: false, borderBottom: false, borderColor: 'gray', paddingLeft: 1},
+          ...usage.slice(0, draft.length + 3).map((text, index) => React.createElement(Text, {key: `usage:${index}`, wrap: 'truncate-end'}, text))))
+        : prompt,
+    ];
+  }
+  // Inline: finished rows are printed once into the terminal's own
+  // scrollback through <Static>; below them only the turn in flight and the prompt area are redrawn, sized to their
+  // content, so scrolling, search and selection are the terminal's. No sidebar.
+  function InlineWorkspace({inline, view}) {
+    const {Static} = Ink;
+    const columns = Math.max(20, view.columns ?? 80);
+    const height = Math.max(8, view.rows ?? 24);
+    const usage = view.sidebar === false ? [] : view.metadata?.usageLines ?? [];
+    const draft = promptLayout(view.input ?? '', view.inputCursor, columns - 4 - (usageWidth(columns, usage) && USAGE_WIDTH + 1), Math.max(1, Math.floor(height / 3)));
+    const menu = (view.menu ?? []).slice(0, Math.max(0, height - draft.length - 6)).map(item => typeof item === 'string' ? {text: item} : item);
+    const main = view.main ?? {};
+    const now = view.now ?? Date.now();
+    const working = Boolean(view.busy) || ['running', 'starting'].includes(main.state);
+    const mainState = working ? 'working' : main.state === 'blocked' ? 'blocked' : 'ready';
+    const statusText = statusLine({view, columns, sidebar: 0, mainState, mainModel: shortModel(main.model || view.metadata?.model), working, now, where: `Conversation · ${view.details ? 'details expanded' : 'details folded'} · /details`});
+    // The live rows never outgrow the screen: a frame taller than the terminal cannot be redrawn in place.
+    const liveRows = inline.liveRows.slice(-Math.max(1, height - menu.length - draft.length - 4));
+    return React.createElement(Box, {flexDirection: 'column', width: columns},
+      React.createElement(Static, {key: `static:${inline.staticKey}`, items: inline.staticItems},
+        item => React.createElement(Box, {key: item.id, flexDirection: 'column'}, ...item.lines.map((text, index) => React.createElement(Text, {key: index}, text || ' ')))),
+      ...liveRows.map((text, index) => React.createElement(Text, {key: `live:${index}`, wrap: 'truncate-end'}, text || ' ')),
+      ...promptArea({view, columns, draft, menu, working, statusText, usage}));
+  }
+  function Workspace({model, transcriptRows, view, onScrollClamp, onLayout, inline}) {
+    if (inline) return React.createElement(InlineWorkspace, {inline, view});
+    const selection = view.selection ?? null;
+    const selectionFor = id => selection?.region === id ? selection : null;
     const {total, content: columns, sidebar} = workspaceColumns(view.columns, {sidebar: view.sidebar});
     const height = Math.max(8, view.rows ?? 24);
-    const draft = promptLayout(view.input ?? '', view.inputCursor, columns - 4, Math.max(1, Math.floor(height / 3)));
+    // The full sidebar shows every plan already; the usage box stands in for it only where it does not fit.
+    const usage = sidebar || view.sidebar === false ? [] : view.metadata?.usageLines ?? [];
+    const draft = promptLayout(view.input ?? '', view.inputCursor, columns - 4 - (usageWidth(columns, usage) && USAGE_WIDTH + 1), Math.max(1, Math.floor(height / 3)));
     const menu = (view.menu ?? []).slice(0, Math.max(0, height - draft.length - 6))
       .map(item => typeof item === 'string' ? {text: item} : item);
     const main = view.main ?? {};
@@ -191,42 +280,40 @@ export function createWorkspace(React, Ink) {
       if (!view.agentsOpen && (view.scroll ?? 0) !== boundedScroll) onScrollClamp?.('orchestrator', boundedScroll);
     }, [view.agentsOpen, view.scroll, boundedScroll, onScrollClamp]);
     const end = transcript.length - boundedScroll;
-    const rows = transcript.slice(Math.max(0, end - bodyHeight), end);
-    // The main worker's status line (under the prompt box): glyph, name, model, state, how long, what it is
-    // doing; a narrow column drops the model and the doing so the state and — sidebar hidden — the AI and mode fit.
-    const narrow = columns < 60; // the same bound the agent panes use for a single column
-    const quiet = working && quietFor(main.startedAt, now) ? ` ${quietFor(main.startedAt, now)}` : '';
-    const doing = !narrow && working && doingLine(main.doing, now, 60) ? ` · ${doingLine(main.doing, now, 60)}` : '';
+    const firstShown = Math.max(0, end - bodyHeight);
+    const rows = transcript.slice(firstShown, end);
+    const sideLines = sidebar ? sidebarLines({metadata: view.metadata, panes: model.panes, main: allPanes[0], now}) : [];
+    const paneScroll = pane => view.paneScrolls?.[pane.id] ?? (pane.id === view.selectedId ? view.scroll : 0);
+    const shownPanes = view.agentsOpen ? visible.slice(0, grid.visible).map((pane, index) => {
+      const box = grid.panes[index];
+      const content = paneContent(pane, {width: box.width, height: box.height, scroll: paneScroll(pane), now});
+      const titleRow = pane.kind === 'orchestrator' ? `${pane.id === view.selectedId ? '●' : '○'} ${content.title}` : content.titleRow;
+      return {pane, box, content, titleRow};
+    }) : [];
+    // Where each kind of text is on the screen, for selection and the wheel (src/tui/selection.js): the text area
+    // inside a pane's border and padding, the sidebar's inside its left border and padding.
+    const regions = [
+      ...(view.agentsOpen ? shownPanes.map(({pane, box, content, titleRow}) => ({id: pane.id, x: box.x + 2, y: box.y + 1, width: Math.max(0, box.width - 4), height: Math.max(0, box.height - 2), rows: [titleRow, ...content.all], visible: content.visible, scrollFrom: content.header}))
+        : [{id: 'orchestrator', x: 0, y: 0, width: columns, height: bodyHeight, rows: transcript, visible: rows.map((_, index) => firstShown + index)}]),
+      ...(sidebar ? [{id: 'sidebar', x: columns + 3, y: 0, width: 30, height, rows: sideLines.slice(0, height).map(line => line.text)}] : []),
+    ];
+    React.useLayoutEffect(() => { onLayout?.(regions); });
     const where = view.agentsOpen ? 'Agent workspace · Tab changes pane' : `Conversation · ${view.details ? 'details expanded' : 'details folded'} · /details`;
-    const statusText = `${glyph(mainState, now)} ${view.metadata?.orchestrator ?? 'main'}${!narrow && mainModel ? ` · ${mainModel}` : ''} · ${mainState}${quiet}${doing}${sidebar ? '' : ` · ${view.metadata?.provider ?? 'agent'} · ${view.metadata?.mode ?? 'READY'}`}${narrow ? '' : ` · ${where}`}`;
+    const statusText = statusLine({view, columns, sidebar, mainState, mainModel, working, now, where});
     const content = React.createElement(Box, {flexDirection: 'column', width: columns, height, flexShrink: 0, overflow: 'hidden'},
       view.agentsOpen
-        ? React.createElement(Box, {position: 'relative', width: columns, height: bodyHeight}, ...visible.slice(0, grid.visible).map((pane, index) => React.createElement(Pane, {
-          key: pane.id, pane, selected: pane.id === view.selectedId,
-          x: grid.panes[index].x, y: grid.panes[index].y,
-          width: grid.panes[index].width, height: grid.panes[index].height,
-          scroll: view.paneScrolls?.[pane.id] ?? (pane.id === view.selectedId ? view.scroll : 0),
-          now, onScrollClamp,
+        ? React.createElement(Box, {position: 'relative', width: columns, height: bodyHeight}, ...shownPanes.map(({pane, box, content}) => React.createElement(Pane, {
+          key: pane.id, pane, content, selected: pane.id === view.selectedId,
+          x: box.x, y: box.y, width: box.width, height: box.height,
+          scroll: paneScroll(pane), onScrollClamp, selection: selectionFor(pane.id),
         })))
         // An empty Text is zero rows high in Ink, which would swallow the blank row between
         // blocks, paragraphs and headings; a single space keeps the row.
-        : React.createElement(Box, {height: bodyHeight, flexDirection: 'column', overflow: 'hidden'}, ...rows.map((text, index) => React.createElement(Text, {key: `${index}:${text}`, wrap: 'truncate-end'}, text || ' '))),
+        : React.createElement(Box, {height: bodyHeight, flexDirection: 'column', overflow: 'hidden'}, ...rows.map((text, index) => React.createElement(Text, {key: `${index}:${text}`, wrap: 'truncate-end'}, marked(text || ' ', selectionFor('orchestrator'), firstShown + index)))),
       view.agentsOpen && remaining ? React.createElement(Text, {color: 'gray'}, `+ ${remaining} more agents · Tab cycles`) : null,
-      ...menu.map((item, index) => React.createElement(Box, {key: `menu:${index}`, height: 1, flexShrink: 0}, React.createElement(Text, {wrap: 'truncate-end', color: item.selected ? 'cyan' : item.muted ? 'gray' : undefined}, item.text.replace(/\n/g, ' ')))),
-      React.createElement(Box, {height: draft.length + 3, flexShrink: 0, flexDirection: 'column'},
-        React.createElement(Text, {color: 'cyan', wrap: 'truncate-end'}, `── Message ${view.inputTarget ?? 'orchestrator'} · Enter send · Shift+Enter newline ${'─'.repeat(columns)}`),
-        ...draft.map((row, index) => React.createElement(Text, {key: `input:${index}`, wrap: 'truncate-end'},
-          React.createElement(Text, {color: 'cyan'}, `${index === 0 ? '❯' : ' '} `),
-          row.caret === undefined ? row.text : React.createElement(React.Fragment, null,
-            row.before, React.createElement(Text, {inverse: true}, row.atEnd ? '▏' : row.caret), row.after),
-          // The main worker's proposed next step, dim after the caret while the input is empty: Tab takes it, typing replaces it.
-          index === 0 && !view.input && view.suggestion ? React.createElement(Text, {color: 'gray'}, ` ${view.suggestion}  ⇥ Tab`) : null)),
-        React.createElement(Text, {color: 'yellow', wrap: 'truncate-end'}, (view.notice ?? '').replace(/\n/g, ' ')),
-        // The main worker's status line lives under the prompt box, not above the transcript (Daniel,
-        // 2026-10-01): what it is doing and for how long, and — with the sidebar hidden — which AI and mode.
-        React.createElement(Text, {bold: true, color: working ? 'yellow' : 'cyan', wrap: 'truncate-end'}, statusText)));
+      ...promptArea({view, columns, draft, menu, working, statusText, usage}));
     return React.createElement(Box, {flexDirection: 'row', columnGap: sidebar ? 1 : 0, width: total, height}, content,
-      sidebar ? React.createElement(Sidebar, {metadata: view.metadata, panes: model.panes, main: allPanes[0], height, now}) : null);
+      sidebar ? React.createElement(Sidebar, {lines: sideLines, height, selection: selectionFor('sidebar')}) : null);
   }
   return Workspace;
 }

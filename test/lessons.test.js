@@ -1,4 +1,4 @@
-// docs/plans/lessons-and-sweep.md §1 (Daniel, 2026-10-01): a correction the orchestrator makes becomes
+// 2026-10-01: a correction the orchestrator makes becomes
 // one line in the project's .bounce/LESSONS.md, and every later worker of that job reads it. Every
 // lesson of the week before (evidence inside the copy, checks that run the work, no thinking for the
 // builder) reached the agent files only through a person reading journals.
@@ -15,15 +15,15 @@ const project = t => {
   return dir;
 };
 const agents = new Set(['builder', 'analyst', 'reviewer']);
-const when = {date: '2026-10-01', session: 'e3bd01d5-b809-49bc-b68c-10d8db2fb00d'};
+const when = {date: '2026-10-01', session: 'a1b2c3d4-b809-49bc-b68c-10d8db2fb00d'};
 
 test('a lesson lands once as one line of the project file, with its job, date and session in a comment', t => {
   const cwd = project(t);
   const first = recordLesson(cwd, {agent: 'builder', text: 'Evidence the orders ask for goes inside the working copy at the path they name.'}, {agents, ...when});
-  assert.deepEqual(first, {ok: true, lesson: {agent: 'builder', text: 'Evidence the orders ask for goes inside the working copy at the path they name.', date: '2026-10-01', session: 'e3bd01d5'}});
+  assert.deepEqual(first, {ok: true, lesson: {agent: 'builder', text: 'Evidence the orders ask for goes inside the working copy at the path they name.', date: '2026-10-01', session: 'a1b2c3d4'}});
   assert.equal(fs.readFileSync(LESSONS_FILE(cwd), 'utf8'),
     '# Lessons\n\nOne line per lesson, written by the orchestrator when it corrected a worker\'s work here; every later worker of that job reads them. Delete a line to withdraw it.\n\n'
-    + '- Evidence the orders ask for goes inside the working copy at the path they name. <!-- builder · 2026-10-01 · e3bd01d5 -->\n');
+    + '- Evidence the orders ask for goes inside the working copy at the path they name. <!-- builder · 2026-10-01 · a1b2c3d4 -->\n');
 
   const again = recordLesson(cwd, {agent: 'all', text: '  evidence the orders ask for goes inside the working copy at the path they name  '}, {agents, ...when});
   assert.deepEqual(again, {ok: false, reason: 'duplicate: this lesson is already in .bounce/LESSONS.md'});
@@ -63,10 +63,10 @@ test('a worker sees the lines for its job and for all, after a heading; another 
 test('a hand-edited file is read as written: a deleted line is gone, a line without the comment is for all', t => {
   const cwd = project(t);
   fs.mkdirSync(path.join(cwd, '.bounce'), {recursive: true});
-  fs.writeFileSync(LESSONS_FILE(cwd), '# Lessons\n\n- Kept by hand, no comment.\n- Shaped by bounce. <!-- builder · 2026-09-29 · d1bc0206 -->\nNot a list item, ignored.\n');
+  fs.writeFileSync(LESSONS_FILE(cwd), '# Lessons\n\n- Kept by hand, no comment.\n- Shaped by bounce. <!-- builder · 2026-09-29 · b2c3d4e5 -->\nNot a list item, ignored.\n');
   assert.deepEqual(readLessons(cwd), [
     {agent: 'all', text: 'Kept by hand, no comment.', date: null, session: null},
-    {agent: 'builder', text: 'Shaped by bounce.', date: '2026-09-29', session: 'd1bc0206'},
+    {agent: 'builder', text: 'Shaped by bounce.', date: '2026-09-29', session: 'b2c3d4e5'},
   ]);
   // the newest lines are the ones shown when there are more than the cap
   for (let n = 0; n < LESSONS_SHOWN_MAX + 5; n += 1) recordLesson(cwd, {agent: 'all', text: `Lesson number ${n}.`}, {agents, ...when});

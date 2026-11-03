@@ -100,7 +100,7 @@ async function startOrchestratorDaemon(root, cwd, env = {}) {
 }
 
 // ---- E2 ------------------------------------------------------------------
-// CONTRACT.md §4 (amendment A2): the availableStarts check and the reservation are one
+// The availableStarts check and the reservation are one
 // synchronous span, before the checkpoint's own await — an await between check and
 // reservation would let two concurrent submits over-reserve the same root (see W8 in
 // test/watchdog.test.js). So a baseline refusal here DOES reserve, then releases what it

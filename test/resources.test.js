@@ -1,4 +1,4 @@
-// What the machine can run (docs/plans/resource-aware.md). Every fixture here is real output from the
+// What the machine can run. Every fixture here is real output from the
 // machine this was built on (2026-09-22): 128 GiB, 8.5 GB of swap already used with no pressure, a 92 GB
 // GPU wiring cap, a 20 GB model resident and a 73 GB one on disk. Nothing in these tests reads the
 // machine: the reads are injected, so the numbers cannot drift under the assertions.
@@ -111,4 +111,10 @@ test('R6 the report: what is free, what is resident, and what each model would c
     '  lmstudio/minimax-m2-reap-139b-a10b  73.0 GB  does not fit: needs 73.0 GB plus a reserve of 8.0 GB, and only 65.9 GB is free',
   ].join('\n'));
   assert.equal(resourceReport({machine: {known: false, reason: 'vm_stat unreadable'}, fleet}), 'Machine: unknown (vm_stat unreadable) · bounce will not hold a local task back');
+});
+
+// Found in the real-console pass 2026-10-21: on Linux `bounce resources` printed "spawnSync vm_stat ENOENT". The
+// numbers are macOS's (unified memory); off it, bounce says it does not measure rather than fail at a macOS tool.
+test('off macOS the machine is not measured, and says so in words', () => {
+  assert.deepEqual(readMachine({platform: 'linux'}), {known: false, reason: 'bounce measures memory on macOS only'});
 });

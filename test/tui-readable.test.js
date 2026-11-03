@@ -247,3 +247,16 @@ test('details expand tool output and folding restores the compact view without s
     terminal.unmount();
   }
 });
+
+// Found in the real-console pass 2026-10-21: a claude worker's pane listed "● hook_started" and "● hook_response",
+// plumbing the conversation view already hides.
+test('a worker pane hides the vendor plumbing the conversation hides', () => {
+  const Workspace = createWorkspace(React, Ink);
+  const activity = ['hook_started', 'hook_response', 'background_tasks_changed', 'Ready · 102 tools'].map(text => ({text, source: 'activity'}));
+  const output = stripAnsi(Ink.renderToString(React.createElement(Workspace, {
+    model: {panes: [{id: 'worker:abc', task: 'abc', profile: 'build', state: 'running', activity}], transcript: []},
+    transcriptRows: [], view: {columns: 58, rows: 20, agentsOpen: true, selectedId: 'worker:abc'},
+  }), {columns: 58}));
+  assert.equal(/hook_started|hook_response|background_tasks_changed/.test(output), false, output);
+  assert.match(output, /Ready · 102 tools/);
+});

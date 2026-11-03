@@ -31,7 +31,9 @@ export const parseSwapUsage = text => {
 
 // One read of the machine. Never throws: anything unreadable is {known: false, reason}, and every caller
 // treats that as "no opinion" — bounce then behaves exactly as it did before this module existed.
-export function readMachine({run = sh} = {}) {
+export function readMachine({run = sh, platform = process.platform} = {}) {
+  // Unified memory: on Linux and Windows a GPU's own memory decides what loads, and these numbers would mislead.
+  if (run === sh && platform !== 'darwin') return {known: false, reason: 'bounce measures memory on macOS only'};
   try {
     const vm = parseVmStat(run('vm_stat', []));
     if (!vm) return {known: false, reason: 'vm_stat unreadable'};

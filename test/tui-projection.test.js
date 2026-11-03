@@ -129,7 +129,7 @@ test('verified replacement keeps the logical pane identity and exposes recovery 
   assert.equal(projection.snapshot().panes[0].recovery, 'replacement for original');
 });
 
-// Found live (session 159f4746): a replacement for a task still BLOCKED (integration refused) was added
+// Found live: a replacement for a task still BLOCKED (integration refused) was added
 // as a second pane with the same `worker:<original>` id; React warned about the duplicate key on the
 // terminal, under Ink's frame, and the screen twitched. The replacement takes over the pane.
 test('a replacement for a task that is still blocked takes over its pane instead of adding a second one', () => {
@@ -231,7 +231,7 @@ test('a task.observed row copying an already-shown task.activity row is not stor
   assert.deepEqual(projection.snapshot().panes[0].activity.map(row => row.text), ['reading file.js', 'now writing file.js']);
 });
 
-// Found live (2026-09-25, session 159f4746): "Lint passes (exit code 0…)" showed twice in a worker pane
+// Found live (2026-09-25): "Lint passes (exit code 0…)" showed twice in a worker pane
 // while the journal held it once — the journal copy can reach a view before the live row does, and
 // a live row can repeat. Whichever arrives second is the copy.
 test('the live row arriving after its journal copy, or a live row repeated, is not stored again', () => {
@@ -253,4 +253,43 @@ test('a task.observed row replayed with no source field is still stored', () => 
     {kind: 'task.observed', id: '2', seq: 2, task: 'build', text: 'restarted mid-run, still reading file.js'},
   ]);
   assert.deepEqual(projection.snapshot().panes[0].activity, [{text: 'restarted mid-run, still reading file.js', source: null}]);
+});
+
+// Found live: a task's check ran for over a minute after its worker finished, and the UI showed no work in progress:
+// the pane said `completed` (with a review to come) or was gone (with none). A running check is work.
+test('a task whose check is running reads as checking until the check answers, with or without a review after it', async () => {
+  const {isWorking} = await import('../src/tui/status.js');
+  for (const review of [{completion: 'reviewer'}, undefined]) {
+    const projection = createWorkspaceProjection();
+    projection.replay([
+      {kind: 'task.submitted', id: '1', seq: 1, task: 'build', profile: 'builder', check: 'npm test', ...(review ? {review} : {})},
+      {kind: 'task.started', id: '2', seq: 2, task: 'build', attempt: 1},
+      {kind: 'task.completed', id: '3', seq: 3, task: 'build', summary: 'built it'},
+      {kind: 'task.milestone', id: '4', seq: 4, task: 'build', attempt: 1, phase: 'check', text: "Running the task's check: npm test"},
+    ]);
+    const pane = projection.snapshot().panes.find(p => p.task === 'build');
+    assert.equal(pane?.state, 'checking', review ? 'with a review' : 'with no review');
+    assert.equal(isWorking(pane.state), true);
+    projection.ingest({kind: 'task.check', id: '5', seq: 5, task: 'build', attempt: 1, passed: true});
+    if (review) {
+      projection.ingest({kind: 'review.started', id: '6', seq: 6, task: 'build', stage: 'completion', round: 1, profile: 'reviewer'});
+      assert.equal(projection.snapshot().panes.find(p => p.task === 'build').state, 'reviewing');
+    } else assert.deepEqual(projection.paneIds(), ['orchestrator'], 'a passed check with no review ends the pane as completion did');
+  }
+});
+
+test('a failed check puts the task back to running; a task with no check still leaves on completion', () => {
+  const projection = createWorkspaceProjection();
+  projection.replay([
+    {kind: 'task.submitted', id: '1', seq: 1, task: 'build', profile: 'builder', check: 'npm test'},
+    {kind: 'task.started', id: '2', seq: 2, task: 'build', attempt: 1},
+    {kind: 'task.completed', id: '3', seq: 3, task: 'build'},
+    {kind: 'task.milestone', id: '4', seq: 4, task: 'build', phase: 'check', text: "Running the task's check: npm test"},
+    {kind: 'task.check', id: '5', seq: 5, task: 'build', passed: false},
+    {kind: 'task.submitted', id: '6', seq: 6, task: 'plain', profile: 'builder'},
+    {kind: 'task.started', id: '7', seq: 7, task: 'plain', attempt: 1},
+    {kind: 'task.completed', id: '8', seq: 8, task: 'plain'},
+  ]);
+  assert.equal(projection.snapshot().panes.find(p => p.task === 'build').state, 'running');
+  assert.deepEqual(projection.paneIds(), ['orchestrator', 'worker:build']);
 });

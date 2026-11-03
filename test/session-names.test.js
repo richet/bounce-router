@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {deriveSessionName} from '../src/session-names.js';
 
 test('deriveSessionName: deterministic, matches the adjective-noun shape, two ids differ', () => {
-  const id = 'e9353126-0000-0000-0000-000000000000';
+  const id = 'c3d4e5f6-0000-0000-0000-000000000000';
   const first = deriveSessionName(id);
   assert.equal(deriveSessionName(id), first, 'same id must always derive the same name');
   assert.match(first, /^[a-z]+-[a-z]+$/);
@@ -15,7 +15,7 @@ test('deriveSessionName: deterministic, matches the adjective-noun shape, two id
 test('deriveSessionName: fixed fixtures give the expected name', () => {
   // Pinned against the current word lists and hash scheme; a deliberate list/scheme change
   // updates these together.
-  assert.equal(deriveSessionName('e9353126-1111-1111-1111-111111111111'), 'wide-meteor');
+  assert.equal(deriveSessionName('c3d4e5f6-1111-1111-1111-111111111111'), 'silent-warbler');
   assert.equal(deriveSessionName('abc'), 'happy-horizon');
   assert.equal(deriveSessionName('session-123'), 'sure-viper');
 });

@@ -8,7 +8,7 @@ entry, chained as fallbacks — so nothing else defines a role.
 ---
 name: coder                      # lowercase; letters, digits, _ -; `orchestrator` is reserved
 description: Implements owned modules in this repository.
-policy: write                    # write (default) | read-only
+policy: write                    # write (default) | read-only (reads only, runs no commands)
 maxSteps: 60                     # optional, 1..500; caps tool steps on runtimes that can (OpenCode)
 readPaths: [.]                   # optional, relative paths; used when a local AI plays it
 writePaths: [src, test]          # required for a write agent to run on a local model
@@ -25,6 +25,12 @@ You build. Own only the paths you were given; verify red-first; report with evid
   agent runs on otherwise. The shipped agents are `models: [auto]`. A list without `auto` is never overridden.
   `provider/default` is the provider's own default model. With no `models:`, every signed-in provider
   plays it in `order`, then the local endpoint on `auto`.
+- How a LOCAL model samples for this job, each key optional, sent with every request the job makes so
+  agents sharing one loaded model each get their own: `thinking: on|off`, `temperature` (0..2), `topP`
+  (above 0, up to 1), `topK` (integer), `minP` (0..1), `presencePenalty` and `frequencyPenalty` (-2..2),
+  `repeatPenalty` (above 0, up to 2), `maxTokens` (1..32000), `seed`. A key left out falls through to the
+  server's per-model default (`thinking: on` sends nothing, since on is LM Studio's default). A cloud model
+  in `models:` ignores them all.
 - Layers, later shadowing by name: this skill's `team/` → `~/.bounce/agents/` → `<project>/.bounce/agents/`.
 - One file is the whole definition. Never write per-vendor copies of an agent (Claude subagent files, Codex TOML): the AI that plays it is chosen by `models:`, not by the file.
 - A file that fails to parse is reported as INVALID, never silently replaced by a default.

@@ -34,21 +34,20 @@ test('real guided CLI offers discovery, accepts confirmation, and never starts a
     child.stdin.end(answers.join('\n')+'\n');
   });
   await fs.writeFile(file,JSON.stringify(settings));
-  // The four shipped agents, alphabetically: analyst takes the suggested model (Enter), the rest skip.
-  const accepted=await run(['','skip','skip','skip','y']);
+  // The shipped team and no bindings: setup names the loaded model and writes the starting bindings, then saves on y.
+  const accepted=await run(['y']);
   assert.equal(accepted.code,0,accepted.output);
-  assert.match(accepted.output,/Loaded: \[1\] loaded \(8k\)/);
-  assert.match(accepted.output,/analyst → loaded · then claude\/default/);
+  assert.match(accepted.output,/LM Studio has: \[1\] loaded/);
   assert.match(accepted.output,/OpenCode bridge ready/);
-  const analyst=agentMetadata(await fs.readFile(path.join(root,'agents','analyst.md'),'utf8'));
-  assert.deepEqual(analyst.models.slice(0,1),['lmstudio/loaded']);
+  assert.equal(await fs.readFile(path.join(root,'models.yaml'),'utf8'),'# This machine\'s models, by alias: what bindings.yml names. bounce local setup wrote it; edit freely.\nloaded: lmstudio/loaded\n');
+  assert.equal(await fs.readFile(path.join(root,'bindings.yml'),'utf8'),'# Which alias plays each agent, first choice first. auto lets Jev pick among the rest of the list; "*" is every other agent.\nagents:\n  "*": [auto, loaded, claude/sonnet, codex]\n');
   assert.deepEqual(JSON.parse(await fs.readFile(file)).profiles,{main:{adapter:'claude'}},'no profile is created');
   assert.equal(posts,0,'setup never sends an inference or load request to LM Studio itself');
-  assert.deepEqual((await fs.readdir(root)).sort(),['agents','config.json']);
-  // The config changes while setup is open: nothing is saved, and no agent file is left behind.
-  await fs.rm(path.join(root,'agents'),{recursive:true,force:true});
+  assert.deepEqual((await fs.readdir(root)).sort(),['bindings.yml','config.json','models.yaml']);
+  // The config changes while setup is open: nothing is saved, and no file is left behind.
+  for (const name of ['bindings.yml','models.yaml']) await fs.rm(path.join(root,name),{force:true});
   await fs.writeFile(file,JSON.stringify(settings));requests=0;change=true;
-  const conflict=await run(['','skip','skip','skip','y']);
+  const conflict=await run(['y']);
   assert.equal(conflict.code,1,conflict.output);
   assert.match(conflict.output,/configuration changed/i);
   assert.equal(JSON.parse(await fs.readFile(file)).cooldownMinutes,99);

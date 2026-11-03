@@ -36,7 +36,9 @@ export async function checkUpdate({root, force = false, run = npm, now = Date.no
       if (now >= cached.checkedAt && now - cached.checkedAt < 86400000 && stable(cached.latest)) return {latest: cached.latest, available: newer(cached.latest)};
     } catch {}
   }
-  const latest = JSON.parse(await run(['view', 'bouncerouter@latest', 'version', '--json']));
+  // npm 12 wraps the one version in an array; earlier npms print it bare.
+  const answer = JSON.parse(await run(['view', 'bouncerouter@latest', 'version', '--json']));
+  const latest = Array.isArray(answer) && answer.length === 1 ? answer[0] : answer;
   if (!stable(latest)) throw new Error('npm returned an invalid stable release version');
   if (file) {
     try {fs.mkdirSync(root, {recursive: true}); fs.writeFileSync(file, JSON.stringify({checkedAt: now, latest}) + '\n');} catch {}

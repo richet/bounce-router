@@ -35,7 +35,7 @@ const submit = scheduler => scheduler.submit({task: 'audit', profile: 'analyst',
 // The worker's own final answer is the source of truth the moment no valid structured report
 // survives parsing (src/final-report.js synthesizeReport): a long malformed-JSON answer is
 // synthesized directly, never spending a repair turn asking the model to fix its own formatting.
-// Observed live (session 159f4746, 7/19 tasks): a good prose final answer over a missing report
+// Observed live: a good prose final answer over a missing report
 // was lost to a report repair that timed out or was unavailable.
 test('a long malformed-JSON answer is synthesized directly, with no repair round', {timeout: 3000}, async t => {
   const malformed = JSON.stringify({...valid, text: 'Evidence '.repeat(2400)}).replace('],"outcome"', ',"outcome"');
@@ -177,8 +177,8 @@ test('a report-only timeout with no answer at all still fails, never for formatt
   assert.equal(session.events.some(row => row.kind === 'task.reported'), false);
 });
 
-// Observed live (reviewer c33dcf6b): a PASS verdict reported with remaining "None." was blocked as unfinished work.
-// Found live (159f4746 eeebd5b9, sonnet): "None for the assigned P3 steps 1 and 3 scope." was read as owed work.
+// Observed live: a PASS verdict reported with remaining "None." was blocked as unfinished work.
+// Found live: "None for the assigned P3 steps 1 and 3 scope." was read as owed work.
 for (const nothing of ['None.', 'N/A', 'nothing', '-', 'None — all three steps completed and the scratch test was removed.', 'None for the assigned P3 steps 1 and 3 scope.', 'Nothing within this task\'s scope.', 'None in scope.']) test(`a completed report whose remaining says "${nothing}" completes, by text and by tool`, {timeout: 3000}, async t => {
   const byText = setup(t, fakeAdapter(() => [{kind: 'result', status: 'completed', text: JSON.stringify({...valid, remaining: nothing})}]));
   submit(byText.scheduler);
@@ -189,7 +189,7 @@ for (const nothing of ['None.', 'N/A', 'nothing', '-', 'None — all three steps
   assert.equal((await byTool.terminal).kind, 'task.completed');
 });
 
-// Reversed 2026-09-26 (ACE d1bc0206): named remaining work no longer blocks the task and discards its
+// Reversed 2026-09-26: named remaining work no longer blocks the task and discards its
 // work; the task completes and carries the remaining work to the orchestrator as a follow-up. "None."
 // and its variants (above) still complete with nothing carried.
 for (const owed of ['Re-run the corrupt-tail probes.', 'None of the Docker probes ran.', 'None for now, but the lint step still fails.']) test(`a completed report that names unfinished work completes and carries it as a follow-up: "${owed}"`, {timeout: 3000}, async t => {
