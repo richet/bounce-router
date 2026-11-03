@@ -15,6 +15,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {dataRoot, saveJSON} from './core.js';
 import {catalogNote, cloudTier} from './model-catalog.js';
+import {weeklyRoom, readQuotaSettings} from './quota.js';
 
 export const JEV_DEFAULT_MODEL = 'jev-1.13.0'; // pinned: an alias (`jev-latest`) moves between releases and shifts calibrated thresholds
 export const JEV_REVIEWER = 'jev'; // the synthetic read-only critic profile the daemon registers
@@ -667,11 +668,13 @@ const TIER_WALK = {cheapest: ['cheapest', 'mid', 'strongest'], mid: ['mid', 'str
 const resetOf = (entry, label, now) => entry?.windows?.find(w => w.label === label && Number.isFinite(w.resetsAt) && w.resetsAt > now)?.resetsAt ?? Infinity;
 
 // Pure. Which AI of the agent's own list plays the task, among those of `tier` (or the nearest tier the list has).
-// 2026-10-26: between peers the subscriptions decide — the vendor whose weekly window resets first, then its
-// 5-hour one; a vendor with a window spent or in cooldown is out, one with no reading goes last. A local peer has no
+// Between peers the subscriptions decide: the vendor with the most room per hour left before its weekly reset
+// (src/quota.js weeklyRoom, under the user's ceiling), since a week's share unused at its reset is lost; then the
+// sooner weekly reset, then the sooner 5-hour one. A vendor with a window spent or in cooldown is out, one with no
+// reading goes last, and one over its ceiling only goes after those under it. A local peer has no
 // window and costs nothing, so it goes first while its slot is free, loaded, and big enough for the orders.
 // Ties keep the list's order. Every candidate comes back with why it lost.
-export function pickAI({profiles = {}, head = null, notes = {}, locals = [], tier = 'mid', longContext = false, quotas = {}, cooldowns = {}, localFree = () => true, now = Date.now()} = {}) {
+export function pickAI({profiles = {}, head = null, notes = {}, locals = [], tier = 'mid', longContext = false, quotas = {}, quotaSettings = null, cooldowns = {}, localFree = () => true, now = Date.now()} = {}) {
   const chain = chainOf(profiles, head);
   const at = match => { const index = chain.findIndex(match); return index === -1 ? chain.length : index; };
   const cloud = Object.entries(ownProfiles(profiles, head)).filter(routable).map(([name, p]) => ({name, adapter: p.adapter,
@@ -686,13 +689,13 @@ export function pickAI({profiles = {}, head = null, notes = {}, locals = [], tie
     const clouds = cloud.filter(c => c.tier === wanted).map(c => {
       const entry = quotas[c.adapter];
       const spent = entry?.windows?.find(w => Number(w.percent) >= 100 && !(Number.isFinite(w.resetsAt) && w.resetsAt <= now));
-      return {...c, weekly: resetOf(entry, '7d', now), hours: resetOf(entry, '5h', now),
+      return {...c, weekly: resetOf(entry, '7d', now), hours: resetOf(entry, '5h', now), room: weeklyRoom(entry, c.adapter, quotaSettings, now),
         reason: cooldowns[c.adapter] > now ? `${c.adapter} is in cooldown` : spent ? `${c.adapter} ${spent.label} at 100%` : null};
-    }).sort((a, b) => a.weekly - b.weekly || a.hours - b.hours || a.index - b.index);
+    }).sort((a, b) => (b.room?.score ?? -1) - (a.room?.score ?? -1) || a.weekly - b.weekly || a.hours - b.hours || a.index - b.index);
     for (const c of [...locals, ...clouds]) candidates.push(c);
     const first = [...locals, ...clouds].find(c => !c.reason);
     if (first) {
-      const why = first.item ? 'a free local model' : Number.isFinite(first.weekly) ? `its weekly window resets first (${new Date(first.weekly).toISOString().slice(0, 16)}Z)` : Number.isFinite(first.hours) ? 'its 5-hour window resets first' : 'first in the list';
+      const why = first.item ? 'a free local model' : first.room ? `${first.room.headroom} points left ${first.room.ceiling < 100 ? `under its ${first.room.ceiling}% ceiling` : 'of its week'}, ${Math.round(first.room.hours)} h before its weekly reset` : Number.isFinite(first.weekly) ? `its weekly window resets first (${new Date(first.weekly).toISOString().slice(0, 16)}Z)` : Number.isFinite(first.hours) ? 'its 5-hour window resets first' : 'first in the list';
       return {ai: first.name, ...(first.item ? {local: {endpoint: first.item.endpoint, model: first.item.model}} : {}), tier: wanted, why,
         candidates: candidates.map(c => ({name: c.name, tier: c.tier, ...(c === first ? {picked: true} : c.reason ? {reason: c.reason} : {reason: `after ${first.name}`})}))};
     }
@@ -850,14 +853,15 @@ export function jevReviewerProfile(settings = {}) {
 // bound to the typesafe adapter's client. `notes` (a function, may be async) supplies the
 // roster's {tier, capabilities} per profile at route time — the roster setup of
 // src/roster-notes.js in the daemon; absent, routing sees adapter/model/role/policy only.
-// `quotas()` is the daemon's quota store (src/quota.js): what `auto` agents' AIs are picked by, never sent to Jev.
-export function createJevDecisions({root = dataRoot(), adapter, readSettings = () => readJevSettings(root), notes = null, order = () => [], locals = null, quotas = null} = {}) {
+// `quotas()` is the daemon's quota store (src/quota.js): what `auto` agents' AIs are picked by, never sent to Jev;
+// `readQuota()` the user's ceilings on it.
+export function createJevDecisions({root = dataRoot(), adapter, readSettings = () => readJevSettings(root), readQuota = () => readQuotaSettings(root), notes = null, order = () => [], locals = null, quotas = null} = {}) {
   return {
     reviewer: JEV_REVIEWER,
     settings: readSettings,
     lease: request => judgeLease({...request, settings: readSettings(), ask: adapter?.ask}),
     routeAI: ({orders, profiles, head, tier = null, load: live = () => ({}), local = true, signal}) => routeAgentAI({orders, profiles, head, tier, ...(locals && local ? {locals} : {}), settings: readSettings(), ask: adapter?.ask, ...(notes ? {notes} : {}), signal,
-      load: async () => ({quotas: quotas?.() ?? {}, ...(await live())})}),
+      load: async () => ({quotas: quotas?.() ?? {}, quotaSettings: readQuota(), ...(await live())})}),
     route: ({orders, profiles, signal}) => routeTask({orders, profiles, order: order(), ...(locals ? {locals} : {}), settings: readSettings(), ask: adapter?.ask, ...(notes ? {notes} : {}), signal}),
     inPlace: ({citedText, messages, orders, signal}) => judgeInPlace({citedText, messages, orders, settings: readSettings(), ask: adapter?.ask, signal}),
   };

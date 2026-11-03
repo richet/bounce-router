@@ -41,13 +41,13 @@ async function untilEnd(channel, watcher, timeoutMs) {
 // `wait` holds until this message's own turn ends (a queued one waits behind the current turn) and returns the
 // orchestrator's last answer in it; past `timeoutMs` it answers `status: 'waiting'` with the request to ask about
 // later (answerOf). Without it, send returns as soon as the daemon took the message.
-export async function sendToOrchestrator(channel, text, {wait = false, timeoutMs = 60 * 60_000} = {}) {
+export async function sendToOrchestrator(channel, text, {wait = false, timeoutMs = 60 * 60_000, caller} = {}) {
   const session = await createRemoteSession(channel);
   let watcher = null;
   const early = [];
   const unsubscribe = session.subscribe(row => (watcher ? watcher.see(row) : early.push(row)));
   try {
-    const ack = await session.runMain({text, via: 'send'});
+    const ack = await session.runMain({text, via: 'send', ...(caller ? {caller} : {})});
     if (!ack?.accepted) return {accepted: false, reason: ack?.reason ?? 'refused'};
     const sent = {accepted: true, requestId: ack.requestId, queued: Boolean(ack.queued)};
     if (!wait) return sent;

@@ -99,6 +99,21 @@ test('control MCP: send, then answer, reach the live session the way bounce send
   assert.equal((await call('answer', {request: 'nope'})).structuredContent.status, 'unknown');
 });
 
+test('a sender can say who it is, on bounce send and on the control MCP, and only a sent turn carries it', async t => {
+  const f = fixture(t);
+  await sendToOrchestrator(await viewOf(t, f), 'first', {caller: 'control-session-1', wait: true, timeoutMs: 5000});
+  assert.equal(f.session.events.findLast(e => e.kind === 'user').caller, 'control-session-1');
+  const {createControlServer} = await import('../src/mcp-control.js');
+  const server = await createViewServer({session: f.session, main: f.main, token: 'secret'});
+  t.after(() => server.close());
+  const control = createControlServer({sessions: () => [{id: f.session.id, name: 'webapp', cwd: '/w/webapp', live: true}], connect: () => connectView({path: server.path, token: 'secret'})});
+  await control.handle({jsonrpc: '2.0', id: 1, method: 'tools/call', params: {name: 'send', arguments: {message: 'second', caller: 'control-session-2', wait_seconds: 5}}});
+  assert.equal(f.session.events.findLast(e => e.kind === 'user').caller, 'control-session-2');
+  assert.equal((await f.main.run({text: 'typed', caller: 'someone'})).reason, 'invalid_caller');
+  assert.equal((await f.main.run({text: 'sent', via: 'send', caller: 'x'.repeat(201)})).reason, 'invalid_caller');
+  assert.equal((await f.main.run({text: 'sent', via: 'send', caller: 'two\nlines'})).reason, 'invalid_caller');
+});
+
 test('control MCP: with several live sessions, send names them instead of guessing', async () => {
   const {createControlServer} = await import('../src/mcp-control.js');
   const control = createControlServer({sessions: () => [{id: 'aaaa1111', name: 'webapp', cwd: '/w/webapp', live: true}, {id: 'bbbb2222', name: 'api', cwd: '/w/api', live: true}], connect: () => { throw new Error('never'); }});
@@ -180,4 +195,21 @@ test('control MCP: the operating rules come with initialize and the guide tool, 
   for (const heading of ['## The loop', '## Waiting', '## Reading status', '## Verifying', '## Writing to the orchestrator', '## Leave alone']) assert.match(guide, new RegExp(heading));
   const inside = createControlServer({sessions: () => [], connect: () => { throw new Error('never'); }, inside: true});
   assert.equal(Object.hasOwn((await inside.handle({jsonrpc: '2.0', id: 1, method: 'initialize'})).result, 'instructions'), false);
+});
+
+test('status: a last turn that failed says so, and its error is not read as an answer', async () => {
+  const {orchestratorStatus, formatStatus} = await import('../src/control-status.js');
+  const failed = [
+    {kind: 'assistant', from: 'main', text: 'The migration is merged.', time: '2026-10-25T10:00:00.000Z'},
+    {kind: 'main.started', requestId: 'r2', time: '2026-10-25T10:01:00.000Z'},
+    {kind: 'assistant', from: 'main', text: 'Prompt is too long', time: '2026-10-25T10:01:01.000Z'},
+    {kind: 'main.terminal', requestId: 'r2', status: 'failed', reason: 'Prompt is too long', text: 'Prompt is too long', time: '2026-10-25T10:01:02.000Z'},
+  ];
+  const view = orchestratorStatus(failed, {now: Date.parse('2026-10-25T10:02:00.000Z')});
+  assert.equal(view.orchestrator.state, 'idle');
+  assert.equal(view.orchestrator.failed, 'Prompt is too long');
+  assert.equal(view.lastAnswer, 'The migration is merged.');
+  assert.match(formatStatus(view), /^Orchestrator: idle for 1 min; its last turn failed: Prompt is too long/);
+  const recovered = orchestratorStatus([...failed, {kind: 'main.started', requestId: 'r3', time: '2026-10-25T10:03:00.000Z'}], {now: Date.parse('2026-10-25T10:04:00.000Z')});
+  assert.equal(recovered.orchestrator.failed, undefined, 'a turn running after the failure is the state now');
 });

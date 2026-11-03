@@ -6,6 +6,7 @@ import path from 'node:path';
 import {Session} from '../src/core.js';
 import {createBus, connectBus} from '../src/bus.js';
 import {createMainService} from '../src/main-service.js';
+import claude from '../src/adapters/claude.js';
 
 function fixture(t, provider = 'codex') {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-main-service-'));
@@ -1139,6 +1140,17 @@ test('a typed message the vendor refuses before saying anything is tried once mo
   assert.equal(f.calls.length, 2);
   assert.equal(f.session.events.filter(e => e.kind === 'main.terminal').length, 1, 'the refusal is not shown as the turn\'s end');
   assert.equal(f.session.events.findLast(e => e.kind === 'status').text, 'codex refused the message (model is not enabled); trying once more.');
+});
+
+test('a typed message past the context limit is tried once more, since the next run compacts first', async t => {
+  const tooLong = [{kind: 'model', model: 'opus'}, ...claude.normalize({type: 'assistant', message: {model: '<synthetic>', content: [{type: 'text', text: 'Prompt is too long'}]}}),
+    {kind: 'error', text: 'Prompt is too long'}, {kind: 'result', status: 'failed', text: 'Prompt is too long'}];
+  const f = refusingFixture(t, [tooLong, answered]);
+  const ended = nextEvent(f.main, 'main.terminal');
+  f.main.run({id: 'one', text: 'ship the migration'});
+  const terminal = await ended;
+
+  assert.deepEqual([terminal.status, terminal.reason, f.calls.length], ['completed', 'pong', 2]);
 });
 
 test('a message refused twice ends failed with the vendor\'s words, and is not tried a third time', async t => {

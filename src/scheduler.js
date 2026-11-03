@@ -862,6 +862,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const problem = validate(spec, view);
     if (problem) throw new Error(`malformed: ${problem}`);
     const task = spec.task ?? randomUUID();
+    const turnRequestId = spec.from === 'orchestrator' ? reducers.openTurnRequest(session.events) : null;
     const row = {
       kind: 'task.submitted', task,
       parent: spec.parent ?? null,
@@ -887,6 +888,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       ...(spec.tier ? {tier: spec.tier} : {}),
       jobId: spec.jobId, retryOf: spec.retryOf,
       ...(spec.continues ? {continues: spec.continues} : {}),
+      ...(turnRequestId ? {turnRequestId} : {}),
       ...(spec.worker ? {worker: spec.worker} : {}),
       ...(spec.corrections?.length ? {corrections: spec.corrections} : {}),
     };

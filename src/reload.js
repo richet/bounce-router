@@ -970,7 +970,7 @@ async function attachCommand(args) {
 // `bounce send [--session REF] [--wait] [--json] MESSAGE`: the message goes to that session's orchestrator as if typed
 // in its view (src/send.js). With no --session, the one live session started in this directory.
 async function sendCommand(args) {
-  const {values, positionals} = parseArgs({args: args.slice(1), allowPositionals: true, options: {session: {type: 'string'}, wait: {type: 'boolean'}, json: {type: 'boolean'}, cwd: {type: 'string'}}});
+  const {values, positionals} = parseArgs({args: args.slice(1), allowPositionals: true, options: {session: {type: 'string'}, wait: {type: 'boolean'}, caller: {type: 'string'}, json: {type: 'boolean'}, cwd: {type: 'string'}}});
   const text = positionals.join(' ').trim();
   if (!text) { console.error('bounce: send requires a message: bounce send [--session REF] [--wait] "message"'); process.exitCode = 2; return; }
   const root = dataRoot();
@@ -987,7 +987,7 @@ async function sendCommand(args) {
   let channel;
   try { channel = await connectSession(root, id); }
   catch (error) { console.error(`bounce: ${error.message}`); process.exitCode = 1; return; }
-  const sent = await sendToOrchestrator(channel, text, {wait: Boolean(values.wait)});
+  const sent = await sendToOrchestrator(channel, text, {wait: Boolean(values.wait), caller: values.caller});
   if (values.json) console.log(JSON.stringify({session: id, ...sent}));
   else if (!sent.accepted) console.error(`bounce: the orchestrator did not take the message: ${sent.reason}`);
   else if (!values.wait) console.log(`${sent.queued ? 'queued: it runs when the current turn ends' : 'sent'} · session ${id.slice(0, 8)} · request ${sent.requestId}`);
