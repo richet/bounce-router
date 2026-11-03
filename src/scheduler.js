@@ -85,6 +85,8 @@ const reportInstruction = profile => reportsByTool(profile)
 // 18 were rejected as invalid and 19 rewritten by bounce. To be measured on real sessions against Jev's
 // ranking of wrong work; `reports: "structured"` brings the fixed format back.
 const PLAIN_ENDING = 'End your last turn with a plain answer in your own words: what you did, each check you ran with the last lines it printed, and what is left of this assignment. No JSON and no report call for the end. If you could not finish, begin the answer with "Blocked:" or "Failed:" and say why.';
+// A worker's copy is removed later (src/prune.js); what it started there is not.
+const STOP_SERVICES = 'Services you start in your copy (a stack, containers, a server) you stop before you end, and your answer names the command that stopped them: your copy is removed later, and what you leave running is not.';
 const plainContract = profile => [
   `To report progress, ${reportInstruction(profile)} using your scoped report endpoint (it is the only bounce command you need; \`bounce\` alone starts nothing useful here).`,
   'A progress report is a JSON object with op ("milestone" | "blocked" | "input_required"), phase ("inspect" | "plan" | "implement" | "test" | "verify" | "review" | "document" | "done"),',
@@ -93,6 +95,7 @@ const plainContract = profile => [
   'You run headless, as one turn: ending your turn ends your process, and nothing re-invokes you. Never background a command, set a',
   'monitor, or stop to "pick up when it finishes" — run long commands (deploys, test suites) in the foreground with a generous timeout,',
   'then give your answer in this same turn. Work you leave running when you stop is orphaned.',
+  STOP_SERVICES,
   `Example: ${reportsByTool(profile) ? 'bounce_report ' : "bounce report --report '"}{"op":"milestone","phase":"inspect","text":"Read the three files the orders name","next":"Implement the helper","evidence":["src/a.js"]}${reportsByTool(profile) ? '' : "'"}`,
   PLAIN_ENDING,
 ].join('\n');
@@ -108,6 +111,7 @@ const reportContract = profile => [
   'You run headless, as one turn: ending your turn ends your process, and nothing re-invokes you. Never background a command, set a',
   'monitor, or stop to "pick up when it finishes" — run long commands (deploys, test suites) in the foreground with a generous timeout,',
   'then send the final report in this same turn. Work you leave running when you stop is orphaned and the task is failed as unreported.',
+  STOP_SERVICES,
   `Example: ${reportsByTool(profile) ? 'bounce_report ' : "bounce report --report '"}{"op":"milestone","phase":"inspect","text":"Read the three files the orders name","next":"Implement the helper","evidence":["src/a.js"]}${reportsByTool(profile) ? '' : "'"}`,
 ].join('\n');
 
@@ -249,7 +253,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const policies = adapters[selectedAdapter]?.capabilities?.().executionPolicies;
     if (Array.isArray(policies) && !policies.includes(effectivePolicy(profiles[agent] ?? {}))) return null;
     const name = `${agent}@${ai}`;
-    if (profiles[agent]?.auto === true && (local || profiles[ai])) profiles[name] = playedBy(profiles[agent], ai, profiles[ai], local);
+    if (profiles[agent]?.auto === true && (local || profiles[ai])) profiles[name] = {...playedBy(profiles[agent], ai, profiles[ai], local), routed: true};
     return profiles[name] ? name : null;
   };
   for (const e of session.events) if ((e.kind === 'jev.routed' || e.kind === 'review.routed') && e.agent && e.ai) compose(e.agent, e.ai, e.local ?? null);
@@ -828,6 +832,14 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       ...(original ? {replaces: predecessor, retryOf: predecessor, parent: original.parent ?? null,
         deadline: original.deadline, requires: original.requires ?? spec.requires, budget: undefined, owns: spec.owns ?? original.owns, review: original.review ?? undefined,
         depends_on: original.depends_on ?? []} : {})};
+    // A review agent's verdict is the task's result: nothing reviews a review (found live: Jev read a FAIL verdict as
+    // unmet acceptance and escalated it to another review).
+    if (REVIEW_ROLES.has(profiles[spec.profile]?.role)) {
+      if (!spec.review?.completion) return spec;
+      const {completion: _completion, ...review} = spec.review;
+      return {...spec, review: Object.keys(review).length ? review : undefined,
+        corrections: [...(spec.corrections ?? []), `review.completion: dropped; ${spec.profile} is a review task, and its verdict is the result: nothing reviews a review`]};
+    }
     const reviewer = jev && profiles[jev.reviewer];
     if (!reviewer || reviewer.adapter !== 'typesafe' || !READONLY_ROLES.has(reviewer.role) || strategy !== defaultStrategy) return spec;
     if (spec.review?.completion) return spec;
@@ -934,6 +946,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (typeof adapters[profile.adapter]?.resume !== 'function') return {reason: `${profile.adapter} cannot resume a session`};
     return {native: {provider: nativeRow.provider, sessionId: nativeRow.sessionId}, worker: session.events.findLast(e => e.kind === 'task.launch.requested' && e.task === row.continues && e.worker)?.worker ?? null};
   };
+  // The size of the worker's context after its last call, as the adapter measured it: a turn's usage sums every
+  // call (481k of usage for a 43k context). The row's own `context` is the session's id.
+  const contextUsedOf = event => (Number.isInteger(event.context?.used) ? {contextUsed: event.context.used} : {});
   // Standing workers: a task with no `continues` goes to its agent's idle
   // standing worker by itself; a named `worker` goes to that one if it is idle. A busy or retired one is not
   // continued — the task starts a fresh worker and the row says so — so parallel work stays parallel.
@@ -1022,16 +1037,20 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const rewritten = toWorkingCopy(text, workspace);
     return `${rewritten}\n\nYour working copy is ${workspace.cwd}: it is a copy of the project, and only changes made there are your work: bounce integrates them into the original checkout (${source}) after review, so edit the copy, never the original. What your orders ask you to deliver, evidence and reports included, goes inside this copy at the path they name: a file saved anywhere else on disk is not delivered.${fs.existsSync(path.join(workspace.cwd, '.git')) ? ' It has its own git with the project\'s history: log, diff and status work, and a commit there stays in the copy — bounce integrates your file changes, not commits.' : ''}`;
   };
+  // task -> where its workspace is. Never the workspace: its baseline lists every file of the project, and a
+  // long session kept one per task for good (found live, with 67 tasks, a daemon out of memory).
   const workspaces = new Map();
-  // Shared by workspaceFor and the integrate handler: the in-memory map first (same process,
-  // possibly already advanced by a prior integration), then the persisted metadata written at
-  // creation time (restart replay reads the same file, which advanceBaseline keeps current).
+  const remember = (task, workspace) => workspaces.set(task, {cwd: workspace.cwd, metadata: path.join(workspace.cwd, '.attempt-workspace.json')});
+  // Shared by workspaceFor and the integrate handler: the persisted metadata written at creation
+  // time, which advanceBaseline keeps current, found through this map or, after a restart, the journal.
+  // Null when a copy is gone (the user pruned it).
   function existingWorkspace(task) {
-    const prior = workspaces.get(task) ?? workspaces.get(submittedRow(task)?.replaces);
-    if (prior) return prior;
-    const previous = session.events.findLast(e => e.kind === 'task.workspace' && (e.task === task || e.task === submittedRow(task)?.replaces));
+    const previous = workspaces.get(task) ?? workspaces.get(submittedRow(task)?.replaces)
+      ?? session.events.findLast(e => e.kind === 'task.workspace' && (e.task === task || e.task === submittedRow(task)?.replaces));
     if (!previous) return null;
-    const workspace = JSON.parse(fs.readFileSync(previous.metadata, 'utf8'));
+    let workspace;
+    try { workspace = JSON.parse(fs.readFileSync(previous.metadata, 'utf8')); }
+    catch (error) { if (error.code === 'ENOENT') return null; throw error; }
     workspace.cwd = previous.cwd;
     return workspace;
   }
@@ -1039,7 +1058,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (POLICY_RANK[effectivePolicy(profile)] < POLICY_RANK.write) return null;
     const prior = existingWorkspace(task);
     if (prior) {
-      workspaces.set(task, prior); return {...prior, attemptId: `${task}-${attempt}`};
+      remember(task, prior); return {...prior, attemptId: `${task}-${attempt}`};
     }
     const relative = path.relative(fs.realpathSync(session.cwd), fs.realpathSync(session.dir));
     const nested = relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
@@ -1050,7 +1069,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // actually protects the checkout is integrateArtifact's conflict check against the real file.
     const workspace = createAttemptWorkspace({cwd: session.cwd, dir, owns: ['**'], attemptId: `${task}-${attempt}`, skills: skillsInUse(session.root, session.cwd).skills,
       ...(nested ? {} : {copyRoot: path.join(session.root, 'w')})});
-    workspaces.set(task, workspace);
+    remember(task, workspace);
     append({kind: 'task.workspace', task, attempt, purpose: 'publish', cwd: workspace.cwd, metadata: path.join(workspace.cwd, '.attempt-workspace.json'), baselineHash: workspace.baselineHash});
     return workspace;
   }
@@ -1344,7 +1363,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
           case 'milestone': append({kind: 'task.milestone', task, text: event.text, evidence: event.evidence, from, context}); break;
           case 'blocked': append({kind: 'task.blocked', task, reason: 'worker_blocked', text: event.text, from, context}); break;
           case 'diagnostic': append({kind: 'task.diagnostic', task, text: String(event.text ?? '').slice(0, 2000), ...(event.reason ? {reason: event.reason} : {}), ...(event.phase ? {phase: event.phase} : {}), ...(event.toolsDisabled ? {toolsDisabled: true} : {}), from, context}); break;
-          case 'usage': append({kind: 'task.usage', task, usage: event.usage, from, context}); break;
+          case 'usage': append({kind: 'task.usage', task, usage: event.usage, ...contextUsedOf(event), from, context}); break;
           case 'native': append({kind: 'peer.native', from, provider: event.provider, sessionId: event.sessionId, ...(event.cwd ? {cwd: event.cwd} : {}), context}); break;
           case 'jev': append({kind: `jev.${event.name}`, ...(event.data ?? {}), text: event.text, task, from, context}); break;
           case 'result':
@@ -1731,6 +1750,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // task's next AI is tried. It used to be a bare `error`, which no fallback follows (found live:
       // a codex thread/resume timed out after a Jev rework and the session stopped).
       if (reportOnly) { await repairUnavailable(task, error.message, context); return; }
+      // The worker the resume was for may still be live (found live: a worker blocked mid-turn kept its thread, the
+      // resume was refused as a second writer, and the first worker ran on for ten minutes after the task failed).
+      const live = handles.get(task);
+      if (live?.handle) { try { await live.adapter.cancel(live.handle); } catch {} }
       append({kind: 'task.failed', task, ...startFailure(error), from: workerFrom(task), context});
       return;
     }
@@ -1878,7 +1901,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         if (closed) return {verdict: 'unreadable', cancelled: true};
         switch (event.kind) {
           case 'milestone': append({kind: 'task.milestone', task, text: event.text, evidence: event.evidence, from: peer, context}); break;
-          case 'usage': append({kind: 'task.usage', task, usage: event.usage, from: peer, context}); break;
+          case 'usage': append({kind: 'task.usage', task, usage: event.usage, ...contextUsedOf(event), from: peer, context}); break;
           case 'raw': append({kind: 'raw', raw: event.raw ?? null, provider: profile.adapter, task, from: peer, context}); break;
           case 'model': append({kind: 'model', model: String(event.model), provider: profile.adapter, task, from: peer, context}); break;
           case 'native': append({kind: 'peer.native', from: peer, provider: event.provider, sessionId: event.sessionId, ...(event.cwd ? {cwd: event.cwd} : {}), context}); break;
@@ -2028,12 +2051,36 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // A review on an agent whose list opens with `auto` is routed the way a dispatch is: Jev picks the AI among the ones
   // the list names (found live: every review ran on the list's first AI, because only a dispatch ever asked). The pick
   // is review.routed — never jev.routed, which is the task's own profile — and a restart reuses it for the same slot.
-  async function routeReview({task, stage, round, agent, peer, row, context}) {
-    if (profiles[agent]?.auto !== true || !jev?.routeAI) return agent;
+  // A review runs on a local model only when one was named for it (found live: reviews escalated to the reviewer agent
+  // ran on its list's first AI, the local qwen, for minutes on the user's GPU with no verdict bounce could read): Jev
+  // picks among the cloud AIs, and a list that opens with a local model gives its first cloud AI instead.
+  const firstCloud = agent => {
+    const seen = new Set();
+    for (const queue = [agent]; queue.length;) {
+      const name = queue.shift();
+      if (seen.has(name) || !profiles[name]) continue;
+      seen.add(name);
+      if (!profiles[name].backend && adapters[profiles[name].adapter]) return name;
+      queue.push(...(profiles[name].fallback ?? []));
+    }
+    return null;
+  };
+  async function routeReview(slot) {
+    const {task, stage, round, agent, peer, context} = slot;
     const earlier = session.events.findLast(e => e.kind === 'review.routed' && e.task === task && e.stage === stage && e.round === round && e.peer === peer);
     if (earlier) return earlier.chosen && profiles[earlier.chosen] ? earlier.chosen : agent;
+    const name = await jevReview(slot);
+    if (name !== agent || !profiles[name]?.backend || profiles[name].pinned) return name;
+    const cloud = firstCloud(agent);
+    if (!cloud || cloud === name) return name;
+    append({kind: 'review.routed', task, stage, round, peer, chosen: cloud, agent, ai: null, fallback: true, reason: 'local_unnamed',
+      text: `Routed the review: ${agent} → ${cloud} (a review runs on a local model only when one is named for it)`, context});
+    return cloud;
+  }
+  async function jevReview({task, stage, round, agent, peer, row, context}) {
+    if (profiles[agent]?.auto !== true || !jev?.routeAI) return agent;
     let decision;
-    try { decision = await jev.routeAI({task, orders: row.orders, profiles, head: profiles[agent], tier: row.tier ?? null, load: routingLoad}); }
+    try { decision = await jev.routeAI({task, orders: row.orders, profiles, head: profiles[agent], tier: row.tier ?? null, load: routingLoad, local: false}); }
     catch { decision = null; }
     const played = decision?.ai ? compose(agent, decision.ai, decision.local ?? null) : null;
     if (!decision?.asked) return agent;
@@ -2816,7 +2863,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         // A follow-up (retryOf) reusing this same workspace diffs against what's now in the
         // checkout, not the pre-integration copy it started from — see advanceBaseline.
         const workspace = existingWorkspace(action.task);
-        if (workspace) workspaces.set(action.task, advanceBaseline(workspace, artifact, result.mergedStates));
+        if (workspace) advanceBaseline(workspace, artifact, result.mergedStates);
         append(continuation);
       } catch (error) {
         append({kind: 'task.blocked', task: action.task, reason: 'integration_interrupted', text: `Artifact integration interrupted: ${error.message}; durable manifest retained for restart recovery`});

@@ -264,6 +264,7 @@ test('scheduler: a review on an `auto` agent runs on the AI Jev picks, said in r
   assert.match(routed[0].text, /^Routed the review: reviewer → build \(Jev: tier mid/);
   assert.equal(session.events.find(e => e.kind === 'review.started' && e.task === row.task).profile, 'reviewer@build');
   assert.equal(session.events.some(e => e.kind === 'jev.routed' && e.task === row.task), false, "the task's own profile is untouched");
+  assert.equal(profiles['reviewer@build'].routed, true, "Jev's pick is marked as one, so its selection reads as Jev's");
   assert.equal(scheduler.tasks()[row.task].profile, 'builder');
 });
 
@@ -277,4 +278,16 @@ test('scheduler: a review routed before a restart runs on the same AI after it, 
     jev: {reviewer: 'jev', settings: () => ({}), route: async () => { throw new Error('asked again'); }, routeAI: async () => { throw new Error('asked again'); }}});
   t.after(() => again.close());
   assert.deepEqual([fresh['reviewer@build']?.adapter, fresh['reviewer@build']?.model, fresh['reviewer@build']?.agent?.name], ['codex', 'gpt-6-astra', 'reviewer']);
+});
+
+// A review is routed with `local: false`: Jev picks among the cloud AIs of the list and never offers a local model.
+test('routeAI with local: false never reads or offers the local models', async () => {
+  let read = 0;
+  const jev = createJevDecisions({readSettings: () => ({enabled: true, model: 'jev-1.13.0', review: false, routing: {enabled: true, default: null}, confidence: 0.8}),
+    locals: () => { read++; return []; }, adapter: {ask: async () => ({answers: DESCRIBED, model: 'jev-1.13.0', latencyMs: 1})}});
+  const profiles = validateOrchestration(settings, undefined, {roles: rolesOf(NAMES_BUILD)}).profiles;
+  await jev.routeAI({orders: ORDERS, profiles, head: profiles.reviewer, local: false});
+  assert.equal(read, 0);
+  await jev.routeAI({orders: ORDERS, profiles, head: profiles.reviewer});
+  assert.equal(read, 1, 'a dispatch still offers them');
 });

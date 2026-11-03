@@ -603,3 +603,20 @@ test('a reviewer that ends without a verdict hands the review to the next AI in 
   assert.equal(session.events.some(e => e.kind === 'review.blocked' && e.task === row.task), false, 'the orchestrator is not asked to decide');
   assert.match(JSON.stringify(session.events.find(e => e.kind === 'task.rework' && e.task === row.task).findings), /the input is returned whole/);
 });
+
+// Found live: a review task (a reviewer agent on a named AI) came back FAIL with three majors, and its completion
+// review, Jev, read that verdict as unmet acceptance, leaned rework below its bar and escalated to the reviewer agent
+// on a local model: a review of a review, 17 minutes in `reviewing` for a verdict already in hand.
+test('a task by a review agent gets no completion review: none added by Jev, and one asked for is dropped, said so', t => {
+  const {session} = setup(t);
+  const worker = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'FAIL'}]);
+  const {profiles, typesafe, jev} = jevScheduler(session, {settings: {enabled: true}, respond: () => ({answers: answers('accept', 0.95)}),
+    profiles: {R: {adapter: 'worker', model: 'w', mode: 'yolo', fallback: [], role: 'reviewer', policy: 'write'}}});
+  const scheduler = createScheduler({session, adapters: {worker, typesafe}, profiles, jev, gitHead: () => 'start-sha'});
+  const plain = scheduler.prepare({parent: null, profile: 'R', orders: 'review the change; end with PASS or FAIL', deadline: null});
+  assert.equal(plain.review?.completion, undefined);
+  const asked = scheduler.prepare({parent: null, from: 'orchestrator', profile: 'R', orders: 'review the change', deadline: null, review: {completion: 'jev'}});
+  assert.equal(asked.review?.completion, undefined);
+  assert.deepEqual(asked.corrections, ['review.completion: dropped; R is a review task, and its verdict is the result: nothing reviews a review']);
+  assert.equal(scheduler.prepare({parent: null, profile: 'A', orders: 'build it', deadline: null}).review.completion, 'jev', 'a builder still gets Jev');
+});

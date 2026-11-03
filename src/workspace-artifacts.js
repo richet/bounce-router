@@ -40,6 +40,9 @@ function assertNoSymlink(root, rel) {
 // A skill bounce wrote into a copy carries this file; the manifest never sees it, so it is never integrated back.
 const GENERATED = '.bounce-generated';
 const NATIVE_SKILLS = ['.claude/skills', '.codex/skills', '.agents/skills'];
+// A preview of its own, code unit for code unit: a slice of a string is a view that keeps the whole string. Found live: each
+// baseline kept every text file of its project in the heap: 67 copies, 3970 MB of text, and a daemon died at its 4 GB limit.
+const previewOf = text => Buffer.from(text.slice(0, PREVIEW_MAX), 'utf16le').toString('utf16le');
 function manifest(root) {
   const files = {};
   const visit = (dir, prefix = '') => {
@@ -55,7 +58,7 @@ function manifest(root) {
         if (stat.size > MAX_FILE) files[rel] = {hash: fileHash(full), size: stat.size, mode: stat.mode & 0o777, unsupported: 'large'};
         else {
           const data = fs.readFileSync(full);
-          files[rel] = {hash: hash(data), size: data.length, mode: stat.mode & 0o777, binary: data.includes(0), preview: data.includes(0) ? null : data.toString('utf8').slice(0, PREVIEW_MAX)};
+          files[rel] = {hash: hash(data), size: data.length, mode: stat.mode & 0o777, binary: data.includes(0), preview: data.includes(0) ? null : previewOf(data.toString('utf8'))};
         }
       }
     }
@@ -418,12 +421,34 @@ const onlyAdds = (base, side) => {
 
 // A Markdown file both sides only added to keeps both additions, even at the same place (the checkout's first): that is a
 // log or tracker entry each, never an edit to choose between. Anything else that overlaps still conflicts.
+// The copy's change is already in the checkout: every block it added is there as a run of lines, and every block it
+// removed is gone (found live: a worker's ignore lines and a test's edits the checkout had made too, among more).
+const hasRun = (lines, run) => { for (let i = 0; i + run.length <= lines.length; i++) if (run.every((line, j) => lines[i + j] === line)) return true; return false; };
+function holds(scratch, ours) {
+  const diff = spawnSync('git', ['diff', '--no-index', '--no-color', '-U0', 'base', 'theirs'], {cwd: scratch, env: gitEnv(), maxBuffer: 64 * 1024 * 1024, encoding: 'utf8'});
+  if (diff.status !== 1) return false;
+  const hunks = [];
+  for (const line of diff.stdout.split('\n')) {
+    if (line.startsWith('@@')) hunks.push({added: [], removed: []});
+    else if (hunks.length && line.startsWith('+')) hunks.at(-1).added.push(line.slice(1));
+    else if (hunks.length && line.startsWith('-')) hunks.at(-1).removed.push(line.slice(1));
+  }
+  // A block's blank lines at either end are spacing, not content: the checkout may space its own additions differently.
+  const trim = run => { let a = 0, b = run.length; while (a < b && !run[a].trim()) a++; while (b > a && !run[b - 1].trim()) b--; return run.slice(a, b); };
+  const lines = ours.toString('utf8').split('\n');
+  // A removal counts only as part of a replacement the checkout made too: a bare deletion of lines the checkout
+  // changed is a real conflict, left to the line merge.
+  return hunks.length > 0 && hunks.every(({added, removed}) => trim(removed).length
+    ? trim(added).length > 0 && hasRun(lines, trim(added)) && !hasRun(lines, trim(removed))
+    : !trim(added).length || hasRun(lines, trim(added)));
+}
 function mergeText(base, ours, theirs, file) {
   if (!base || [base, ours, theirs].some(data => data.includes(0))) return null;
   const union = /\.md$/i.test(file) && onlyAdds(base, ours) && onlyAdds(base, theirs);
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-merge-'));
   try {
     for (const [name, data] of [['ours', ours], ['base', base], ['theirs', theirs]]) fs.writeFileSync(path.join(scratch, name), data);
+    if (holds(scratch, ours)) return ours;
     const result = spawnSync('git', ['merge-file', '-p', '--quiet', ...(union ? ['--union'] : []), 'ours', 'base', 'theirs'], {cwd: scratch, env: gitEnv(), maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore']});
     return result.status === 0 ? result.stdout : null;
   } catch {

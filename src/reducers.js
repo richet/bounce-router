@@ -80,7 +80,7 @@ export function tasks(events) {
         t.attempt = e.attempt;
         break;
       case 'task.blocked':
-        t.state = 'blocked'; t.blocker = e.text;
+        t.state = 'blocked'; t.blocker = e.text; t.resuming = false;
         if (e.reason === 'integration_interrupted') integrationBlocked.add(e.task);
         else integrationBlocked.delete(e.task);
         break;
@@ -91,7 +91,15 @@ export function tasks(events) {
           t.state = t.review?.completion ? 'reviewing' : 'running'; t.blocker = null;
         }
         break;
-      case 'task.input_required': t.state = 'input_required'; break;
+      case 'task.input_required': t.state = 'input_required'; t.resuming = false; break;
+      // A parked worker messaged live goes on in the same process: its next row of work means it runs again (found
+      // live: usage and tool rows for a minute after the answer, the task still `blocked`, and a rework collided with it).
+      case 'task.delivered':
+        if ((t.state === 'blocked' || t.state === 'input_required') && e.tier === 'live') t.resuming = true;
+        break;
+      case 'task.usage': case 'task.observed':
+        if (t.resuming && (t.state === 'blocked' || t.state === 'input_required') && String(e.from ?? '').startsWith('worker:')) { t.state = 'running'; t.blocker = null; t.resuming = false; }
+        break;
       // bounce's own steps after the work speak through the same line: a check that ended and a review that runs
       // never leave the task saying "Running the task's check" (found live: read as a hung check during a review).
       case 'task.check':

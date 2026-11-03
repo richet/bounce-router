@@ -112,11 +112,16 @@ export function requestViewControl(channel, action) {
   });
 }
 
-export function connectView({path, token}) {
+// A daemon that does not answer in time is busy or hung, and nothing reached it: found live, a daemon busy for
+// minutes failed every `bounce send` with "View connection timed out", which did not say the message was lost.
+export function connectView({path, token, timeoutMs = 5000}) {
   return new Promise((resolve, reject) => {
     const socket = net.connect(path);
     const channel = channelFor(socket);
-    const timer = setTimeout(() => { reject(new Error('View connection timed out')); socket.destroy(); }, 5000);
+    const timer = setTimeout(() => {
+      reject(new Error(`The session's daemon did not answer within ${timeoutMs / 1000} s, so nothing was sent: it is busy or hung. Send again once it answers; if it stays like this, it needs a restart`));
+      socket.destroy();
+    }, timeoutMs);
     const ready = message => {
       if (message.type === 'view.ready' && message.version === VERSION) {
         clearTimeout(timer); channel.off('message', ready); resolve(channel);

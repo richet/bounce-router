@@ -29,6 +29,7 @@ import {jevSidebarLabel} from './jev.js';
 import {rolesFor, agentStore, agentsCommand, agentTable, handAIsToJev} from './agents.js';
 import {bindingsCommand, bindingUpdatesNotice, bindingUpdates, bindingsFile, readBindings} from './bindings.js';
 import {createInterface} from 'node:readline';
+import {listCopies, copyTable, chooseCopies, removeCopies} from './prune.js';
 import stringWidth from 'string-width';
 import {clean, createFormatter, createWorkSummary, workReview, withAsides, continueMain} from './format.js';
 import {validateOrchestration} from './profiles.js';
@@ -191,6 +192,25 @@ async function main() {
     const fleet = await discoverLocalModels(settings.local, {maxAge: 0}).catch(() => []);
     if (values.json) return console.log(JSON.stringify({machine, fleet}, null, 2));
     return console.log(resourceReport({machine, fleet, busy: []}));
+  }
+  if (positionals[0] === 'prune') {
+    const copies = listCopies({root});
+    if (values.json) return console.log(JSON.stringify(copies, null, 2));
+    console.log(copyTable(copies));
+    if (!copies.some(copy => !copy.live)) return;
+    if (!process.stdin.isTTY) return console.log('\nRun bounce prune in a terminal to choose which to remove.');
+    const prompt = createInterface({input: process.stdin, output: process.stdout});
+    let chosen = null;
+    while (chosen === null) {
+      const answer = await new Promise(resolve => prompt.question('\nRemove which? y = all, n = none, or numbers (1,3-5): ', resolve));
+      chosen = chooseCopies(answer, copies);
+      if (chosen === null) console.log('Answer y, n, or numbers from the list.');
+    }
+    prompt.close();
+    const {removed, failed} = await removeCopies(chosen);
+    console.log(`Removed ${removed.length} ${removed.length === 1 ? 'copy' : 'copies'}.${copies.some(copy => copy.live) ? ' Copies of running tasks were kept.' : ''}`);
+    for (const {copy, error} of failed) console.log(`Could not remove ${copy.name}: ${error}`);
+    return;
   }
   if (positionals[0] === 'quota') {
     const store = await refreshQuota(settings, {root, cwd});
@@ -373,6 +393,7 @@ async function main() {
     migratedPolicies.length ? `Local models now load on demand (${migratedPolicies.map(name => name.split('.')[1]).join(', ')}: the old loaded-only default was dropped).` : '',
   ].filter(Boolean).join(' ');
   let skillNotice = '';
+  let pruneListed = null; // the copies /prune last listed, which its numbers refer to
   if (settings.skills.autoSync) {
     try { if (skillsChanged(syncSkills({root, scope: settings.skills.scope, cwd}))) skillNotice = 'Skills installed to your agents.'; }
     catch (error) { skillNotice = `Skills not synced: ${error.message}`; }
@@ -578,7 +599,7 @@ async function main() {
   const undo = createUndo();
   const pastes = new Map();
   let killed = '', reverseSearch = null, lastEscape = 0, lastCtrlC = 0;
-  const DOUBLE_PRESS_MS = 2000, DOUBLE_ESCAPE_MS = 500, DRAFT_CLEARED = 'Draft cleared · Ctrl+_ brings it back';
+  const DOUBLE_PRESS_MS = 2000, QUIT_FLUSH_MS = 2000, DOUBLE_ESCAPE_MS = 500, DRAFT_CLEARED = 'Draft cleared · Ctrl+_ brings it back';
   // What the next turn runs on: the orchestrator profile in orchestrator mode, else the active agent.
   const selected = () => headerProvider({settings, orchestration, active: session.active}).provider;
   const setupDefaults = {};
@@ -759,6 +780,7 @@ async function main() {
     const pane = terminal?.snapshot().panes.find(row => row.task === task);
     return `${pane?.profile ?? 'worker'} ${task.slice(0, 8)}`;
   };
+  let daemonNotice = null; // what a lost daemon left to say: it stays, whatever the turn it cut short says after it
   function render() {
     if (suspended || !terminal) return;
     if (agentsOpen && !paneIds().includes(selectedAgentPane)) {
@@ -838,10 +860,10 @@ async function main() {
       paneScrolls: {...Object.fromEntries([...paneInputs].map(([id, value]) => [id, value.scroll])), [selectedAgentPane]: scroll},
       // When this turn began, so the header and the rail can say how long the main worker has been at it.
       // What the main worker is doing right now — thinking, a command, or a wait on a task — from the tail of the journal.
-      main: {...session.main, text: progress || notice, operation: orchestration.operation, startedAt: (busySince = busy ? busySince || new Date().toISOString() : null),
+      main: {...session.main, text: daemonNotice ?? (progress || notice), operation: orchestration.operation, startedAt: (busySince = busy ? busySince || new Date().toISOString() : null),
         doing: busy ? doingNow(session.events.slice(-400), {tasks: reducers.tasks(session.events)}) : null},
       now: Date.now(),
-      notice: localSetup?.state.question || notice, mouseScroll,
+      notice: daemonNotice ?? (localSetup?.state.question || notice), mouseScroll,
       menu: menu.map(([text, paint]) => paint(clean(text))),
       metadata: {
         ...headerProvider({settings, orchestration, active: session.active}), mode: settings.mode,
@@ -956,7 +978,8 @@ async function main() {
     process.exit(75);
   }
   const quit = (detach = false) => { leave(); terminal?.unmount({scrollback: true}); if (!detach && process.stdout.isTTY) process.stdout.write(`\x1b[2mResume: bounce --resume ${session.id.slice(0, 8)}\x1b[22m\n`); router.close?.(); session.unlock(); void (async () => {
-    try { await session.flush?.(); } catch {}
+    // Bounded: a daemon that answers nothing never acknowledges, and leaving does not wait on it.
+    try { await Promise.race([session.flush?.(), new Promise(resolve => setTimeout(resolve, QUIT_FLUSH_MS))]); } catch {}
     if (!detach && process.env.BOUNCE_PERSISTENT_VIEW === '1') {
       await new Promise(resolve => process.send({type: 'control', action: 'quit'}, resolve));
     }
@@ -1132,6 +1155,18 @@ async function main() {
             : 'Sidebar hidden · /sidebar to show';
           render();
           return;
+        } else if (command === 'prune') {
+          // The list comes first; numbers refer to the list last shown, so a copy made meanwhile is never picked by them.
+          if (!arg || !pruneListed) {
+            pruneListed = listCopies({root});
+            session.append({kind: 'status', text: `${copyTable(pruneListed)}${pruneListed.some(copy => !copy.live) ? '\n\nRemove with /prune all, or /prune and the numbers (1,3-5). Copies of running tasks are kept.' : ''}`});
+            if (!arg) return;
+          }
+          const chosen = chooseCopies(arg, pruneListed);
+          if (chosen === null) throw new Error('Use /prune to list, then /prune all, /prune none, or /prune 1,3-5');
+          const {removed, failed} = await removeCopies(chosen);
+          pruneListed = null;
+          session.append({kind: 'status', text: `Removed ${removed.length} ${removed.length === 1 ? 'copy' : 'copies'}.${failed.map(({copy, error}) => ` Could not remove ${copy.name}: ${error}.`).join('')}`});
         } else if (command === 'quota') {
           await refreshQuota(settings, {root, store: quotas, cwd: session.cwd});
           session.append({kind: 'quota', text: quotaReport(quotas, quotaOrder())});
@@ -1285,6 +1320,8 @@ async function main() {
   }
   function handleKey(str, key = {}) {
     if (suspended) return;
+    // Nothing is left to cancel or stop with the daemon gone: Ctrl+C leaves, like any console program, whatever is open.
+    if (daemonLostAt && key.ctrl && key.name === 'c') { quit(); return; }
     if (localSetup && !picker && (key.name === 'escape' || (key.ctrl && key.name === 'c'))) {cancelLocalSetup(); return;}
     if (key.name === 'f3') {
       mouseScroll = !mouseScroll;
@@ -1295,9 +1332,14 @@ async function main() {
       render(); return;
     }
     // Ctrl+C: a running turn is cancelled; else a draft is cleared (Ctrl+_ brings it back); else a second press
-    // within two seconds quits, so one stray press never ends the session.
+    // within two seconds quits, so one stray press never ends the session. A second press quits during a turn too:
+    // found live, a daemon that answered nothing left Ctrl+C at "Cancelling…" for good.
     if (key.ctrl && key.name === 'c') {
-      if (busy) {void Promise.resolve(router.cancel()).catch(error => { notice = error.message; render(); }); notice = 'Cancelling…'; render(); return;}
+      if (busy) {
+        if (Date.now() - lastCtrlC < DOUBLE_PRESS_MS) { quit(); return; }
+        lastCtrlC = Date.now();
+        void Promise.resolve(router.cancel()).catch(error => { notice = error.message; render(); }); notice = 'Cancelling… · Ctrl+C again to quit'; render(); return;
+      }
       if (reverseSearch) { input = reverseSearch.input; inputCursor = reverseSearch.cursor; reverseSearch = null; render(); return; }
       if (input && !picker && !textPrompt) { undo.push({input, cursor: inputCursor}); input = ''; inputCursor = 0; lastCtrlC = 0; notice = DRAFT_CLEARED; render(); return; }
       if (Date.now() - lastCtrlC < DOUBLE_PRESS_MS) { quit(); return; }
@@ -1522,9 +1564,10 @@ async function main() {
   session.onEvent = event => {
     if (event?.kind === 'main.disconnected' && remoteMain && !daemonLostAt) {
       daemonLostAt = new Date();
+      busy = false;
       clearInterval(activityTimer);
       const at = daemonLostAt.toTimeString().slice(0, 5);
-      notice = `bounce stopped at ${at}, nothing is running · quit, then: bounce --resume ${session.id.slice(0, 8)}`;
+      daemonNotice = `bounce stopped at ${at}, nothing is running · Ctrl+C, then: bounce --resume ${session.id.slice(0, 8)}`;
     }
     scheduleRender(event);
   };

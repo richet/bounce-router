@@ -345,6 +345,9 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     // The view prefills the input from this line (src/tui/suggestion.js): Tab accepts it, Enter sends it.
     // Found live: it sent a user-requested commit to workers seven times; none had git.
     'Workers run in copies of the repository: only an in-place task (task.submitted with `inPlace: {authorizedBy: <seq>}`) runs in the real checkout, for a version-control or other real-folder step (commit, push, open a PR) the user\'s own message asked for. Cite that message\'s seq (omit authorizedBy to cite the user\'s latest message) and keep the orders to exactly what it asked — push and PR only when it asked for them. A refusal names what exceeded the request.',
+    // A copy is removed when the user prunes it (src/prune.js), and services a worker started in it are stopped
+    // (found live: a stopped stack from a worker's copy was left behind).
+    'A worker\'s copy is temporary: the user removes copies with /prune, so anything you want to keep from one (evidence, a report, a probe or its output) goes into the checkout, and a path into a copy is no reference to keep. Before you accept a task, make sure a worker that started services in its copy stopped them (its answer names the command); otherwise stop what is still running yourself, from that copy.',
     // Found live (a session): a review's reproduction script, run in the real checkout, stopped the user's stack on exit.
     'A script a worker wrote (a reproduction, a probe, a review\'s evidence) is the worker\'s, made for its copy: read all of it in its own step before running any of it, and never run it in the real checkout — it may stop, reset or wipe the user\'s running services (a `down`, a reset, a trap on exit). To see it run again, run it in the worker\'s copy or send it to a worker.',
     'When one prompt from the user would move the work forward (an approval, a decision, a follow-up request), end the answer with one line `Next: <the prompt, as the user would type it>` — the view offers it prefilled in the input. One concrete prompt, not a question or a list; omit the line when nothing is needed from the user.',
@@ -371,7 +374,7 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     'you a message during the wait: it is in your turn now — read it and act on it before anything else.',
     'Fields: parent (null for a root task), profile (an agent above: the job), model (optional: the AI that plays it, see above), orders (the brief, required), deadline (ms, optional),',
     'jobId (stable logical job) and retryOf (the previous task attempt). A retry continues the same job; use retryOf rather than parent, which creates dependent work instead of retrying the job.',
-    'Workers stand: a worker is a session per agent that outlives its tasks (builder#1, builder#2 …; the handoff and tasks_list list them with what each has done, how long idle, and its last context size). A new task for an agent goes to its idle worker by itself; a busy one means a second worker starts, so parallel work stays parallel. `worker: "builder#1"` names one; `worker: "new"` asks for a fresh one on purpose — do that after a correction of wrong work. Retire one with worker_retire (or publish worker.retire) when its context has grown heavy or its work went wrong; give a handoff when the next worker should open with what it knew, or set ask: true and the retiring worker writes its own handoff (one read-only turn). A Claude worker can compact instead (worker_compact): one turn on its session, its context shrinks, it keeps what it did; OpenCode and Codex workers cannot — retire those. bounce reports; you decide.',
+    'Workers stand: a worker is a session per agent that outlives its tasks (builder#1, builder#2 …; the handoff and tasks_list list them with what each has done, how long idle, and its last context size). A new task for an agent goes to its idle worker by itself, unless its context is past 150k (the roster says so); a busy or over-cap one means a fresh worker starts, so parallel work stays parallel. `worker: "builder#1"` names one; `worker: "new"` asks for a fresh one on purpose — do that after a correction of wrong work. Retire one with worker_retire (or publish worker.retire) when its context has grown heavy or its work went wrong; give a handoff when the next worker should open with what it knew, or set ask: true and the retiring worker writes its own handoff (one read-only turn). A Claude worker can compact instead (worker_compact): one turn on its session, its context shrinks, it keeps what it did; OpenCode and Codex workers cannot — retire those. bounce reports; you decide.',
     'continues (a task of yours): the worker that did that task is resumed, with its memory of the project, into this task\'s own copy, and told where it is. Use it for a follow-up on the same area by the same job — it saves the worker re-reading the project. After a correction of wrong work, start fresh instead: a session that produced the wrong result keeps the misunderstanding that produced it. bounce launches fresh and says why when the earlier task ran on another profile or left no session.',
     'depends_on (task ids, optional), review ({"prelaunch": <reviewer>, "completion": <reviewer>}, optional): only a review agent reviews — the reviewer, or a critic or verifier profile; give its AI as {"profile": "reviewer", "model": "sol"}. A builder or an AI named here is corrected to the reviewer agent (on that AI),',
     'steps (the verification steps, as text) — required when the completion reviewer is a verifier profile, refused with reason `steps` without it.',
@@ -894,12 +897,15 @@ async function interactiveView(args, {existing, restart} = {}) {
     if (message?.type === 'switch') { switchTo = message.id; return; }
     try { channel.send(message); } catch {}
   });
+  let daemonGone = false;
   channel.on('disconnect', () => {
+    daemonGone = true;
     if (child.connected) child.send({type: 'main.event', event: {kind: 'main.disconnected', state: 'unavailable', text: 'Daemon disconnected; session journal is saved'}}, () => {});
   });
   // Detaching a view never cancels its provider. Explicit /quit is sent before the view exits.
   const code = await new Promise(resolve => { child.once('error', () => resolve(1)); child.once('close', value => resolve(value ?? 1)); });
-  if ((code === 75 && requestedRestart) || (code === 76 && switchTo) || requestedQuit) {
+  // A daemon that is gone has nothing to stop, and nobody to answer (its daemon.json stays behind after a crash).
+  if (!daemonGone && ((code === 75 && requestedRestart) || (code === 76 && switchTo) || requestedQuit)) {
     const stopped = await (quitRequest ?? requestViewControl(channel, 'quit'));
     if (stopped?.verified !== true) {
       channel.close();

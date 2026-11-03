@@ -26,6 +26,7 @@ export const CLI_USAGE = [
   ['bounce local on|off', '', 'Let agents run on local models, or make them skip their local AIs'],
   ['bounce local setup', '', 'Write this machine\'s models (models.yaml) and who plays each agent (bindings.yml)'],
   ['bounce quota', '[--json]', 'Show the subscription usage each agent reports'],
+  ['bounce prune', '[--json]', 'List the workers\' copies (last used, integrated or not), then remove the ones you pick'],
   ['bounce resources', '[--json]', 'Show what the machine can run: free memory, swap, and what each local model would cost'],
   ['bounce tasks', '[--all] [--session REF] [--json]', 'What each task is doing now'],
   ['bounce task TASK', '[--session REF] [--json]', 'One task: state, milestones, findings, summary'],
@@ -97,6 +98,7 @@ export const TUI_SECTIONS = [
   {title: 'View & housekeeping', rows: [
     ['/details', '[on|off]', 'Expand or fold tool output and worker dispatch details'],
     ['/sidebar', '[on|off]', 'Show or hide the status sidebar (saved; needs a 100-column terminal)'],
+    ['/prune', '[all|none|1,3-5]', 'List the workers\' copies (last used, integrated or not), then remove the ones you pick'],
     ['/quota', '', 'Show the subscription usage each agent reports'],
     ['/retry', '', 'Clear locally recorded quota cooldowns'],
     ['/unblock', '', 'Continue after a restart when the previous orchestrator is gone'],

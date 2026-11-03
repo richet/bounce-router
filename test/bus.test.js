@@ -872,3 +872,22 @@ test('a peer that hangs up while its reply is in flight does not take the daemon
   const row = await again.publish({kind: 'task.milestone', task: 't2', text: 'still here'});
   assert.equal(row.text, 'still here');
 });
+
+// Found live: a session of ~31k rows took about 15 s per new row for each open outcome wait, since the
+// wait looked up the task's latest replacement once for every row of the journal on every new row. The
+// daemon answered nothing else meanwhile: views timed out connecting, and SIGTERM sat behind the rows.
+test('an open outcome wait keeps each new row cheap on a long journal', async t => {
+  const {session, bus} = await setup(t);
+  for (let i = 0; i < 8000; i++) session.events.push({id: `pad-${i}`, kind: 'task.milestone', task: `p${i % 50}`, text: 'x', seq: session.nextSeq++});
+  const orchestrator = await connect(bus, 'orchestrator', {canSubmit: true, tasks: ['t1'], context: session.id});
+  t.after(() => orchestrator.close());
+  const worker = await connect(bus, 'worker:t2', {tasks: ['t2']});
+  t.after(() => worker.close());
+  const started = performance.now();
+  const waiting = orchestrator.wait({match: {kind: 'task.completed', task: 't1'}, timeout: 60000}).catch(() => 'closed');
+  for (let i = 0; i < 5; i++) await worker.publish({kind: 'task.milestone', task: 't2', text: `step ${i}`});
+  const elapsed = performance.now() - started;
+  orchestrator.close();
+  assert.equal(await waiting, 'closed');
+  assert.ok(elapsed < 1000, `five rows took ${Math.round(elapsed)} ms with one wait open`);
+});

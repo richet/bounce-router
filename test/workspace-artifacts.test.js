@@ -390,3 +390,49 @@ test('a text file outside the baseline commit (a nested, ignored repository) is 
   assert.equal(result.status, 'integrated');
   assert.equal(fs.readFileSync(path.join(source, 'notes/PROGRESS.md'), 'utf8'), LOG.replace('top\n', 'top\n- step 11\n').replace('bottom\n', 'bottom\n- step 10\n'));
 });
+
+// Found live (a session): two tasks were refused with a conflict whose copy's change was already in the checkout: a
+// worker's three ignore lines the checkout had also appended at the same place (among more), and a test file where
+// the checkout had the copy's same edits and a longer block appended where the copy appended its own. Taking the
+// checkout loses nothing; a different edit of the same line still conflicts.
+test('a copy whose change the checkout already holds integrates as the checkout, and a different edit of the line still conflicts', () => {
+  const {source, dir} = setup(test);
+  const IGNORE = 'node_modules\n.git\ndb\n';
+  const SPEC = 'a\nb\nc\nd\nend\n';
+  gitRepo(source, {'.dockerignore': IGNORE, 'spec.ts': SPEC, 'TABLE.md': '| x | 1 |\n| y | 2 |\n'});
+  const copy = createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'contained'});
+  write(copy.cwd, '.dockerignore', `${IGNORE}\n!db/\n!db/migrations/\n`);
+  write(source, '.dockerignore', `${IGNORE.replace('db\n', 'db/*\n')}\nexports\n!db/\n!db/migrations/\n# deploy\n`);
+  write(copy.cwd, 'spec.ts', SPEC.replace('b\n', 'B\n').replace('end\n', 'end\nnew 1\nnew 2\n'));
+  write(source, 'spec.ts', SPEC.replace('b\n', 'B\n').replace('end\n', 'end\nnew 1\nnew 2\nnew 3\n'));
+  const artifact = captureArtifact(copy);
+  const result = integrateArtifact({cwd: source, dir, artifact, base: copy.cwd});
+  assert.equal(result.status, 'integrated', JSON.stringify(result.paths));
+  assert.deepEqual(result.merged.sort(), ['.dockerignore', 'spec.ts']);
+  assert.equal(fs.readFileSync(path.join(source, 'spec.ts'), 'utf8'), SPEC.replace('b\n', 'B\n').replace('end\n', 'end\nnew 1\nnew 2\nnew 3\n'));
+
+  const row = createAttemptWorkspace({cwd: source, dir, owns: ['TABLE.md'], attemptId: 'row'});
+  write(row.cwd, 'TABLE.md', '| x | 1, as the copy has it |\n| y | 2 |\n');
+  write(source, 'TABLE.md', '| x | 1, as the checkout has it |\n| y | 2 |\n');
+  assert.equal(integrateArtifact({cwd: source, dir, artifact: captureArtifact(row), base: row.cwd}).status, 'conflict');
+  write(row.cwd, 'TABLE.md', '| y | 2 |\n');
+  assert.equal(integrateArtifact({cwd: source, dir, artifact: captureArtifact(row), base: row.cwd}).status, 'conflict', 'a deletion of a row the checkout changed is not held by it');
+});
+
+// Found live: a daemon died at its 4 GB heap limit holding 67 baselines, 3970 MB of text between them. A preview cut from
+// a file's whole text is a view of that text, so each baseline kept every text file of the project in the heap.
+test('a baseline keeps the previews of its files, not their whole text', async t => {
+  const v8 = await import('node:v8'), vm = await import('node:vm');
+  v8.setFlagsFromString('--expose-gc');
+  const gc = vm.runInNewContext('gc');
+  const {source, dir} = setup(t);
+  for (let i = 0; i < 80; i++) write(source, `big-${i}.txt`, `${i}`.padEnd(256 * 1024, 'x'));
+  gc();
+  const before = process.memoryUsage().heapUsed;
+  const workspace = createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'a'});
+  gc();
+  const grown = process.memoryUsage().heapUsed - before;
+  assert.equal(Object.keys(workspace.baseline).length, 80);
+  assert.equal(workspace.baseline['big-0.txt'].preview.length, 4096);
+  assert.ok(grown < 5 * 1024 * 1024, `the baseline kept ${Math.round(grown / 1024 / 1024)} MB of 20 MB of files`);
+});

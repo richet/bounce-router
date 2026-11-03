@@ -85,3 +85,16 @@ test('a view attaches to a session whose history is larger than one channel mess
   assert.equal(remote.events.filter(e => e.kind === 'raw').at(-1).text.startsWith('179 '), true);
   channel.close();
 });
+
+// Found live: a daemon busy for minutes timed out every `bounce send` with "View connection timed out", which
+// did not say whether the message had gone through. It had not.
+test('a daemon that does not answer the view in time is named as busy, and nothing was sent', {timeout: 3000}, async t => {
+  const net = await import('node:net');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-view-silent-'));
+  const socketPath = path.join(root, 'silent.view');
+  const sockets = new Set();
+  const server = net.createServer(socket => { sockets.add(socket); socket.on('error', () => {}); });
+  await new Promise(resolve => server.listen(socketPath, resolve));
+  t.after(async () => { for (const socket of sockets) socket.destroy(); await new Promise(resolve => server.close(resolve)); fs.rmSync(root, {recursive: true, force: true}); });
+  await assert.rejects(connectView({path: socketPath, token: 'secret', timeoutMs: 50}), /did not answer within 0\.05 s.*nothing was sent/);
+});
