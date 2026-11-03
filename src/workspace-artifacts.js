@@ -458,6 +458,21 @@ function mergeText(base, ours, theirs, file) {
   }
 }
 
+// Whether bounce can write a path of the checkout: a write makes its temp file in the path's folder and renames it
+// over, and a delete unlinks it there, so it is the nearest folder that exists on the way that has to be writable.
+function writable(root, file) {
+  let folder = path.dirname(safeJoin(root, file));
+  while (!fs.existsSync(folder) && folder !== root) folder = path.dirname(folder);
+  try { fs.accessSync(folder, fs.constants.W_OK); return true; } catch { return false; }
+}
+
+// A file as it is in the checkout now, to put back if a later write of the same change fails: null when it is absent.
+function snapshot(root, file) {
+  const full = safeJoin(root, file);
+  if (!fs.existsSync(full)) return {path: file, data: null};
+  return {path: file, data: fs.readFileSync(full), mode: fs.lstatSync(full).mode & 0o777};
+}
+
 // `base` is the worker's copy: a text file the checkout also changed since the copy was taken is merged three ways
 // against the copy's baseline, so two tasks adding to one file both land (found live: a second log entry was
 // refused whole and copied over by hand). Edits that overlap, or a file with no readable baseline, still conflict.
@@ -481,9 +496,18 @@ export function integrateArtifact({cwd, artifact, dir, base = null}) {
   };
   const applied = new Set(record.applied);
   const merged = {...(record.merged ?? {})}; // path -> hash of the merged content written
+  // Found live: a container build left an ignored output folder owned by root, and the worker's own build changed a
+  // file in it. Every path is checked before the first write: an ignored one bounce cannot write is left out and
+  // named, and one the project keeps refuses the change with nothing written.
+  const locked = artifact.changes.filter(change => !applied.has(change.path) && !writable(root, change.path)).map(change => change.path);
+  const ignored = ignoredPaths(root, locked);
+  const unwritable = locked.filter(file => !ignored.has(file));
+  if (unwritable.length) return {status: 'unwritable', path: unwritable[0], paths: unwritable};
+  const leftOut = new Set(locked);
   const plans = new Map();
   const conflicts = [];
   for (const change of artifact.changes) {
+    if (leftOut.has(change.path)) continue;
     const state = targetState(root, change);
     const desired = change.kind === 'delete' ? null : change.after;
     if (matches(state, desired) || (merged[change.path] && state?.hash === merged[change.path])) { applied.add(change.path); continue; }
@@ -498,18 +522,40 @@ export function integrateArtifact({cwd, artifact, dir, base = null}) {
   // Every file that conflicts is named, so the one decision covers them all.
   if (conflicts.length) return {status: 'conflict', path: conflicts[0], paths: conflicts};
   record.status = 'prepared'; record.applied = [...applied]; record.merged = merged; atomicJSON(recordFile, record);
+  // What this run wrote, as it was before: a write that fails partway puts these back, so the checkout never keeps
+  // half a change.
+  const written = [];
+  const putBack = () => {
+    const failed = [];
+    for (const before of written.reverse()) {
+      try {
+        writeAtomic(root, before.data === null ? {path: before.path, kind: 'delete'} : {path: before.path, kind: 'write', data: before.data.toString('base64'), mode: before.mode});
+        applied.delete(before.path); delete merged[before.path];
+      } catch { failed.push(before.path); }
+    }
+    record.applied = [...applied]; record.merged = merged; atomicJSON(recordFile, record);
+    return failed;
+  };
   for (const change of artifact.changes) {
-    if (applied.has(change.path)) continue;
+    if (applied.has(change.path) || leftOut.has(change.path)) continue;
     // Recheck after persisting the manifest, immediately before touching this path.
     // Another process may have edited it since the batch preflight.
     const plan = plans.get(change.path);
     const state = targetState(root, change);
-    if (plan ? state?.hash !== plan.ours : !matches(state, change.before)) return {status: 'conflict', path: change.path};
-    writeAtomic(root, plan ? {...change, data: plan.data.toString('base64')} : change); applied.add(change.path);
+    if (plan ? state?.hash !== plan.ours : !matches(state, change.before)) { putBack(); return {status: 'conflict', path: change.path}; }
+    const before = snapshot(root, change.path);
+    try { writeAtomic(root, plan ? {...change, data: plan.data.toString('base64')} : change); }
+    catch (error) {
+      const failed = putBack();
+      error.message = `${error.message}; put back ${written.length} file${written.length === 1 ? '' : 's'} already written${failed.length ? `, except ${failed.join(', ')}` : ''}`;
+      throw error;
+    }
+    written.push(before); applied.add(change.path);
     if (plan) merged[change.path] = hash(plan.data);
     record.applied = [...applied]; record.merged = merged; atomicJSON(recordFile, record);
   }
   record.status = 'integrated'; record.applied = [...applied]; record.merged = merged; atomicJSON(recordFile, record);
   const paths = Object.keys(merged);
-  return {status: 'integrated', id: artifact.id, ...(paths.length ? {merged: paths, mergedStates: Object.fromEntries(paths.map(file => [file, targetState(root, {path: file})]))} : {})};
+  return {status: 'integrated', id: artifact.id, ...(leftOut.size ? {leftOut: [...leftOut]} : {}),
+    ...(paths.length ? {merged: paths, mergedStates: Object.fromEntries(paths.map(file => [file, targetState(root, {path: file})]))} : {})};
 }

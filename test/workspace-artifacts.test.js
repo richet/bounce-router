@@ -436,3 +436,54 @@ test('a baseline keeps the previews of its files, not their whole text', async t
   assert.equal(workspace.baseline['big-0.txt'].preview.length, 4096);
   assert.ok(grown < 5 * 1024 * 1024, `the baseline kept ${Math.round(grown / 1024 / 1024)} MB of 20 MB of files`);
 });
+
+// Found live: a container build had made an ignored output folder in the checkout owned by root, a worker's own build
+// regenerated a file in it, and integration wrote the worker's other files before failing on that one, leaving the
+// checkout half changed. Every path is checked for a write before the first one; an ignored path bounce cannot write
+// is left out and named, and one the project tracks refuses the whole change with nothing written.
+// Unlocked before the test's own folder is removed (hooks run in the order they were added).
+const locked = (dir, body) => { fs.chmodSync(dir, 0o555); try { return body(); } finally { fs.chmodSync(dir, 0o755); } };
+test('an ignored path the checkout cannot write is left out and named; the rest integrates', t => {
+  const {source, dir} = setup(t);
+  gitRepo(source, {'.gitignore': '/build/\n', 'README.md': 'old\n'});
+  write(source, 'build/manifest.json', '{"v":1}\n'); write(source, 'build/old.json', '{}\n');
+  const copy = createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'locked-ignored'});
+  write(copy.cwd, 'README.md', 'new\n');
+  write(copy.cwd, 'build/manifest.json', '{"v":2}\n'); fs.rmSync(path.join(copy.cwd, 'build/old.json'));
+  const artifact = captureArtifact(copy);
+  const result = locked(path.join(source, 'build'), () => integrateArtifact({cwd: source, dir, artifact, base: copy.cwd}));
+  assert.equal(result.status, 'integrated');
+  assert.deepEqual(result.leftOut, ['build/manifest.json', 'build/old.json'], 'a delete there is left out too');
+  assert.equal(fs.readFileSync(path.join(source, 'README.md'), 'utf8'), 'new\n');
+  assert.equal(fs.readFileSync(path.join(source, 'build/manifest.json'), 'utf8'), '{"v":1}\n');
+  assert.equal(fs.existsSync(path.join(source, 'build/old.json')), true);
+});
+
+test('a project path the checkout cannot write refuses the change before anything is written', t => {
+  const {source, dir} = setup(t);
+  gitRepo(source, {'README.md': 'old\n', 'locked/config.json': '{"v":1}\n'});
+  const copy = createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'locked-tracked'});
+  write(copy.cwd, 'README.md', 'new\n');
+  write(copy.cwd, 'locked/config.json', '{"v":2}\n');
+  const artifact = captureArtifact(copy);
+  const result = locked(path.join(source, 'locked'), () => integrateArtifact({cwd: source, dir, artifact, base: copy.cwd}));
+  assert.deepEqual([result.status, result.paths], ['unwritable', ['locked/config.json']]);
+  assert.equal(fs.readFileSync(path.join(source, 'README.md'), 'utf8'), 'old\n', 'nothing was written');
+});
+
+test('a write that fails midway puts back the files already written, and says so', t => {
+  const {source, dir} = setup(t);
+  gitRepo(source, {'a.md': 'old a\n', 'z/b.md': 'old b\n'});
+  const copy = createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'midway'});
+  write(copy.cwd, 'a.md', 'new a\n'); write(copy.cwd, 'new.md', 'added\n'); write(copy.cwd, 'z/b.md', 'new b\n');
+  const artifact = captureArtifact(copy);
+  // The folder turns read-only after the check, as another process could make it.
+  const realWrite = fs.openSync;
+  t.mock.method(fs, 'openSync', (file, ...rest) => { if (String(file).includes(`${path.sep}z${path.sep}b.md.`)) { const error = new Error(`EACCES: permission denied, open '${file}'`); error.code = 'EACCES'; throw error; } return realWrite(file, ...rest); });
+  assert.throws(() => integrateArtifact({cwd: source, dir, artifact, base: copy.cwd}), /EACCES[^]*put back 2 files/);
+  assert.equal(fs.readFileSync(path.join(source, 'a.md'), 'utf8'), 'old a\n');
+  assert.equal(fs.existsSync(path.join(source, 'new.md')), false);
+  t.mock.restoreAll();
+  assert.equal(integrateArtifact({cwd: source, dir, artifact, base: copy.cwd}).status, 'integrated', 'a later try still integrates the whole change');
+  assert.equal(fs.readFileSync(path.join(source, 'z/b.md'), 'utf8'), 'new b\n');
+});
