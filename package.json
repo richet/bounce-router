@@ -22,7 +22,8 @@
   },
   "files": [
     "src/",
-    "skills/"
+    "skills/",
+    "tool-skill/"
   ],
   "publishConfig": {
     "access": "public"

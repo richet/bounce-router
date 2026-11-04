@@ -152,9 +152,8 @@ function readStore(dir, source) {
   });
 }
 
-// Three layers, later ones shadowing by name: the shipped defaults (always present, even before
-// anything is seeded — so a read path never has to write), the user's store, then the project's.
-// A file that fails to parse is reported, not hidden, so a broken role never silently falls back.
+// Three layers: the shipped defaults (always present, even before anything is seeded — so a read
+// path never has to write), the user's store, then the project's. A file that fails to parse is reported, not hidden, so a broken role never silently falls back.
 // The team is the most specific layer that has agents, whole — the project's, else the user's, else the shipped one —
 // never a sum (a layer replaces the ones below it, and an agent from outside a
 // project never joins its team unasked). The installed skill's copy is the shipped team.

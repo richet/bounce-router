@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {skillMetadata, skillDir, skillStore, skillHash, listSkills, syncSkills, inspectSkills, addSkill, newSkill, importSkills, importCandidates, importSelected, clearSkills, resetSkills, skillsCommand, skillsChanged, seedSkills, seededFile, seedSummary} from '../src/skills.js';
+import {skillMetadata, skillDir, skillStore, skillHash, listSkills, syncSkills, inspectSkills, addSkill, newSkill, importSkills, importCandidates, importSelected, clearSkills, resetSkills, skillsCommand, skillsChanged, seedSkills, seededFile, seedSummary, readSkill, installToolSkill, refreshToolSkill, toolSkillSource} from '../src/skills.js';
 import {config, defaults} from '../src/core.js';
 
 const write = (dir, name, description, extra = {}) => {
@@ -419,4 +419,54 @@ test('seeding is a no-op for an absent bundled directory or an empty bundled ski
   const {root} = setup(t);
   assert.deepEqual(seedSkills({root, bundled: path.join(root, 'no-such-dir')}), []);
   assert.deepEqual(seedSkills({root, bundled: fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-empty-'))}), []);
+});
+
+test('the bounce skill installs into each agent present, stays current, updates, and never takes a folder it did not write', t => {
+  const {base, home} = setup(t);
+  fs.rmSync(path.join(home, '.agents'), {recursive: true});
+  const source = write(path.join(base, 'tool', 'bounce'), 'bounce', 'Operate bounce', {'references/setup.md': 'one\n'});
+  const options = {source, home, env: {}};
+  const codexCopy = path.join(home, '.codex', 'skills', 'bounce');
+
+  assert.deepEqual(installToolSkill(options).map(row => [row.provider, row.action]), [['claude', 'installed'], ['codex', 'installed'], ['muse', 'absent']]);
+  assert.equal(fs.existsSync(path.join(home, '.agents')), false, 'no folder is created for an agent that is not here');
+  assert.equal(fs.readFileSync(path.join(codexCopy, 'references/setup.md'), 'utf8'), 'one\n');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(codexCopy, '.bounce-tool-skill.json'), 'utf8')).skill, 'bounce');
+  assert.deepEqual(installToolSkill(options).filter(row => row.provider !== 'muse').map(row => row.action), ['current', 'current']);
+
+  fs.writeFileSync(path.join(source, 'references/setup.md'), 'two\n');
+  assert.deepEqual(installToolSkill(options).filter(row => row.provider !== 'muse').map(row => row.action), ['updated', 'updated']);
+  assert.equal(fs.readFileSync(path.join(codexCopy, 'references/setup.md'), 'utf8'), 'two\n');
+
+  fs.rmSync(path.join(codexCopy, '.bounce-tool-skill.json'));
+  fs.writeFileSync(path.join(codexCopy, 'SKILL.md'), 'the user\'s own\n');
+  const conflict = installToolSkill(options).find(row => row.provider === 'codex');
+  assert.equal(conflict.action, 'conflict');
+  assert.equal(fs.readFileSync(path.join(codexCopy, 'SKILL.md'), 'utf8'), 'the user\'s own\n');
+});
+
+test('a launch refresh updates only copies the bounce skill install wrote', t => {
+  const {base, home} = setup(t);
+  const source = write(path.join(base, 'tool', 'bounce'), 'bounce', 'Operate bounce');
+  const options = {source, home, env: {}};
+  installToolSkill({...options, providers: ['claude']});
+  write(path.join(home, '.codex', 'skills', 'bounce'), 'bounce', 'Someone else\'s bounce skill');
+
+  assert.deepEqual(refreshToolSkill(options), [], 'nothing to refresh while the copy is current');
+  fs.appendFileSync(path.join(source, 'SKILL.md'), 'More.\n');
+  assert.deepEqual(refreshToolSkill(options).map(row => [row.provider, row.action]), [['claude', 'updated']]);
+  assert.match(fs.readFileSync(path.join(home, '.claude', 'skills', 'bounce', 'SKILL.md'), 'utf8'), /More\./);
+  assert.match(fs.readFileSync(path.join(home, '.codex', 'skills', 'bounce', 'SKILL.md'), 'utf8'), /Someone else's/);
+  assert.equal(fs.existsSync(path.join(home, '.agents', 'skills', 'bounce')), false, 'a refresh never installs');
+});
+
+test('the bounce skill ships apart from the store skills, so it never reaches workers or an import', t => {
+  const shipped = readSkill(toolSkillSource);
+  assert.equal(shipped.error, undefined);
+  assert.equal(shipped.name, 'bounce');
+  assert.ok(fs.existsSync(path.join(toolSkillSource, 'references', 'setup.md')));
+  const {root, home, options} = setup(t);
+  assert.deepEqual(seedSkills({root}).map(row => row.skill).includes('bounce'), false);
+  installToolSkill({home, env: {}, providers: ['claude']});
+  assert.deepEqual(importCandidates({...options, providers: ['claude']}).filter(row => row.skill === 'bounce'), []);
 });

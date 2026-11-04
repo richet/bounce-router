@@ -226,3 +226,27 @@ test('bounce task takes the short id bounce tasks prints, and names a missing on
   assert.equal(missing.code, 1);
   assert.match(missing.stderr, /No task zzzz9999 in this session/);
 });
+
+test('bounce skill install writes into the user\'s own Codex and Claude folders, not bounce\'s private Codex home', async t => {
+  const home = tmpRoot('bounce-skill-home-');
+  t.after(() => fs.rmSync(home, {recursive: true, force: true}));
+  const root = path.join(home, '.bounce');
+  for (const dir of ['.claude', '.codex', '.bounce/codex']) fs.mkdirSync(path.join(home, dir), {recursive: true});
+  const env = bounceEnv(root, {HOME: home});
+  delete env.CODEX_HOME;
+  delete env.CLAUDE_CONFIG_DIR;
+  delete env.BOUNCE_USER_CODEX_HOME;
+  const {code, stdout} = await run(['skill', 'install', '--json'], env);
+  assert.equal(code, 0);
+  assert.deepEqual(JSON.parse(stdout).map(row => [row.provider, row.action, row.target]), [
+    ['claude', 'installed', path.join(home, '.claude', 'skills', 'bounce')],
+    ['codex', 'installed', path.join(home, '.codex', 'skills', 'bounce')],
+    ['muse', 'absent', undefined],
+  ]);
+  assert.equal(fs.existsSync(path.join(root, 'codex', 'skills', 'bounce')), false);
+  // A CODEX_HOME the user set is where their Codex reads skills.
+  const own = path.join(home, 'my-codex');
+  fs.mkdirSync(own);
+  const second = await run(['skill', 'install', '--json'], {...env, CODEX_HOME: own});
+  assert.equal(JSON.parse(second.stdout).find(row => row.provider === 'codex').target, path.join(own, 'skills', 'bounce'));
+});

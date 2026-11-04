@@ -73,6 +73,7 @@ bounce quota
 bounce lineage [SESSION] [--json]   # which vendor session did what: each turn, task and review
 bounce prune                        # the workers' copies: last used, integrated or not; remove the ones you pick
 bounce skills
+bounce skill install                # teach your own agents to set up and run bounce
 bounce agents                       # the team: which AI plays each job
 bounce local                        # local models, the OpenCode bridge, agents a local model may play
 bounce --cwd /path/to/repo
@@ -293,7 +294,7 @@ You are the reviewer. …
 
 An agent can also say how a **local** model samples for it, sent with each of its requests, so several agents can share one loaded model and still think (or not) their own way: `thinking: off`, `temperature: 0.7`, `topP`, `topK`, `minP`, `presencePenalty`, `frequencyPenalty`, `repeatPenalty`, `maxTokens`, `seed`. Each is optional; one left out keeps LM Studio's per-model default. A cloud model in `models:` ignores them.
 
-Agent files are layered, later ones shadowing by name: the four shipped with bounce (`analyst`, `builder`, `debugger`, `reviewer`) → `~/.bounce/agents/` → `<workspace>/.bounce/agents/`.
+The team is one layer, whole: `<workspace>/.bounce/agents/` if it has any file, else `~/.bounce/agents/`, else the four shipped with bounce (`analyst`, `builder`, `debugger`, `reviewer`). Layers never mix, so a project team copies every agent it needs. The `bounce` skill (`bounce skill install`) walks an agent through setting up a project.
 
 ```sh
 bounce agents                                  # the team in force: name · policy · source · who may play it
@@ -423,6 +424,23 @@ Each installed copy carries a `.bounce-skill.json` marker naming the skill and h
 Skills are the only capability bounce carries across providers. Instructions in the handoff packet — the transcript and `/note` — reach every agent as text; `CLAUDE.md`, `AGENTS.md` and each vendor's own configuration remain that vendor's business.
 
 bounce ships its own `agent-orchestrator` skill and seeds it into the store the first time an orchestrator session starts, so the brief resolves even on a machine that has never run `bounce skills import`. If you already have a skill named `agent-orchestrator`, or you edit the seeded copy, seeding never overwrites it. Seeding is first-run only: remove it, or reset the store, and it stays gone — `bounce skills seed --force` puts it back. The store entry is named `agent-orchestrator` rather than `orchestrator` so it cannot collide with a skill of that name you already keep for your own agents; the two are separate copies from then on, and yours is the one bounce leaves alone. The skill defines the team once, in `team/*.md` — `analyst`, `builder`, `debugger`, `reviewer` — one harness-agnostic file per job; which AI plays each is decided by its `models:` list, Jev routing and the provider order, never by per-vendor copies (see `bounce agents`).
+
+### The bounce skill, for your own agents
+
+The skills above are for the agents bounce runs. A Claude Code or Codex session working *for* you outside bounce
+needs something else: how to set bounce up for a project (its team, bindings, the orchestrator's model, cloud
+only) and how to start, message and inspect a session. That is the `bounce` skill:
+
+```sh
+bounce skill install
+```
+
+It writes the skill to `~/.claude/skills/bounce`, to your own Codex's skills folder (`$CODEX_HOME/skills`, else
+`~/.codex/skills`, never bounce's private Codex home) and to `~/.agents/skills` for Muse, for each agent installed
+here. Running it again reports `current` or `updated`. A folder of that name it did not write is reported as a
+conflict and left alone. Each launch of bounce updates the copies it wrote, so the skill follows your bounce
+version; it never installs where you have not. The skill ships apart from bounce's skill store, so workers never
+get it and `bounce skills import` skips it.
 
 ## Your agents' commands
 

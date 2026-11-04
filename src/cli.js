@@ -34,7 +34,7 @@ import stringWidth from 'string-width';
 import {clean, createFormatter, createWorkSummary, workReview, withAsides, continueMain} from './format.js';
 import {validateOrchestration} from './profiles.js';
 import {loadQuota, readQuotaSettings, recordQuota, refreshQuota, quotaSnapshot, quotaShort, quotaPanel, quotaStrip, modelPanel, quotaReport, quotaUnavailable, usageOrder} from './quota.js';
-import {skillsCommand, syncSkills, inspectSkills, skillsChanged, importCandidates, importSelected, importSummary, importOrigin, syncSummary, skillAreas} from './skills.js';
+import {installToolSkill, refreshToolSkill, toolSkillSummary, skillsCommand, syncSkills, inspectSkills, skillsChanged, importCandidates, importSelected, importSummary, importOrigin, syncSummary, skillAreas} from './skills.js';
 import {expandVendorCommand, findVendorCommand, vendorCommandRows} from './vendor-commands.js';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -56,12 +56,18 @@ import {askBtw, createBtwAsk} from './btw.js';
 import {createRemoteSession} from './remote.js';
 import {version, checkUpdate, globalInstall, installUpdate} from './update.js';
 import {helpText, helpRows} from './help.js';
+import {Chalk} from 'chalk';
 import {codexHome} from './codex-home.js';
 import {copyToClipboard} from './clipboard.js';
 
 // Every Codex process bounce starts — workers, the orchestrator, one-off calls, quota and catalog
 // queries, `bounce login codex` — inherits bounce's own Codex home, never the desktop app's ~/.codex.
+// The bounce skill is for the user's own agents, outside bounce: their Codex reads its CODEX_HOME, else ~/.codex.
+// bounce re-runs itself as a child, which sees only bounce's home, so the user's is handed down beside it.
+if (process.env.BOUNCE_USER_CODEX_HOME === undefined) process.env.BOUNCE_USER_CODEX_HOME = process.env.CODEX_HOME && process.env.CODEX_HOME !== codexHome() ? process.env.CODEX_HOME : '';
+const userCodexHome = process.env.BOUNCE_USER_CODEX_HOME || undefined;
 process.env.CODEX_HOME = codexHome();
+const userAgentEnv = () => { const env = {...process.env}; if (userCodexHome) env.CODEX_HOME = userCodexHome; else delete env.CODEX_HOME; return env; };
 const handedText = names => `${names.join(', ')} now let Jev pick their AI per task (models: [auto, …]); the models you chose stay behind it as the fallback. Needs \`bounce jev on\`.`;
 
 // The `profiles` block is an overlay on the shipped roster (validateOrchestration), so a
@@ -82,7 +88,10 @@ async function main() {
     check: {type: 'boolean'}, scope: {type: 'string'}, force: {type: 'boolean'}, list: {type: 'boolean'}, all: {type: 'boolean'}, session: {type: 'string'}, report: {type: 'boolean'},
     save: {type: 'boolean'}, fix: {type: 'boolean'}, 'allow-network': {type: 'boolean'}, tasks: {type: 'boolean'}, against: {type: 'string'}, control: {type: 'boolean'},
   }});
-  if (values.help) return console.log(helpText(process.stdout.columns || 100));
+  if (values.help) {
+    const c = new Chalk({level: process.stdout.isTTY && !('NO_COLOR' in process.env) && process.env.TERM !== 'dumb' ? 1 : 0});
+    return console.log(helpText(process.stdout.columns || 100, {title: c.bold.cyan, name: c.cyan, hint: c.gray, muted: c.gray, key: c.yellow}));
+  }
   if (values.version) return console.log(`bounce ${version}`);
   const restarted = process.env.BOUNCE_RESTART ? JSON.parse(process.env.BOUNCE_RESTART) : null;
   delete process.env.BOUNCE_RESTART;
@@ -243,6 +252,11 @@ async function main() {
     const catalogs = positionals[1] === 'update' ? await modelCatalog(settings, {maxAge: 0}) : [];
     const {text, report} = bindingsCommand(positionals.slice(1), {root, cwd, catalogs, save: values.save});
     return console.log(values.json ? JSON.stringify(report, null, 2) : text);
+  }
+  if (positionals[0] === 'skill') {
+    if (positionals[1] !== 'install') throw new Error('Use bounce skill install');
+    const report = installToolSkill({env: userAgentEnv()});
+    return console.log(values.json ? JSON.stringify(report, null, 2) : `The bounce skill, for agents that configure and run bounce:\n${toolSkillSummary(report)}`);
   }
   if (positionals[0] === 'skills') {
     const options = {root, scope: values.scope || settings.skills.scope, cwd, base: process.cwd()};
@@ -411,6 +425,9 @@ async function main() {
     try { if (skillsChanged(syncSkills({root, scope: settings.skills.scope, cwd}))) skillNotice = 'Skills installed to your agents.'; }
     catch (error) { skillNotice = `Skills not synced: ${error.message}`; }
   }
+  // The bounce skill (`bounce skill install`) follows this bounce's version wherever it was installed.
+  try { if (refreshToolSkill({env: userAgentEnv()}).length) skillNotice = [skillNotice, 'The bounce skill was updated in your agents.'].filter(Boolean).join(' '); }
+  catch (error) { skillNotice = [skillNotice, `The bounce skill was not refreshed: ${error.message}`].filter(Boolean).join(' '); }
   // BOUNCE_REMOTE_SESSION is a distinct flag from BOUNCE_SUPERVISED (which also covers
   // the legacy TUI restart loop, src/reload.js's legacySupervise, that hosts no real
   // session over IPC): only src/reload.js's daemonSupervise sets it, for `run`. This

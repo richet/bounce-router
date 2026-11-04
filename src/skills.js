@@ -24,6 +24,8 @@ export const skillAreas = {
 // Names an installed copy as bounce's. Sync updates or removes exactly the directories
 // carrying it, so a skill the agent or the user installed natively is never touched.
 const MARKER = '.bounce-skill.json';
+// Names a copy of the bounce skill (tool-skill/bounce) that `bounce skill install` wrote.
+const TOOL_MARKER = '.bounce-tool-skill.json';
 const NAME = /^[a-z0-9][a-z0-9-]*$/;
 export const skillStore = root => path.join(root, 'skills');
 export function skillDir(provider, {scope = 'user', cwd, env = process.env, home = os.homedir()} = {}) {
@@ -56,7 +58,7 @@ function skillFiles(dir, base = dir) {
   return fs.readdirSync(dir, {withFileTypes: true}).sort((a, b) => a.name.localeCompare(b.name)).flatMap(entry => {
     const file = path.join(dir, entry.name);
     if (entry.isDirectory()) return skillFiles(file, base);
-    if (!entry.isFile() || entry.name === MARKER) return [];
+    if (!entry.isFile() || entry.name === MARKER || entry.name === TOOL_MARKER) return [];
     return [{relative: path.relative(base, file), file}];
   });
 }
@@ -132,6 +134,40 @@ function install(skill, target, {bundled = false} = {}) {
     copyInto(skill.dir, dir);
     fs.writeFileSync(path.join(dir, MARKER), JSON.stringify({skill: skill.name, hash: skill.hash, source: skill.dir, installed: new Date().toISOString(), ...(bundled ? {bundled: true} : {})}, null, 2) + '\n', {mode: 0o600});
   });
+}
+
+// The bounce skill teaches an agent outside bounce to configure and run it. It is not a store skill:
+// those reach every worker bounce runs, and a worker has no business reconfiguring bounce. So it ships
+// apart from skills/ (which seeding copies into the store), goes into the agents' own skill folders
+// only when asked, and carries its own marker so a launch can keep exactly those copies current.
+export const toolSkillSource = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'tool-skill', 'bounce');
+const toolMarker = dir => { try { const value = JSON.parse(fs.readFileSync(path.join(dir, TOOL_MARKER), 'utf8')); return typeof value?.hash === 'string' ? value : null; } catch { return null; } };
+
+export function installToolSkill({source = toolSkillSource, env = process.env, home = os.homedir(), providers = Object.keys(skillAreas), refreshOnly = false} = {}) {
+  const skill = readSkill(source);
+  if (skill.error) throw new Error(`The bounce skill at ${source} is unusable: ${skill.error}`);
+  const report = [];
+  for (const provider of providers) {
+    const dir = skillDir(provider, {scope: 'user', env, home});
+    if (!fs.existsSync(path.dirname(dir))) { report.push({provider, skill: skill.name, action: 'absent', detail: `${path.dirname(dir)} does not exist`}); continue; }
+    const target = path.join(dir, skill.name);
+    const installed = toolMarker(target);
+    if (!installed && fs.existsSync(target)) { report.push({provider, skill: skill.name, action: 'conflict', detail: `${target} is not a copy bounce wrote; left in place`}); continue; }
+    if (!installed && refreshOnly) { report.push({provider, skill: skill.name, action: 'not-installed'}); continue; }
+    if (installed?.hash === skill.hash) { report.push({provider, skill: skill.name, action: 'current', target}); continue; }
+    replace(target, staging => {
+      copyInto(skill.dir, staging);
+      fs.writeFileSync(path.join(staging, TOOL_MARKER), JSON.stringify({skill: skill.name, hash: skill.hash, source: skill.dir, installed: new Date().toISOString()}, null, 2) + '\n', {mode: 0o600});
+    });
+    report.push({provider, skill: skill.name, action: installed ? 'updated' : 'installed', target});
+  }
+  return report;
+}
+// At launch: bring every copy `bounce skill install` wrote up to this bounce's version, and nothing else.
+export const refreshToolSkill = options => installToolSkill({...options, refreshOnly: true}).filter(row => row.action === 'updated');
+export function toolSkillSummary(report) {
+  const said = {installed: 'installed', updated: 'updated', current: 'already current', absent: 'not installed here (no agent folder)', conflict: 'left alone'};
+  return report.map(row => `${row.provider.padEnd(7)}${said[row.action] ?? row.action}${row.target ? ` · ${row.target}` : ''}${row.action === 'conflict' ? ` · ${row.detail}` : ''}`).join('\n');
 }
 
 // Which bundled skills this machine has already been given. Seeding is a first-run courtesy,
@@ -326,7 +362,7 @@ export function importCandidates({root, cwd, env, home, providers = Object.keys(
       for (const entry of fs.readdirSync(dir, {withFileTypes: true}).sort((a, b) => a.name.localeCompare(b.name))) {
         if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
         const source = path.join(dir, entry.name);
-        if (marker(source)) continue;
+        if (marker(source) || toolMarker(source)) continue;
         const skill = readSkill(source);
         if (skill.error) { found.push({provider, scope, skill: entry.name, action: 'invalid', detail: skill.error}); continue; }
         // The same skill often sits in two agents' directories, or in a workspace and the
