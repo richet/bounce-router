@@ -293,7 +293,7 @@ You are the reviewer. …
 
 An agent can also say how a **local** model samples for it, sent with each of its requests, so several agents can share one loaded model and still think (or not) their own way: `thinking: off`, `temperature: 0.7`, `topP`, `topK`, `minP`, `presencePenalty`, `frequencyPenalty`, `repeatPenalty`, `maxTokens`, `seed`. Each is optional; one left out keeps LM Studio's per-model default. A cloud model in `models:` ignores them.
 
-Agent files are layered, later ones shadowing by name: the four shipped with bounce (`analyst`, `builder`, `debugger`, `reviewer`) → `~/.bounce/agents/` → `<workspace>/.bounce/agents/`.
+The team is one layer, whole: `<workspace>/.bounce/agents/` if it has any file, else `~/.bounce/agents/`, else the four shipped with bounce (`analyst`, `builder`, `debugger`, `reviewer`). Layers never mix, so a project team copies every agent it needs. The skill's `references/setup.md` walks through setting up a project.
 
 ```sh
 bounce agents                                  # the team in force: name · policy · source · who may play it
