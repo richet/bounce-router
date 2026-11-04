@@ -31,7 +31,7 @@ You build. Own only the paths you were given; verify red-first; report with evid
   `repeatPenalty` (above 0, up to 2), `maxTokens` (1..32000), `seed`. A key left out falls through to the
   server's per-model default (`thinking: on` sends nothing, since on is LM Studio's default). A cloud model
   in `models:` ignores them all.
-- The team is one layer, whole: `<project>/.bounce/agents/` if it has any file, else `~/.bounce/agents/`, else this skill's `team/`. They never mix, so a project team must copy every agent it needs. Setup steps: `references/setup.md`.
+- The team is one layer, whole: `<project>/.bounce/agents/` if it has any file, else `~/.bounce/agents/`, else this skill's `team/`. They never mix, so a project team must copy every agent it needs. Setting up a project (team, bindings, orchestrator model) is in the `bounce` skill (`bounce skill install`).
 - One file is the whole definition. Never write per-vendor copies of an agent (Claude subagent files, Codex TOML): the AI that plays it is chosen by `models:`, not by the file.
 - A file that fails to parse is reported as INVALID, never silently replaced by a default.
 

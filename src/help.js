@@ -7,43 +7,83 @@ import stripAnsi from 'strip-ansi';
 
 export const TAGLINE = 'one terminal, your coding agents';
 
-// A row is [name, argument hint, description]. The hint is painted apart from the name so the
-// part you type verbatim stands out from the part you fill in.
-export const CLI_USAGE = [
-  ['bounce', '[--cwd PATH] [--resume ID] [--provider NAME] [--model ID]', 'Open the interactive view'],
-  ['bounce run', '"prompt" [--image PATH ...] [--cwd PATH] [--json] [--mode yolo|plan] [--detach]', 'Run one prompt'],
-  ['bounce attach', 'ID [--json]', 'Reopen its interactive view; --json streams the journal'],
-  ['bounce send', '[--session REF] [--wait] [--json] [--caller WHO] "message"', 'Send the orchestrator a message as if typed in its view; --wait prints its answer'],
-  ['bounce stop', 'ID', 'Cancel a running session\'s task tree and exit its daemon'],
-  ['bounce publish', '--event JSON|@FILE [--json]', 'One-process bridge: publish an event'],
-  ['bounce report', '--report JSON|@FILE [--json]', 'Worker: report progress or final outcome'],
-  ['bounce wait', '--match JSON --timeout SECONDS [--after-seq N] [--json]', 'Bridge: wait for one event'],
-  ['bounce login', 'claude|codex|muse', 'Open the vendor\'s native login flow'],
-  ['bounce models', '[--json]', 'List the models each agent reports, cloud and local'],
-  ['bounce agents', '[list|show NAME|set NAME [--force]|remove NAME] [--scope user|project]', 'Agent files (the team); set reads markdown from stdin'],
-  ['bounce bindings', '[update [--save]]', 'Show who plays each agent; update finds newer releases of the models named (terra 5.6 → 6.1)'],
-  ['bounce local', '[--verify] [--json]', 'Local status: models, the OpenCode bridge, agents a local model may play'],
-  ['bounce local on|off', '', 'Let agents run on local models, or make them skip their local AIs'],
-  ['bounce local setup', '', 'Write this machine\'s models (models.yaml) and who plays each agent (bindings.yml)'],
-  ['bounce quota', '[--json]', 'Show the subscription usage each agent reports'],
-  ['bounce lineage', '[SESSION] [--json]', 'Which vendor session did what: each orchestrator turn, task and review, with its window'],
-  ['bounce prune', '[--json]', 'List the workers\' copies (last used, integrated or not), then remove the ones you pick'],
-  ['bounce resources', '[--json]', 'Show what the machine can run: free memory, swap, and what each local model would cost'],
-  ['bounce tasks', '[--all] [--session REF] [--json]', 'What each task is doing now'],
-  ['bounce task TASK', '[--session REF] [--json]', 'One task: state, milestones, findings, summary'],
-  ['bounce mcp install', '', 'Register bounce\'s MCP server with codex and claude'],
-  ['bounce mcp uninstall', '', 'Remove the registration bounce wrote'],
-  ['bounce mcp-serve --control', '', 'Serve a live session to an agent outside bounce as MCP tools: sessions, status, tasks, task, send, answer'],
-  ['bounce mcp-serve', '', 'Serve the agent interface over MCP on stdio (registered for you by `bounce mcp install`)'],
-  ['bounce jev', '[key KEY|key clear|on|off|review on|off|routing on|off|roster [refresh]|model ID|confidence N|test]', 'Jev (TypeSafe) decision model; no arg shows status'],
-  ['bounce skills', '[list|sync|new NAME|add PATH|remove NAME|import [NAME] [--list]|clear|reset] [--scope user|project]', 'Manage the skills bounce installs into every agent'],
-  ['bounce sessions', '[--json]', 'List sessions: name, age, mode, id, workspace (● = live)'],
-  ['bounce rename', 'SESSION NAME', 'Name a session (SESSION = name, id or id prefix; --resume takes the same)'],
-  ['bounce task compare', 'SESSION A B', 'Built-in A/B: compare two tasks (tokens, wall, rounds) from the log'],
-  ['bounce doctor [--fix]', '', 'Report workspace, data dir, mode, order, each agent\'s version and quota, and whether bounce can drive the installed opencode; --fix installs one it can'],
-  ['bounce update', '[--check]', 'Check for or install the latest npm release'],
-  ['bounce dev', '', 'Improve bounce itself; validate/reload after changes'],
+// `bounce --help`, laid out like `ace --help`: a usage line, commands grouped by what you are trying to
+// do (named without the repeated `bounce`), one description column, then the options. A row is
+// [command, argument hint, description]; the hint is painted apart in /help so the part you type
+// verbatim stands out from the part you fill in.
+export const CLI_USAGE_LINES = [
+  ['bounce [options]', 'Open the interactive view'],
+  ['bounce <command> [options]', 'Run one command'],
 ];
+
+export const CLI_SECTIONS = [
+  {title: 'Sessions', rows: [
+    ['run', '"prompt" [--image <path> ...] [--mode yolo|plan] [--detach]', 'Run one prompt; --detach keeps it in the background'],
+    ['sessions', '', 'List sessions: name, age, mode, id, workspace (● = live)'],
+    ['attach', '<session>', 'Reopen a session\'s view; --json streams its journal'],
+    ['send', '[--session <ref>] [--wait] [--caller <who>] "message"', 'Message a live orchestrator; --wait prints its answer'],
+    ['stop', '<session>', 'Cancel a session\'s task tree and end its daemon'],
+    ['rename', '<session> <name>', 'Name a session'],
+    ['tasks', '[--all] [--session <ref>]', 'What each task is doing now'],
+    ['task', '<task> [--session <ref>]', 'One task: state, milestones, findings, summary'],
+    ['stats', '[session] [--tasks] [--against <session>]', 'What a session cost and got'],
+    ['lineage', '[session]', 'Which vendor session served each turn, task and review'],
+  ]},
+  {title: 'Agents and models', rows: [
+    ['login', 'claude|codex|muse', 'Open the vendor\'s own login'],
+    ['models', '', 'List the models each agent reports, cloud and local'],
+    ['quota', '', 'Show the subscription usage each agent reports'],
+    ['agents', '[list|show <name>]', 'The team in force, and who may play each agent'],
+    ['agents set', '<name> [--scope user|project] [--force]', 'Define or replace an agent from markdown on stdin'],
+    ['agents remove', '<name>', 'Delete an agent file'],
+    ['bindings', '[update [--save]]', 'Who plays each agent; update finds newer models'],
+    ['jev', '[on|off|key <key>|routing on|off|review on|off|help]', 'Jev (TypeSafe) decisions; no argument shows status'],
+  ]},
+  {title: 'Local models', rows: [
+    ['local', '[--verify]', 'LM Studio, the OpenCode bridge, agents it may play'],
+    ['local on|off', '', 'Let agents use local models, or skip them'],
+    ['local setup', '', 'Write models.yaml and bindings.yml (interactive)'],
+    ['resources', '', 'Free memory, swap, and what each local model would cost'],
+  ]},
+  {title: 'Skills', rows: [
+    ['skills', '[list|sync] [--scope user|project]', 'The skills bounce keeps and copies into every agent'],
+    ['skills new|add|remove', '<name|path>', 'Create, adopt or delete one of them'],
+    ['skills import', '[agent] [--list]', 'Adopt skills an agent already has'],
+    ['skills clear|reset', '[--force]', 'Withdraw bounce\'s copies; reset also empties its store'],
+    ['skills seed', '--force', 'Reinstall the skills bounce ships'],
+    ['skill install', '', 'Teach your own agents to set up and run bounce'],
+  ]},
+  {title: 'MCP', rows: [
+    ['mcp install|uninstall', '', 'Add or remove bounce\'s MCP server in Claude and Codex'],
+    ['mcp-serve', '[--control]', 'Serve MCP on stdio; --control exposes a live session'],
+  ]},
+  {title: 'Bridge (workers and scripts)', rows: [
+    ['publish', '--event <json|@file>', 'Publish an event on the session bus'],
+    ['report', '--report <json|@file>', 'Worker: report progress or the final outcome'],
+    ['wait', '--match <json> --timeout <seconds> [--after-seq <n>]', 'Wait for one event'],
+  ]},
+  {title: 'Maintenance', rows: [
+    ['doctor', '[--fix]', 'Versions, quota, setup; --fix installs a usable opencode'],
+    ['prune', '', 'List the workers\' copies, then remove the ones you pick'],
+    ['task compare', '<session> <a> <b>', 'Compare two tasks: tokens, wall time, rounds'],
+    ['update', '[--check]', 'Install the latest npm release, or only check'],
+    ['dev', '', 'Improve bounce itself; validate and reload after changes'],
+  ]},
+];
+
+export const CLI_OPTIONS = [
+  ['--cwd <path>', '', 'Work in that folder instead of the current one'],
+  ['--resume <session>', '', 'Reopen a session: its name, id or a unique id prefix'],
+  ['--provider <name>', '', 'Start on this agent'],
+  ['--model <id>', '', 'Start on this model'],
+  ['--session <ref>', '', 'Which session; default: the live one in this folder'],
+  ['--json', '', 'Print JSON instead of readable output'],
+  ['-v, --version', '', 'Print the version'],
+  ['-h, --help', '', 'Show this help'],
+];
+
+// Every command as one row, for the TUI's /help, which lists the command line after its own commands.
+export const CLI_USAGE = CLI_SECTIONS.flatMap(section => section.rows.map(([name, hint, description]) => [`bounce ${name}`, hint, description]));
 
 export const TUI_SECTIONS = [
   {title: 'Agents & models', rows: [
@@ -225,5 +265,40 @@ export function helpRows({width = 100, paint = {}, vendor = [], tui = false} = {
   ];
 }
 
-// `bounce --help`: plain text, usage first.
-export const helpText = (width = 100) => helpRows({width}).join('\n');
+// `bounce --help`: plain text in ace's shape. Rows share one description column; a label too wide for
+// it stands on its own line with the description under that column, as ace does.
+const CLI_COLUMN = 44;
+// Painted with /help's palette when `paint` is given: titles bold cyan, commands cyan, arguments gray,
+// options yellow. Layout is measured on the plain text, so colour never moves a column.
+export function cliRows(width = 100, paint = {}) {
+  const p = {...noPaint, ...paint};
+  const column = Math.min(CLI_COLUMN, Math.max(20, Math.floor(width * 0.45)));
+  const pad = ' '.repeat(column);
+  const paintLabel = (line, name, nameOf) => line.startsWith(name) ? nameOf(name) + p.hint(line.slice(name.length)) : p.hint(line);
+  const row = (name, hint, description, indent, nameOf = p.name) => {
+    const label = hint ? `${name} ${hint}` : name;
+    const body = wrapText(description, Math.max(20, width - column)).map(line => p.text(line));
+    const lead = ' '.repeat(indent);
+    if (indent + stringWidth(label) + 2 <= column) {
+      return [lead + paintLabel(label, name, nameOf) + ' '.repeat(column - indent - stringWidth(label)) + body[0], ...body.slice(1).map(line => pad + line)];
+    }
+    const labelLines = wrapText(label, width - indent - 2).map((line, i) => lead + (i ? '  ' + p.hint(line) : paintLabel(line, name, nameOf)));
+    return [...labelLines, ...body.map(line => pad + line)];
+  };
+  const section = (title, rows, nameOf) => [p.title(`${title}:`), ...rows.flatMap(([name, hint, description]) => row(name, hint, description, 2, nameOf)), ''];
+  return [
+    `${p.title('bounce')} ${p.muted('— ' + TAGLINE)}`,
+    '',
+    ...CLI_USAGE_LINES.flatMap(([usage, description], i) => {
+      const [command, ...rest] = usage.split(' ');
+      const lead = i ? '       ' : 'Usage: ';
+      return row(lead + command, rest.join(' '), description, 0, () => (i ? lead : p.title(lead)) + p.name(command));
+    }),
+    '',
+    ...CLI_SECTIONS.flatMap(({title, rows}) => section(title, rows)),
+    ...section('Options', CLI_OPTIONS, p.key),
+    ...wrapText('Inside the view, /help lists its own commands and keys. Settings and sessions live in BOUNCE_HOME or ~/.bounce.', width).map(line => p.muted(line)),
+    ...wrapText('YOLO, the default mode, turns off the agents\' own approvals and sandboxing.', width).map(line => p.muted(line)),
+  ];
+}
+export const helpText = (width = 100, paint) => cliRows(width, paint).join('\n');

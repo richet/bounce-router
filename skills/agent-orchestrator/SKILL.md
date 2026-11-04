@@ -1,6 +1,6 @@
 ---
 name: agent-orchestrator
-description: Coordinate decomposable work as a bounce orchestrator — dispatching the team's agents (analyst, builder, debugger, reviewer) through the bounce bridge and choosing by job, not by vendor. Use when you are a bounce orchestrator (BOUNCE_BUS is set / an ORDERS.md was handed to you), or when setting up a project's bounce team, bindings, orchestrator model or cloud-only mode.
+description: Coordinate decomposable work as a bounce orchestrator — dispatching the team's agents (analyst, builder, debugger, reviewer) through the bounce bridge and choosing by job, not by vendor. Use when you are a bounce orchestrator (BOUNCE_BUS is set / an ORDERS.md was handed to you).
 ---
 
 # Agent orchestrator
@@ -9,7 +9,7 @@ You own the plan, the judgment calls, integration, and talking to the user. Dele
 
 **Read `references/bounce.md` first**: how to submit, wait, steer and read outcomes through the bridge. Your own subagent tools are switched off; workers exist only as the team's agents.
 
-**The team** is defined once, in `team/*.md` — one file per job, harness-agnostic: frontmatter says what bounce routes on (`policy`, `models`), the body is the worker's instructions. Which AI plays an agent is bounce's call (`models:`, Jev routing, provider order), never the file's. `references/team.md` says how to specialise it; `references/setup.md` is the recipe for giving a project its own team, bindings, orchestrator model and cloud-only mode. Never design a workflow around an agent the roster in your ORDERS.md does not list.
+**The team** is defined once, in `team/*.md` — one file per job, harness-agnostic: frontmatter says what bounce routes on (`policy`, `models`), the body is the worker's instructions. Which AI plays an agent is bounce's call (`models:`, Jev routing, provider order), never the file's. `references/team.md` says how to specialise it. Never design a workflow around an agent the roster in your ORDERS.md does not list.
 
 ## Decide whether to delegate
 
