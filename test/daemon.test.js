@@ -1015,6 +1015,50 @@ test('a resume stops this session\'s stuck daemon that holds the lock, and leave
 // Found by the integration run 2026-10-21: an orchestrated `bounce run`
 // was its first turn only, so an orchestrator that dispatched and ended its turn — as real ones do — never heard back
 // and the job stopped there. The run now hands the outcome over in one more turn, then ends.
+// Nirby control session, 2026-11-04: `bounce send` refused every `bounce run --detach` ("older daemon with no view
+// socket"), so control could not steer a run and started one run per batch of orders.
+test('O12 a detached orchestrated run takes a message sent mid-run as its next turn, marked via send', async t => {
+  const root = tmpRoot('bounce-o12-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  writeOrchestratorConfig(root, {profiles: {main: {adapter: 'codex'}, build: {adapter: 'codex'}}});
+  const release = path.join(root, 'release-worker');
+  const holdingAdapter = () => ({
+    async launch({profile}) { return {profile}; },
+    async *events({profile}) {
+      while (!fs.existsSync(release)) await new Promise(resolve => setTimeout(resolve, 20));
+      await finalWorkerReport(profile);
+      yield {kind: 'result', status: 'completed', text: 'child done'};
+    },
+    async cancel() { return {verified: true}; },
+  });
+  let session, sent, daemonInfo;
+  const steer = async ({session: s}) => {
+    session = s;
+    await waitFor(() => s.events.some(e => e.kind === 'task.started'), {timeout: 10000});
+    const {connectSession, sendToOrchestrator} = await import('../src/send.js');
+    sent = await sendToOrchestrator(await connectSession(root, s.id), 'STEER: also fix the docs', {wait: true, timeoutMs: 10000});
+    daemonInfo = JSON.parse(fs.readFileSync(path.join(s.dir, 'daemon.json'), 'utf8'));
+    fs.writeFileSync(release, 'go');
+  };
+  await withEnv({BOUNCE_HOME: root, BOUNCE_DETACHED: '1', FAKE_ORCH_MODE: 'submit', FAKE_ORCH_PROFILE: 'build', FAKE_ORCH_NOWAIT: '1'}, async () => {
+    let timer;
+    try {
+      await Promise.race([
+        supervise(['run', 'go'], {adapters: {codex: holdingAdapter()}, onReady: s => { steer(s).catch(error => { sent = {error: error.message}; fs.writeFileSync(release, 'go'); }); }}),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('detached run did not finish within 25s')), 25000); }),
+      ]);
+    } finally { clearTimeout(timer); }
+  });
+  assert.deepEqual({accepted: sent.accepted, status: sent.status, answer: sent.answer, error: sent.error},
+    {accepted: true, status: 'completed', answer: 'steered: also fix the docs', error: undefined});
+  const users = session.events.filter(e => e.kind === 'user');
+  assert.equal(users.length, 3, 'the prompt, the sent message, then one handoff turn');
+  assert.match(users[1].text, /STEER: also fix the docs$/);
+  assert.equal(users[1].via, 'send');
+  assert.match(users[2].text, /Worker outcomes not yet handed to you/);
+  assert.equal(daemonInfo.run, true, 'bounce watch reads it: only the exit of a run\'s daemon says the run is done');
+});
+
 test('O11 an orchestrated run that dispatches without waiting is handed its worker\'s outcome in one more turn', async t => {
   const root = tmpRoot('bounce-o11-');
   t.after(() => fs.rmSync(root, {recursive: true, force: true}));

@@ -451,3 +451,62 @@ test('W14 the live activity map is pruned when a task goes terminal (F2/A5)', as
   assert.equal(scheduler.tasks()[row.task].state, 'cancelled');
   assert.equal(scheduler._activitySize(), 0);
 });
+
+// Nirby control session, 2026-11-04 (journal f1ea92b8): two builders passed their checks and went to review; the
+// reviewer ran a long test suite and said nothing for five minutes. The watchdog sent its correction to the builder
+// (`no live worker`) and then cancelled the task, so work that had passed its check was never integrated.
+test('W15 a silent reviewer is corrected and its review stopped; the task under review is never cancelled', async t => {
+  const {session} = setup(t);
+  let now = 0;
+  const clock = () => now;
+  const workerAdapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done'}]);
+  const criticAdapter = fakeAdapter(() => ({never: true}));
+  const profiles = {W: worker('W'), Crit: {adapter: 'crit', model: 'c', mode: 'yolo', fallback: [], role: 'critic'}};
+  const scheduler = createScheduler({session, adapters: {W: workerAdapter, crit: criticAdapter}, profiles, clock, watchdog: {interval: null, silence: 120000, stall: 600000, grace: 120000}});
+  t.after(() => scheduler.close());
+  const row = scheduler.submit({parent: null, profile: 'W', orders: 'w', deadline: null, review: {completion: 'Crit'}});
+  await waitFor(() => criticAdapter.calls.events === 1);
+
+  for (now = 120000; now <= 125000; now += 5000) await scheduler.tick();
+  const corrected = session.events.filter(e => e.kind === 'policy.corrected' && e.task === row.task);
+  assert.equal(corrected.length, 1);
+  const delivered = await waitFor(() => session.events.find(e => e.kind === 'task.delivered' && e.task === row.task));
+  assert.deepEqual([delivered.tier, criticAdapter.calls.deliver, workerAdapter.calls.deliver], ['live', 1, 0]);
+  assert.match(criticAdapter.deliveries[0].event.text, /^bounce watchdog: silent for 125 s/);
+
+  now = 245000;
+  await scheduler.tick();
+  const finished = await waitFor(() => session.events.find(e => e.kind === 'review.finished' && e.task === row.task));
+  assert.equal(finished.verdict, 'unreadable');
+  assert.equal(finished.text, 'The reviewer was silent through correction and grace; its review was stopped');
+  assert.equal(criticAdapter.calls.cancel, 1);
+  assert.equal(session.events.filter(e => e.kind === 'policy.escalated' && e.task === row.task && e.reason === 'cancelled').length, 0);
+  assert.equal(session.events.some(e => ['task.cancel.requested', 'task.cancelled'].includes(e.kind) && e.task === row.task), false);
+});
+
+test('W16 the reviewer next in the chain after a stopped review is warned before it is stopped', async t => {
+  const {session} = setup(t);
+  let now = 0;
+  const clock = () => now;
+  const workerAdapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: 'done'}]);
+  const criticAdapter = fakeAdapter(() => ({never: true}));
+  const backupAdapter = fakeAdapter(() => ({never: true}));
+  const profiles = {W: worker('W'), Crit: {adapter: 'crit', model: 'c', mode: 'yolo', fallback: ['Backup'], role: 'critic'},
+    Backup: {adapter: 'backup', model: 'b', mode: 'yolo', fallback: [], role: 'critic'}};
+  const scheduler = createScheduler({session, adapters: {W: workerAdapter, crit: criticAdapter, backup: backupAdapter}, profiles, clock, watchdog: {interval: null, silence: 120000, stall: 600000, grace: 120000}});
+  t.after(() => scheduler.close());
+  const row = scheduler.submit({parent: null, profile: 'W', orders: 'w', deadline: null, review: {completion: 'Crit'}});
+  await waitFor(() => criticAdapter.calls.events === 1);
+  for (const at of [120000, 125000, 245000]) { now = at; await scheduler.tick(); }
+  await waitFor(() => backupAdapter.calls.events === 1);
+  assert.equal(session.events.filter(e => e.kind === 'review.started' && e.task === row.task).map(e => e.profile).join(','), 'Crit,Backup');
+
+  now = 370000;
+  await scheduler.tick();
+  assert.equal(backupAdapter.calls.cancel, 0, 'not stopped at its first silent tick');
+  assert.equal(session.events.filter(e => e.kind === 'policy.escalated' && e.task === row.task && e.reason === 'silent').length, 2);
+  now = 375000;
+  await scheduler.tick();
+  await waitFor(() => backupAdapter.calls.deliver === 1);
+  assert.equal(session.events.some(e => e.kind === 'task.cancelled' && e.task === row.task), false);
+});

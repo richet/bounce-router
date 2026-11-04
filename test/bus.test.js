@@ -628,6 +628,33 @@ test('task.accepted: the orchestrator may accept held work whatever held it, and
   assert.deepEqual(['gate', 'unsure', 'nothing', 'unfinished'].map(task => reducers.tasks(session.events)[task].state), ['accepted', 'accepted', 'accepted', 'accepted']);
 });
 
+// Nirby control session, 2026-11-04: seven cancelled builders had green checks, and the orchestrator copied or committed
+// their copies by hand. The orchestrator may now accept a cancelled task, which lands its copy's work.
+test('task.accepted: the orchestrator may accept a cancelled task, a worker may not, and a refusal to land comes back as the reason', async t => {
+  const accepted = [];
+  const {session, bus} = await setup(t, {accept: e => {
+    accepted.push(e);
+    if (e.task === 'gone') throw new Error('task gone has no working copy to land');
+    return {kind: 'task.integration.requested', task: e.task};
+  }});
+  for (const task of ['plain', 'reviewed', 'gone']) {
+    session.append({kind: 'task.submitted', task, parent: null, profile: 'p', orders: 'x', ...(task === 'reviewed' ? {review: {completion: 'jev'}} : {})});
+    session.append({kind: 'task.cancelled', task, reason: 'orchestrator', text: 'stopped'});
+  }
+  const worker = await connect(bus, 'worker:plain', {tasks: ['plain']});
+  t.after(() => worker.close());
+  await assert.rejects(worker.publish({kind: 'task.accepted', task: 'plain', stage: 'completion'}), {code: -32001, message: 'unauthorized'});
+  const a = await connect(bus, 'orchestrator', {tasks: ['plain', 'reviewed', 'gone']});
+  t.after(() => a.close());
+  assert.deepEqual(await a.publish({kind: 'task.accepted', task: 'plain', stage: 'completion'}), {kind: 'task.integration.requested', task: 'plain'});
+  assert.equal((await a.publish({kind: 'task.accepted', task: 'reviewed', stage: 'completion', text: 'its checks were green'})).task, 'reviewed');
+  await assert.rejects(a.publish({kind: 'task.accepted', task: 'gone', stage: 'completion'}), {code: -32602, message: 'task gone has no working copy to land'});
+  assert.deepEqual(accepted.map(e => [e.task, e.overrides, e.text]), [
+    ['plain', 'cancelled', 'Accepted by the orchestrator after it was cancelled'],
+    ['reviewed', 'cancelled', 'its checks were green'],
+    ['gone', 'cancelled', 'Accepted by the orchestrator after it was cancelled']]);
+});
+
 test('task.accepted: the owning grant is journaled when the submitted row has review.prelaunch only, or no review at all', async t => {
   const {session, bus} = await setup(t);
   session.append({kind: 'task.submitted', task: 't1', parent: null, profile: 'p', orders: 'x', review: {prelaunch: 'critic'}});

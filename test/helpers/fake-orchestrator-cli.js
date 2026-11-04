@@ -20,6 +20,8 @@
 //                        (the text defaults), then refuse the same task again now that it is terminal.
 // FAKE_ORCH_NOWAIT=1     submit and end the turn without waiting, the way a real orchestrator dispatches; a turn whose
 //                        prompt hands it worker outcomes says what it was handed and submits nothing.
+//                        A prompt that holds `STEER:` (a message sent with `bounce send`) is answered with
+//                        `steered: <the rest of that line>` and submits nothing.
 import fs from 'node:fs';
 import {randomUUID} from 'node:crypto';
 
@@ -42,6 +44,8 @@ async function main() {
   }
   if (process.env.FAKE_ORCH_NOWAIT === '1') {
     await new Promise(resolve => setTimeout(resolve, 100)); // the prompt is written as the process starts
+    const steer = prompt.match(/STEER:(.*)/);
+    if (steer) { say(`steered:${steer[1]}`); return finish(); }
     if (prompt.includes('Worker outcomes not yet handed to you')) {
       say(`handed: ${(prompt.match(/- task \S+ · profile \S+ · task\.\w+/g) ?? []).join('; ')}`);
       return finish();

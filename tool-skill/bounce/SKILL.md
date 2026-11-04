@@ -48,10 +48,14 @@ Team, bindings, orchestrator model, cloud-only and parallel workspaces: follow `
     bounce task TASK [--json]                   # one task: state, milestones, findings, summary
     bounce attach REF [--json]                  # reopen its view; --json streams the journal
     bounce stop REF                             # cancel its task tree and end its daemon
+    bounce watch REF [--after N] [--timeout S]  # block until done (0), needs you (2), quiet --idle min (3), timeout (4)
 
 REF is a session name, id or unique id prefix. With no `--session`, `send` picks the one live session in the
 current directory. For tools instead of shell calls, register the control server once:
 `claude mcp add bounce-control -- bounce mcp-serve --control` (sessions, status, tasks, task, send, answer, guide).
+
+`watch` replaces polling `tasks`: it prints `--after N` with every return; pass it on the next call so what was
+already reported is not reported again. `--idle` defaults to 10 minutes. A detached run is done when its daemon exits.
 
 Stopping a session or sending into one the user is driving changes their work: confirm first.
 

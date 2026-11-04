@@ -387,6 +387,63 @@ export function advanceBaseline(workspace, artifact, mergedStates = {}) {
   return updated;
 }
 
+// A send-back after a refused integration brings the refused files of the copy up to the checkout, so the worker
+// reconciles against what is there now and the next integrate is clean. Without it a worker that resolved the conflict
+// in its copy conflicted again: the merge base was still where the copy started (Nirby control session, 2026-11-04).
+// Each file's baseline becomes the checkout's version, and the copy gets:
+// - markers: both sides changed it; the worker's change and the checkout's, with git's conflict markers where they overlap.
+// - you_deleted: the worker deleted it and the checkout edited it; the checkout's file is back, deleting it again is the worker's call.
+// - checkout_deleted: the checkout deleted it and the worker edited it; the worker's file stays, keeping it is its call.
+// - binary: not refreshed; it still conflicts.
+const MARKER_LABELS = ['-L', 'your change', '-L', 'where your copy started', '-L', 'the checkout now'];
+export function refreshConflicts(workspace, paths) {
+  const root = fs.realpathSync(workspace.source);
+  const baseline = {...workspace.baseline};
+  const refreshed = [];
+  for (const file of paths) {
+    const target = safeJoin(root, file), copied = safeJoin(workspace.cwd, file);
+    assertNoSymlink(root, file); assertNoSymlink(workspace.cwd, file);
+    const checkout = fs.existsSync(target) ? fs.readFileSync(target) : null;
+    const yours = fs.existsSync(copied) ? fs.readFileSync(copied) : null;
+    if ([checkout, yours].some(data => data?.includes(0))) { refreshed.push({path: file, how: 'binary'}); continue; }
+    let how;
+    if (!checkout) how = 'checkout_deleted';
+    else if (!yours) { fs.mkdirSync(path.dirname(copied), {recursive: true}); fs.writeFileSync(copied, checkout, {mode: fs.statSync(target).mode & 0o777}); how = 'you_deleted'; }
+    else {
+      const start = baselineContent(workspace.cwd, {path: file, before: workspace.baseline[file] ?? null}, workspace.dir) ?? Buffer.alloc(0);
+      fs.writeFileSync(copied, markedMerge(yours, start, checkout));
+      how = 'markers';
+    }
+    if (checkout) {
+      baseline[file] = {hash: hash(checkout), size: checkout.length, mode: fs.statSync(target).mode & 0o777, binary: false, preview: previewOf(checkout.toString('utf8'))};
+      keepContent(workspace.dir, checkout);
+    } else delete baseline[file];
+    refreshed.push({path: file, how});
+  }
+  const updated = {...workspace, baseline, baselineHash: manifestHash(baseline)};
+  atomicJSON(path.join(workspace.cwd, '.attempt-workspace.json'), {...updated, cwd: undefined});
+  return {workspace: updated, refreshed};
+}
+// git merge-file with labelled markers: exit 0 is clean, a positive exit the number of conflicts, both a result.
+function markedMerge(yours, start, checkout) {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-refresh-'));
+  try {
+    for (const [name, data] of [['yours', yours], ['start', start], ['checkout', checkout]]) fs.writeFileSync(path.join(scratch, name), data);
+    const result = spawnSync('git', ['merge-file', '-p', '--diff3', ...MARKER_LABELS, 'yours', 'start', 'checkout'], {cwd: scratch, env: gitEnv(), maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore']});
+    if (result.status === null || result.status < 0 || result.status > 127) throw new Error('git merge-file failed');
+    return result.stdout;
+  } finally {
+    fs.rmSync(scratch, {recursive: true, force: true});
+  }
+}
+// The checkout's version kept by hash, so a later integrate can still merge three ways if the checkout moves again.
+function keepContent(dir, data) {
+  const file = path.join(keptDir(dir), hash(data));
+  if (fs.existsSync(file)) return;
+  fs.mkdirSync(keptDir(dir), {recursive: true, mode: 0o700});
+  fs.writeFileSync(file, data, {mode: 0o600});
+}
+
 const BASELINE_MESSAGE = 'bounce: baseline of the checkout this copy was made from';
 const gitEnv = () => Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
 

@@ -23,6 +23,7 @@ export const CLI_SECTIONS = [
     ['attach', '<session>', 'Reopen a session\'s view; --json streams its journal'],
     ['send', '[--session <ref>] [--wait] [--caller <who>] "message"', 'Message a live orchestrator; --wait prints its answer'],
     ['stop', '<session>', 'Cancel a session\'s task tree and end its daemon'],
+    ['watch', '<session> [--after <n>] [--idle <min>] [--timeout <s>]', 'Wait until it is done (0), needs you (2) or goes quiet (3)'],
     ['rename', '<session> <name>', 'Name a session'],
     ['tasks', '[--all] [--session <ref>]', 'What each task is doing now'],
     ['task', '<task> [--session <ref>]', 'One task: state, milestones, findings, summary'],

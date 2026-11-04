@@ -252,6 +252,89 @@ test('b2: two tasks that edit different parts of one text file both integrate; t
   assert.equal(fs.readFileSync(path.join(cwd, 'PROGRESS.md'), 'utf8'), LOG.replace('top\n', 'top\n- step 10\n').replace('bottom\n', 'bottom\n- step 11\n'));
 });
 
+// Nirby control session, 2026-11-04: a task refused for a conflict was cancelled and its work copied by hand; a worker
+// that resolved it in its copy would have conflicted again. A send-back after a conflict refreshes the copy first.
+test('b3: a task refused for a conflict and sent back gets the checkout\'s version with markers and a note, and its resolution integrates', async t => {
+  const {session, cwd} = fixture(t);
+  const START = 'a\nb\nc\nd\ne\nf\n';
+  fs.writeFileSync(path.join(cwd, 'x.txt'), START);
+  const launched = new Map(), resumed = [];
+  let ready;
+  const bothReady = new Promise(resolve => { ready = resolve; });
+  const adapter = {
+    async launch(args) { const handle = {task: args.task, cwd: args.cwd}; launched.set(args.task, handle); return handle; },
+    async resume(args) { const handle = {task: args.task, cwd: args.cwd, resumed: true}; resumed.push({...args, handle}); return handle; },
+    async *events(handle) {
+      if (handle.resumed) { fs.writeFileSync(path.join(handle.cwd, 'x.txt'), START.replace('b\n', 'first and second\n')); yield {kind: 'result', status: 'completed', text: 'reconciled'}; return; }
+      yield await new Promise(resolve => { handle.finish = resolve; if ([...launched.values()].filter(h => h.finish).length === 2) ready(); });
+    },
+    async cancel() { return {verified: true}; },
+  };
+  const scheduler = createScheduler({session, adapters: {fake: adapter}, profiles: {builder: {adapter: 'fake', policy: 'write'}}, watchdog: {interval: null}});
+  t.after(() => scheduler.close());
+  const endedFirst = next(session, e => e.kind === 'task.integrated' && e.task === 'first');
+  const blockedSecond = next(session, e => e.kind === 'task.blocked' && e.task === 'second');
+  scheduler.submit({task: 'first', profile: 'builder', orders: 'Edit b first'});
+  scheduler.submit({task: 'second', profile: 'builder', orders: 'Edit b second'});
+  await bothReady;
+  fs.writeFileSync(path.join(launched.get('first').cwd, 'x.txt'), START.replace('b\n', 'first\n'));
+  fs.writeFileSync(path.join(launched.get('second').cwd, 'x.txt'), START.replace('b\n', 'second\n'));
+  launched.get('first').finish({kind: 'result', status: 'completed', text: 'done first'});
+  await endedFirst;
+  launched.get('second').finish({kind: 'result', status: 'completed', text: 'done second'});
+  assert.deepEqual([(await blockedSecond).reason, (await blockedSecond).paths], ['integration_conflict', ['x.txt']]);
+  const integratedSecond = next(session, e => e.kind === 'task.integrated' && e.task === 'second');
+  scheduler.reworkOverride({kind: 'task.rework', task: 'second', text: 'Keep both edits of line b', overrides: true, from: 'orchestrator'});
+  assert.equal(resumed.length, 1);
+  assert.equal(resumed[0].cwd, launched.get('second').cwd, 'the same copy is sent back');
+  const message = resumed[0].message;
+  assert.match(message, /- Keep both edits of line b\n/);
+  assert.match(message, /- x\.txt: the checkout changed it too\. Your copy now holds both versions with conflict markers/);
+  assert.match(message, /- A generated file \(a lockfile, a golden fixture, a numbered migration\) is regenerated or renumbered/);
+  const milestone = session.events.find(e => e.kind === 'task.milestone' && e.task === 'second' && e.phase === 'refreshed');
+  assert.deepEqual(milestone.refreshed, [{path: 'x.txt', how: 'markers'}]);
+  await integratedSecond;
+  assert.equal(fs.readFileSync(path.join(cwd, 'x.txt'), 'utf8'), START.replace('b\n', 'first and second\n'));
+});
+
+// Nirby control session, 2026-11-04: work in a cancelled task's copy, committed or not, was landed by hand.
+test('b4: accepting a cancelled task lands its copy as it is now; a conflicting one is refused with the files named; no copy is refused', async t => {
+  const {session, cwd} = fixture(t);
+  fs.writeFileSync(path.join(cwd, 'x.txt'), 'old x');
+  fs.writeFileSync(path.join(cwd, 'y.txt'), 'old y');
+  const launched = new Map();
+  const adapter = {
+    async launch(args) { const handle = {task: args.task, cwd: args.cwd}; launched.set(args.task, handle); return handle; },
+    async *events() { await new Promise(() => {}); },
+    async cancel() { return {verified: true}; },
+  };
+  const scheduler = createScheduler({session, adapters: {fake: adapter}, profiles: {builder: {adapter: 'fake', policy: 'write'}, reader: {adapter: 'fake', policy: 'read-only'}}, watchdog: {interval: null}});
+  t.after(() => scheduler.close());
+  for (const [task, profile] of [['good', 'builder'], ['clash', 'builder'], ['look', 'reader']]) scheduler.submit({task, profile, orders: `Do ${task}`});
+  await new Promise(resolve => { const check = () => launched.size === 3 ? resolve() : setTimeout(check, 5); check(); });
+  fs.writeFileSync(path.join(launched.get('good').cwd, 'x.txt'), 'good x');
+  fs.writeFileSync(path.join(launched.get('good').cwd, 'new.txt'), 'brand new');
+  fs.writeFileSync(path.join(launched.get('clash').cwd, 'y.txt'), 'clash y');
+  for (const task of ['good', 'clash', 'look']) {
+    const cancelled = next(session, e => e.kind === 'task.cancelled' && e.task === task);
+    scheduler.cancel(task); await cancelled;
+  }
+  fs.writeFileSync(path.join(cwd, 'y.txt'), 'user y');
+  const integrated = next(session, e => e.kind === 'task.integrated' && e.task === 'good');
+  scheduler.acceptOverride({kind: 'task.accepted', task: 'good', stage: 'completion', overrides: 'cancelled', text: 'green checks'});
+  await integrated;
+  assert.deepEqual(['x.txt', 'new.txt'].map(file => fs.readFileSync(path.join(cwd, file), 'utf8')), ['good x', 'brand new']);
+  assert.equal(scheduler.tasks().good.state, 'accepted');
+  const blocked = next(session, e => e.kind === 'task.blocked' && e.task === 'clash');
+  scheduler.acceptOverride({kind: 'task.accepted', task: 'clash', stage: 'completion', overrides: 'cancelled', text: 'green checks'});
+  const refusal = await blocked;
+  assert.deepEqual([refusal.reason, refusal.paths], ['integration_conflict', ['y.txt']]);
+  assert.equal(fs.readFileSync(path.join(cwd, 'y.txt'), 'utf8'), 'user y');
+  assert.equal(scheduler.tasks().clash.state, 'blocked', 'a refused landing can be sent back to refresh, like any conflict');
+  assert.throws(() => scheduler.acceptOverride({kind: 'task.accepted', task: 'look', stage: 'completion', overrides: 'cancelled'}),
+    {message: 'task look has no working copy to land: it ran read-only or in the checkout, or its copy was removed'});
+});
+
 // Rewritten 2026-09-27: a review that gives no verdict no longer holds finished work. The task is accepted
 // with advice saying the review gave none, and its isolated work integrates into the checkout.
 // 2026-09-29: that is so for work its check verified; without one the work waits for the orchestrator.

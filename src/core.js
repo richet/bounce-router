@@ -423,7 +423,7 @@ export class Router {
   // `typed` is the slash line a prompt was expanded from (vendor-commands.js); the journal
   // keeps the expansion as the request — that is what a fallback agent and later turns must
   // read — and the typed line only for the transcript.
-  async run(prompt, files = [], {typed} = {}) {
+  async run(prompt, files = [], {typed, via, caller} = {}) {
     if (this.controller) throw new Error('A turn is already running');
     this.controller = new AbortController();
     const {signal} = this.controller;
@@ -436,7 +436,7 @@ export class Router {
     try {
       const images = saveImages([...new Set([...imagePaths(prompt, s.cwd), ...files.map(file => path.resolve(s.cwd, file))])], s);
       const isFirstPrompt = !s.events.some(e => e.kind === 'user');
-      s.append({kind: 'user', text: prompt, ...(typed ? {typed} : {}), ...(images.length ? {images} : {})});
+      s.append({kind: 'user', text: prompt, ...(typed ? {typed} : {}), ...(via ? {via} : {}), ...(caller ? {caller} : {}), ...(images.length ? {images} : {})});
       if (isFirstPrompt) { try { this.onFirstUserPrompt(s, this.settings); } catch {} }
       s.append({kind: 'checkpoint', ...gitSnapshot(s.cwd)});
       const first = s.active && cfg.order.includes(s.active) ? s.active : cfg.order[0];

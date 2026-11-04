@@ -33,6 +33,8 @@ import {providers} from './providers.js';
 import {createScheduler} from './scheduler.js';
 import {hostSession} from './remote.js';
 import {createMainService} from './main-service.js';
+import {createRunInbox} from './run-inbox.js';
+import {watchSession, formatWatch, WATCH_EXIT, DEFAULT_IDLE_MS} from './session-watch.js';
 import {createViewServer, connectView, requestViewControl} from './view-transport.js';
 
 const CHILD_KILL_GRACE_MS = 1500; // same grace as runProcess's cancel and live-common's verifiedCancel
@@ -395,6 +397,8 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     'You may publish only: task.submitted, task.accepted, task.rework, task.cancel, task.milestone, task.blocked, task.input_required, task.usage, task.activity, message.',
     'A review sends a task back at most once; after that it is accepted, and what the review still found arrives as `advice` on task.accepted — read it before building on the work. Any task holding finished work (blocked, under review, or asking for input) you may accept yourself (task.accepted with `text`) or send back to the same worker (task.rework with `text` naming what to fix).',
     'When you replace a blocked task with a fresh one, or no longer need a task, cancel it with task.cancel and a reason, so its outcome stops waiting.',
+    'When the checkout refuses a task\'s work (blocked `integration_conflict`, the files named), send it back (task.rework): bounce first brings those files of its copy up to the checkout, with conflict markers, and the worker reconciles them. Never copy a worker\'s files or tree into the checkout yourself.',
+    'A cancelled task whose work you still want (its checks were green, its commit was done): accept it (task.accepted with `text`), and bounce lands its copy as it is now, committed or not. If the checkout changed the same files, it comes back blocked `integration_conflict`: send it back as above.',
     'When a worker is blocked or asks for input because it needs a decision, answer it by publishing a message to worker:<task id>: the same worker resumes with your answer. Do not re-dispatch the job as new work for that.',
     '`bounce agents set` journals agents.defined for you.',
     'Everything else is refused — `user`, `control.*`, and every other task lifecycle row the scheduler owns.',
@@ -719,11 +723,19 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
         return {verified: true, afterAck: () => finish(0)};
       }
     }});
+  } else if (orchestrating && positionals[0] === 'run' && detachedDaemon) {
+    // A detached run's own child drives the orchestrator; the inbox lets `bounce send` queue its next turns.
+    viewServer = await createViewServer({session, main: createRunInbox({session}), token: fs.readFileSync(userGrant.file, 'utf8').trim(), onControl: async message => {
+      if (message.action === 'cancel' && message.task) await scheduler.cancel(message.task);
+      else if (message.action === 'stop') await scheduler.stop();
+    }});
   }
   // Now discoverable: a signal from here on is caught by onSigterm and torn down cleanly.
   writeDaemonJson(session.dir, {pid: process.pid, bus: bus.path, started: new Date().toISOString(), userToken: userGrant.file,
+    // `bounce watch` reads it: a run's daemon exits when the job ends, so only that exit says it is done.
+    ...(positionals[0] === 'run' ? {run: true} : {}),
     ...(viewServer ? {view: viewServer.path, protocol: 1, profile: orchestratorProfile} : {})});
-  if (viewServer) {
+  if (viewServer && main) {
     await new Promise(resolve => { if (finished) resolve(); else wakeViewDaemon = resolve; });
     return;
   }
@@ -996,6 +1008,39 @@ async function sendCommand(args) {
   process.exitCode = sent.accepted && (!values.wait || sent.status === 'completed') ? 0 : 1;
 }
 
+// bounce watch [SESSION] [--after SEQ] [--idle MIN] [--timeout SEC] [--json]: block until the session is done (exit 0),
+// needs its controller (2), has written nothing for --idle minutes (3), or --timeout passes (4). Journal only, no socket.
+async function watchCommand(args, {pollMs = 1000} = {}) {
+  const {positionals, values} = parseArgs({args: args.slice(1), allowPositionals: true, options: {
+    session: {type: 'string'}, after: {type: 'string'}, idle: {type: 'string'}, timeout: {type: 'string'}, json: {type: 'boolean'}}});
+  const number = (flag, value, what) => {
+    if (value === undefined) return undefined;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed < 0 || (what !== 'a row number' && parsed === 0)) throw new Error(`--${flag} takes ${what}`);
+    return parsed;
+  };
+  const after = number('after', values.after, 'a row number') ?? 0;
+  const idleMs = (number('idle', values.idle, 'minutes, a positive number') ?? DEFAULT_IDLE_MS / 60000) * 60000;
+  const timeout = number('timeout', values.timeout, 'seconds, a positive number');
+  const root = dataRoot();
+  const ref = values.session ?? positionals[0] ?? listSessions(root).find(row => row.live && row.cwd === fs.realpathSync(process.cwd()))?.id;
+  if (!ref) throw new Error('watch needs a session: bounce watch <session>');
+  const id = resolveSessionRef(root, ref);
+  const dir = path.join(root, 'sessions', id);
+  const deadline = timeout === undefined ? Infinity : Date.now() + timeout * 1000;
+  for (;;) {
+    const info = readDaemonJson(dir);
+    const live = Boolean(info && pidAlive(info.pid));
+    const result = watchSession(new Session(process.cwd(), {root, id}).events, {after, live, run: Boolean(info?.run), idleMs});
+    if (result.outcome !== 'waiting' || Date.now() >= deadline) {
+      console.log(values.json ? JSON.stringify(result) : formatWatch(result, id));
+      process.exitCode = WATCH_EXIT[result.outcome];
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, Math.min(pollMs, Math.max(0, deadline - Date.now()))));
+  }
+}
+
 async function stopCommand(args) {
   const id = resolveOrRaw(args[1]);
   if (!id) { console.error('bounce: stop requires a session id'); process.exitCode = 2; return; }
@@ -1046,6 +1091,7 @@ export async function supervise(args = process.argv.slice(2), {spawnChild = spaw
   if (command === 'attach') return attachCommand(args);
   if (command === 'send') return sendCommand(args);
   if (command === 'stop') return stopCommand(args);
+  if (command === 'watch') return watchCommand(args);
   if (command === 'run' && args.includes('--detach')) return detachRun(args, {spawnChild});
   if (command === 'run') return daemonSupervise(args, {spawnChild, updateInstall, adapters, profiles, strategy, onReady});
   // Phase 9 (interactive orchestrator): the interactive TUI whose config is orchestrator gets the

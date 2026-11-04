@@ -233,7 +233,12 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         // and the refusals cost orchestrator turns; the review sends work back at most once now anyway.
         if (e.kind === 'task.accepted') {
           const submitted = session.events.find(row => row.kind === 'task.submitted' && row.task === e.task);
-          if (submitted?.review?.completion) {
+          // A cancelled task's copy can still hold good work (Nirby control session, 2026-11-04: seven cancelled
+          // builders with green checks, landed by hand). Its owner's accept lands the copy as it is now.
+          if (tasks(session.events)[e.task]?.state === 'cancelled') {
+            if (peer !== 'orchestrator' || typeof acceptOverride !== 'function') return refuse(id, -32001, 'unauthorized');
+            e = {...e, overrides: 'cancelled', text: typeof e.text === 'string' && e.text.trim() ? e.text : 'Accepted by the orchestrator after it was cancelled'};
+          } else if (submitted?.review?.completion) {
             const state = tasks(session.events)[e.task]?.state;
             if (!DECIDABLE.has(state)) return refuse(id, -32602, `invalid event: task.accepted: task ${e.task} is ${state ?? 'unknown'}, with no finished work to accept yet; wait for its outcome${state === 'accepted' ? ' (it is already accepted)' : ''}`);
             const blocked = state === 'blocked' ? session.events.findLast(row => row.kind === 'task.blocked' && row.task === e.task) : null;
@@ -296,7 +301,10 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         // What bounce corrected or noticed about this submission, in the reply the orchestrator reads now.
         const notes = session.events.filter(event => event.kind === 'task.corrected' && event.task === e.task).map(event => event.text);
         if (row && notes.length) row = {...row, notes};
-      } else if (e.kind === 'task.accepted' && e.overrides && typeof acceptOverride === 'function') row = acceptOverride(e);
+      } else if (e.kind === 'task.accepted' && e.overrides && typeof acceptOverride === 'function') {
+        try { row = acceptOverride(e); }
+        catch (error) { return refuse(id, -32602, error.message); }
+      }
       else if (e.kind === 'task.rework' && e.overrides && typeof reworkOverride === 'function') row = reworkOverride(e);
       else if (e.kind === 'task.cancel') {
         if (typeof cancelOverride !== 'function') return refuse(id, -32001, 'unauthorized');

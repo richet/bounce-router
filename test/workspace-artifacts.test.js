@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {execFileSync} from 'node:child_process';
 import crypto from 'node:crypto';
-import {createAttemptWorkspace, captureArtifact, integrateArtifact, advanceBaseline, reviewDiff} from '../src/workspace-artifacts.js';
+import {createAttemptWorkspace, captureArtifact, integrateArtifact, advanceBaseline, reviewDiff, refreshConflicts} from '../src/workspace-artifacts.js';
 
 // Matches src/workspace-artifacts.js's own hash(json(binding)) exactly, to build a legacy
 // artifact's digest by hand (c, d below) without exporting the internal helpers.
@@ -486,4 +486,50 @@ test('a write that fails midway puts back the files already written, and says so
   t.mock.restoreAll();
   assert.equal(integrateArtifact({cwd: source, dir, artifact, base: copy.cwd}).status, 'integrated', 'a later try still integrates the whole change');
   assert.equal(fs.readFileSync(path.join(source, 'z/b.md'), 'utf8'), 'new b\n');
+});
+
+// Nirby control session, 2026-11-04: a refused integration was cancelled and its work copied over by hand. A worker
+// that resolved the conflict in its copy conflicted again, since the merge base was still the copy's old start.
+// A send-back after a conflict now brings those files up to the checkout first.
+const EIGHT = 'a\nb\nc\nd\ne\nf\ng\nh\n';
+test('a conflict refreshed into the copy: the worker resolves the markers and the next integrate lands, merged with a later checkout edit', t => {
+  const {source, dir} = setup(t);
+  write(source, 'x.txt', EIGHT);
+  let workspace = createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'w'});
+  write(workspace.cwd, 'x.txt', EIGHT.replace('b\n', 'worker\n'));
+  write(source, 'x.txt', EIGHT.replace('b\n', 'user\n'));
+  const refused = integrateArtifact({cwd: source, dir, artifact: captureArtifact(workspace), base: workspace.cwd});
+  assert.deepEqual([refused.status, refused.paths], ['conflict', ['x.txt']]);
+  const refreshed = refreshConflicts(workspace, refused.paths);
+  assert.deepEqual(refreshed.refreshed, [{path: 'x.txt', how: 'markers'}]);
+  workspace = refreshed.workspace;
+  assert.equal(fs.readFileSync(path.join(workspace.cwd, 'x.txt'), 'utf8'),
+    'a\n<<<<<<< your change\nworker\n||||||| where your copy started\nb\n=======\nuser\n>>>>>>> the checkout now\nc\nd\ne\nf\ng\nh\n');
+  const persisted = JSON.parse(fs.readFileSync(path.join(workspace.cwd, '.attempt-workspace.json'), 'utf8'));
+  assert.equal(persisted.baseline['x.txt'].preview, EIGHT.replace('b\n', 'user\n'));
+  write(workspace.cwd, 'x.txt', EIGHT.replace('b\n', 'user and worker\n'));
+  write(source, 'x.txt', EIGHT.replace('b\n', 'user\n').replace('h\n', 'later\n'));
+  const landed = integrateArtifact({cwd: source, dir, artifact: captureArtifact(workspace), base: workspace.cwd});
+  assert.deepEqual([landed.status, landed.merged], ['integrated', ['x.txt']]);
+  assert.equal(fs.readFileSync(path.join(source, 'x.txt'), 'utf8'), EIGHT.replace('b\n', 'user and worker\n').replace('h\n', 'later\n'));
+});
+
+test('a delete against an edit is refreshed both ways: the copy gets the checkout\'s file back, or keeps its own, and the worker decides', t => {
+  const {source, dir} = setup(t);
+  write(source, 'gone.txt', 'old gone'); write(source, 'kept.txt', 'old kept');
+  let workspace = createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'w'});
+  fs.rmSync(path.join(workspace.cwd, 'gone.txt')); write(workspace.cwd, 'kept.txt', 'worker kept');
+  write(source, 'gone.txt', 'user gone'); fs.rmSync(path.join(source, 'kept.txt'));
+  const refused = integrateArtifact({cwd: source, dir, artifact: captureArtifact(workspace), base: workspace.cwd});
+  assert.deepEqual([refused.status, refused.paths], ['conflict', ['gone.txt', 'kept.txt']]);
+  const refreshed = refreshConflicts(workspace, refused.paths);
+  assert.deepEqual(refreshed.refreshed, [{path: 'gone.txt', how: 'you_deleted'}, {path: 'kept.txt', how: 'checkout_deleted'}]);
+  workspace = refreshed.workspace;
+  assert.equal(fs.readFileSync(path.join(workspace.cwd, 'gone.txt'), 'utf8'), 'user gone', 'the checkout\'s edit is back in the copy, not silently deleted');
+  assert.equal(fs.readFileSync(path.join(workspace.cwd, 'kept.txt'), 'utf8'), 'worker kept');
+  // The worker keeps its delete and its file: both now land cleanly.
+  fs.rmSync(path.join(workspace.cwd, 'gone.txt'));
+  const landed = integrateArtifact({cwd: source, dir, artifact: captureArtifact(workspace), base: workspace.cwd});
+  assert.equal(landed.status, 'integrated');
+  assert.deepEqual([fs.existsSync(path.join(source, 'gone.txt')), fs.readFileSync(path.join(source, 'kept.txt'), 'utf8')], [false, 'worker kept']);
 });

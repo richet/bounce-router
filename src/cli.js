@@ -46,6 +46,7 @@ import {parseArgs, isDeepStrictEqual} from 'node:util';
 import {Session, Router, config, saveJSON, dataRoot} from './core.js';
 import * as reducers from './reducers.js';
 import {pendingMainActions} from './continuations.js';
+import {pendingSends} from './run-inbox.js';
 import {handoffBlock} from './main-service.js';
 import {providers, runProcess} from './providers.js';
 import {projectRoot, fingerprint, validate, supervise, pidAlive} from './reload.js';
@@ -495,7 +496,7 @@ async function main() {
     try {
       let result = await router.run(orchestratorBrief + (expanded?.prompt ?? typed), values.image || [], expanded ? {typed} : {});
       // Orchestrated, the first turn usually only dispatches: the job goes on until no outcome is left to hand over.
-      const carried = orchestrating && result === 'completed' ? await carryJob({session, turn: text => router.run(orchestratorBrief + text)}) : null;
+      const carried = orchestrating && result === 'completed' ? await carryJob({session, turn: (text, options) => router.run(orchestratorBrief + text, [], options)}) : null;
       if (carried) result = carried.status;
       if (carried?.waiting.length) console.log(`[router:waiting] ${carried.waiting.map(t => `${t.id.slice(0, 8)} (${t.profile ?? 'task'})`).join(', ')} need${carried.waiting.length === 1 ? 's' : ''} your answer: bounce --resume ${session.id.slice(0, 8)}`);
       process.exitCode = carried?.waiting.length ? 2 : result === 'completed' ? 0 : result === 'cancelled' ? 130 : 1;
@@ -1645,22 +1646,43 @@ async function main() {
 // handed; when its tasks have ended or wait on the user, any outcome it has not seen goes to it in one more turn.
 // Found by the integration run 2026-10-21: the job stopped at its first dispatch and slugify was never fixed.
 const MAX_HANDOFF_TURNS = 20;
+// A message sent with `bounce send` (src/run-inbox.js) is the run's next turn, under the sender's requestId.
+async function sentTurn(session, sent, turn) {
+  session.append({kind: 'main.started', from: 'main', context: session.id, requestId: sent.requestId, state: 'running'});
+  const status = await turn(sent.text, {via: sent.via, ...(sent.caller ? {caller: sent.caller} : {})});
+  session.append({kind: 'main.terminal', from: 'main', context: session.id, requestId: sent.requestId, status});
+  return status;
+}
 async function carryJob({session, turn, pollMs = 500}) {
   const hand = (actions, from) => { for (const action of actions) session.append({kind: 'main.disposition', actionId: action.actionId, outcomeSeq: action.outcomeSeq, task: action.task, disposition: 'reported', from: 'main', text: `handed to the orchestrator (${from})`}); };
   let status = 'completed', since = 0;
-  for (let round = 0; round <= MAX_HANDOFF_TURNS; round++) {
-    const served = new Set(session.events.filter(e => e.kind === 'wait.served' && e.seq > since).map(e => e.served));
-    hand(pendingMainActions(session.events).filter(action => served.has(action.outcomeSeq)), 'its own wait');
-    // Its tasks run on in the daemon: wait until each has ended or waits on the user.
+  // Only handoff turns count against the cap: a sent message is the user's turn, not the job looping.
+  for (let round = 0; round <= MAX_HANDOFF_TURNS;) {
+    // Its tasks run on in the daemon: wait until each has ended or waits on the user, or a message is sent to it.
     for (;;) {
       const open = Object.values(reducers.tasks(session.events)).filter(t => !reducers.TERMINAL.has(t.state) && !['blocked', 'input_required'].includes(t.state));
-      if (!open.length) break;
+      if (!open.length || pendingSends(session.events).length) break;
       await new Promise(resolve => setTimeout(resolve, pollMs));
+    }
+    // This process's journal is a copy of the daemon's, and the `wait.served` row of the turn that just ended can land
+    // after the turn does: missed, every outcome the orchestrator had waited on was handed to it again and the fake
+    // orchestrator dispatched anew each time (O2, O10, 2026-11-04). The daemon journaled that row before it answered
+    // the wait, and its rows reach this process in order, so once it has acknowledged this turn's own rows (flush),
+    // the row is here. Read after the wait above too, for outcomes that ended meanwhile.
+    await session.flush?.();
+    const served = new Set(session.events.filter(e => e.kind === 'wait.served' && e.seq > since).map(e => e.served));
+    hand(pendingMainActions(session.events).filter(action => served.has(action.outcomeSeq)), 'its own wait');
+    const [sent] = pendingSends(session.events);
+    if (sent) {
+      status = await sentTurn(session, sent, turn);
+      if (status !== 'completed') return {status, waiting: []};
+      continue;
     }
     const pending = pendingMainActions(session.events);
     const waiting = Object.values(reducers.tasks(session.events)).filter(t => t.state === 'input_required');
     if (!pending.length || round === MAX_HANDOFF_TURNS) return {status, waiting};
     since = session.events.at(-1)?.seq ?? since;
+    round++;
     hand(pending, 'a handoff turn');
     status = await turn(handoffBlock(session, pending.map(action => action.row)));
     if (status !== 'completed') return {status, waiting};

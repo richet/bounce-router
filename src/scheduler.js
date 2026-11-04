@@ -4,7 +4,7 @@ import {randomUUID, createHash} from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import {createAttemptWorkspace, captureArtifact, integrateArtifact, advanceBaseline, reviewDiff} from './workspace-artifacts.js';
+import {createAttemptWorkspace, captureArtifact, integrateArtifact, advanceBaseline, refreshConflicts, reviewDiff} from './workspace-artifacts.js';
 import * as reducers from './reducers.js';
 import {takeCheckpoint, sameTree} from './checkpoint.js';
 import {POLICY_RANK, effectivePolicy, LOCAL_ADAPTERS, playedBy, READ_ONLY_ROLES as READONLY_ROLES} from './profiles.js';
@@ -1099,15 +1099,50 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return false;
   }
 
+  // A cancelled task's copy, captured as it is now: committed or not, its files are the work. Its worker is stopped,
+  // so nothing writes the copy meanwhile. publishArtifact then integrates it like any accepted work.
+  function captureCancelled(task) {
+    const workspace = existingWorkspace(task);
+    if (!workspace) throw new Error(`task ${task} has no working copy to land: it ran read-only or in the checkout, or its copy was removed`);
+    const artifact = captureArtifact(workspace);
+    const context = submittedRow(task)?.context;
+    append({kind: 'task.artifact', task, attempt: reducers.tasks(session.events)[task]?.attempt,
+      artifactId: artifact.id, digest: artifact.digest, resultHash: artifact.resultHash,
+      file: path.join(workspace.dir, 'artifacts', `${artifact.id}.json`), dir: workspace.dir, cwd: workspace.cwd, after: 'cancelled', context});
+    if (artifact.unsupported.length) throw new Error(`task ${task}'s copy holds changes bounce cannot integrate: ${artifact.unsupported.map(entry => `${entry.path} (${entry.reason})`).join(', ')}`);
+  }
+
   // An owner's accept of finished work (blocked, under review, asking for input) closes the task the way a review does:
   // the isolated work integrates into the checkout first and the accepted row lands after it, or the
   // task blocks on the integration failure. Observed live: the row journaled directly left the task
   // blocked and its fix unintegrated.
   function acceptOverride(event) {
+    if (event.overrides === 'cancelled') captureCancelled(event.task);
     const row = {...event, stage: 'completion', context: event.context ?? submittedRow(event.task)?.context};
     if (!publishArtifact(row.task, row)) return session.events.findLast(e => e.kind === 'task.integration.requested' && e.task === row.task);
     append(row);
     return session.events.findLast(e => e.kind === 'task.accepted' && e.task === row.task);
+  }
+
+  // A task blocked by a refused integration and sent back: the refused files of its copy are brought up to the checkout
+  // first (refreshConflicts), and the worker is told what each one needs. Nothing for any other send-back.
+  const REFRESH_NOTES = {
+    markers: file => `${file}: the checkout changed it too. Your copy now holds both versions with conflict markers; keep what both meant and remove the markers.`,
+    you_deleted: file => `${file}: you deleted or moved it, and the checkout edited it. The checkout's version is back in your copy; delete it again only if that is still right.`,
+    checkout_deleted: file => `${file}: the checkout deleted or moved it, and you edited it. Your version is still in your copy; delete it if the checkout was right.`,
+    binary: file => `${file}: a binary file both sides changed; bounce cannot merge it. Rebuild or replace it so it fits the checkout.`,
+  };
+  function refreshRefused(task, context) {
+    const blocked = session.events.findLast(e => e.task === task && ['task.blocked', 'task.rework', 'task.started'].includes(e.kind));
+    if (blocked?.kind !== 'task.blocked' || blocked.reason !== 'integration_conflict' || !blocked.paths?.length) return [];
+    const workspace = existingWorkspace(task);
+    if (!workspace) return [];
+    const {refreshed} = refreshConflicts(workspace, blocked.paths);
+    append({kind: 'task.milestone', task, phase: 'refreshed', reason: 'integration_conflict', paths: blocked.paths, refreshed,
+      text: `Brought ${refreshed.length} refused file${refreshed.length === 1 ? '' : 's'} of the copy up to the checkout: ${blocked.paths.join(', ')}`, context});
+    return ['Your change was refused because the checkout changed the same files since your copy was made. Your copy is now up to date with the checkout for them:',
+      ...refreshed.map(({path: file, how}) => REFRESH_NOTES[how](file)),
+      'A generated file (a lockfile, a golden fixture, a numbered migration) is regenerated or renumbered, never merged by hand. Then run the checks again.'];
   }
 
   // The symmetric "send back": an owner's rework verdict on finished work. This IS a
@@ -1121,7 +1156,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const context = event.context ?? row.context;
     const root = budgetRootOf(task, reducers.tasks(session.events));
     const round = api.roundsUsed(task) + 1;
-    const findings = [event.text];
+    const findings = [event.text, ...refreshRefused(task, context)];
     append({kind: 'budget.reserved', task, root, amount: {rounds: 1}, context});
     append({kind: 'task.rework', task, round, findings, overrides: event.overrides, context});
     void resumeWorker({task, row, round, findings, context});
@@ -1930,6 +1965,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // A stream that broke after the reviewer spoke still carries what it said: read that too.
     const verdict = parseVerdict(resultStatus, resultText ?? '');
     if (streamError) resultText = streamError.message;
+    if (reviewEntry.stopReason) resultText = reviewEntry.stopReason;
     append({kind: 'review.finished', task, stage, round, candidateSeq: review.candidateSeq ?? null, candidateDigest: review.candidateDigest ?? null, verdict: verdict.verdict, text: resultText ?? null, from: peer, context});
     return verdict;
   }
@@ -2592,7 +2628,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const entry = target.review ? [...reviews.values()].find(item => item.task === task && item.handle) : handles.get(task);
     const delivered = (tier, text = null) => append({kind: 'task.delivered', task, tier, message: row.id, text, from: 'bounce', context: row.context});
     if (target.entry && (entry !== target.entry || entry?.handle.turnId !== target.turnId)) return delivered('failed', 'turn changed before delivery');
-    if (!entry || reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) return delivered('queued', 'no live worker');
+    // A task under review is often already `completed`: its reviewer is live while the review runs.
+    if (!entry || (!target.review && reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state))) return delivered('queued', 'no live worker');
     if (typeof row.text !== 'string') return delivered('queued', 'no text');
     let outcome;
     try {
@@ -2639,7 +2676,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     let best = null;
     for (const e of session.events) {
       if (e.task !== task) continue;
-      if (e.kind === 'task.milestone' || e.kind === 'task.blocked' || e.kind === 'task.usage') best = Math.max(best ?? -Infinity, Date.parse(e.time));
+      // A new review is a new reviewer: it is warned before it is stopped, whatever the one before it did.
+      if (e.kind === 'task.milestone' || e.kind === 'task.blocked' || e.kind === 'task.usage' || e.kind === 'review.started') best = Math.max(best ?? -Infinity, Date.parse(e.time));
       // Same exclusion as reducers.watchdog: the watchdog's own corrective delivery is not a
       // reset trigger for the signature it was sent because of.
       else if (e.kind === 'task.delivered' && (e.tier === 'live' || e.tier === 'next-turn')) {
@@ -2793,12 +2831,24 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (!corrected.length) {
       append({kind: 'policy.corrected', task: r.task, reason, text: `${reason} for ${elapsedSeconds} s`, context: row?.context});
       const text = `bounce watchdog: ${reason} for ${elapsedSeconds} s — ${reportInstruction(profiles[row?.profile])} with op:milestone and evidence, or op:blocked with the blocker; include phase, text and next`;
-      append({kind: 'message', to: workerFrom(r.task), from: 'bounce', text, context: row?.context});
+      // In review the silence is the reviewer's: the builder has finished and cannot answer for it.
+      append({kind: 'message', to: r.stage === 'review' ? reviewFrom(r.task) : workerFrom(r.task), from: 'bounce', text, context: row?.context});
       return;
     }
     const correctedAt = Date.parse(corrected.at(-1).time);
     // Missing authored milestones are not evidence of a dead worker while observed work
     // continues. Silence or the hard deadline may terminate it; missing reports alone may not.
+    if (reason === 'silent' && now >= correctedAt + watchdogConfig.grace && r.stage === 'review') {
+      // Only the review stops: it ends unreadable and goes down the reviewer's chain, then to the orchestrator.
+      // Cancelling the task threw away builders' work that had passed its check (Nirby, f1ea92b8, 2026-11-04).
+      const entry = [...reviews.values()].find(item => item.task === r.task && item.handle);
+      if (entry && !entry.stopReason) {
+        entry.stopReason = 'The reviewer was silent through correction and grace; its review was stopped';
+        append({kind: 'policy.escalated', task: r.task, reason: 'review_stopped', text: entry.stopReason, context: row?.context});
+        await stopReview(entry);
+      }
+      return;
+    }
     if (reason === 'silent' && now >= correctedAt + watchdogConfig.grace) {
       append({kind: 'policy.escalated', task: r.task, reason: 'cancelled', text: `${reason} persisted through correction and grace`, context: row?.context});
       await cancel(r.task, {reason: 'watchdog'});
@@ -2857,7 +2907,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         const copy = session.events.findLast(e => e.kind === 'task.artifact' && e.task === action.task)?.cwd ?? null;
         const result = integrateArtifact({cwd: session.cwd, artifact, dir, base: copy});
         if (result.status !== 'integrated') {
-          append({kind: 'task.blocked', task: action.task, reason: `integration_${result.status}`, text: `Artifact integration ${result.status}${result.paths?.length ? `: ${result.paths.join(', ')}` : result.path ? `: ${result.path}` : ''}; isolated work preserved`, ...(result.paths ? {paths: result.paths} : {}), artifactId});
+          append({kind: 'task.blocked', task: action.task, reason: `integration_${result.status}`, ...(reducers.tasks(session.events)[action.task]?.state === 'cancelled' ? {reopens: true} : {}), text: `Artifact integration ${result.status}${result.paths?.length ? `: ${result.paths.join(', ')}` : result.path ? `: ${result.path}` : ''}; isolated work preserved`, ...(result.paths ? {paths: result.paths} : {}), artifactId});
           return;
         }
         if (!session.events.some(e => e.kind === 'task.integrated' && e.task === action.task && e.artifactId === artifactId)) append({kind: 'task.integrated', task: action.task, artifactId, resultHash: artifact.resultHash,
