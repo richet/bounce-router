@@ -228,6 +228,24 @@ test('P6b completion critic receives the brief plus the worker report', async t 
   assert.equal(seenOrders, 'the brief\n\n--- worker report ---\nsummary text here');
 });
 
+// Nirby control session, 2026-11-04 (an analyst's final reply "arrived truncated"): the critic was handed the report's
+// one-line summary, the document's title, under "worker report", and failed the work as "only the title"; the report's
+// text was also cut at 16000 characters. A critic reads the worker's whole answer.
+test('P6b2 a completion critic reads the worker\'s whole answer, not its one-line summary, past the report\'s 16000-character cut', async t => {
+  const {session} = setup(t);
+  let seenOrders;
+  const answer = ['# Workstreams plan', '', ...Array.from({length: 400}, (_, i) => `- step ${i}: ${'detail '.repeat(7)}`), '', 'The end of the plan.'].join('\n');
+  assert.equal(answer.length > 16000, true, String(answer.length));
+  const workerAdapter = fakeAdapter(() => [{kind: 'result', status: 'completed', text: answer}]);
+  const criticAdapter = fakeAdapter(args => { seenOrders = args.orders; return [{kind: 'result', status: 'completed', text: '{"verdict":"accept"}'}]; });
+  const scheduler = createScheduler({session, adapters: {worker: workerAdapter, critic: criticAdapter}, profiles: {A: worker(), C: critic()}, requireFinalReport: true});
+  const row = scheduler.submit({parent: null, profile: 'A', orders: 'the brief', deadline: null, review: {completion: 'C'}});
+  await waitFor(() => scheduler.tasks()[row.task]?.state === 'accepted');
+  assert.equal(scheduler.tasks()[row.task].summary, 'Workstreams plan', 'the summary is the title, which is all the critic used to get');
+  assert.equal(session.events.findLast(e => e.kind === 'task.reported').text.length, 16000, 'the report keeps its cut; the critic does not read it');
+  assert.equal(seenOrders, `the brief\n\n--- worker report ---\n${answer}`);
+});
+
 test('P6c completion verifier receives steps verbatim, dir ends review-completion-1', async t => {
   const {session} = setup(t);
   let seenOrders, seenDir;

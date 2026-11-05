@@ -10,8 +10,8 @@ import {takeCheckpoint, sameTree} from './checkpoint.js';
 import {POLICY_RANK, effectivePolicy, LOCAL_ADAPTERS, playedBy, READ_ONLY_ROLES as READONLY_ROLES} from './profiles.js';
 import {modelVersion} from './bindings.js';
 import {defaultStrategy} from './strategy.js';
-import {reportEvent, validateReport, remainingWork} from './reporting.js';
-import {inspectFinalReport, synthesizeReport, synthesizeReportFromChanges, FINAL_REPORT_INSTRUCTION} from './final-report.js';
+import {reportEvent, validateReport, remainingWork, TEXT_MAX} from './reporting.js';
+import {inspectFinalReport, synthesizeReport, synthesizeReportFromChanges, FINAL_REPORT_INSTRUCTION, withoutToolMarkup} from './final-report.js';
 import {lessonsBlock} from './lessons.js';
 import {skillsInUse, skillsBlock} from './skills.js';
 import {workersView, idleWorkerOf, nextWorkerName, pendingHandoffFor} from './workers.js';
@@ -1031,6 +1031,19 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const blocks = [STANDING_RULES, lessonsBlock(session.cwd, profile.role), skillsBlock(inUse.skills, fileOf)].filter(block => block && !profile.agent.prompt.includes(block));
     if (!blocks.length) return profile;
     return {...profile, agent: {...profile.agent, prompt: [profile.agent.prompt, ...blocks].join('\n\n')}};
+  };
+  // What a completion critic reads as the worker's report: its whole answer. The one-line summary alone was a document's
+  // title, and the critic failed the work as "only the title" (Nirby control session, 2026-11-04); a report's text is
+  // cut at TEXT_MAX, so a cut one gives way to the worker's own output of that attempt.
+  const workerAnswer = task => {
+    const summary = reducers.tasks(session.events)[task]?.summary ?? '';
+    const reported = session.events.findLast(e => e.kind === 'task.reported' && e.task === task);
+    const output = session.events.findLast(e => e.kind === 'task.output' && e.task === task && (!reported || e.attempt === reported.attempt));
+    let text = typeof reported?.text === 'string' ? reported.text : '';
+    const whole = withoutToolMarkup(output?.text);
+    if (text.length >= TEXT_MAX && whole.length > text.length) text = whole;
+    if (!text.trim()) return summary;
+    return !summary || text.includes(summary) ? text : `${summary}\n\n${text}`;
   };
   const toWorkingCopy = (text, workspace) => {
     const source = fs.realpathSync(session.cwd);
@@ -2211,7 +2224,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       const lead = withLessons(reviewProfile, row).agent?.prompt;
       const roleLead = lead && reviewProfile.adapter !== 'opencode' && reviewProfile.adapter !== 'typesafe' ? `${lead}\n\n---\n\n` : '';
       const orders = roleLead + (stage === 'completion'
-        ? (reviewProfile.role === 'verifier' ? row.steps : `${row.orders}\n\n--- worker report ---\n${reducers.tasks(session.events)[task]?.summary ?? ''}`)
+        ? (reviewProfile.role === 'verifier' ? row.steps : `${row.orders}\n\n--- worker report ---\n${workerAnswer(task)}`)
         : row.orders);
       // What a decision-model reviewer (typesafe) judges: the raw orders, the worker's final
       // report and the tree's HEAD when the lineage's first worker started — the diff base.
