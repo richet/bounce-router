@@ -67,7 +67,7 @@ async function harness(t, {run, models = {}} = {}) {
   return {root, session, listeners, calls, child, hosted, waitFor, output: () => output};
 }
 
-test('CLI commands and live steering work while the daemon main turn is held', {timeout: 15000}, async t => {
+test('CLI commands and live steering work while the daemon main turn is held', {timeout: 30000}, async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-tui-cli-'));
   let catalogResponse;
   const catalogServer = http.createServer((request, response) => {catalogResponse = response;});

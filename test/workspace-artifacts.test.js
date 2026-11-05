@@ -542,3 +542,27 @@ test('a delete against an edit is refreshed both ways: the copy gets the checkou
   assert.equal(landed.status, 'integrated');
   assert.deepEqual([fs.existsSync(path.join(source, 'gone.txt')), fs.readFileSync(path.join(source, 'kept.txt'), 'utf8')], [false, 'worker kept']);
 });
+
+// Nirby control, 2026-11-05 (session 5f266119): a copy carried the checkout's ignored .ace/ folder, Ace's state for
+// that one checkout, with a "record test durations here" marker, so every copy's gates rewrote a tracked file. A copy
+// leaves the project's .ace/ out, as Ace's own workspaces do; Ace runs the copy's stack from ace.yaml without it.
+// What Ace writes there in the copy is never integrated, and a nested .ace/ (a subproject's) is copied as before.
+test('a copy leaves the checkout\'s .ace/ out, never integrates what Ace writes there, and keeps a nested .ace/', () => {
+  const {source, dir} = setup(test);
+  const git = (cwd, ...args) => execFileSync('git', args, {cwd, encoding: 'utf8', env: {...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t'}}).trim();
+  git(source, 'init', '-q', '-b', 'main');
+  write(source, 'ace.yaml', 'project: {id: app}\n'); write(source, '.gitignore', '/.ace/\n'); write(source, 'tools/.ace/keep.txt', 'nested\n');
+  git(source, 'add', '.'); git(source, 'commit', '-qm', 'First commit');
+  write(source, '.ace/record-test-durations', ''); write(source, '.ace/test-timings/shard-1.json', '{}');
+  const copy = createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'ace'});
+  assert.equal(fs.existsSync(path.join(copy.cwd, '.ace')), false, 'the checkout\'s .ace/ stays in the checkout');
+  assert.equal(fs.readFileSync(path.join(copy.cwd, 'ace.yaml'), 'utf8'), 'project: {id: app}\n');
+  assert.equal(fs.readFileSync(path.join(copy.cwd, 'tools/.ace/keep.txt'), 'utf8'), 'nested\n');
+  assert.equal(git(copy.cwd, 'status', '--porcelain'), '');
+  write(copy.cwd, '.ace/test-timings/shard-1.json', '{"copy":true}'); write(copy.cwd, 'a.txt', 'work\n');
+  const artifact = captureArtifact(copy);
+  assert.deepEqual(artifact.changes.map(change => change.path), ['a.txt']);
+  assert.equal(integrateArtifact({cwd: source, dir, artifact}).status, 'integrated');
+  assert.equal(fs.readFileSync(path.join(source, '.ace/test-timings/shard-1.json'), 'utf8'), '{}');
+  assert.equal(fs.existsSync(path.join(source, '.ace/record-test-durations')), true, 'nothing in the checkout\'s .ace/ is read as deleted');
+});

@@ -6,6 +6,10 @@ import path from 'node:path';
 import {validOwns} from './owned-paths.js';
 
 const EXCLUDED = new Set(['.git', '.bounce', 'node_modules', '.attempt-workspace.json']);
+// Left out at the project's top only. .ace is Ace's state for one checkout (markers, test timings, locks); Ace's own
+// workspaces leave it out too, and a copy's stack runs from ace.yaml without it (Nirby control, 2026-11-05: a copied
+// "record test durations here" marker made every copy's gates rewrite a tracked file).
+const TOP_EXCLUDED = new Set(['.ace']);
 const MAX_FILE = 4 * 1024 * 1024;
 const PREVIEW_MAX = 4096; // what the baseline keeps of a file's text
 const DIFF_FILE_MAX = 40_000; // one file's share of the text a review reads
@@ -48,7 +52,7 @@ function manifest(root) {
   const visit = (dir, prefix = '') => {
     if (fs.existsSync(path.join(dir, GENERATED))) return;
     for (const entry of fs.readdirSync(dir, {withFileTypes: true})) {
-      if (EXCLUDED.has(entry.name)) continue;
+      if (EXCLUDED.has(entry.name) || (!prefix && TOP_EXCLUDED.has(entry.name))) continue;
       const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
       const full = path.join(dir, entry.name);
       const stat = fs.lstatSync(full);
@@ -74,15 +78,15 @@ function atomicJSON(file, value) {
 }
 function readJSON(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } }
 
-function copyTree(source, target) {
+function copyTree(source, target, top = true) {
   fs.mkdirSync(target, {recursive: true, mode: 0o700});
   for (const entry of fs.readdirSync(source, {withFileTypes: true})) {
     if (entry.name === 'node_modules') { fs.cpSync(path.join(source, entry.name), path.join(target, entry.name), {recursive: true, dereference: true, mode: fs.constants.COPYFILE_FICLONE}); continue; }
-    if (EXCLUDED.has(entry.name)) continue;
+    if (EXCLUDED.has(entry.name) || (top && TOP_EXCLUDED.has(entry.name))) continue;
     const from = path.join(source, entry.name), to = path.join(target, entry.name);
     const stat = fs.lstatSync(from);
     if (stat.isSymbolicLink()) throw new Error(`symlink denied: ${entry.name}`);
-    if (stat.isDirectory()) copyTree(from, to);
+    if (stat.isDirectory()) copyTree(from, to, false);
     else if (stat.isFile()) fs.copyFileSync(from, to, fs.constants.COPYFILE_EXCL);
   }
 }
@@ -127,10 +131,10 @@ function giveGit(source, copy, generated = []) {
     else git(copy, 'update-ref', '--no-deref', 'HEAD', head);
     git(copy, 'reset', '--quiet');
     // What the copy leaves out on purpose (.bounce) would otherwise read as deleted in every `git status`.
-    const omitted = execFileSync('git', ['ls-files', '-z', '--', '.bounce', ':(glob)**/.bounce/**'], {cwd: copy, env, stdio: ['ignore', 'pipe', 'ignore']});
+    const omitted = execFileSync('git', ['ls-files', '-z', '--', '.bounce', ':(glob)**/.bounce/**', ':(top).ace'], {cwd: copy, env, stdio: ['ignore', 'pipe', 'ignore']});
     if (omitted.length) execFileSync('git', ['update-index', '--skip-worktree', '-z', '--stdin'], {cwd: copy, env, input: omitted, stdio: ['pipe', 'ignore', 'ignore']});
     fs.mkdirSync(path.join(copy, '.git', 'info'), {recursive: true});
-    fs.appendFileSync(path.join(copy, '.git', 'info', 'exclude'), `\n/.attempt-workspace.json\n${generated.map(rel => `/${rel}/\n`).join('')}`);
+    fs.appendFileSync(path.join(copy, '.git', 'info', 'exclude'), `\n/.attempt-workspace.json\n/.ace/\n${generated.map(rel => `/${rel}/\n`).join('')}`);
     // The checkout as the copy got it — the user's uncommitted edits included — becomes a baseline
     // commit, so `git status` starts clean and `git diff` is only the worker's own work. Found live:
     // a worker read the user's uncommitted edits as its own out-of-scope
