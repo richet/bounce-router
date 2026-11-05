@@ -29,11 +29,15 @@ import {routingFallback, PROFILE_TIERS} from './jev.js';
 import {validOwns} from './owned-paths.js';
 import {execFileSync} from 'node:child_process';
 import {parseVerdict} from './verdict.js';
+import {watchedDirs, snapshot as outsideSnapshot, outsideChanges, outsideFinding} from './outside-writes.js';
 
-// Rules every worker and reviewer reads, whatever its job or project. Owner data: a worker printed file names from the
-// owner's private export in its tool output (Nirby control session, 2026-11-04).
+// Rules every worker and reviewer reads, whatever its job or project (Nirby control session, 2026-11-04): a worker
+// printed file names from the owner's private export in its tool output; a builder ran two suites at once in one copy
+// and each wiped the other's test databases; a builder linked a file into /opt/homebrew/bin.
 export const STANDING_RULES = ['Standing rules for every worker:',
-  "- Owner data: when the project holds the owner's personal data (exports, archives, mail, messages, notes), show its structure and counts only. Never print its file names, contents or excerpts in commands, output or your report."].join('\n');
+  "- Owner data: when the project holds the owner's personal data (exports, archives, mail, messages, notes), show its structure and counts only. Never print its file names, contents or excerpts in commands, output or your report.",
+  "- One test run at a time: never start a test suite while another is running in this working copy, in the background or in parallel. Suites share the project's test databases and wipe each other's.",
+  '- Stay in your working copy: create, edit, link or install files only inside it and the system temp directory. Never change anything outside it (global packages, /opt/homebrew, /usr/local, ~/.config, shell profiles, other checkouts). If the task needs that, stop and say so in your report.'].join('\n');
 const processAlive = pid => { try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } };
 
 const FALLBACK_REASONS = new Set(['limited', 'missing', 'backend_unavailable', 'watchdog', 'local_unavailable', 'local_busy', 'worker_runtime', 'incomplete_report']);
@@ -132,6 +136,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   machineSlots = createMachineSlots(),
   // Runs a task's check (src/task-check.js): the command its orders name as proof the work is done.
   checkRunner = runCheck, checkTimeoutMs = CHECK_TIMEOUT_MS,
+  // The directories watched for writes outside a worker's copy (src/outside-writes.js); null: the ones on PATH.
+  outsideDirs = null,
   sessionMode = 'yolo', depthCap = 1, checkpointRunner, limits: suppliedLimits = {}, strict = false, requireFinalReport = false, reportFormat = 'structured', reportGrant = null, clock = () => Date.now(), watchdog: suppliedWatchdog = {}, strategy = defaultStrategy, jev = null, gitHead = defaultGitHead, maxConcurrentCloud = 3}) {
   // Sizing limits (lines/probes/minutes) gate dispatch ONLY when the caller configures them: a
   // task's declared size is otherwise informational. The old built-in 150/6/15 defaults refused
@@ -145,6 +151,23 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   const intervalOk = watchdogConfig.interval === null || isPositiveInt(watchdogConfig.interval);
   if (!intervalOk || !isPositiveInt(watchdogConfig.startupMs) || !isPositiveInt(watchdogConfig.silence) || !isPositiveInt(watchdogConfig.stall) || !isPositiveInt(watchdogConfig.grace) || !isPositiveInt(watchdogConfig.concludeGrace) || !isPositiveInt(watchdogConfig.concludeCap) || !isPositiveInt(watchdogConfig.reportOnly)) throw new Error('malformed: watchdog');
   const handles = new Map(); // task -> {adapter, handle}
+  // A writing worker's attempt: what the PATH directories held when it started, compared when it ends.
+  const outsideBefore = new Map(); // `${task}:${attempt}` -> {before, dirs, copy}
+  const watchOutside = (task, attempt, profile, owned) => {
+    if (profile.policy === 'read-only') return;
+    const dirs = outsideDirs ?? watchedDirs({exclude: [path.join(session.root, 'w'), session.dir, session.cwd]});
+    if (dirs.length) outsideBefore.set(`${task}:${attempt}`, {before: outsideSnapshot(dirs), dirs, copy: owned?.cwd ?? null});
+  };
+  const outsideAfter = row => {
+    const key = `${row.task}:${row.attempt}`;
+    const watched = outsideBefore.get(key);
+    if (!watched) return;
+    outsideBefore.delete(key);
+    const changes = outsideChanges(watched.before, outsideSnapshot(watched.dirs));
+    if (!changes.length) return;
+    append({kind: 'task.finding', task: row.task, attempt: row.attempt, source: 'outside_write', paths: changes.map(change => change.path),
+      finding: {severity: 'warning', title: 'Written outside the working copy'}, text: `FINDING: ${outsideFinding(changes, watched.copy)}`, from: 'bounce', context: row.context});
+  };
   let closed = false;
   const cancellationRequests = new Set();
   const reviews = new Map(); // task -> {adapter, handle}, one review in flight per task (A3)
@@ -324,7 +347,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       requestTerminal(row, [row]);
       return session.events.findLast(e => e.kind === row.kind && e.task === row.task);
     }
-    return session.append(row);
+    const written = session.append(row);
+    if (row.kind === 'task.attempt.ended') outsideAfter(row);
+    return written;
   };
   const publish = event => closed ? null : session.publish({...event, time: stamp()});
   const localActivity = (task, attempt, context) => event => {
@@ -1675,6 +1700,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // this task's own copy and told where it is, instead of a stranger being launched. Probed with the
       // real CLIs (2026-10-01): OpenCode, Claude and Codex all edit the new copy once told.
       const continuation = row.continues ? continuationOf(row, profile) : null;
+      watchOutside(task, attempt, profile, owned);
       const common = {task, attempt, context, signal: admission?.signal,
         onActivity: LOCAL_ADAPTERS.has(profile.adapter) ? localActivity(task, attempt, context) : undefined,
         report: requireFinalReport ? ({report: payload}) => report({task, attempt, context, report: payload}) : undefined};
@@ -1781,6 +1807,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       profile = withLessons(profile, row);
       if (owned && profile.agent?.prompt) profile = {...profile, agent: {...profile.agent, prompt: toWorkingCopy(profile.agent.prompt, owned)}};
       append({kind: 'task.launch.requested', task, attempt, executionKey: `${task}:${attempt}`, resumed: true, context});
+      if (!reportOnly) watchOutside(task, attempt, profile, owned);
       if (owned) message = inWorkingCopy(message, owned);
       // A reportOnly turn asks in plain words on purpose (requestPlainAnswer): the JSON schema
       // reminder below is for every OTHER resume, never appended onto that one turn back.

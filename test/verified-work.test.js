@@ -479,7 +479,12 @@ test('a worker is handed the standing worker rules and the project\'s lessons fo
 
   const block = 'Lessons from earlier sessions in this project:\n- Put evidence inside the working copy.\n- A check must run the work.';
   // Nirby control session, 2026-11-04: a worker printed file names from the owner's private export in its tool output.
-  const standing = 'Standing rules for every worker:\n- Owner data: when the project holds the owner\'s personal data (exports, archives, mail, messages, notes), show its structure and counts only. Never print its file names, contents or excerpts in commands, output or your report.';
+  // A builder ran two suites at once in one copy and each wiped the other's test databases; another linked a file into
+  // /opt/homebrew/bin. Both rules ride with every worker.
+  const standing = ['Standing rules for every worker:',
+    '- Owner data: when the project holds the owner\'s personal data (exports, archives, mail, messages, notes), show its structure and counts only. Never print its file names, contents or excerpts in commands, output or your report.',
+    '- One test run at a time: never start a test suite while another is running in this working copy, in the background or in parallel. Suites share the project\'s test databases and wipe each other\'s.',
+    '- Stay in your working copy: create, edit, link or install files only inside it and the system temp directory. Never change anything outside it (global packages, /opt/homebrew, /usr/local, ~/.config, shell profiles, other checkouts). If the task needs that, stop and say so in your report.'].join('\n');
   assert.equal(launched.profile.agent.prompt, `You are a builder.\n\n${standing}\n\n${block}`, 'the agent definition a local worker runs as');
   assert.equal(launched.orders.startsWith(`You are a builder.\n\n${standing}\n\n${block}\n\n---\n\nMake state "new"`), true, launched.orders.slice(0, 300));
   assert.equal(launched.orders.includes('PASS or FAIL'), false, 'the reviewer\'s line is not the builder\'s');

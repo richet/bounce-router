@@ -69,6 +69,10 @@ export function handoffBlock(session, ended) {
         ? `${answer.slice(0, HANDOFF_ANSWER_MAX)}\n[… ${answer.length - HANDOFF_ANSWER_MAX} more characters: task_get with full: true]` : answer;
       lines.push('  answer, in the worker\'s words:', `    ${shown.replace(/\n/g, '\n    ')}`);
     }
+    // Something written outside the worker's copy while it ran (src/outside-writes.js): the orchestrator decides whether it stays.
+    for (const finding of session.events.filter(event => event.kind === 'task.finding' && event.task === row.task && event.source === 'outside_write')) {
+      lines.push(`  outside the working copy: ${String(finding.text).replace(/^FINDING: Written outside the working copy while this attempt ran: /, '').slice(0, HANDOFF_TEXT_MAX)}`);
+    }
     // A task.accepted row may carry advice from an unsure Jev review (src/strategy.js jevAdvice):
     // read it before building on the accepted work, not just its summary.
     if (row.kind === 'task.accepted' && row.advice) lines.push(`  advice: ${String(row.advice).slice(0, HANDOFF_TEXT_MAX)}`);
