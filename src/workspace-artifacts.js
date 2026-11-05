@@ -96,8 +96,14 @@ function realAncestor(dir) {
   return parent === resolved ? resolved : path.join(realAncestor(parent), path.basename(resolved));
 }
 
+// Where a copy's origin pushes: nowhere. git refuses it locally ("unable to find remote helper"), so a worker's push
+// never reaches the checkout or its remote.
+export const COPY_PUSH_URL = 'bounce-copy-cannot-push://origin';
+
 // The copy gets its own git: a clone sharing the source's objects (no duplicated history, about a second),
-// on the source's branch, with a baseline commit of the checkout as copied (see below). It has no remote, so nothing a worker does in git can reach the source, and
+// on the source's branch, with a baseline commit of the checkout as copied (see below). Its origin names the source's
+// origin (the source itself when it has none), so a session run in the copy knows its project, and pushes nowhere
+// (COPY_PUSH_URL), so nothing a worker does in git can reach the source; and
 // .git is outside every manifest, so only file changes are ever integrated. A source that is not a git
 // checkout, or a clone that fails, leaves the copy without git as before.
 function giveGit(source, copy, generated = []) {
@@ -107,11 +113,16 @@ function giveGit(source, copy, generated = []) {
   const staging = path.join(copy, `.git-clone-${crypto.randomUUID()}`);
   try {
     const head = git(source, 'rev-parse', '--verify', '-q', 'HEAD');
+    let origin = source;
+    try { origin = git(source, 'remote', 'get-url', 'origin') || source; } catch {}
     let branch = '';
     try { branch = git(source, 'symbolic-ref', '--short', '-q', 'HEAD'); } catch {}
     git(copy, 'clone', '--shared', '--no-checkout', '--quiet', source, staging);
     fs.renameSync(path.join(staging, '.git'), path.join(copy, '.git'));
+    // Removed and added back rather than repointed: the clone's origin/* refs are the source's local branches.
     git(copy, 'remote', 'remove', 'origin');
+    git(copy, 'remote', 'add', 'origin', origin);
+    git(copy, 'remote', 'set-url', '--push', 'origin', COPY_PUSH_URL);
     if (branch) git(copy, 'update-ref', `refs/heads/${branch}`, head), git(copy, 'symbolic-ref', 'HEAD', `refs/heads/${branch}`);
     else git(copy, 'update-ref', '--no-deref', 'HEAD', head);
     git(copy, 'reset', '--quiet');

@@ -29,6 +29,11 @@ import {routingFallback, PROFILE_TIERS} from './jev.js';
 import {validOwns} from './owned-paths.js';
 import {execFileSync} from 'node:child_process';
 import {parseVerdict} from './verdict.js';
+
+// Rules every worker and reviewer reads, whatever its job or project. Owner data: a worker printed file names from the
+// owner's private export in its tool output (Nirby control session, 2026-11-04).
+export const STANDING_RULES = ['Standing rules for every worker:',
+  "- Owner data: when the project holds the owner's personal data (exports, archives, mail, messages, notes), show its structure and counts only. Never print its file names, contents or excerpts in commands, output or your report."].join('\n');
 const processAlive = pid => { try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } };
 
 const FALLBACK_REASONS = new Set(['limited', 'missing', 'backend_unavailable', 'watchdog', 'local_unavailable', 'local_busy', 'worker_runtime', 'incomplete_report']);
@@ -1016,14 +1021,14 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     }
     return append({kind: 'worker.retired', worker, profile: found.profile, by, ...(text ? {handoff: text} : {}), ...(ask ? {asked: true} : {}), ...(context ? {context} : {})});
   }
-  // The agent prompt plus the project's lessons for its job and the index of the skills in use, when there are any and
+  // The agent prompt plus the standing worker rules, the project's lessons for its job and the index of the skills in use, when there are any and
   // the profile has a job. A skill is named by its path in the checkout, which the copy rewrites to its own (the copy
   // carries the skills); an in-place worker reads the user's skills where they are.
   const withLessons = (profile, row = {}) => {
     if (!profile.agent?.prompt || !profile.role) return profile;
     const inUse = skillsInUse(session.root, session.cwd);
     const fileOf = skill => row.inPlace && inUse.source !== 'project' ? path.join(skill.dir, 'SKILL.md') : path.join(session.cwd, '.bounce', 'skills', skill.name, 'SKILL.md');
-    const blocks = [lessonsBlock(session.cwd, profile.role), skillsBlock(inUse.skills, fileOf)].filter(block => block && !profile.agent.prompt.includes(block));
+    const blocks = [STANDING_RULES, lessonsBlock(session.cwd, profile.role), skillsBlock(inUse.skills, fileOf)].filter(block => block && !profile.agent.prompt.includes(block));
     if (!blocks.length) return profile;
     return {...profile, agent: {...profile.agent, prompt: [profile.agent.prompt, ...blocks].join('\n\n')}};
   };

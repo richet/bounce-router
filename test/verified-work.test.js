@@ -465,7 +465,7 @@ test('strategy: every way of accepting finished work holds it when it changed fi
 
 // A worker reads the project's lessons for its job after its agent prompt —
 // in the orders for a cloud worker, in the agent definition for a local one — and not another job's.
-test('a worker is handed the project\'s lessons for its job with its agent prompt, and not another job\'s', async t => {
+test('a worker is handed the standing worker rules and the project\'s lessons for its job with its agent prompt, and not another job\'s', async t => {
   let launched = null;
   const f = setup(t, {worker: args => { launched = args; write(args.cwd, 'export const state = "new";\n'); return [{kind: 'result', status: 'completed', text: ownReport('state is now "new"')}]; }});
   fs.mkdirSync(path.join(f.session.cwd, '.bounce'), {recursive: true});
@@ -478,7 +478,9 @@ test('a worker is handed the project\'s lessons for its job with its agent promp
   await waitFor(() => ['completed', 'accepted', 'blocked', 'failed'].includes(scheduler.tasks()[task]?.state));
 
   const block = 'Lessons from earlier sessions in this project:\n- Put evidence inside the working copy.\n- A check must run the work.';
-  assert.equal(launched.profile.agent.prompt, `You are a builder.\n\n${block}`, 'the agent definition a local worker runs as');
-  assert.equal(launched.orders.startsWith(`You are a builder.\n\n${block}\n\n---\n\nMake state "new"`), true, launched.orders.slice(0, 300));
+  // Nirby control session, 2026-11-04: a worker printed file names from the owner's private export in its tool output.
+  const standing = 'Standing rules for every worker:\n- Owner data: when the project holds the owner\'s personal data (exports, archives, mail, messages, notes), show its structure and counts only. Never print its file names, contents or excerpts in commands, output or your report.';
+  assert.equal(launched.profile.agent.prompt, `You are a builder.\n\n${standing}\n\n${block}`, 'the agent definition a local worker runs as');
+  assert.equal(launched.orders.startsWith(`You are a builder.\n\n${standing}\n\n${block}\n\n---\n\nMake state "new"`), true, launched.orders.slice(0, 300));
   assert.equal(launched.orders.includes('PASS or FAIL'), false, 'the reviewer\'s line is not the builder\'s');
 });

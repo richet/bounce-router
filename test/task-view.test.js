@@ -6,7 +6,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {taskView, taskList, FINDINGS_SHOWN, MILESTONES_SHOWN} from '../src/task-view.js';
 import {candidateResult} from '../src/task-result.js';
-import {formatTaskView} from '../src/task-report.js';
+import {formatTaskView, formatTaskList} from '../src/task-report.js';
 
 const at = (s, rest) => ({time: `2026-09-22T18:${String(s).padStart(2, '0')}:00.000Z`, ...rest});
 const log = [
@@ -74,6 +74,34 @@ test('V4 the list is what is live, newest last, one line each', () => {
   assert.deepEqual(live.map(row => [row.task, row.state, row.profile]), [['land', 'reviewing', 'integrator'], ['probe', 'running', 'reviewer']]);
   assert.equal(live[0].doing, 'suite green', 'its last milestone, so the line says what it is on');
   assert.deepEqual(taskList(two, {now, all: true}).map(row => row.task), ['land', 'probe', 'old']);
+});
+
+// Nirby control session, 2026-11-04: `bounce tasks` showed a re-dispatched task as "cancelled", and control could not
+// tell whether the order was still alive. A cancelled or failed task names the task that carries its order now (the
+// end of the chain of replacements and continuations) and that task's state.
+test('a cancelled or failed task names the task that carries its order now, and that task\'s state', () => {
+  const events = [
+    at(1, {kind: 'task.submitted', seq: 1, task: 'first0001', parent: null, profile: 'builder', orders: 'add the parser'}),
+    at(2, {kind: 'task.cancelled', seq: 2, task: 'first0001', reason: 'orchestrator'}),
+    at(3, {kind: 'task.submitted', seq: 3, task: 'second002', parent: null, profile: 'builder', orders: 'add the parser', replaces: 'first0001'}),
+    at(4, {kind: 'task.failed', seq: 4, task: 'second002', reason: 'error', text: 'boom'}),
+    at(5, {kind: 'task.submitted', seq: 5, task: 'third0003', parent: null, profile: 'builder', orders: 'add the parser', continues: 'second002'}),
+    at(5, {kind: 'task.started', seq: 6, task: 'third0003', attempt: 1}),
+    at(6, {kind: 'task.submitted', seq: 7, task: 'done00004', parent: null, profile: 'analyst', orders: 'x'}),
+    at(6, {kind: 'task.completed', seq: 8, task: 'done00004', summary: 'ok'}),
+    at(7, {kind: 'task.submitted', seq: 9, task: 'next00005', parent: null, profile: 'analyst', orders: 'y', continues: 'done00004'})];
+  const rows = taskList(events, {now, all: true});
+  assert.deepEqual(rows.map(row => [row.task, row.state, row.replacedBy ?? null]), [
+    ['first0001', 'cancelled', {task: 'third0003', state: 'running'}],
+    ['second002', 'failed', {task: 'third0003', state: 'running'}],
+    ['third0003', 'running', null],
+    ['done00004', 'completed', null],
+    ['next00005', 'queued', null]], 'a finished task that is continued is not replaced');
+  assert.equal(formatTaskList(rows).split('\n')[0], 'first000 · cancelled · builder      ·         · replaced by third000 (running)');
+  const view = taskView(events, 'first0001', {now});
+  assert.deepEqual(view.replacedBy, {task: 'third0003', state: 'running'});
+  assert.match(formatTaskView(view), /^replaced by: third0003 · running$/m);
+  assert.equal(taskView(events, 'third0003', {now}).replacedBy, null);
 });
 
 test('task view uses the reducer lease and exposes accepted provenance', () => {

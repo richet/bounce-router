@@ -186,6 +186,13 @@ export function config(root = dataRoot()) {
   Object.defineProperty(value, 'migratedProfiles', {value: migrated, enumerable: false});
   return value;
 }
+// The checkout's origin URL, recorded on the session row: a worker's vendor session runs in a copy outside the project,
+// so a reader of it (bounce lineage) learns the project from here. Null outside a git checkout or with no origin.
+function originOf(cwd) {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+  try { return execFileSync('git', ['remote', 'get-url', 'origin'], {cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']}).trim() || null; } catch { return null; }
+}
+
 export class Session {
   constructor(cwd, {root = dataRoot(), id} = {}) {
     this.root = root;
@@ -207,7 +214,10 @@ export class Session {
     this.nextSeq = journal.nextSeq;
     this.listeners = new Set(); this.subscriberErrors = []; this.emitQueue = []; this.emitting = false; this.writerUsable = true;
     this.cwd = this.events.find(e => e.kind === 'session')?.cwd ?? fs.realpathSync(cwd);
-    if (!this.events.length) this.append({kind: 'session', cwd: this.cwd, text: this.cwd, schemaVersion: 2, policyVersion: 2, runtime: process.version});
+    if (!this.events.length) {
+      const repository = originOf(this.cwd);
+      this.append({kind: 'session', cwd: this.cwd, text: this.cwd, ...(repository ? {repository} : {}), schemaVersion: 2, policyVersion: 2, runtime: process.version});
+    }
     this.active = this.events.findLast(e => e.kind === 'route')?.provider;
   }
   append(event) {

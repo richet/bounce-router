@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {execFileSync} from 'node:child_process';
 import crypto from 'node:crypto';
-import {createAttemptWorkspace, captureArtifact, integrateArtifact, advanceBaseline, reviewDiff, refreshConflicts} from '../src/workspace-artifacts.js';
+import {createAttemptWorkspace, captureArtifact, integrateArtifact, advanceBaseline, reviewDiff, refreshConflicts, COPY_PUSH_URL} from '../src/workspace-artifacts.js';
 
 // Matches src/workspace-artifacts.js's own hash(json(binding)) exactly, to build a legacy
 // artifact's digest by hand (c, d below) without exporting the internal helpers.
@@ -155,7 +155,7 @@ test('a copyRoot puts each working copy at <copyRoot>/<8 hex>, and its artifact 
 // Found live: the copy had no .git, so a worker that needed `git log` blocked
 // with "not a git repository". Each copy now gets its own clone sharing the source's objects: git works in
 // it, a commit there stays there, and only file changes are integrated.
-test('a copy of a git checkout has its own git: history and status work, and its commits never reach the source', () => {
+test('a copy of a git checkout has its own git: history and status work, it names the checkout\'s origin, and its commits never reach the source', () => {
   const {source, dir} = setup(test);
   const git = (cwd, ...args) => execFileSync('git', args, {cwd, encoding: 'utf8', env: {...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t'}}).trim();
   git(source, 'init', '-q', '-b', 'main'); write(source, 'a.txt', 'one\n'); write(source, '.bounce/agents/builder.md', 'agent\n'); git(source, 'add', '.'); git(source, 'commit', '-qm', 'First commit');
@@ -169,12 +169,21 @@ test('a copy of a git checkout has its own git: history and status work, and its
   assert.equal(git(copy.cwd, 'rev-parse', '--abbrev-ref', 'HEAD'), 'main');
   assert.equal(git(copy.cwd, 'status', '--porcelain'), '', 'nothing to see before the worker changes anything; the left-out .bounce is not "deleted"');
   assert.equal(git(copy.cwd, 'diff', '--name-only', 'HEAD~1', 'HEAD'), 'a.txt', 'the user\'s uncommitted edit is in the baseline, not in the worker\'s diff');
-  assert.equal(git(copy.cwd, 'remote'), '', 'no remote to push back through');
+  // Nirby control session, 2026-11-04: with no remote, a copy's sessions carried no project (an archive filed them under
+  // none). The copy names the checkout's origin, or the checkout itself when it has none, and cannot push to it.
+  assert.equal(git(copy.cwd, 'remote', 'get-url', 'origin'), fs.realpathSync(source), 'a checkout with no origin: the copy names the checkout');
+  assert.equal(git(copy.cwd, 'remote', 'get-url', '--push', 'origin'), COPY_PUSH_URL);
+  assert.throws(() => git(copy.cwd, 'push', '-q', 'origin', 'HEAD'), 'no push back through origin');
+  assert.equal(git(copy.cwd, 'for-each-ref', '--format=%(refname)', 'refs/remotes'), '', 'no origin/* refs standing for the checkout\'s local branches');
   write(copy.cwd, 'b.txt', 'new\n'); git(copy.cwd, 'add', '.'); git(copy.cwd, 'commit', '-qm', 'Worker commit');
   assert.equal(git(source, 'rev-parse', 'HEAD'), sourceHead);
   assert.equal(git(source, 'status', '--porcelain'), 'M a.txt');
   const artifact = captureArtifact(copy);
   assert.deepEqual(artifact.changes.map(change => change.path), ['b.txt']);
+  git(source, 'remote', 'add', 'origin', 'git@github.com:example/app.git');
+  const named = createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'named'});
+  assert.deepEqual([git(named.cwd, 'remote'), git(named.cwd, 'remote', 'get-url', 'origin'), git(named.cwd, 'remote', 'get-url', '--push', 'origin')],
+    ['origin', 'git@github.com:example/app.git', COPY_PUSH_URL]);
   const plain = createAttemptWorkspace({cwd: path.join(source, '..', 'state'), dir: path.join(source, '..', 'other'), owns: ['**'], attemptId: 'plain'});
   assert.equal(fs.existsSync(path.join(plain.cwd, '.git')), false);
 });

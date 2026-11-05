@@ -65,7 +65,8 @@ function currentReview(events, task, candidate, kind) {
 // was cut mid-word at SUMMARY_MAX and the orchestrator had no way to ask for the rest — and its orders forbid
 // reading the journal, so nothing could reach it. The bounded summary stays exactly as it was, beside it.
 export function taskView(events, task, {now = Date.now(), journal = null, report = false} = {}) {
-  const state = taskStates(events)[task];
+  const states = taskStates(events);
+  const state = states[task];
   if (!state) return null;
   const submitted = events.find(e => e.kind === 'task.submitted' && e.task === task);
   const started = events.find(e => e.kind === 'task.started' && e.task === task);
@@ -100,6 +101,7 @@ export function taskView(events, task, {now = Date.now(), journal = null, report
   } : null;
   return {
     task, state: state.state, profile: state.profile ?? null, ai: started?.requested ?? null,
+    replacedBy: replacementOf(events, states, task),
     orders: ordersLine(task, submitted?.orders),
     inPlace,
     elapsed: started ? minutes(now - Date.parse(started.time)) : null,
@@ -144,6 +146,23 @@ export function taskView(events, task, {now = Date.now(), journal = null, report
 
 const LIVE = new Set(['queued', 'running', 'waiting', 'reviewing', 'blocked', 'input_required']);
 
+// The task that carries a cancelled or failed task's order now: the end of its chain of replacements and continuations,
+// with that task's state, so a reader can tell whether the order is still alive. Null for any other task.
+const ENDED_UNDONE = new Set(['cancelled', 'failed']);
+function replacementOf(events, states, task) {
+  if (!ENDED_UNDONE.has(states[task]?.state)) return null;
+  let current = task;
+  const seen = new Set([task]);
+  for (;;) {
+    const next = events.findLast(e => e.kind === 'task.submitted' && (e.replaces === current || e.continues === current) && !seen.has(e.task) && states[e.task]);
+    if (!next) break;
+    seen.add(next.task);
+    current = next.task;
+    if (!ENDED_UNDONE.has(states[current].state)) break;
+  }
+  return current === task ? null : {task: current, state: states[current].state};
+}
+
 // Every task that is still live (or all of them), one line each, in the order they were submitted.
 export function taskList(events, {now = Date.now(), all = false} = {}) {
   const states = taskStates(events);
@@ -153,10 +172,12 @@ export function taskList(events, {now = Date.now(), all = false} = {}) {
     .map(task => {
       const started = events.find(e => e.kind === 'task.started' && e.task === task);
       const last = rowsOf(events, task, 'task.milestone').at(-1);
+      const replacedBy = replacementOf(events, states, task);
       return {task, state: states[task].state, profile: states[task].profile ?? null,
         elapsed: started ? minutes(now - Date.parse(started.time)) : null,
         doing: cut(last?.text, TITLE_MAX) || null,
-        findings: rowsOf(events, task, 'task.finding').length};
+        findings: rowsOf(events, task, 'task.finding').length,
+        ...(replacedBy ? {replacedBy} : {})};
     });
 }
 

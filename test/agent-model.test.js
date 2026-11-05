@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {Session} from '../src/core.js';
-import {createScheduler} from '../src/scheduler.js';
+import {createScheduler, STANDING_RULES} from '../src/scheduler.js';
 import {fakeAdapter} from './helpers/fake-adapter.js';
 import {waitFor} from './helpers/wait.js';
 
@@ -100,7 +100,7 @@ test('a review agent on a cloud AI gets its own instructions, and one the user n
   await waitFor(() => ['accepted', 'failed', 'blocked', 'completed'].includes(scheduler.tasks()[row.task]?.state) && !session.events.some(e => e.kind === 'review.started' && e.task === row.task && !session.events.some(f => f.kind === 'review.finished' && f.seq > e.seq)), {timeout: 6000});
   const reviews = seen.filter(s => s.review);
   assert.ok(reviews.length >= 1, JSON.stringify(seen));
-  assert.equal(reviews[0].orders.startsWith('review it; end with PASS or FAIL\n\n---\n\nimplement step 10'), true, reviews[0].orders);
+  assert.equal(reviews[0].orders.startsWith(`review it; end with PASS or FAIL\n\n${STANDING_RULES}\n\n---\n\nimplement step 10`), true, reviews[0].orders);
   assert.deepEqual([...new Set(reviews.map(s => `${s.adapter}/${s.model}`))], ['codex/gpt-6.1-sol'], 'every review ran on the AI the user named');
   assert.equal(session.events.some(e => e.kind === 'review.escalated' && e.task === row.task), false);
 });

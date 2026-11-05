@@ -2,7 +2,7 @@
 // message → orchestrator turn → task → worker. One row per binding, derived from the journal alone, so it covers past
 // sessions and needs no marker in a vendor's files. A vendor session can serve several tasks, so a reader joins a
 // message by provider, native session and the row's [from, to] window. Rows hold ids, roles and times: no message,
-// orders or path.
+// orders or path; repository is the checkout's origin URL, so a reader knows the project of a session run in a copy.
 import path from 'node:path';
 import {readJournal} from './core.js';
 
@@ -38,6 +38,7 @@ function track(pieces, event) {
 export function lineageRows(events, bounceSession) {
   const users = new Map(), tasks = new Map(), peers = new Map(), turns = [];
   let turn = null, native = null, previous = null;
+  const repository = events.find(event => event.kind === 'session')?.repository ?? null;
   for (const event of events) {
     if (turn) turn.to = event.time;
     if (event.kind === 'user' && event.requestId) users.set(event.requestId, event);
@@ -63,7 +64,7 @@ export function lineageRows(events, bounceSession) {
   const shaped = ({provider, nativeSession, level, role, task, attempt, parentTask, continues, replaces, requestInferred, requestId, from, to}) => {
     const user = users.get(requestId);
     return {v: LINEAGE_VERSION, bounceSession, provider, nativeSession, level, role, task, attempt, parentTask, continues, replaces,
-      requestId: requestId ?? null, requestInferred: requestInferred ?? false, via: user ? user.via ?? 'tui' : null, control: user?.caller ?? null, from, to};
+      requestId: requestId ?? null, requestInferred: requestInferred ?? false, via: user ? user.via ?? 'tui' : null, control: user?.caller ?? null, repository, from, to};
   };
   const rows = turns.map(({requestId, ...binding}) => shaped({...binding, requestId, level: 'orchestrator', role: 'orchestrator', task: null, attempt: null,
     parentTask: null, continues: null, replaces: null}));
