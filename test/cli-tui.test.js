@@ -185,6 +185,15 @@ test('CLI commands and live steering work while the daemon main turn is held', {
   await waitFor(() => calls.filter(([kind]) => kind === 'run').length === 2);
   assert.equal(calls.at(-1)[1].provider, 'codex');
   assert.equal(calls.at(-1)[1].model, '');
+  // `/verify MODE` is sent as `verify=MODE`, which the orchestrator's service applies (src/verify-mode.js); a mode
+  // it does not know is refused in the view and sends nothing.
+  for (const fn of listeners) fn({kind: 'main.terminal', requestId: calls.at(-1)[1].id, status: 'completed', state: 'idle'});
+  running = false;
+  child.stdin.write('/verify both\r');
+  await waitFor(() => output.includes('Use /verify orchestrator|worker|auto'));
+  child.stdin.write('/verify worker\r');
+  await waitFor(() => calls.filter(([kind]) => kind === 'run').length === 3);
+  assert.equal(calls.at(-1)[1].text, 'verify=worker');
 
   // /operation to the other mode restarts the session into it — refused (and not saved) while a
   // worker still runs, then a restart request naming the mode and exit 75 once the tree is idle.

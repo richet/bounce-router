@@ -47,6 +47,7 @@ import {Session, Router, config, saveJSON, dataRoot} from './core.js';
 import * as reducers from './reducers.js';
 import {pendingMainActions} from './continuations.js';
 import {pendingSends} from './run-inbox.js';
+import {parseVerify} from './verify-mode.js';
 import {handoffBlock} from './main-service.js';
 import {providers, runProcess} from './providers.js';
 import {projectRoot, fingerprint, validate, supervise, pidAlive} from './reload.js';
@@ -1524,7 +1525,13 @@ async function main() {
         else notice = 'Setup is working · keep editing, use a slash command, or Esc to cancel setup';
         render(); return;
       }
-      const text = expandPastes(input, pastes).trim(); input = ''; inputCursor = 0; pastes.clear();
+      let text = expandPastes(input, pastes).trim(); input = ''; inputCursor = 0; pastes.clear();
+      // `/verify MODE` is the typed form of `verify=MODE` (src/verify-mode.js): the orchestrator's service applies it.
+      if (/^\/verify\b/i.test(text)) {
+        const mode = parseVerify(text);
+        if (!mode || !orchestrating) { notice = !mode ? 'Use /verify orchestrator|worker|auto' : '/verify needs the orchestrator: /operation orchestrator'; render(); return; }
+        text = `verify=${mode}`;
+      }
       if (text) {
         const decision = inputDisposition(text, {busy, vendorCommand});
         if (agentsOpen && selectedWorker() && decision.kind === 'prompt') {

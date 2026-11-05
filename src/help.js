@@ -114,6 +114,7 @@ export const TUI_SECTIONS = [
     ['/msg', 'TASK TEXT', 'Send a message to a running worker'],
     ['/agents', '[TASK]', 'Interactive split panes for the orchestrator and every worker; optionally focus one'],
     ['/tasks', '', 'Show task states and retained outcomes'],
+    ['/verify', 'orchestrator|worker|auto', 'Who runs the final gates in this session, live; same as bounce send "verify=MODE"'],
     ['/jev', '', 'Jev (TypeSafe) decision model status: key (last 4 chars), model, review/routing flags; /jev help lists subcommands'],
     ['/jev key', '[KEY|clear]', 'Store the API key in a 0600 file (TYPESAFE_API_KEY overrides); no KEY opens a masked prompt'],
     ['/jev', 'on|off', 'Enable everything Jev does (verdicts and routing); also /jev review on|off · /jev routing on|off · /jev roster [refresh] · /jev model ID · /jev confidence N · /jev test'],
