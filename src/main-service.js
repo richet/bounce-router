@@ -76,9 +76,13 @@ export function handoffBlock(session, ended) {
     // A task.accepted row may carry advice from an unsure Jev review (src/strategy.js jevAdvice):
     // read it before building on the accepted work, not just its summary.
     if (row.kind === 'task.accepted' && row.advice) lines.push(`  advice: ${String(row.advice).slice(0, HANDOFF_TEXT_MAX)}`);
+    // Branch delivery (src/branch-delivery.js): the work is on the worker's branch in its copy, not in the checkout.
+    const delivered = ['task.completed', 'task.accepted'].includes(row.kind) ? session.events.findLast(event => event.kind === 'task.integrated' && event.task === row.task && event.delivery === 'branch') : null;
+    if (delivered) lines.push(`  ${delivered.text}`);
     // The task's check, as bounce ran it on the accepted work (src/task-check.js).
     const check = row.kind === 'task.accepted' ? session.events.findLast(event => event.kind === 'task.check' && event.task === row.task && typeof event.passed === 'boolean') : null;
-    if (check) lines.push(`  check: ${check.passed ? 'passed' : 'FAILED'} (exit code ${check.exit})${check.passed && check.weak ? ', but it only looks for files or text and did not run the work' : ''} · ${String(check.command).slice(0, 500)}`);
+    // The tree the check ran on: a merged tree equal to it needs no rerun (kb control session, 2026-11-04).
+    if (check) lines.push(`  check: ${check.passed ? 'passed' : 'FAILED'} (exit code ${check.exit})${check.tree ? ` on tree ${check.tree.slice(0, 12)} (head ${String(check.head).slice(0, 12)})` : ''}${check.passed && check.weak ? ', but it only looks for files or text and did not run the work' : ''} · ${String(check.command).slice(0, 500)}`);
     // A correction of accepted work, or a check that failed twice: the moment a lesson is in hand
     //. The orchestrator decides whether there is one.
     const retryOf = session.events.find(event => event.kind === 'task.submitted' && event.task === row.task)?.retryOf;

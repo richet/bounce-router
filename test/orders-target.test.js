@@ -110,3 +110,13 @@ test('the orders say a worker\'s copy is temporary, and that a worker\'s service
   assert.equal(contract.includes('Services you start in your copy (a stack, containers, a server) you stop before you end'), true);
   assert.equal(contract.match(/STOP_SERVICES,/g)?.length, 2, 'both worker contracts carry it');
 });
+
+// kb control session, 2026-11-04 (run a639d737): tasks sat 11–64 min while the orchestrator reran every gate one
+// after another and only then dispatched reviews. The orders say how to verify without that wait.
+test('the orders say: gates in the check and the review in review.completion run at once; builder output with its commit between rounds; every gate seen on the final head', () => {
+  const orders = fs.readFileSync(new URL('../src/reload.js', import.meta.url), 'utf8').replaceAll("\\'", "'");
+  for (const part of ['Verifying work: put the gates in the task\'s check', 'bounce runs both at once on the same copy',
+    'Do not rerun the gates yourself and then dispatch a reviewer', 'names the exact commit it ran on is enough to send the next round',
+    'Before you accept the final head, see every gate pass on it', 'a merged tree equal to it needs no rerun'])
+    assert.equal(orders.includes(part), true, part);
+});

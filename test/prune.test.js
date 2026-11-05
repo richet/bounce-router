@@ -70,3 +70,36 @@ test('removing takes only the chosen copies, never a running task\'s, and leaves
   assert.deepEqual(fs.readdirSync(path.join(root, 'w')).sort(), ['aaaaaaa1', 'ccccccc1']);
   assert.equal(fs.existsSync(path.join(root, 'sessions', 'live', 'journal.jsonl')), true);
 });
+
+// Nirby control session, 2026-11-04: 241 old copies (215 GB) sat in ~/.bounce/w, because prune only ran in a terminal.
+// `bounce prune --ended --older-than D` picks, without asking, the copies of sessions that are not running whose task
+// ended (or that no journal names), unused for D; it lists them, and removes them only with --yes. A copy of a running
+// session stays even when its task ended: a cancelled task can still be accepted and land from its copy.
+import {endedCopies, parseAge} from '../src/prune.js';
+import {spawnSync} from 'node:child_process';
+import {fileURLToPath} from 'node:url';
+test('prune --ended --older-than picks ended copies of sessions not running, unused that long; --yes removes them', t => {
+  const {root, copy, session} = home(t);
+  const done = copy('aaaaaaa1'), cancelled = copy('bbbbbbb1'), endedLive = copy('ccccccc1'), running = copy('eeeeeee1'); copy('ddddddd1');
+  session('old', [...lived('t-done', done, {kind: 'task.integrated', task: 't-done', time: at(11)}, {kind: 'task.completed', task: 't-done', time: at(12)}),
+    ...lived('t-cancel', cancelled, {kind: 'task.cancelled', task: 't-cancel', time: at(21)})]);
+  session('live', [...lived('t-ended', endedLive, {kind: 'task.cancelled', task: 't-ended', time: at(31)}), ...lived('t-run', running)], {pid: process.pid});
+  const copies = listCopies({root});
+  const day = 86400000;
+  assert.deepEqual(endedCopies(copies, {now: Date.now() + 8 * day, olderThanMs: 7 * day}).map(c => c.name).sort(), ['aaaaaaa1', 'bbbbbbb1', 'ddddddd1']);
+  assert.deepEqual(endedCopies(copies, {now: Date.now() + day, olderThanMs: 7 * day}), [], 'used within the week: kept');
+  assert.deepEqual([parseAge('7d'), parseAge('12h'), parseAge('30m'), parseAge('0m'), parseAge('soon'), parseAge('')], [7 * day, 12 * 3600000, 30 * 60000, 0, null, null]);
+  const cli = fileURLToPath(new URL('../src/cli.js', import.meta.url));
+  const bounce = (...args) => spawnSync(process.execPath, [cli, 'prune', ...args], {env: {...process.env, BOUNCE_HOME: root, BOUNCE_NO_UPDATE_CHECK: '1'}, encoding: 'utf8', timeout: 15000});
+  const dry = bounce('--ended', '--older-than', '0m');
+  assert.equal(dry.status, 0, dry.stderr);
+  assert.match(dry.stdout, /aaaaaaa1 .* integrated/);
+  assert.equal(dry.stdout.includes('ccccccc1') || dry.stdout.includes('eeeeeee1'), false, 'the running session\'s copies are not listed');
+  assert.match(dry.stdout, /\n3 copies would be removed\. Add --yes to remove them\.\n$/);
+  assert.equal(fs.existsSync(done), true, 'nothing removed without --yes');
+  const removed = bounce('--ended', '--older-than', '0m', '--yes');
+  assert.match(removed.stdout, /\nRemoved 3 copies\.\n$/);
+  assert.deepEqual(fs.readdirSync(path.join(root, 'w')).sort(), ['ccccccc1', 'eeeeeee1']);
+  const bad = bounce('--ended', '--older-than', 'soon');
+  assert.deepEqual([bad.status, bad.stderr.trim()], [1, 'bounce: --older-than takes an age like 7d, 12h or 30m']);
+});

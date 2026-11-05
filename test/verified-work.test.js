@@ -117,7 +117,7 @@ test('a worker sent back after a report bounce wrote is told it stopped without 
   ].join('\n'));
 });
 
-test('a task\'s check runs in the worker\'s copy: a pass is integrated, and the review is shown its output', async t => {
+test('a task\'s check runs in the worker\'s copy beside its review: a pass is integrated', async t => {
   let shown = null;
   const f = setup(t, {
     worker: ({cwd}) => {
@@ -128,7 +128,9 @@ test('a task\'s check runs in the worker\'s copy: a pass is integrated, and the 
   });
   const {task} = f.submit({check: says('new')});
   assert.equal(await f.settled(task), 'accepted');
-  assert.deepEqual(shown, ['npm test: 3 passed', `bounce ran the task's check \`${says('new')}\` in the worker's copy: exit code 0. The end of its output:\nfound`]);
+  // The review runs while the check runs (docs/plans/faster-verification.md), so it is not shown the check's output;
+  // bounce decides with both.
+  assert.deepEqual(shown, ['npm test: 3 passed']);
 
   const [check] = f.rows('task.check', task);
   assert.deepEqual([check.command, check.exit, check.passed, check.output, check.weak ?? false], [says('new'), 0, true, 'found', false]);
@@ -151,7 +153,7 @@ test('a failing check sends the work back once with what it printed; a pass afte
   assert.deepEqual(f.rows('task.rework', task).map(row => row.findings), [[
     'The task\'s check failed. bounce ran `grep new src/x.js || { echo "src/x.js does not say new"; exit 3; }` in your working copy: exit code 3. The end of its output:\nsrc/x.js does not say new\nFix what it reports, and run it yourself before you finish.',
   ]]);
-  assert.equal(f.adapters.reviewer.calls.launch, 1, 'a failing check is not reviewed: the review judges work that passes');
+  assert.equal(f.adapters.reviewer.calls.launch, 2, 'each round is reviewed beside its check; the failed check decided the first');
   assert.equal(f.inCheckout(), 'export const state = "new";\n');
 });
 
@@ -169,7 +171,7 @@ test('a check that still fails after the one send-back holds the work: kept, not
   assert.equal(f.rows('task.rework', task).length, 1);
   assert.equal(f.rows('task.integrated', task).length, 0);
   assert.equal(f.inCheckout(), 'export const state = "old";\n');
-  assert.equal(f.adapters.reviewer.calls.launch, 0);
+  assert.equal(f.adapters.reviewer.calls.launch, 2, 'reviewed beside each check; the failed checks decided');
 });
 
 test('work nothing verified is held, and says all that is missing: bounce wrote the report, the task names no check, and the review still objects after the send-back', async t => {
@@ -349,7 +351,7 @@ test('a weak check that passes does not verify work whose report bounce wrote: i
 
   assert.equal(f.rows('task.blocked', task).at(-1).reason, 'unverified');
   assert.equal(f.rows('task.blocked', task).at(-1).text, `Nothing that runs this work has verified it, so it waits for you and is not in the checkout: the task's check only looks for files or text, and the worker wrote no report (bounce wrote one from what it saw). After the one rework round the review still found: An acceptance criterion in the orders is not met. The work is in ${f.copyOf(task)}. Decide: accept it (task.accepted with what you checked), send it back (task.rework with what to fix), or retry it on another AI (retryOf).`);
-  assert.equal(f.shown.at(-1), 'bounce ran the task\'s check `grep -q new src/x.js` in the worker\'s copy: exit code 0. It printed nothing. This check only looks for files or text; it did not run the work.');
+  assert.equal(f.shown.some(line => line.startsWith('bounce ran the task\'s check')), false, 'reviewed beside the check, before its output exists');
   assert.equal(f.inCheckout(), 'export const state = "old";\n');
 });
 

@@ -918,3 +918,37 @@ test('an open outcome wait keeps each new row cheap on a long journal', async t 
   assert.equal(await waiting, 'closed');
   assert.ok(elapsed < 1000, `five rows took ${Math.round(elapsed)} ms with one wait open`);
 });
+
+// Shared names across parallel sessions of one project (src/reservations.js). Nirby control session, 2026-11-04: run
+// A was given migration 0045, and run B's builder took 0045 too.
+import {sessionReservations} from '../src/reservations.js';
+test('the orchestrator reserves a shared name against every other session of the project, binds it to the task its orders use, and a worker cannot reserve', async t => {
+  const root = fs.mkdtempSync('/tmp/bb-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const ledger = path.join(root, 'machine');
+  const open = async () => {
+    const session = new Session(root, {root});
+    const bus = await createBus({session, dir: session.dir, reservations: sessionReservations(session, {dir: ledger})});
+    t.after(() => bus.close());
+    const orchestrator = await connect(bus, 'orchestrator', {tasks: [], canSubmit: true});
+    t.after(() => orchestrator.close());
+    return {session, bus, orchestrator};
+  };
+  const a = await open();
+  const b = await open();
+  assert.deepEqual(await a.orchestrator.publish({kind: 'reservation.taken', name: 'migration', value: '0045'}).then(row => [row.kind, row.name, row.value]), ['reservation.taken', 'migration', '0045']);
+  await assert.rejects(b.orchestrator.publish({kind: 'reservation.taken', name: 'migration', value: '0045'}),
+    e => e.code === -32602 && e.message.startsWith(`migration 0045 is reserved by session ${a.session.id.slice(0, 8)} since `), 'another session of the project is refused, told who holds it');
+  assert.equal((await b.orchestrator.publish({kind: 'reservation.taken', name: 'migration', next: '0045'})).value, '0046');
+  const worker = await connect(a.bus, 'worker:t1', {tasks: ['t1']});
+  t.after(() => worker.close());
+  await assert.rejects(worker.publish({kind: 'reservation.taken', name: 'migration', value: '0050'}), e => e.code === -32001);
+  // Bound to the task whose orders carry it; a name this session does not hold refuses the submission.
+  const submitted = await a.orchestrator.publish({kind: 'task.submitted', parent: null, profile: 'builder', orders: 'add migration 0045', reservations: ['migration:0045']});
+  assert.deepEqual(sessionReservations(a.session, {dir: ledger}).list().map(r => [r.value, r.task ?? null]), [['0045', submitted.task], ['0046', null]]);
+  await assert.rejects(b.orchestrator.publish({kind: 'task.submitted', parent: null, profile: 'builder', orders: 'x', reservations: ['migration:0045']}),
+    e => e.code === -32602 && e.message === 'invalid event: reservations: migration:0045 is not reserved by this session: reserve it first');
+  assert.equal(b.session.events.some(e => e.kind === 'task.submitted'), false);
+  assert.equal((await b.orchestrator.publish({kind: 'reservation.released', name: 'migration', value: '0046'})).kind, 'reservation.released');
+  await assert.rejects(b.orchestrator.publish({kind: 'reservation.released', name: 'migration', value: '0046'}), e => e.message === 'migration 0046 is not reserved');
+});

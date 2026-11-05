@@ -4,6 +4,7 @@ import {randomUUID, createHash} from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import {readDelivery, deliverBranch} from './branch-delivery.js';
 import {createAttemptWorkspace, captureArtifact, integrateArtifact, advanceBaseline, refreshConflicts, reviewDiff} from './workspace-artifacts.js';
 import * as reducers from './reducers.js';
 import {takeCheckpoint, sameTree} from './checkpoint.js';
@@ -30,6 +31,11 @@ import {validOwns} from './owned-paths.js';
 import {execFileSync} from 'node:child_process';
 import {parseVerdict} from './verdict.js';
 import {watchedDirs, snapshot as outsideSnapshot, outsideChanges, outsideFinding} from './outside-writes.js';
+
+// What a completion reviewer is told when bounce runs the task's check beside its review (kb control session,
+// 2026-11-04): the gates are covered, so it reads; a reviewer told it could not run commands stopped as blocked,
+// though reading files took the shell.
+export const checkBesideReview = command => `bounce runs this task's check (${String(command).slice(0, 300)}) itself, at the same time as your review: do not run tests, the stack CLI or anything that writes. Read the change with read-only commands (cat, sed, grep, git show, git diff, git log).`;
 
 // Rules every worker and reviewer reads, whatever its job or project (Nirby control session, 2026-11-04): a worker
 // printed file names from the owner's private export in its tool output; a builder ran two suites at once in one copy
@@ -1328,6 +1334,20 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // Runs the task's check on the work that just completed, once per completion, in the worker's own
   // copy (an in-place task has none: its work is already in the checkout). False when the task moved
   // on while it ran, for the caller to stop.
+  // The files a check runs on, as git names them: the copy's HEAD and the tree hash of its working files, written
+  // through a temporary index so the copy's own index is untouched. A merged tree equal to this one needs no rerun
+  // (kb control session, 2026-11-04). Empty when the copy has no git.
+  function verifiedTree(copy) {
+    const index = path.join(os.tmpdir(), `bounce-tree-${process.pid}-${randomUUID()}`);
+    const env = {...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))), GIT_INDEX_FILE: index};
+    const git = (...args) => execFileSync('git', args, {cwd: copy, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']}).trim();
+    try {
+      const head = git('rev-parse', '--verify', '-q', 'HEAD');
+      git('read-tree', 'HEAD');
+      git('add', '-A');
+      return {head, tree: git('write-tree')};
+    } catch { return {}; } finally { fs.rmSync(index, {force: true}); }
+  }
   async function ensureCheck(task, row, context) {
     const completedSeq = completedSeqOf(task);
     if (completedSeq === null || checkRowOf(task)) return true;
@@ -1338,9 +1358,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       return true;
     }
     append({kind: 'task.milestone', task, attempt, phase: 'check', text: `Running the task's check: ${row.check}`, next: 'review and integrate if it passes', context});
+    const verified = verifiedTree(copy);
     const outcome = await checkRunner({command: row.check, cwd: copy, timeoutMs: checkTimeoutMs});
     if (closed || completedSeqOf(task) !== completedSeq || !['completed', 'reviewing'].includes(reducers.tasks(session.events)[task]?.state)) return false;
-    append({kind: 'task.check', task, attempt, completedSeq, ...outcome, cwd: copy, context,
+    append({kind: 'task.check', task, attempt, completedSeq, ...outcome, ...verified, cwd: copy, context,
       text: `The task's check ${outcome.passed ? 'passed' : 'failed'}: ${row.check}`});
     return true;
   }
@@ -1350,7 +1371,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (!t) return;
     const row = submittedRow(task);
     const context = row?.context;
-    if (row?.check && !(await ensureCheck(task, row, context))) return;
+    // A task with a completion review runs its check and its review at the same time; the verdict waits for the
+    // check (kb control session, 2026-11-04: tasks sat 11–64 min while gates ran before any review).
+    let checking = null;
+    if (row?.check && !checkRowOf(task) && row.review?.completion) checking = ensureCheck(task, row, context);
+    else if (row?.check && !(await ensureCheck(task, row, context))) return;
     const view = reducers.tasks(session.events);
     const hook = invokeHook(() => strategy.onCompleted(task, view, api), task, context);
     if (!hook.ok) return;
@@ -1361,6 +1386,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // take the review path, whose verdict strategy holds them for the orchestrator.
     if (intent?.action === 'review' && jevReviewOff(intent.reviewers) && !api.unverifiedChanges(task)
       && !(changesOf(task)?.length && escalationReviewer({lean: REVIEW_OFF, reviewers: intent.reviewers, profiles, changes: changesOf(task)}))) intent = {action: 'accept'};
+    // Anything but a review decides with the check in hand.
+    if (checking && intent?.action !== 'review') {
+      if (!(await checking)) return;
+      return handleCompleted(task);
+    }
     // A check that failed: the work goes back once, or is held for the orchestrator.
     if (intent && typeof intent === 'object' && (intent.action === 'rework' || intent.action === 'escalate')) {
       if (!['completed', 'reviewing'].includes(view[task]?.state)) return;
@@ -1383,7 +1413,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       return;
     }
     if (intent && typeof intent === 'object' && intent.action === 'review') {
-      await runCompletionReview(task, intent);
+      await runCompletionReview(task, intent, {checking});
       return;
     }
     append({kind: 'task.failed', task, reason: 'strategy', text: 'malformed onCompleted intent', context});
@@ -2251,7 +2281,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       const lead = withLessons(reviewProfile, row).agent?.prompt;
       const roleLead = lead && reviewProfile.adapter !== 'opencode' && reviewProfile.adapter !== 'typesafe' ? `${lead}\n\n---\n\n` : '';
       const orders = roleLead + (stage === 'completion'
-        ? (reviewProfile.role === 'verifier' ? row.steps : `${row.orders}\n\n--- worker report ---\n${workerAnswer(task)}`)
+        ? (reviewProfile.role === 'verifier' ? row.steps : `${row.orders}\n\n--- worker report ---\n${workerAnswer(task)}${row.check ? `\n\n${checkBesideReview(row.check)}` : ''}`)
         : row.orders);
       // What a decision-model reviewer (typesafe) judges: the raw orders, the worker's final
       // report and the tree's HEAD when the lineage's first worker started — the diff base.
@@ -2333,7 +2363,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return verdicts;
   }
 
-  async function runCompletionReview(task, reviewIntent, {note = null} = {}) {
+  async function runCompletionReview(task, reviewIntent, {note = null, checking = null} = {}) {
     const view = reducers.tasks(session.events);
     const t = view[task];
     if (!t || t.state !== 'reviewing') return; // stale trigger (already handled, or never entered review)
@@ -2371,6 +2401,16 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     }
     verdicts = await reviewDownChain({task, round, reviewer: agentReviewer ?? reviewers[0], verdicts, row, context, root, note, stale});
     if (!verdicts) return;
+    // The check that ran beside the review decides first: a failed one sends the work back whatever the review said.
+    if (checking) {
+      if (!(await checking) || stale()) return;
+      const first = invokeHook(() => strategy.onCompleted(task, reducers.tasks(session.events), api), task, context);
+      if (!first.ok) return;
+      if (first.intent && typeof first.intent === 'object' && (first.intent.action === 'rework' || first.intent.action === 'escalate')) {
+        await applyVerdictIntent(first.intent, {task, stage: 'completion', row, round, context, root, reviewIntent: null});
+        return;
+      }
+    }
 
     const hook = invokeHook(() => strategy.onReviewVerdict(task, verdicts, reducers.tasks(session.events), api), task, context);
     if (!hook.ok) return;
@@ -2943,6 +2983,27 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const attempt = row.attempt ?? reducers.tasks(session.events)[row.task]?.attempt ?? 0;
     requestAction(session, {actionId: `terminal:${row.task}:${row.kind}:${attempt}`, type: 'terminal', task: row.task, payload: {kind: row.kind}}, events);
   }
+  // Branch delivery (docs/plans/branch-delivery.md): true when the project's setting took this action, and the
+  // checkout was not written. A setting bounce cannot read blocks the task; it never falls back to the checkout.
+  function deliverAsBranch(action, artifact, copy, continuation) {
+    const reopens = reducers.tasks(session.events)[action.task]?.state === 'cancelled' ? {reopens: true} : {};
+    const setting = readDelivery(session.cwd);
+    if (setting.error) {
+      append({kind: 'task.blocked', task: action.task, reason: 'integration_settings', ...reopens, text: `${setting.error}. Nothing was written into the checkout.`, artifactId: artifact.id});
+      return true;
+    }
+    if (setting.delivery !== 'branch') return false;
+    const delivered = copy ? deliverBranch({copy}) : {error: 'delivery_no_copy'};
+    if (delivered.error) {
+      const why = {delivery_detached: 'the worker\'s copy is not on a branch', delivery_uncommitted: `the worker left changes uncommitted: ${delivered.paths?.join(', ')}`, delivery_no_copy: 'the worker\'s copy is gone'}[delivered.error];
+      append({kind: 'task.blocked', task: action.task, reason: delivered.error, ...reopens, text: `Not delivered: ${why}. Nothing was written into the checkout; the copy is kept.`, ...(delivered.paths ? {paths: delivered.paths} : {}), artifactId: artifact.id});
+      return true;
+    }
+    if (!session.events.some(e => e.kind === 'task.integrated' && e.task === action.task && e.artifactId === artifact.id)) append({kind: 'task.integrated', task: action.task, artifactId: artifact.id, resultHash: artifact.resultHash,
+      delivery: 'branch', copy, ...delivered, text: `Delivered as branch ${delivered.branch} (head ${delivered.head.slice(0, 12)}, tree ${delivered.tree.slice(0, 12)}) in ${copy}, not written into the checkout: git fetch ${copy} ${delivered.branch}`});
+    append(continuation);
+    return true;
+  }
   const effects = createActionRunner({session, handlers: {
     integrate: action => {
       try {
@@ -2950,6 +3011,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         const artifact = JSON.parse(fs.readFileSync(file, 'utf8'));
         if (artifact.id !== artifactId) throw new Error('artifact identity mismatch');
         const copy = session.events.findLast(e => e.kind === 'task.artifact' && e.task === action.task)?.cwd ?? null;
+        if (deliverAsBranch(action, artifact, copy, continuation)) return;
         const result = integrateArtifact({cwd: session.cwd, artifact, dir, base: copy});
         if (result.status !== 'integrated') {
           append({kind: 'task.blocked', task: action.task, reason: `integration_${result.status}`, ...(reducers.tasks(session.events)[action.task]?.state === 'cancelled' ? {reopens: true} : {}), text: `Artifact integration ${result.status}${result.paths?.length ? `: ${result.paths.join(', ')}` : result.path ? `: ${result.path}` : ''}; isolated work preserved`, ...(result.paths ? {paths: result.paths} : {}), artifactId});

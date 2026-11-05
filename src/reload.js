@@ -27,6 +27,7 @@ import {createBus, connectBus} from './bus.js';
 import {validateOrchestration, LOCAL_ADAPTERS} from './profiles.js';
 import {rolesFor} from './agents.js';
 import {recordLesson, lessonsBlock} from './lessons.js';
+import {sessionReservations} from './reservations.js';
 import {normalizeLocalSettings, discoverLocalModels, localCandidates} from './local-models.js';
 import {createLocalActivation} from './local-activation.js';
 import {providers} from './providers.js';
@@ -336,6 +337,8 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     // The project's lessons: every line, with its job, and how one is recorded.
     ...(() => { const block = lessonsBlock(session.cwd, 'orchestrator'); return block ? ['', block, ''] : []; })(),
     ...ordersSkills(root, session.cwd),
+    'Verifying work: put the gates in the task\'s check (one command; chain them) and the review in review.completion; bounce runs both at once on the same copy and decides with both, so a task waits only for the slower of them. Do not rerun the gates yourself and then dispatch a reviewer. Between fix rounds, a builder\'s raw gate output that names the exact commit it ran on is enough to send the next round. Before you accept the final head, see every gate pass on it: bounce\'s check on that head, or your own rerun. The handoff names the tree the check passed on; a merged tree equal to it needs no rerun.', '',
+    'Shared names: other bounce sessions may be working on this project at the same time, and a worker sees only its own copy. Before you put a shared name in a worker\'s orders (a migration number, a port, a database or branch name), reserve it with the reserve tool (or publish reservation.taken): value for an exact one, next to take the first free one from a number. A refusal names the session that holds it: take the next one. Pass the reserved names to task_submit as reservations, so they are released when that task ends.', '',
     'Lessons: when a task redid work that had been accepted, or a check failed twice, the handoff asks whether there is a lesson. If there is, record it with the lesson tool (or publish lesson.learned): agent (the job it is for, or all) and text (one sentence, imperative, no task ids). It lands in .bounce/LESSONS.md in the project and in every later worker\'s prompt for that job; a person deletes a line to withdraw it. Record what a worker should do differently here, not what happened.', '',
     `Worker profiles (one AI each): ${Object.entries(profiles).filter(([name, p]) => name !== orchestrator && name !== JEV_REVIEWER && !p.derived).map(([name, p]) => p.model ? `${name} (${p.model})` : name).join(', ') || 'none configured'} — name one only when the user asks for that AI, or for a retry (see above).`,
     ...(jev && autoFallback ? [`    auto → ${routingOn ? 'Jev (TypeSafe) routes each task: to the agent above whose job the orders clearly describe (that agent\'s own models then decide the AI), otherwise by the tier the orders need — the first fitting worker profile of that tier in the provider order; unconfident picks go to' : 'Jev routing is off (/jev routing on): resolves to'} ${autoFallback}`] : []),
@@ -538,7 +541,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
     const kept = recordLesson(session.cwd, {agent, text}, {agents: new Set([...readRoles().values()].filter(role => !role.error).map(role => role.name)), session: session.id});
     return kept;
   };
-  bus = await createBus({session, dir: session.dir, validate: scheduler.validate, prepare: scheduler.prepare, report: scheduler.report, lesson: keepLesson, retire: scheduler.retireWorker, compact: scheduler.compactWorker, accept: scheduler.acceptOverride, rework: scheduler.reworkOverride, cancel: scheduler.cancelRequest});
+  bus = await createBus({session, dir: session.dir, validate: scheduler.validate, prepare: scheduler.prepare, report: scheduler.report, lesson: keepLesson, retire: scheduler.retireWorker, compact: scheduler.compactWorker, accept: scheduler.acceptOverride, rework: scheduler.reworkOverride, cancel: scheduler.cancelRequest, reservations: sessionReservations(session)});
   const userGrant = bus.grant({peer: 'user', canSubmit: true, tasks: [], context: session.id});
   // daemon.json is written AFTER the SIGTERM/SIGINT handlers are installed (below), never here:
   // it is the daemon's discovery record, so the moment it exists a `stop`/SIGTERM can arrive, and

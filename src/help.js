@@ -24,6 +24,9 @@ export const CLI_SECTIONS = [
     ['send', '[--session <ref>] [--wait] [--caller <who>] "message"', 'Message a live orchestrator; --wait prints its answer'],
     ['stop', '<session>', 'Cancel a session\'s task tree and end its daemon'],
     ['watch', '<session> [--after <n>] [--idle <min>] [--timeout <s>]', 'Wait until it is done (0), needs you (2) or goes quiet (3)'],
+    ['reserve', '<name> <value>|--next <n> [--session <ref>]', 'Hold a migration number, port or name against other sessions'],
+    ['release', '<name> <value> [--session <ref>]', 'Give a reserved name back'],
+    ['reservations', '[--session <ref>] [--json]', 'What this project\'s sessions hold'],
     ['rename', '<session> <name>', 'Name a session'],
     ['tasks', '[--all] [--session <ref>]', 'What each task is doing now'],
     ['task', '<task> [--session <ref>]', 'One task: state, milestones, findings, summary'],
@@ -66,6 +69,7 @@ export const CLI_SECTIONS = [
   {title: 'Maintenance', rows: [
     ['doctor', '[--fix]', 'Versions, quota, setup; --fix installs a usable opencode'],
     ['prune', '', 'List the workers\' copies, then remove the ones you pick'],
+    ['prune', '--ended [--older-than 7d] [--yes]', 'Without asking: ended copies of stopped sessions, unused that long'],
     ['task compare', '<session> <a> <b>', 'Compare two tasks: tokens, wall time, rounds'],
     ['update', '[--check]', 'Install the latest npm release, or only check'],
     ['dev', '', 'Improve bounce itself; validate and reload after changes'],

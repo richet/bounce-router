@@ -6,6 +6,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {pidAlive, readJournal} from './core.js';
+import {reachedCheckout} from './branch-delivery.js';
 import {tasks as taskView, TERMINAL} from './reducers.js';
 
 const COPY = /^[0-9a-f]{8}$/;
@@ -14,6 +15,14 @@ const running = dir => [path.join(dir, 'daemon.json'), path.join(dir, 'lock')].s
 
 // Every copy folder, newest use first: {name, dir, session, task, state, integrated, live, lastUsed}. A copy no
 // journal names has no session or task (its session was deleted, or it was never journaled).
+// A copy holding a delivered branch the checkout has not fetched yet (src/branch-delivery.js) is the only place that
+// work exists, so it is never removed as ended. Returns the branch name, or null.
+function unfetchedBranch(events, task, checkout) {
+  const delivered = events.findLast(row => row.kind === 'task.integrated' && row.task === task && row.delivery === 'branch');
+  if (!delivered) return null;
+  return checkout && reachedCheckout({checkout, head: delivered.head}) ? null : delivered.branch;
+}
+
 export function listCopies({root}) {
   const copyRoot = path.join(root, 'w'), sessions = path.join(root, 'sessions');
   let names = [];
@@ -25,13 +34,14 @@ export function listCopies({root}) {
     let events;
     try { events = readJournal(path.join(sessions, id, 'journal.jsonl')).events; } catch { continue; }
     const view = taskView(events), live = running(path.join(sessions, id));
+    const checkout = events.find(e => e.kind === 'session')?.cwd ?? null;
     const lastByTask = new Map();
     for (const e of events) if (e.task && e.time) lastByTask.set(e.task, e.time);
     for (const e of events) {
       if (e.kind !== 'task.workspace' || typeof e.cwd !== 'string' || path.dirname(e.cwd) !== copyRoot) continue;
       const state = view[e.task]?.state ?? 'unknown';
-      owners.set(path.basename(e.cwd), {session: id, task: e.task, state, live: live && !TERMINAL.has(state),
-        integrated: events.some(row => row.task === e.task && row.kind === 'task.integrated'), lastUsed: lastByTask.get(e.task) ?? e.time});
+      owners.set(path.basename(e.cwd), {session: id, task: e.task, state, live: live && !TERMINAL.has(state), sessionLive: live,
+        integrated: events.some(row => row.task === e.task && row.kind === 'task.integrated'), unfetched: unfetchedBranch(events, e.task, checkout), lastUsed: lastByTask.get(e.task) ?? e.time});
     }
   }
   return names.map(name => {
@@ -41,12 +51,25 @@ export function listCopies({root}) {
     const owner = owners.get(name);
     const lastUsed = [owner?.lastUsed, mtime].filter(Boolean).sort().at(-1) ?? null;
     return {name, dir, session: owner?.session ?? null, task: owner?.task ?? null, state: owner?.state ?? 'unknown',
-      integrated: owner?.integrated ?? false, live: owner?.live ?? false, lastUsed};
+      integrated: owner?.integrated ?? false, unfetched: owner?.unfetched ?? null, live: owner?.live ?? false, sessionLive: owner?.sessionLive ?? false, lastUsed};
   }).sort((a, b) => String(b.lastUsed).localeCompare(String(a.lastUsed)));
 }
 
+// `bounce prune --ended --older-than D`, without asking (Nirby control session, 2026-11-04: 241 copies, 215 GB, because
+// prune only ran in a terminal): copies of sessions not running whose task ended, or that no journal names, unused for
+// D. A running session's copies stay even when their task ended: a cancelled task can still be accepted from its copy.
+export function endedCopies(copies, {now = Date.now(), olderThanMs}) {
+  return copies.filter(copy => !copy.live && !copy.sessionLive && !copy.unfetched && (!copy.task || TERMINAL.has(copy.state))
+    && copy.lastUsed && now - Date.parse(copy.lastUsed) >= olderThanMs);
+}
+const AGE = {d: 86400000, h: 3600000, m: 60000};
+export function parseAge(text) {
+  const match = /^(\d+)([dhm])$/.exec(String(text ?? '').trim());
+  return match ? Number(match[1]) * AGE[match[2]] : null;
+}
+
 const short = id => (id ? id.slice(0, 8) : '—');
-const work = copy => copy.live ? 'still running' : copy.integrated ? 'integrated' : copy.task ? `${copy.state}, not integrated` : 'no task found';
+const work = copy => copy.live ? 'still running' : copy.unfetched ? `branch ${copy.unfetched} not fetched yet` : copy.integrated ? 'integrated' : copy.task ? `${copy.state}, not integrated` : 'no task found';
 export function copyTable(copies) {
   if (!copies.length) return 'No worker copies.';
   const rows = copies.map((copy, i) => [`${i + 1}.`, copy.name, copy.lastUsed ? copy.lastUsed.slice(0, 16).replace('T', ' ') : '—', `session ${short(copy.session)}`, `task ${short(copy.task)}`, work(copy)]);
@@ -58,7 +81,7 @@ export function copyTable(copies) {
 // Null when the answer is not one of those.
 export function chooseCopies(answer, copies) {
   const text = String(answer ?? '').trim().toLowerCase();
-  if (['y', 'yes', 'all', 's', 'si', 'sí'].includes(text)) return copies.filter(copy => !copy.live);
+  if (['y', 'yes', 'all', 's', 'si', 'sí'].includes(text)) return copies.filter(copy => !copy.live && !copy.unfetched);
   if (['', 'n', 'no', 'none'].includes(text)) return [];
   const picked = new Set();
   for (const part of text.split(/[\s,]+/).filter(Boolean)) {
