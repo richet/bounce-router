@@ -34,7 +34,7 @@ import {providers} from './providers.js';
 import {createScheduler} from './scheduler.js';
 import {hostSession} from './remote.js';
 import {createMainService} from './main-service.js';
-import {createRunInbox} from './run-inbox.js';
+import {createRunInbox, pendingSends} from './run-inbox.js';
 import {watchSession, formatWatch, WATCH_EXIT, DEFAULT_IDLE_MS} from './session-watch.js';
 import {createViewServer, connectView, requestViewControl} from './view-transport.js';
 
@@ -337,7 +337,7 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     // The project's lessons: every line, with its job, and how one is recorded.
     ...(() => { const block = lessonsBlock(session.cwd, 'orchestrator'); return block ? ['', block, ''] : []; })(),
     ...ordersSkills(root, session.cwd),
-    'Verifying work: put the gates in the task\'s check (one command; chain them) and the review in review.completion; bounce runs both at once on the same copy and decides with both, so a task waits only for the slower of them. Do not rerun the gates yourself and then dispatch a reviewer. Between fix rounds, a builder\'s raw gate output that names the exact commit it ran on is enough to send the next round. Before you accept the final head, see every gate pass on it: bounce\'s check on that head, or your own rerun. The handoff names the tree the check passed on; a merged tree equal to it needs no rerun.', '',
+    'Verifying work: put the gates in the task\'s check (one command; chain them) and the review in review.completion; bounce runs both at once on the same copy and decides with both, so a task waits only for the slower of them. Do not rerun the gates yourself and then dispatch a reviewer. Between fix rounds, a builder\'s raw gate output that names the exact commit it ran on is enough to send the next round. Before you accept the final head, see every gate pass on it: bounce\'s check on that head, or your own rerun. The handoff names the tree the check passed on; a merged tree equal to it needs no rerun. In your final result, name the commit each gate ran on, and say so plainly when one is not the delivered head.', '',
     'Shared names: other bounce sessions may be working on this project at the same time, and a worker sees only its own copy. Before you put a shared name in a worker\'s orders (a migration number, a port, a database or branch name), reserve it with the reserve tool (or publish reservation.taken): value for an exact one, next to take the first free one from a number. A refusal names the session that holds it: take the next one. Pass the reserved names to task_submit as reservations, so they are released when that task ends.', '',
     'Lessons: when a task redid work that had been accepted, or a check failed twice, the handoff asks whether there is a lesson. If there is, record it with the lesson tool (or publish lesson.learned): agent (the job it is for, or all) and text (one sentence, imperative, no task ids). It lands in .bounce/LESSONS.md in the project and in every later worker\'s prompt for that job; a person deletes a line to withdraw it. Record what a worker should do differently here, not what happened.', '',
     `Worker profiles (one AI each): ${Object.entries(profiles).filter(([name, p]) => name !== orchestrator && name !== JEV_REVIEWER && !p.derived).map(([name, p]) => p.model ? `${name} (${p.model})` : name).join(', ') || 'none configured'} — name one only when the user asks for that AI, or for a retry (see above).`,
@@ -747,20 +747,30 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // to already have run, via control.stop/SIGTERM) before the daemon is allowed to
   // exit — a headless `run --detach` whose child process already closed must still
   // stay up while a delegated task runs.
+  // A message sent with `bounce send` meanwhile (src/run-inbox.js) ends the wait too: 'sent', and a run child is
+  // started again to take it as its next turn (Nirby control, 2026-11-05: it sat "queued" for an hour, unrun).
   function waitForDrain() {
+    const sent = () => orchestrating && pendingSends(session.events).length > 0;
     return new Promise(resolve => {
-      if (finished || allRootsTerminal()) return resolve();
-      const unsub = session.subscribe(() => { if (finished || allRootsTerminal()) { unsub(); resolve(); } });
+      if (!finished && sent()) return resolve('sent');
+      if (finished || allRootsTerminal()) return resolve('drained');
+      const unsub = session.subscribe(() => {
+        if (!finished && sent()) { unsub(); resolve('sent'); }
+        else if (finished || allRootsTerminal()) { unsub(); resolve('drained'); }
+      });
     });
   }
 
   let resume = values.resume ? {id: session.id} : null;
+  let carryOnly = false;
   for (;;) {
     if (finished) break;
     const childArgs = args.filter(a => a !== '--detach');
     const childEnv = {
       ...process.env, BOUNCE_SUPERVISED: '1', BOUNCE_REMOTE_SESSION: '1',
       BOUNCE_RESTART: resume ? JSON.stringify(resume) : '',
+      // The run's prompt has been answered: this child only carries the job (sent messages, outcomes).
+      BOUNCE_RUN_CARRY: carryOnly ? '1' : '',
     };
     // Removed first, then set only in orchestrator mode: a classic run must not inherit a stale
     // (or hostile) BOUNCE_ROLE/BOUNCE_BUS from whoever started the daemon.
@@ -812,7 +822,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
     }
     if (outcome.code !== 75 || !outcome.request) {
       if (detachedDaemon) {
-        await waitForDrain();
+        if (await waitForDrain() === 'sent' && !finished) { carryOnly = true; continue; }
       } else {
         // Attached: a live task must not keep `bounce run` alive forever just because
         // its own child process exited — cancel the tree the same way `stop` does.
@@ -1011,11 +1021,12 @@ async function sendCommand(args) {
   process.exitCode = sent.accepted && (!values.wait || sent.status === 'completed') ? 0 : 1;
 }
 
-// bounce watch [SESSION] [--after SEQ] [--idle MIN] [--timeout SEC] [--json]: block until the session is done (exit 0),
-// needs its controller (2), has written nothing for --idle minutes (3), or --timeout passes (4). Journal only, no socket.
+// bounce watch [SESSION] [--after SEQ] [--idle MIN] [--done] [--timeout SEC] [--json]: block until the session is done (exit 0),
+// needs its controller (2), has written nothing for --idle minutes (3), or --timeout passes (4). With --done, only the
+// end of the job (src/session-watch.js watchDone), with its answer and what it delivered. Journal only, no socket.
 async function watchCommand(args, {pollMs = 1000} = {}) {
   const {positionals, values} = parseArgs({args: args.slice(1), allowPositionals: true, options: {
-    session: {type: 'string'}, after: {type: 'string'}, idle: {type: 'string'}, timeout: {type: 'string'}, json: {type: 'boolean'}}});
+    session: {type: 'string'}, after: {type: 'string'}, idle: {type: 'string'}, timeout: {type: 'string'}, done: {type: 'boolean'}, json: {type: 'boolean'}}});
   const number = (flag, value, what) => {
     if (value === undefined) return undefined;
     const parsed = Number(value);
@@ -1034,7 +1045,7 @@ async function watchCommand(args, {pollMs = 1000} = {}) {
   for (;;) {
     const info = readDaemonJson(dir);
     const live = Boolean(info && pidAlive(info.pid));
-    const result = watchSession(new Session(process.cwd(), {root, id}).events, {after, live, run: Boolean(info?.run), idleMs});
+    const result = watchSession(new Session(process.cwd(), {root, id}).events, {after, live, run: Boolean(info?.run), done: Boolean(values.done), idleMs});
     if (result.outcome !== 'waiting' || Date.now() >= deadline) {
       console.log(values.json ? JSON.stringify(result) : formatWatch(result, id));
       process.exitCode = WATCH_EXIT[result.outcome];

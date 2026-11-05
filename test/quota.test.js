@@ -300,7 +300,7 @@ test('the panel gives up bars, then lines, as the sidebar runs out of rows', () 
 test('window titles and reset text read the way a plan states them', () => {
   const now = Date.parse('2026-09-08T12:00:00Z');
   assert.deepEqual(['5h', '7d', '1d', '1h', '45m', 'fable weekly', '7d Fable'].map(windowTitle),
-    ['5-hour window', 'Weekly', 'Daily window', 'Hourly window', '45m window', 'Fable weekly window', 'Weekly, Fable only']);
+    ['5-hour window', 'Weekly', 'Daily window', 'Hourly window', '45m window', 'Fable weekly window', 'Fable cap, inside Weekly']);
   // Past a day the distance is the only unambiguous form; inside one, the wall clock is quicker.
   assert.equal(resetText({resetsAt: now + 6.75 * 86400000}, now), 'resets in 6d 18h');
   assert.match(resetText({resetsAt: now + 90 * 60000}, now), /^resets \d{1,2}:\d{2}(am|pm)$/);

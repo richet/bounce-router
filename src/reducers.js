@@ -74,7 +74,8 @@ export function tasks(events) {
     // task.accepted is the one row allowed to act on a task already in a terminal
     // state (completed): every other kind is dropped once terminal, as before. The exception: a cancelled task whose
     // accepted work was refused by the checkout (`reopens`) is blocked again, so its owner can send it back or decide.
-    if (!t || (TERMINAL.has(t.state) && e.kind !== 'task.accepted' && !(e.kind === 'task.blocked' && e.reopens && t.state === 'cancelled'))) continue;
+    // So is a completed task whose checked work the checkout refused (no review: it lands after its check).
+    if (!t || (TERMINAL.has(t.state) && e.kind !== 'task.accepted' && !(e.kind === 'task.blocked' && e.reopens && ['cancelled', 'completed'].includes(t.state)))) continue;
     switch (e.kind) {
       case 'task.started':
         if (t.state === 'waiting') priorState[e.task] = 'running'; else t.state = 'running';

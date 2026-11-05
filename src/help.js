@@ -23,7 +23,7 @@ export const CLI_SECTIONS = [
     ['attach', '<session>', 'Reopen a session\'s view; --json streams its journal'],
     ['send', '[--session <ref>] [--wait] [--caller <who>] "message"', 'Message a live orchestrator; --wait prints its answer'],
     ['stop', '<session>', 'Cancel a session\'s task tree and end its daemon'],
-    ['watch', '<session> [--after <n>] [--idle <min>] [--timeout <s>]', 'Wait until it is done (0), needs you (2) or goes quiet (3)'],
+    ['watch', '<session> [--after <n>] [--idle <min>] [--done] [--timeout <s>]', 'Wait until it is done (0), needs you (2), goes quiet (3) or times out (4); --done: only the job\'s end, with its answer'],
     ['reserve', '<name> <value>|--next <n> [--session <ref>]', 'Hold a migration number, port or name against other sessions'],
     ['release', '<name> <value> [--session <ref>]', 'Give a reserved name back'],
     ['reservations', '[--session <ref>] [--json]', 'What this project\'s sessions hold'],
@@ -68,7 +68,7 @@ export const CLI_SECTIONS = [
   ]},
   {title: 'Maintenance', rows: [
     ['doctor', '[--fix]', 'Versions, quota, setup; --fix installs a usable opencode'],
-    ['prune', '', 'List the workers\' copies, then remove the ones you pick'],
+    ['prune', '', 'List the workers\' copies, then remove the ones you pick; a branch not yet fetched is kept'],
     ['prune', '--ended [--older-than 7d] [--yes]', 'Without asking: ended copies of stopped sessions, unused that long'],
     ['task compare', '<session> <a> <b>', 'Compare two tasks: tokens, wall time, rounds'],
     ['update', '[--check]', 'Install the latest npm release, or only check'],
@@ -144,7 +144,7 @@ export const TUI_SECTIONS = [
   {title: 'View & housekeeping', rows: [
     ['/details', '[on|off]', 'Expand or fold tool output and worker dispatch details'],
     ['/sidebar', '[on|off]', 'Show or hide the status sidebar (saved; needs a 100-column terminal)'],
-    ['/prune', '[all|none|1,3-5]', 'List the workers\' copies (last used, integrated or not), then remove the ones you pick'],
+    ['/prune', '[all|none|1,3-5]', 'List the workers\' copies (last used, integrated or not), then remove the ones you pick; all keeps a branch not yet fetched'],
     ['/quota', '', 'Show the subscription usage each agent reports'],
     ['/retry', '', 'Clear locally recorded quota cooldowns'],
     ['/unblock', '', 'Continue after a restart when the previous orchestrator is gone'],

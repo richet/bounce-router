@@ -117,6 +117,6 @@ test('the orders say: gates in the check and the review in review.completion run
   const orders = fs.readFileSync(new URL('../src/reload.js', import.meta.url), 'utf8').replaceAll("\\'", "'");
   for (const part of ['Verifying work: put the gates in the task\'s check', 'bounce runs both at once on the same copy',
     'Do not rerun the gates yourself and then dispatch a reviewer', 'names the exact commit it ran on is enough to send the next round',
-    'Before you accept the final head, see every gate pass on it', 'a merged tree equal to it needs no rerun'])
+    'Before you accept the final head, see every gate pass on it', 'a merged tree equal to it needs no rerun', 'name the commit each gate ran on, and say so plainly when one is not the delivered head'])
     assert.equal(orders.includes(part), true, part);
 });

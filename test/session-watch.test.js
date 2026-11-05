@@ -62,6 +62,28 @@ test('a live interactive session is done when every task ended and its orchestra
   assert.equal(watchSession(ended, {live: true, after: 4, now: T0 + 4 * 60000}).outcome, 'waiting', 'done already reported');
 });
 
+// Nirby control, 2026-11-05: `watch --idle 40` fired while the orchestrator waited on a builder or ran gates itself, so
+// control kept its own 10-quiet-minutes script. `--done` returns only when the run's job has ended, with its result.
+test('--done waits through quiet stretches and held tasks, and returns when the run\'s job ends, with its answer and what it delivered', () => {
+  const working = journal([{kind: 'main.started', requestId: 'r1'}, submitted('a'), {kind: 'main.terminal', requestId: 'r1', status: 'completed'},
+    {kind: 'task.blocked', task: 'a', reason: 'check_failed', text: 'check failed'}]);
+  assert.equal(watchSession(working, {live: true, run: true, done: true, now: T0 + 90 * 60000, idleMs: 10 * 60000}).outcome, 'waiting', 'quiet and held: not done');
+  const delivered = {kind: 'task.integrated', task: 'a', delivery: 'branch', branch: 'ui-polish', head: 'h'.repeat(40), tree: 't'.repeat(40), copy: '/w/1', checkStale: true, text: 'Delivered as branch ui-polish'};
+  const ended = journal([...working.map(({seq, time, ...row}) => row), {kind: 'task.accepted', task: 'a'}, delivered,
+    {kind: 'assistant', text: 'Merged ui-polish; gates green on hhhh.'}, {kind: 'run.ended', status: 'completed', waiting: []}]);
+  const result = watchSession(ended, {live: true, run: true, done: true, now: T0 + 9 * 60000});
+  assert.deepEqual({outcome: result.outcome, seq: result.seq, answer: result.answer, status: result.status, delivered: result.delivered}, {outcome: 'done', seq: 8,
+    answer: 'Merged ui-polish; gates green on hhhh.', status: 'completed',
+    delivered: [{task: 'a', branch: 'ui-polish', head: 'h'.repeat(40), tree: 't'.repeat(40), copy: '/w/1', checkStale: true}]});
+  assert.equal(WATCH_EXIT[result.outcome], 0);
+  // A message sent after the job ended starts it again: not done until its own end.
+  const again = journal([...ended.map(({seq, time, ...row}) => row), {kind: 'send.queued', requestId: 'r2', text: 'merge main'}]);
+  assert.equal(watchSession(again, {live: true, run: true, done: true, now: T0 + 10 * 60000}).outcome, 'waiting');
+  // A job that ended with tasks waiting on the user needs them: attention.
+  const asking = journal([submitted('b'), {kind: 'task.input_required', task: 'b', text: 'which port?'}, {kind: 'run.ended', status: 'completed', waiting: ['b']}]);
+  assert.deepEqual([watchSession(asking, {live: true, run: true, done: true, now: T0 + 3 * 60000}).outcome], ['attention']);
+});
+
 // The command end to end: a real CLI process over a journal on disk, with daemon.json saying whether its daemon runs.
 import fs from 'node:fs';
 import os from 'node:os';

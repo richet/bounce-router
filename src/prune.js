@@ -4,6 +4,7 @@
 // panel no task had integrated yet went with them). A copy whose task is still running in a live session is never
 // removed.
 import fs from 'node:fs';
+import {execFileSync} from 'node:child_process';
 import path from 'node:path';
 import {pidAlive, readJournal} from './core.js';
 import {reachedCheckout} from './branch-delivery.js';
@@ -41,25 +42,56 @@ export function listCopies({root}) {
       if (e.kind !== 'task.workspace' || typeof e.cwd !== 'string' || path.dirname(e.cwd) !== copyRoot) continue;
       const state = view[e.task]?.state ?? 'unknown';
       owners.set(path.basename(e.cwd), {session: id, task: e.task, state, live: live && !TERMINAL.has(state), sessionLive: live,
-        integrated: events.some(row => row.task === e.task && row.kind === 'task.integrated'), unfetched: unfetchedBranch(events, e.task, checkout), lastUsed: lastByTask.get(e.task) ?? e.time});
+        integrated: events.some(row => row.task === e.task && row.kind === 'task.integrated'), unfetched: unfetchedBranch(events, e.task, checkout), checkout, lastUsed: lastByTask.get(e.task) ?? e.time});
     }
   }
-  return names.map(name => {
+  const copies = names.map(name => {
     const dir = path.join(copyRoot, name);
     let mtime = null;
     try { mtime = fs.statSync(dir).mtime.toISOString(); } catch {}
     const owner = owners.get(name);
     const lastUsed = [owner?.lastUsed, mtime].filter(Boolean).sort().at(-1) ?? null;
     return {name, dir, session: owner?.session ?? null, task: owner?.task ?? null, state: owner?.state ?? 'unknown',
-      integrated: owner?.integrated ?? false, unfetched: owner?.unfetched ?? null, live: owner?.live ?? false, sessionLive: owner?.sessionLive ?? false, lastUsed};
-  }).sort((a, b) => String(b.lastUsed).localeCompare(String(a.lastUsed)));
+      integrated: owner?.integrated ?? false, unfetched: owner?.unfetched ?? null, live: owner?.live ?? false, sessionLive: owner?.sessionLive ?? false,
+      checkout: owner?.checkout ?? null, lastUsed};
+  });
+  markSuperseded(copies);
+  return copies.map(({checkout, ...copy}) => copy).sort((a, b) => String(b.lastUsed).localeCompare(String(a.lastUsed)));
+}
+
+// kb control, 2026-11-05 (6363e2cd: 20 copies of one branch). A copy holds nothing of its own when it is clean and its
+// commit is already in another copy of the same session (an ancestor of that copy's HEAD) or in the checkout:
+// `superseded` names where ('the checkout', or the copy's name). Null otherwise, and for a copy whose task runs.
+const gitQuiet = (cwd, ...args) => {
+  try { return execFileSync('git', args, {cwd, env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))), encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']}).trim(); }
+  catch { return null; }
+};
+function markSuperseded(copies) {
+  // Only where it changes the answer: a copy a stopped session's ended task owns goes anyway, so git is asked only
+  // about the copies of running sessions and of held (non-terminal) tasks, and their session's other copies.
+  const matters = copy => copy.task && !copy.live && (copy.sessionLive || !TERMINAL.has(copy.state));
+  const heads = new Map();
+  const headOf = copy => { if (!heads.has(copy.name)) heads.set(copy.name, gitQuiet(copy.dir, 'rev-parse', '--verify', '-q', 'HEAD')); return heads.get(copy.name); };
+  for (const copy of copies) {
+    copy.superseded = null;
+    if (!matters(copy)) continue;
+    const own = {head: headOf(copy)};
+    if (!own.head || gitQuiet(copy.dir, 'status', '--porcelain', '--untracked-files=all') !== '') continue;
+    if (copy.checkout && reachedCheckout({checkout: copy.checkout, head: own.head})) { copy.superseded = 'the checkout'; continue; }
+    const holder = copies.find(other => other !== copy && other.task && other.session === copy.session && headOf(other) && headOf(other) !== own.head
+      && gitQuiet(other.dir, 'merge-base', '--is-ancestor', own.head, headOf(other)) !== null);
+    if (holder) copy.superseded = holder.name;
+  }
 }
 
 // `bounce prune --ended --older-than D`, without asking (Nirby control session, 2026-11-04: 241 copies, 215 GB, because
 // prune only ran in a terminal): copies of sessions not running whose task ended, or that no journal names, unused for
 // D. A running session's copies stay even when their task ended: a cancelled task can still be accepted from its copy.
 export function endedCopies(copies, {now = Date.now(), olderThanMs}) {
-  return copies.filter(copy => !copy.live && !copy.sessionLive && !copy.unfetched && (!copy.task || TERMINAL.has(copy.state))
+  // A superseded copy (markSuperseded) goes from a running session too once its task ended, and from a stopped one even
+  // when its task was held: what it holds is elsewhere.
+  return copies.filter(copy => !copy.live && !copy.unfetched
+    && ((!copy.sessionLive && (!copy.task || TERMINAL.has(copy.state))) || (copy.superseded && (TERMINAL.has(copy.state) || !copy.sessionLive)))
     && copy.lastUsed && now - Date.parse(copy.lastUsed) >= olderThanMs);
 }
 const AGE = {d: 86400000, h: 3600000, m: 60000};
@@ -69,7 +101,7 @@ export function parseAge(text) {
 }
 
 const short = id => (id ? id.slice(0, 8) : '—');
-const work = copy => copy.live ? 'still running' : copy.unfetched ? `branch ${copy.unfetched} not fetched yet` : copy.integrated ? 'integrated' : copy.task ? `${copy.state}, not integrated` : 'no task found';
+const work = copy => copy.live ? 'still running' : copy.unfetched ? `branch ${copy.unfetched} not fetched yet` : copy.superseded ? `already in ${copy.superseded === 'the checkout' ? 'the checkout' : `copy ${copy.superseded}`}` : copy.integrated ? 'integrated' : copy.task ? `${copy.state}, not integrated` : 'no task found';
 export function copyTable(copies) {
   if (!copies.length) return 'No worker copies.';
   const rows = copies.map((copy, i) => [`${i + 1}.`, copy.name, copy.lastUsed ? copy.lastUsed.slice(0, 16).replace('T', ' ') : '—', `session ${short(copy.session)}`, `task ${short(copy.task)}`, work(copy)]);

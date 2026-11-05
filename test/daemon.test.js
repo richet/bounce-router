@@ -1059,6 +1059,52 @@ test('O12 a detached orchestrated run takes a message sent mid-run as its next t
   assert.equal(daemonInfo.run, true, 'bounce watch reads it: only the exit of a run\'s daemon says the run is done');
 });
 
+// Nirby control session, 2026-11-05 (sessions 1e1476c0, c85e32c8): a run whose own process had ended, its work held
+// for a decision, kept its daemon up; `bounce send` answered "queued" and nothing ever ran the message (an hour lost).
+test('O13 a message sent after the run\'s own turns ended, its work held, starts a turn instead of waiting forever', async t => {
+  const root = tmpRoot('bounce-o13-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  writeOrchestratorConfig(root, {profiles: {main: {adapter: 'codex'}, build: {adapter: 'codex'}}});
+  const blockingAdapter = () => ({
+    async launch(args) { return args; },
+    async *events(args) {
+      const client = await connectBus({path: args.profile.report.BOUNCE_REPORT_BUS, token: fs.readFileSync(args.profile.report.BOUNCE_REPORT_TOKEN_FILE, 'utf8').trim()});
+      try { await client.report({op: 'final', outcome: 'blocked', phase: 'done', text: 'needs a decision', next: 'none', summary: 'needs a decision', evidence: [], remaining: ''}); }
+      finally { await client.close(); }
+      yield {kind: 'result', status: 'completed', text: 'needs a decision'};
+    },
+    async cancel() { return {verified: true}; },
+  });
+  let session, sent;
+  const steer = async ({session: s}) => {
+    session = s;
+    // The run's own turns are over: the prompt, then the handoff of the held task, and its process has closed.
+    await waitFor(() => s.events.some(e => e.kind === 'task.blocked') && s.events.filter(e => e.kind === 'turn').length >= 2, {timeout: 15000});
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    const {connectSession, sendToOrchestrator} = await import('../src/send.js');
+    sent = await sendToOrchestrator(await connectSession(root, s.id), 'STEER: merge main', {wait: true, timeoutMs: 8000});
+    const {requestViewControl} = await import('../src/view-transport.js');
+    const channel = await connectSession(root, s.id);
+    await requestViewControl(channel, 'stop').catch(() => {});
+    channel.close();
+  };
+  await withEnv({BOUNCE_HOME: root, BOUNCE_DETACHED: '1', FAKE_ORCH_MODE: 'submit', FAKE_ORCH_PROFILE: 'build', FAKE_ORCH_NOWAIT: '1'}, async () => {
+    let timer;
+    try {
+      await Promise.race([
+        supervise(['run', 'go'], {adapters: {codex: blockingAdapter()}, onReady: s => { steer(s).catch(error => { sent = {error: error.message}; }); }}),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('detached run did not finish within 40s')), 40000); }),
+      ]);
+    } finally { clearTimeout(timer); }
+  });
+  assert.deepEqual({accepted: sent?.accepted, status: sent?.status, answer: sent?.answer, error: sent?.error},
+    {accepted: true, status: 'completed', answer: 'steered: merge main', error: undefined});
+  const users = session.events.filter(e => e.kind === 'user');
+  assert.deepEqual(users.map(e => e.via ?? null), [null, null, 'send'], 'the prompt, the handoff, then the sent message; the prompt is not run again');
+  // Each time the run's own process ends its job it says so: bounce watch --done reads it.
+  assert.deepEqual(session.events.filter(e => e.kind === 'run.ended').map(e => e.status), ['completed', 'completed']);
+});
+
 test('O11 an orchestrated run that dispatches without waiting is handed its worker\'s outcome in one more turn', async t => {
   const root = tmpRoot('bounce-o11-');
   t.after(() => fs.rmSync(root, {recursive: true, force: true}));

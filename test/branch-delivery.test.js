@@ -43,8 +43,8 @@ function setup(t, {delivery, commit = true} = {}) {
   const profiles = {builder: {adapter: 'worker', model: 'w', mode: 'yolo', fallback: [], role: 'builder', policy: 'write'}};
   const scheduler = createScheduler({session, adapters, profiles, requireFinalReport: true, gitHead: () => null});
   t.after(() => { scheduler.close(); fs.rmSync(root, {recursive: true, force: true}); });
-  const submit = () => scheduler.submit({parent: null, profile: 'builder', orders: 'Make state "new" in src/x.js', owns: ['src/**'], deadline: null, check: 'grep -q new src/x.js'});
-  const settled = task => waitFor(() => ['completed', 'accepted', 'blocked', 'failed'].includes(scheduler.tasks()[task]?.state) && scheduler.tasks()[task].state);
+  const submit = (check = 'grep -q new src/x.js') => scheduler.submit({parent: null, profile: 'builder', orders: 'Make state "new" in src/x.js', owns: ['src/**'], deadline: null, check});
+  const settled = task => waitFor(() => ['accepted', 'blocked', 'failed'].includes(scheduler.tasks()[task]?.state) && scheduler.tasks()[task].state);
   const row = (kind, task) => session.events.findLast(e => e.kind === kind && e.task === task);
   return {root, project, session, scheduler, submit, settled, row};
 }
@@ -52,19 +52,19 @@ function setup(t, {delivery, commit = true} = {}) {
 test('delivery branch: the worker\'s own branch is reported at its head, the checkout is untouched, and a fetch brings it', async t => {
   const f = setup(t, {delivery: 'branch'});
   const {task} = f.submit();
-  assert.equal(await f.settled(task), 'completed');
+  assert.equal(await f.settled(task), 'accepted');
   assert.equal(fs.readFileSync(path.join(f.project, 'src/x.js'), 'utf8'), 'export const state = "old";\n', 'the checkout is not written');
   assert.equal(fs.existsSync(path.join(f.project, 'src/y.js')), false);
   assert.equal(git(f.project, 'status', '--porcelain'), '');
   const delivered = f.row('task.integrated', task);
   const copy = delivered.copy;
   assert.deepEqual([delivered.delivery, delivered.branch, delivered.head, delivered.tree], ['branch', 'in-progress', git(copy, 'rev-parse', 'in-progress'), git(copy, 'rev-parse', 'in-progress^{tree}')]);
-  assert.equal(delivered.text, `Delivered as branch in-progress (head ${delivered.head.slice(0, 12)}, tree ${delivered.tree.slice(0, 12)}) in ${copy}, not written into the checkout: git fetch ${copy} in-progress`);
+  assert.equal(delivered.text, `Delivered as branch in-progress (head ${delivered.head.slice(0, 12)}, tree ${delivered.tree.slice(0, 12)}) in ${copy}, not written into the checkout: git fetch ${copy} in-progress. The check passed on this tree.`);
   assert.equal(git(copy, 'log', '-1', '--format=%s'), 'in-progress: state is new', 'bounce made no commit of its own');
   git(f.project, 'fetch', '-q', copy, 'in-progress');
   assert.equal(git(f.project, 'show', 'FETCH_HEAD:src/x.js'), 'export const state = "new";');
   assert.equal(git(f.project, 'show', 'FETCH_HEAD:src/y.js'), 'export const y = 1;');
-  assert.match(handoffBlock(f.session, [f.row('task.completed', task)]), /Delivered as branch in-progress \(head /);
+  assert.match(handoffBlock(f.session, [f.row('task.accepted', task)]), /Delivered as branch in-progress \(head /);
 });
 
 test('delivery branch: a worker that left changes uncommitted is blocked, and bounce commits nothing', async t => {
@@ -80,7 +80,7 @@ test('delivery branch: a worker that left changes uncommitted is blocked, and bo
 test('delivery branch: prune keeps a copy whose branch has not reached the checkout, and lets it go once fetched', async t => {
   const f = setup(t, {delivery: 'branch'});
   const {task} = f.submit();
-  assert.equal(await f.settled(task), 'completed');
+  assert.equal(await f.settled(task), 'accepted');
   f.scheduler.close();
   const later = {now: Date.now() + 30 * 86400000, olderThanMs: 7 * 86400000};
   const copy = f.row('task.integrated', task).copy;
@@ -98,6 +98,64 @@ test('a delivery setting bounce cannot read blocks the task instead of writing t
   assert.equal(fs.readFileSync(path.join(bad.project, 'src/x.js'), 'utf8'), 'export const state = "old";\n');
   const plain = setup(t, {commit: false});
   const two = plain.submit();
-  assert.equal(await plain.settled(two.task), 'completed');
+  assert.equal(await plain.settled(two.task), 'accepted');
   assert.equal(fs.readFileSync(path.join(plain.project, 'src/x.js'), 'utf8'), 'export const state = "new";\n');
+});
+
+// Found 2026-11-05 while checking what a delivery's check ran on: a task with a check and no review was written into the
+// checkout before its check ran, and a failing check only sent it back afterwards.
+test('without a review, a task\'s work reaches the checkout only after its check passes', async t => {
+  const failing = setup(t, {commit: false});
+  const one = failing.submit('false');
+  await waitFor(() => failing.row('task.rework', one.task) || failing.row('task.blocked', one.task));
+  assert.equal(failing.row('task.integrated', one.task), undefined);
+  assert.equal(fs.readFileSync(path.join(failing.project, 'src/x.js'), 'utf8'), 'export const state = "old";\n', 'a failing check leaves the checkout alone');
+  const passing = setup(t, {commit: false});
+  const two = passing.submit();
+  assert.equal(await passing.settled(two.task), 'accepted');
+  const kinds = passing.session.events.filter(e => e.task === two.task).map(e => e.kind);
+  assert.ok(kinds.indexOf('task.check') < kinds.indexOf('task.integrated'), kinds.join(' '));
+  assert.equal(passing.row('task.accepted', two.task).by, 'check');
+  assert.equal(fs.readFileSync(path.join(passing.project, 'src/x.js'), 'utf8'), 'export const state = "new";\n');
+});
+
+// kb control, 2026-11-05 (031d5448): gates ran on c980170 and the delivered head was 6a69639, and nothing said so.
+test('delivery branch: a check that ran on another tree than the delivered one is named as such', async t => {
+  const f = setup(t, {delivery: 'branch'});
+  // The check itself moves the branch on after bounce recorded the tree it ran on.
+  const {task} = f.submit('grep -q new src/x.js && echo z > z.txt && git add z.txt && git -c user.name=t -c user.email=t@t commit -qm z');
+  assert.equal(await f.settled(task), 'accepted');
+  const delivered = f.row('task.integrated', task), check = f.row('task.check', task);
+  assert.notEqual(check.tree, delivered.tree);
+  assert.deepEqual([delivered.checkStale, delivered.checkedTree, delivered.checkedHead], [true, check.tree, check.head]);
+  assert.ok(delivered.text.endsWith(`NOT CHECKED AS DELIVERED: the check passed on tree ${check.tree.slice(0, 12)} (head ${check.head.slice(0, 12)}), not on this tree.`), delivered.text);
+});
+
+// kb control, 2026-11-05 (eb26873e): a builder hit the 60-minute limit with nothing committed and its work was lost to
+// the next attempt. A task that ends unfinished has what it left uncommitted saved in its copy, and the handoff says
+// where.
+test('a cancelled task\'s uncommitted work is saved on refs/wip/<task> in its copy, and the handoff names it', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-wip-')));
+  const project = path.join(root, 'project');
+  fs.mkdirSync(path.join(project, 'src'), {recursive: true});
+  fs.writeFileSync(path.join(project, 'src/x.js'), 'old\n');
+  git(project, 'init', '-q', '-b', 'main'); git(project, 'add', '.'); git(project, 'commit', '-qm', 'First');
+  const session = new Session(project, {root: path.join(root, 'home')});
+  const adapters = {worker: fakeAdapter(args => { fs.writeFileSync(path.join(args.cwd, 'src/x.js'), 'half done\n'); fs.writeFileSync(path.join(args.cwd, 'src/new.js'), 'new\n'); return {never: true, cancel: {verified: true}}; })};
+  const scheduler = createScheduler({session, adapters, profiles: {builder: {adapter: 'worker', model: 'w', mode: 'yolo', fallback: [], role: 'builder', policy: 'write'}}, requireFinalReport: true, gitHead: () => null});
+  t.after(() => { scheduler.close(); fs.rmSync(root, {recursive: true, force: true}); });
+  const {task} = scheduler.submit({parent: null, profile: 'builder', orders: 'o', owns: ['src/**'], deadline: null});
+  await waitFor(() => session.events.some(e => e.kind === 'task.started' && e.task === task));
+  await waitFor(() => { try { return fs.readFileSync(path.join(session.events.find(e => e.kind === 'task.workspace').cwd, 'src/new.js'), 'utf8'); } catch { return null; } });
+  await scheduler.cancel(task);
+  await waitFor(() => scheduler.tasks()[task]?.state === 'cancelled');
+  const wip = session.events.find(e => e.kind === 'task.wip' && e.task === task);
+  const copy = session.events.find(e => e.kind === 'task.workspace').cwd;
+  const ref = `refs/wip/${task.slice(0, 8)}`;
+  assert.deepEqual([wip.copy, wip.ref, wip.files, wip.commit], [copy, ref, 2, git(copy, 'rev-parse', ref).trim()]);
+  assert.equal(git(copy, 'show', `${ref}:src/x.js`), 'half done');
+  assert.equal(git(copy, 'show', `${ref}:src/new.js`), 'new');
+  assert.equal(git(copy, 'status', '--porcelain').trim().split('\n').length, 2, 'the copy\'s own files and index are untouched');
+  assert.equal(wip.text, `Unfinished work saved: 2 uncommitted files in ${copy} as ${ref} (commit ${wip.commit.slice(0, 12)}). To build on it, name it in the next orders: git fetch ${copy} ${ref}.`);
+  assert.match(handoffBlock(session, [session.events.findLast(e => e.kind === 'task.cancelled' && e.task === task)]), new RegExp(`Unfinished work saved: 2 uncommitted files in .* as ${ref}`));
 });

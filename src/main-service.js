@@ -76,6 +76,9 @@ export function handoffBlock(session, ended) {
     // A task.accepted row may carry advice from an unsure Jev review (src/strategy.js jevAdvice):
     // read it before building on the accepted work, not just its summary.
     if (row.kind === 'task.accepted' && row.advice) lines.push(`  advice: ${String(row.advice).slice(0, HANDOFF_TEXT_MAX)}`);
+    // Unfinished work bounce saved from the copy of a task that ended without finishing (src/branch-delivery.js saveWip).
+    const wip = ['task.cancelled', 'task.deadline', 'task.failed'].includes(row.kind) ? session.events.findLast(event => event.kind === 'task.wip' && event.task === row.task) : null;
+    if (wip) lines.push(`  ${wip.text}`);
     // Branch delivery (src/branch-delivery.js): the work is on the worker's branch in its copy, not in the checkout.
     const delivered = ['task.completed', 'task.accepted'].includes(row.kind) ? session.events.findLast(event => event.kind === 'task.integrated' && event.task === row.task && event.delivery === 'branch') : null;
     if (delivered) lines.push(`  ${delivered.text}`);

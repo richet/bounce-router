@@ -4,7 +4,7 @@ import {randomUUID, createHash} from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import {readDelivery, deliverBranch} from './branch-delivery.js';
+import {readDelivery, deliverBranch, saveWip} from './branch-delivery.js';
 import {createAttemptWorkspace, captureArtifact, integrateArtifact, advanceBaseline, refreshConflicts, reviewDiff} from './workspace-artifacts.js';
 import * as reducers from './reducers.js';
 import {takeCheckpoint, sameTree} from './checkpoint.js';
@@ -344,12 +344,15 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const submitted = event.task ? session.events.find(e => e.kind === 'task.submitted' && e.task === event.task) : null;
     const row = {...submitted && {jobId: submitted.jobId}, ...event, time: stamp()};
     if (row.kind === 'task.completed') {
-      if (!submitted?.review?.completion && !publishArtifact(row.task, row)) return null;
+      // A task with a check lands only once it passes (handleCompleted), review or not. Found 2026-11-05: without a
+      // review, the work was written into the checkout before its check ran.
+      if (!submitted?.review?.completion && !submitted?.check && !publishArtifact(row.task, row)) return null;
       const actionId = `completion:${row.task}:${reducers.tasks(session.events)[row.task]?.attempt ?? 0}`;
       requestAction(session, {actionId, type: 'completion', task: row.task}, [row]);
       return session.events.findLast(e => e.kind === row.kind && e.task === row.task);
     }
     if (['task.failed', 'task.cancelled', 'task.deadline', 'task.accepted', 'task.rejected'].includes(row.kind)) {
+      if (['task.cancelled', 'task.deadline', 'task.failed'].includes(row.kind)) keepWip(row.task, row.context);
       requestTerminal(row, [row]);
       return session.events.findLast(e => e.kind === row.kind && e.task === row.task);
     }
@@ -358,6 +361,20 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return written;
   };
   const publish = event => closed ? null : session.publish({...event, time: stamp()});
+  // A task ending unfinished keeps what it left uncommitted in its copy as refs/wip/<task8> (src/branch-delivery.js
+  // saveWip), and says where, so the next attempt does not start without it.
+  function keepWip(task, context) {
+    const copy = session.events.findLast(e => e.kind === 'task.workspace' && e.task === task)?.cwd;
+    if (!copy || copy === session.cwd || !fs.existsSync(copy) || session.events.some(e => e.kind === 'task.wip' && e.task === task)) return;
+    let saved = null;
+    try { saved = saveWip({copy, task}); } catch (error) {
+      session.append({kind: 'diagnostic', task, text: `could not save the unfinished work in ${copy}: ${error.message}`, context, time: stamp()});
+      return;
+    }
+    if (!saved) return;
+    session.append({kind: 'task.wip', task, copy, ...saved, context, time: stamp(),
+      text: `Unfinished work saved: ${saved.files} uncommitted file${saved.files === 1 ? '' : 's'} in ${copy} as ${saved.ref} (commit ${saved.commit.slice(0, 12)}). To build on it, name it in the next orders: git fetch ${copy} ${saved.ref}.`});
+  }
   const localActivity = (task, attempt, context) => event => {
     if (reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state) || launchingAttempts.get(task)?.cancelReason) return;
     append({kind: 'task.milestone', task, attempt, phase: event.phase, text: String(event.text).slice(0, 2000), next: 'continue local worker', context});
@@ -1380,6 +1397,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const hook = invokeHook(() => strategy.onCompleted(task, view, api), task, context);
     if (!hook.ok) return;
     let intent = hook.intent;
+    // No review: a task with a check that passed lands now, as an accept by its check.
+    if (intent === 'none' && row?.check && checkRowOf(task)?.passed === true) intent = {action: 'accept', by: 'check'};
     if (intent === 'none') return;
     // Only work known to have changed files goes to the reviewer agent; anything else (a read-only task has no
     // artifact) is accepted, as an unsure Jev accepts a report that changed nothing. Unverified changes still
@@ -1408,7 +1427,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // this task.accepted first, by subscriber order, and resolves with it: the bus's
       // `wait.served` names this row's seq, and main-service's pendingHandoffs() has nothing
       // later to announce.
-      const accepted = {kind: 'task.accepted', task, stage: 'completion', by: 'strategy', context};
+      const accepted = {kind: 'task.accepted', task, stage: 'completion', by: intent.by ?? 'strategy', context};
       if (publishArtifact(task, accepted)) append(accepted);
       return;
     }
@@ -2281,7 +2300,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       const lead = withLessons(reviewProfile, row).agent?.prompt;
       const roleLead = lead && reviewProfile.adapter !== 'opencode' && reviewProfile.adapter !== 'typesafe' ? `${lead}\n\n---\n\n` : '';
       const orders = roleLead + (stage === 'completion'
-        ? (reviewProfile.role === 'verifier' ? row.steps : `${row.orders}\n\n--- worker report ---\n${workerAnswer(task)}${row.check ? `\n\n${checkBesideReview(row.check)}` : ''}`)
+        ? (reviewProfile.role === 'verifier' ? row.steps : `${row.orders}${afterOrders(task)}\n\n--- worker report ---\n${workerAnswer(task)}${row.check ? `\n\n${checkBesideReview(row.check)}` : ''}`)
         : row.orders);
       // What a decision-model reviewer (typesafe) judges: the raw orders, the worker's final
       // report and the tree's HEAD when the lineage's first worker started — the diff base.
@@ -2985,8 +3004,31 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   }
   // Branch delivery (docs/plans/branch-delivery.md): true when the project's setting took this action, and the
   // checkout was not written. A setting bounce cannot read blocks the task; it never falls back to the checkout.
+  // What the task's last check ran on, against what is delivered: a check on an earlier commit or tree is named, so
+  // nobody takes it for a check of the delivered head (kb control, 2026-11-05: gates on c980170, delivered 6a69639).
+  // A refused integration blocks the task again even from a state that otherwise ends it: a cancelled task being landed,
+  // or a completed one whose check passed with no review (src/reducers.js).
+  const reopensFor = task => ['cancelled', 'completed'].includes(reducers.tasks(session.events)[task]?.state) ? {reopens: true} : {};
+  // What the worker was told after its orders: messages to it and the findings it was sent back with. They change or
+  // add to the orders, so a reviewer grades against them too (kb control, 2026-11-05, d4b515ea: a later owner decision,
+  // relayed to the worker, was called a blocker by a review that saw only the original order).
+  function afterOrders(task) {
+    const said = session.events.filter(e => (e.kind === 'message' && e.to === `worker:${task}`) || (e.kind === 'task.rework' && e.task === task))
+      .slice(-12).map(e => e.kind === 'message'
+        ? `${String(e.time ?? '').slice(0, 16)} message: ${String(e.text ?? '').slice(0, 3000)}`
+        : `${String(e.time ?? '').slice(0, 16)} sent back with: ${(Array.isArray(e.findings) ? e.findings.join('; ') : String(e.text ?? '')).slice(0, 3000)}`);
+    return said.length ? `\n\n--- said to the worker after its orders (they change or add to them: grade against them too) ---\n${said.join('\n')}` : '';
+  }
+  function checkedOn(task, delivered) {
+    const check = session.events.findLast(e => e.kind === 'task.check' && e.task === task && typeof e.passed === 'boolean');
+    if (!check) return {checkedTree: null, checkNote: 'No check ran on it.'};
+    const verdict = check.passed ? 'passed' : 'FAILED';
+    if (check.tree === delivered.tree) return {checkedTree: check.tree, checkedHead: check.head ?? null, checkNote: `The check ${verdict} on this tree.`};
+    return {checkedTree: check.tree ?? null, checkedHead: check.head ?? null, checkStale: true,
+      checkNote: `NOT CHECKED AS DELIVERED: the check ${verdict} on tree ${String(check.tree).slice(0, 12)} (head ${String(check.head).slice(0, 12)}), not on this tree.`};
+  }
   function deliverAsBranch(action, artifact, copy, continuation) {
-    const reopens = reducers.tasks(session.events)[action.task]?.state === 'cancelled' ? {reopens: true} : {};
+    const reopens = reopensFor(action.task);
     const setting = readDelivery(session.cwd);
     if (setting.error) {
       append({kind: 'task.blocked', task: action.task, reason: 'integration_settings', ...reopens, text: `${setting.error}. Nothing was written into the checkout.`, artifactId: artifact.id});
@@ -2999,8 +3041,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       append({kind: 'task.blocked', task: action.task, reason: delivered.error, ...reopens, text: `Not delivered: ${why}. Nothing was written into the checkout; the copy is kept.`, ...(delivered.paths ? {paths: delivered.paths} : {}), artifactId: artifact.id});
       return true;
     }
+    const checked = checkedOn(action.task, delivered);
     if (!session.events.some(e => e.kind === 'task.integrated' && e.task === action.task && e.artifactId === artifact.id)) append({kind: 'task.integrated', task: action.task, artifactId: artifact.id, resultHash: artifact.resultHash,
-      delivery: 'branch', copy, ...delivered, text: `Delivered as branch ${delivered.branch} (head ${delivered.head.slice(0, 12)}, tree ${delivered.tree.slice(0, 12)}) in ${copy}, not written into the checkout: git fetch ${copy} ${delivered.branch}`});
+      delivery: 'branch', copy, ...delivered, ...checked,
+      text: `Delivered as branch ${delivered.branch} (head ${delivered.head.slice(0, 12)}, tree ${delivered.tree.slice(0, 12)}) in ${copy}, not written into the checkout: git fetch ${copy} ${delivered.branch}. ${checked.checkNote}`});
     append(continuation);
     return true;
   }
@@ -3014,7 +3058,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         if (deliverAsBranch(action, artifact, copy, continuation)) return;
         const result = integrateArtifact({cwd: session.cwd, artifact, dir, base: copy});
         if (result.status !== 'integrated') {
-          append({kind: 'task.blocked', task: action.task, reason: `integration_${result.status}`, ...(reducers.tasks(session.events)[action.task]?.state === 'cancelled' ? {reopens: true} : {}), text: `Artifact integration ${result.status}${result.paths?.length ? `: ${result.paths.join(', ')}` : result.path ? `: ${result.path}` : ''}; isolated work preserved`, ...(result.paths ? {paths: result.paths} : {}), artifactId});
+          append({kind: 'task.blocked', task: action.task, reason: `integration_${result.status}`, ...reopensFor(action.task), text: `Artifact integration ${result.status}${result.paths?.length ? `: ${result.paths.join(', ')}` : result.path ? `: ${result.path}` : ''}; isolated work preserved`, ...(result.paths ? {paths: result.paths} : {}), artifactId});
           return;
         }
         if (!session.events.some(e => e.kind === 'task.integrated' && e.task === action.task && e.artifactId === artifactId)) append({kind: 'task.integrated', task: action.task, artifactId, resultHash: artifact.resultHash,

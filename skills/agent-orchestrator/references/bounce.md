@@ -56,7 +56,8 @@ lease, renewed while the worker makes progress, up to the 60-minute ceiling — 
 <profile>}`, optional, review-role profiles only), `steps` (the verification steps, as text),
 `check` (one shell command that proves the work is done, optional), `continues` (a task of yours whose
 worker is resumed into this task's copy, for a follow-up on the same area by the same job; after a
-correction of wrong work start fresh instead), `worker` (`builder#1` to pick a standing worker from the
+correction of wrong work start fresh instead), `reservations` (shared names this session holds that the
+task uses, as `name:value`), `worker` (`builder#1` to pick a standing worker from the
 roster, `new` for a fresh one on purpose; absent, the agent's idle worker is continued by itself).
 `worker_retire` ends a standing worker, with an optional handoff for the next one of that job.
 
@@ -66,7 +67,19 @@ report. bounce tells you when you submit one (a note on the reply), and passing 
 as verification. bounce runs it in the worker's copy when the
 worker finishes, in a plain shell with its own environment (give a tool that is not on the path
 its full path), and only work that passes (exit 0) reaches the checkout by itself. A failure
-goes back to the worker once with what the check printed.
+goes back to the worker once with what the check printed. With a `completion` reviewer too, the
+review runs while the check runs, and the verdict waits for the check: put the gates in `check`
+and do not rerun them yourself before dispatching a reviewer. The `task.check` row names the
+head and tree it passed on; a merged tree equal to it needs no rerun.
+
+When the checkout is set to branch delivery (`git config bounce.delivery branch`), accepted work
+is never written into it: the handoff names the worker's branch, head and copy for a `git fetch`.
+Name the branch in the orders and tell the worker to commit on it; uncommitted changes are held
+as `delivery_uncommitted`.
+
+A task that uses a shared name (a migration number, a port) reserves it first with the `reserve`
+tool or `bounce reserve`, and lists it as `reservations: ["migration:0045"]` on the submission;
+it is released when the task ends.
 
 Work that changed files and that no such check has verified is kept in the worker's copy and
 comes to you as `task.blocked`, with the folder it is in and what the review said. That is not a

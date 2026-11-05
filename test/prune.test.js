@@ -103,3 +103,30 @@ test('prune --ended --older-than picks ended copies of sessions not running, unu
   const bad = bounce('--ended', '--older-than', 'soon');
   assert.deepEqual([bad.status, bad.stderr.trim()], [1, 'bounce: --older-than takes an age like 7d, 12h or 30m']);
 });
+
+// kb control, 2026-11-05 (6363e2cd): a session left 20 copies holding intermediate states of one branch. A clean copy
+// whose commit a later copy of the same session already contains, or that the checkout already has, holds nothing
+// else: prune --ended takes it, from a running session too once its task ended, and the copy that holds more stays.
+import {execFileSync} from 'node:child_process';
+test('prune --ended takes a clean copy whose commit a later copy or the checkout contains, and keeps the one that holds more', t => {
+  const {root, session} = home(t);
+  const env = {...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t'};
+  const git = (cwd, ...args) => execFileSync('git', args, {cwd, env, encoding: 'utf8'}).trim();
+  const checkout = path.join(root, 'checkout');
+  fs.mkdirSync(checkout); fs.writeFileSync(path.join(checkout, 'a.js'), '1\n');
+  git(checkout, 'init', '-q', '-b', 'main'); git(checkout, 'add', '.'); git(checkout, 'commit', '-qm', 'one');
+  fs.mkdirSync(path.join(root, 'w'));
+  const clone = name => { const dir = path.join(root, 'w', name); git(root, 'clone', '-q', checkout, dir); git(dir, 'checkout', '-qb', 'phase7'); return dir; };
+  const commit = (dir, text) => { fs.writeFileSync(path.join(dir, 'a.js'), text); git(dir, 'commit', '-qam', text.trim()); };
+  const first = clone('aaaaaaa2'); commit(first, 'round 1\n');
+  const second = clone('bbbbbbb2'); git(second, 'fetch', '-q', first, 'phase7'); git(second, 'reset', '-q', '--hard', 'FETCH_HEAD'); commit(second, 'round 2\n');
+  const dirty = clone('ccccccc2'); git(dirty, 'fetch', '-q', first, 'phase7'); git(dirty, 'reset', '-q', '--hard', 'FETCH_HEAD'); fs.writeFileSync(path.join(dirty, 'a.js'), 'unsaved\n');
+  const nothing = clone('ddddddd2');
+  const ended = (task, cwd, minute) => [...lived(task, cwd), {kind: 'task.cancelled', task, time: at(minute)}];
+  session('live2', [{kind: 'session', cwd: checkout, time: at(0)}, ...ended('t1', first, 10), ...ended('t2', second, 20), ...ended('t3', dirty, 30), ...ended('t4', nothing, 40)], {pid: process.pid});
+  const copies = listCopies({root});
+  assert.deepEqual(Object.fromEntries(copies.map(c => [c.name, c.superseded])), {aaaaaaa2: 'bbbbbbb2', bbbbbbb2: null, ccccccc2: null, ddddddd2: 'the checkout'});
+  const day = 86400000;
+  assert.deepEqual(endedCopies(copies, {now: Date.now() + 8 * day, olderThanMs: 7 * day}).map(c => c.name).sort(), ['aaaaaaa2', 'ddddddd2']);
+  assert.match(copyTable(copies), /aaaaaaa2 .* already in copy bbbbbbb2/);
+});

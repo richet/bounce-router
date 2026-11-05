@@ -529,10 +529,15 @@ async function main() {
     const typed = positionals.slice(1).join(' ');
     const expanded = typed.startsWith('/') ? expandVendorCommand(typed, {root, cwd: session.cwd}) : null;
     try {
-      let result = await router.run(orchestratorBrief + (expanded?.prompt ?? typed), values.image || [], expanded ? {typed} : {});
+      // A detached run's daemon starts a child again for a message sent after the run's own turns ended
+      // (src/reload.js waitForDrain): the prompt was answered, so this child only carries the job.
+      const carryOnly = orchestrating && process.env.BOUNCE_RUN_CARRY === '1';
+      let result = carryOnly ? 'completed' : await router.run(orchestratorBrief + (expanded?.prompt ?? typed), values.image || [], expanded ? {typed} : {});
       // Orchestrated, the first turn usually only dispatches: the job goes on until no outcome is left to hand over.
       const carried = orchestrating && result === 'completed' ? await carryJob({session, turn: (text, options) => router.run(orchestratorBrief + text, [], options)}) : null;
       if (carried) result = carried.status;
+      // `bounce watch --done` reads it: the job's own end, which the daemon outlives while work is held.
+      if (orchestrating) session.append({kind: 'run.ended', status: result, waiting: (carried?.waiting ?? []).map(t => t.id)});
       if (carried?.waiting.length) console.log(`[router:waiting] ${carried.waiting.map(t => `${t.id.slice(0, 8)} (${t.profile ?? 'task'})`).join(', ')} need${carried.waiting.length === 1 ? 's' : ''} your answer: bounce --resume ${session.id.slice(0, 8)}`);
       process.exitCode = carried?.waiting.length ? 2 : result === 'completed' ? 0 : result === 'cancelled' ? 130 : 1;
     }

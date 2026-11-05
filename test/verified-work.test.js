@@ -491,3 +491,23 @@ test('a worker is handed the standing worker rules and the project\'s lessons fo
   assert.equal(launched.orders.startsWith(`You are a builder.\n\n${standing}\n\n${block}\n\n---\n\nMake state "new"`), true, launched.orders.slice(0, 300));
   assert.equal(launched.orders.includes('PASS or FAIL'), false, 'the reviewer\'s line is not the builder\'s');
 });
+
+// kb control, 2026-11-05 (d4b515ea): the owner restricted feedback decisions to the web session after the order went
+// out; the orchestrator told the worker, but the round-3 review graded against the original order and called the
+// restriction a blocker. A completion reviewer gets what was said to the worker after its orders.
+test('a completion reviewer is handed what the worker was told after its orders, in order', async t => {
+  let seen = null, session = null;
+  const f = setup(t, {
+    worker: ({cwd}) => {
+      write(cwd, 'export const state = "new";\n');
+      session.append({kind: 'message', to: `worker:${session.events.findLast(e => e.kind === 'task.submitted').task}`, text: 'Owner decision: only the web session may decide; answer 403 feedback_decision_owner_only otherwise.', from: 'orchestrator'});
+      return [edited, {kind: 'result', status: 'completed', text: ownReport('state is now "new"')}];
+    },
+    reviewer: ({orders}) => { seen = orders; return verdict('accept'); },
+  });
+  session = f.session;
+  const submitted = f.submit({check: says('new')});
+  assert.equal(await f.settled(submitted.task), 'accepted');
+  assert.match(seen, /--- said to the worker after its orders \(they change or add to them: grade against them too\) ---\n.*message: Owner decision: only the web session may decide; answer 403 feedback_decision_owner_only otherwise\./);
+  assert.ok(seen.indexOf('--- said to the worker after its orders') < seen.indexOf('--- worker report ---'), 'before the report');
+});
