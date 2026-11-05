@@ -4,6 +4,7 @@
 // profile list advertised tiers (so it picked the tier itself), the submit example named a cloud
 // profile, and one sentence said local workers are for when the user asks.
 import test from 'node:test';
+import {verifyingOrders} from '../src/verify-mode.js';
 import fs from 'node:fs';
 import assert from 'node:assert/strict';
 import {choosingOrders, defaultTarget} from '../src/reload.js';
@@ -115,8 +116,10 @@ test('the orders say a worker\'s copy is temporary, and that a worker\'s service
 // after another and only then dispatched reviews. The orders say how to verify without that wait.
 test('the orders say: gates in the check and the review in review.completion run at once; builder output with its commit between rounds; every gate seen on the final head', () => {
   const orders = fs.readFileSync(new URL('../src/reload.js', import.meta.url), 'utf8').replaceAll("\\'", "'");
-  for (const part of ['Verifying work: put the gates in the task\'s check', 'bounce runs both at once on the same copy',
+  assert.equal(orders.includes('verifyingOrders(verifyMode(session.events, settings.verify))'), true, 'the paragraph is the session\'s verify mode (test/verify-mode.test.js)');
+  const auto = verifyingOrders('auto');
+  for (const part of ['Verifying work (mode: auto): put the gates in the task\'s check', 'bounce runs both at once in the worker\'s copy',
     'Do not rerun the gates yourself and then dispatch a reviewer', 'names the exact commit it ran on is enough to send the next round',
-    'Before you accept the final head, see every gate pass on it', 'a merged tree equal to it needs no rerun', 'name the commit each gate ran on, and say so plainly when one is not the delivered head'])
-    assert.equal(orders.includes(part), true, part);
+    'see every gate pass on the final head', 'a merged tree equal to it needs no rerun', 'name the commit each gate ran on, saying so plainly when one is not the delivered head'])
+    assert.equal(auto.includes(part), true, part);
 });

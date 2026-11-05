@@ -26,14 +26,30 @@ const gitEnv = extra => ({...Object.fromEntries(Object.entries(process.env).filt
 
 // The worker's own branch at its head, as the worker committed it. bounce commits nothing: a worker that left changes
 // uncommitted, or no branch, is refused with an error identifier, and the copy is kept as it is.
-export function deliverBranch({copy}) {
+export function deliverBranch({copy, checkout = null}) {
   const git = (...args) => execFileSync('git', args, {cwd: copy, env: gitEnv({}), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe']}).trim();
   const branch = git('rev-parse', '--abbrev-ref', 'HEAD');
   if (branch === 'HEAD') return {error: 'delivery_detached'};
   const dirty = execFileSync('git', ['status', '--porcelain', '-z', '--untracked-files=all'], {cwd: copy, env: gitEnv({}), encoding: 'utf8'})
     .split('\0').filter(Boolean).map(entry => entry.slice(3)).sort();
   if (dirty.length) return {error: 'delivery_uncommitted', paths: dirty};
-  return {branch, head: git('rev-parse', 'HEAD'), tree: git('rev-parse', 'HEAD^{tree}')};
+  return {branch, head: git('rev-parse', 'HEAD'), tree: git('rev-parse', 'HEAD^{tree}'), ...ignoredAdds(git, checkout)};
+}
+
+// Files the branch adds that the project's ignore rules match: committed with `git add -f`, they are not work the
+// checkout wants (kb control, 2026-11-05: 130 generated files under an ignored docs-out/ rode in on a delivered branch).
+function ignoredAdds(git, checkout) {
+  if (!checkout) return {};
+  try {
+    const base = git('merge-base', 'HEAD', execFileSync('git', ['rev-parse', 'HEAD'], {cwd: checkout, env: gitEnv({}), encoding: 'utf8'}).trim());
+    const added = git('diff', '--name-only', '--diff-filter=A', '-z', base, 'HEAD').split('\0').filter(Boolean);
+    if (!added.length) return {};
+    let ignored = '';
+    try { ignored = execFileSync('git', ['check-ignore', '--no-index', '-z', '--stdin'], {cwd: checkout, env: gitEnv({}), input: added.join('\0'), encoding: 'utf8'}); }
+    catch (error) { if (error.status !== 1) throw error; }
+    const paths = ignored.split('\0').filter(Boolean);
+    return paths.length ? {ignoredAdded: paths} : {};
+  } catch { return {}; }
 }
 
 // True when the checkout already has the delivered commit (it was fetched or merged).

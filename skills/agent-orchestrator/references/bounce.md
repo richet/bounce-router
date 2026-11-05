@@ -70,7 +70,9 @@ its full path), and only work that passes (exit 0) reaches the checkout by itsel
 goes back to the worker once with what the check printed. With a `completion` reviewer too, the
 review runs while the check runs, and the verdict waits for the check: put the gates in `check`
 and do not rerun them yourself before dispatching a reviewer. The `task.check` row names the
-head and tree it passed on; a merged tree equal to it needs no rerun.
+head and tree it passed on; a merged tree equal to it needs no rerun. Who runs the final gates
+follows the session's verify mode in ORDERS.md (orchestrator, worker or auto); the user can change
+it live, and you are told when it does.
 
 When the checkout is set to branch delivery (`git config bounce.delivery branch`), accepted work
 is never written into it: the handoff names the worker's branch, head and copy for a `git fetch`.

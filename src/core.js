@@ -145,6 +145,8 @@ export function validateSettings(value) {
   if (typeof value.sidebar !== 'boolean') throw new Error('config.sidebar must be true or false');
   if (value.keepProcess !== undefined && typeof value.keepProcess !== 'boolean') throw new Error('config.keepProcess must be true or false');
   if (value.inline !== undefined && typeof value.inline !== 'boolean') throw new Error('config.inline must be true or false');
+  if (value.verify !== undefined && !['orchestrator', 'worker', 'auto'].includes(value.verify)) throw new Error('config.verify must be orchestrator, worker or auto');
+  if (value.gateSlots !== undefined && (!Number.isInteger(value.gateSlots) || value.gateSlots < 0 || value.gateSlots > 64)) throw new Error('config.gateSlots must be a whole number from 0 (no cap) to 64');
   if (value.taskMinutes !== undefined && (!Number.isInteger(value.taskMinutes) || value.taskMinutes < 1 || value.taskMinutes > 240)) throw new Error('taskMinutes must be a whole number of minutes from 1 to 240');
   if (value.taskCeilingMinutes !== undefined && (!Number.isInteger(value.taskCeilingMinutes) || value.taskCeilingMinutes < 1 || value.taskCeilingMinutes > 240 || value.taskCeilingMinutes < (value.taskMinutes ?? 15))) throw new Error('taskCeilingMinutes must be a whole number of minutes from 1 to 240, and at least taskMinutes');
   if (value.reports !== undefined && !['plain', 'structured'].includes(value.reports)) throw new Error('reports must be "plain" or "structured"');

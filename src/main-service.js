@@ -1,3 +1,4 @@
+import {applyVerify} from './verify-mode.js';
 import {candidateResult, isReviewGate} from './task-result.js';
 import {LOCAL_ADAPTERS} from './profiles.js';
 import fs from 'node:fs';
@@ -510,6 +511,8 @@ export function createMainService({session, adapters, profile, settings, profile
     if (params.typed !== undefined && (typeof params.typed !== 'string' || !params.typed.startsWith('/'))) return {accepted: false, reason: 'invalid_typed'};
     const senderError = sentByError(params);
     if (senderError) return {accepted: false, reason: senderError};
+    // `verify=MODE` (src/verify-mode.js): journaled, and the turn carries the new verifying orders instead.
+    if (!wake) { const verified = applyVerify(session, params.text); if (verified) params = {...params, text: verified}; }
     if (params.routing !== undefined && (!params.routing || !Array.isArray(params.routing.order)
       || params.routing.order.some(p => !['claude', 'codex', 'muse'].includes(p))
       || !params.routing.models || typeof params.routing.models !== 'object'

@@ -35,6 +35,9 @@ import {createScheduler} from './scheduler.js';
 import {hostSession} from './remote.js';
 import {createMainService} from './main-service.js';
 import {createRunInbox, pendingSends} from './run-inbox.js';
+import {verifyingOrders, verifyMode} from './verify-mode.js';
+// Full gate runs at once on this machine when config.json says nothing (kb control, 2026-11-05: 8 CPU and 16 GB each).
+const DEFAULT_GATE_SLOTS = 3;
 import {watchSession, formatWatch, WATCH_EXIT, DEFAULT_IDLE_MS} from './session-watch.js';
 import {createViewServer, connectView, requestViewControl} from './view-transport.js';
 
@@ -337,7 +340,7 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     // The project's lessons: every line, with its job, and how one is recorded.
     ...(() => { const block = lessonsBlock(session.cwd, 'orchestrator'); return block ? ['', block, ''] : []; })(),
     ...ordersSkills(root, session.cwd),
-    'Verifying work: put the gates in the task\'s check (one command; chain them) and the review in review.completion; bounce runs both at once on the same copy and decides with both, so a task waits only for the slower of them. Do not rerun the gates yourself and then dispatch a reviewer. Between fix rounds, a builder\'s raw gate output that names the exact commit it ran on is enough to send the next round. Before you accept the final head, see every gate pass on it: bounce\'s check on that head, or your own rerun. The handoff names the tree the check passed on; a merged tree equal to it needs no rerun. In your final result, name the commit each gate ran on, and say so plainly when one is not the delivered head.', '',
+    verifyingOrders(verifyMode(session.events, settings.verify)), 'The user changes the mode live with `bounce send "verify=orchestrator|worker|auto"`; you are told when it changes.', '',
     'Shared names: other bounce sessions may be working on this project at the same time, and a worker sees only its own copy. Before you put a shared name in a worker\'s orders (a migration number, a port, a database or branch name), reserve it with the reserve tool (or publish reservation.taken): value for an exact one, next to take the first free one from a number. A refusal names the session that holds it: take the next one. Pass the reserved names to task_submit as reservations, so they are released when that task ends.', '',
     'Lessons: when a task redid work that had been accepted, or a check failed twice, the handoff asks whether there is a lesson. If there is, record it with the lesson tool (or publish lesson.learned): agent (the job it is for, or all) and text (one sentence, imperative, no task ids). It lands in .bounce/LESSONS.md in the project and in every later worker\'s prompt for that job; a person deletes a line to withdraw it. Record what a worker should do differently here, not what happened.', '',
     `Worker profiles (one AI each): ${Object.entries(profiles).filter(([name, p]) => name !== orchestrator && name !== JEV_REVIEWER && !p.derived).map(([name, p]) => p.model ? `${name} (${p.model})` : name).join(', ') || 'none configured'} — name one only when the user asks for that AI, or for a retry (see above).`,
@@ -527,7 +530,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // `strategy:` setting resolved by validateOrchestration (default: defaultStrategy) applies.
   let bus;
   const reportTokens = new Map();
-  const scheduler = createScheduler({session, adapters, profiles, localSettings: settings.local, sessionMode: settings.mode, strict: orchestration.strict, limits: taskLimits(settings), maxConcurrentCloud: settings.maxConcurrentCloud,
+  const scheduler = createScheduler({session, adapters, profiles, localSettings: settings.local, sessionMode: settings.mode, strict: orchestration.strict, limits: taskLimits(settings), maxConcurrentCloud: settings.maxConcurrentCloud, gateSlots: settings.gateSlots ?? DEFAULT_GATE_SLOTS,
     // How a worker ends: a plain answer (the default) or a report in the fixed format (config.json `reports`).
     requireFinalReport: orchestrating, reportFormat: settings.reports ?? 'plain', reportGrant: ({task, attempt, context}) => {
       if (!orchestrating || !bus) return null;
@@ -571,6 +574,8 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   const orders = () => writeOrders({session, root, bus, grant: orchestratorGrant, profiles, orchestrator: orchestration.orchestrator, jev: jevBlock() ? readJevSettings(root) : null,
     notes: effectiveNotes(profiles, readRosterNotes(root)), roles: readRoles(), settings, adapterNames});
   if (orchestrating) orders();
+  // A live verify change (src/verify-mode.js) rewrites ORDERS.md, so a later turn or a restart reads the new mode.
+  if (orchestrating) session.subscribe(e => { if (e.kind === 'control.verify') { try { orders(); } catch {} } });
   // No agent is asked to describe the roster's models at start: what it wrote changed between askings and routing
   // flipped with it (integration runs 2026-10-22). Routing reads the catalog, pins and LM Studio's own numbers
   // (src/roster-notes.js routingNote); /jev roster refresh still asks, for reading only.

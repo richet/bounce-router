@@ -142,6 +142,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   machineSlots = createMachineSlots(),
   // Runs a task's check (src/task-check.js): the command its orders name as proof the work is done.
   checkRunner = runCheck, checkTimeoutMs = CHECK_TIMEOUT_MS,
+  // Full gate runs at once on this machine, across every session (config gateSlots; 0: no cap): a check waits for a
+  // slot, it never fails for want of one (kb control, 2026-11-05: one run takes 8 CPU and 16 GB).
+  gateSlots = 0, gatePollMs = 2000,
   // The directories watched for writes outside a worker's copy (src/outside-writes.js); null: the ones on PATH.
   outsideDirs = null,
   sessionMode = 'yolo', depthCap = 1, checkpointRunner, limits: suppliedLimits = {}, strict = false, requireFinalReport = false, reportFormat = 'structured', reportGrant = null, clock = () => Date.now(), watchdog: suppliedWatchdog = {}, strategy = defaultStrategy, jev = null, gitHead = defaultGitHead, maxConcurrentCloud = 3}) {
@@ -1365,6 +1368,22 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       return {head, tree: git('write-tree')};
     } catch { return {}; } finally { fs.rmSync(index, {force: true}); }
   }
+  // A machine-wide gate slot for one check (gateSlots); null when the scheduler closed while it waited.
+  async function gateSlot(task, attempt, context) {
+    const started = Date.now();
+    if (!gateSlots) return {release: () => {}, waitedMs: 0};
+    let told = false;
+    for (;;) {
+      if (closed) return null;
+      const got = machineSlots.acquire({url: 'bounce-gates', slots: gateSlots, holder: {session: session.id, task, kind: 'gate'}});
+      if (got.ok) return {release: () => machineSlots.release(got.token), waitedMs: Date.now() - started};
+      if (!told) {
+        told = true;
+        append({kind: 'task.milestone', task, attempt, phase: 'check', text: `Waiting for a gate slot: ${got.holders.length} of ${gateSlots} gate runs on this machine are in use. The check runs when one is free.`, next: 'run the check', context});
+      }
+      await new Promise(resolve => setTimeout(resolve, gatePollMs));
+    }
+  }
   async function ensureCheck(task, row, context) {
     const completedSeq = completedSeqOf(task);
     if (completedSeq === null || checkRowOf(task)) return true;
@@ -1374,11 +1393,16 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       append({kind: 'task.check', task, attempt, completedSeq, command: row.check, passed: null, text: 'The task\'s check was not run: the worker has no working copy to run it in', context});
       return true;
     }
-    append({kind: 'task.milestone', task, attempt, phase: 'check', text: `Running the task's check: ${row.check}`, next: 'review and integrate if it passes', context});
-    const verified = verifiedTree(copy);
-    const outcome = await checkRunner({command: row.check, cwd: copy, timeoutMs: checkTimeoutMs});
+    const slot = await gateSlot(task, attempt, context);
+    if (!slot) return false;
+    let outcome, verified;
+    try {
+      append({kind: 'task.milestone', task, attempt, phase: 'check', text: `Running the task's check: ${row.check}`, next: 'review and integrate if it passes', context});
+      verified = verifiedTree(copy);
+      outcome = await checkRunner({command: row.check, cwd: copy, timeoutMs: checkTimeoutMs});
+    } finally { slot.release(); }
     if (closed || completedSeqOf(task) !== completedSeq || !['completed', 'reviewing'].includes(reducers.tasks(session.events)[task]?.state)) return false;
-    append({kind: 'task.check', task, attempt, completedSeq, ...outcome, ...verified, cwd: copy, context,
+    append({kind: 'task.check', task, attempt, completedSeq, ...outcome, ...verified, queuedMs: slot.waitedMs, cwd: copy, context,
       text: `The task's check ${outcome.passed ? 'passed' : 'failed'}: ${row.check}`});
     return true;
   }
@@ -3027,6 +3051,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return {checkedTree: check.tree ?? null, checkedHead: check.head ?? null, checkStale: true,
       checkNote: `NOT CHECKED AS DELIVERED: the check ${verdict} on tree ${String(check.tree).slice(0, 12)} (head ${String(check.head).slice(0, 12)}), not on this tree.`};
   }
+  // Up to five paths, then how many more; a folder's files collapse to the folder.
+  function ignoredSample(paths) {
+    const folders = [...new Set(paths.map(file => file.includes('/') ? `${file.split('/')[0]}/` : file))];
+    return `${folders.slice(0, 5).join(', ')}${folders.length > 5 ? ` and ${folders.length - 5} more` : ''}`;
+  }
   function deliverAsBranch(action, artifact, copy, continuation) {
     const reopens = reopensFor(action.task);
     const setting = readDelivery(session.cwd);
@@ -3035,7 +3064,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       return true;
     }
     if (setting.delivery !== 'branch') return false;
-    const delivered = copy ? deliverBranch({copy}) : {error: 'delivery_no_copy'};
+    const delivered = copy ? deliverBranch({copy, checkout: session.cwd}) : {error: 'delivery_no_copy'};
     if (delivered.error) {
       const why = {delivery_detached: 'the worker\'s copy is not on a branch', delivery_uncommitted: `the worker left changes uncommitted: ${delivered.paths?.join(', ')}`, delivery_no_copy: 'the worker\'s copy is gone'}[delivered.error];
       append({kind: 'task.blocked', task: action.task, reason: delivered.error, ...reopens, text: `Not delivered: ${why}. Nothing was written into the checkout; the copy is kept.`, ...(delivered.paths ? {paths: delivered.paths} : {}), artifactId: artifact.id});
@@ -3044,7 +3073,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const checked = checkedOn(action.task, delivered);
     if (!session.events.some(e => e.kind === 'task.integrated' && e.task === action.task && e.artifactId === artifact.id)) append({kind: 'task.integrated', task: action.task, artifactId: artifact.id, resultHash: artifact.resultHash,
       delivery: 'branch', copy, ...delivered, ...checked,
-      text: `Delivered as branch ${delivered.branch} (head ${delivered.head.slice(0, 12)}, tree ${delivered.tree.slice(0, 12)}) in ${copy}, not written into the checkout: git fetch ${copy} ${delivered.branch}. ${checked.checkNote}`});
+      text: `Delivered as branch ${delivered.branch} (head ${delivered.head.slice(0, 12)}, tree ${delivered.tree.slice(0, 12)}) in ${copy}, not written into the checkout: git fetch ${copy} ${delivered.branch}. ${checked.checkNote}${delivered.ignoredAdded ? ` WARNING: it adds ${delivered.ignoredAdded.length} file${delivered.ignoredAdded.length === 1 ? '' : 's'} the project ignores (committed with git add -f): ${ignoredSample(delivered.ignoredAdded)}` : ''}`});
     append(continuation);
     return true;
   }

@@ -92,3 +92,41 @@ test('without a check the reviewer is not told bounce runs one', async t => {
   await waitFor(() => f.rows('review.finished', task).length);
   assert.equal(f.seen.reviewOrders.includes('bounce runs this task\'s check'), false);
 });
+
+// kb control, 2026-11-05: one full gate run takes 8 CPU and 16 GB of a 64 GB Docker VM. Checks share a machine-wide
+// cap (gateSlots) as a queue that waits, never a failure, and each check row says how long it waited.
+import {createMachineSlots} from '../src/machine-slots.js';
+test('with one gate slot, a second task\'s check waits for the first to finish, says so, and records the wait', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-gates-')));
+  const project = path.join(root, 'project');
+  fs.mkdirSync(path.join(project, 'src'), {recursive: true});
+  fs.writeFileSync(path.join(project, 'src/x.js'), 'old\n');
+  git(project, 'init', '-q', '-b', 'main'); git(project, 'add', '.'); git(project, 'commit', '-qm', 'First');
+  const session = new Session(project, {root: path.join(root, 'home')});
+  let running = 0, most = 0, release;
+  const first = new Promise(resolve => { release = resolve; });
+  const checkRunner = async ({command, cwd}) => {
+    running++; most = Math.max(most, running);
+    if (command === 'gate one') await first; else await new Promise(resolve => setTimeout(resolve, 20));
+    running--;
+    return {command, cwd, exit: 0, passed: true, output: 'ok'};
+  };
+  const adapters = {worker: fakeAdapter(args => { fs.writeFileSync(path.join(args.cwd, 'src/x.js'), 'new\n'); return [{kind: 'result', status: 'completed', text: report('done')}]; })};
+  const scheduler = createScheduler({session, adapters, profiles: {builder: {adapter: 'worker', model: 'w', mode: 'yolo', fallback: [], role: 'builder', policy: 'write'}},
+    requireFinalReport: true, gitHead: () => null, checkRunner, gateSlots: 1, gatePollMs: 10, machineSlots: createMachineSlots({dir: path.join(root, 'machine')})});
+  t.after(() => { scheduler.close(); fs.rmSync(root, {recursive: true, force: true}); });
+  const one = scheduler.submit({parent: null, profile: 'builder', orders: 'a', owns: ['src/**'], deadline: null, check: 'gate one'});
+  await waitFor(() => running === 1);
+  const two = scheduler.submit({parent: null, profile: 'builder', orders: 'b', owns: ['src/**'], deadline: null, check: 'gate two'});
+  const waiting = await waitFor(() => session.events.find(e => e.kind === 'task.milestone' && e.task === two.task && e.phase === 'check' && /Waiting for a gate slot/.test(e.text)));
+  assert.equal(waiting.text, 'Waiting for a gate slot: 1 of 1 gate runs on this machine are in use. The check runs when one is free.');
+  await new Promise(resolve => setTimeout(resolve, 60));
+  assert.equal(session.events.some(e => e.kind === 'task.check' && e.task === two.task), false, 'still queued while the first runs');
+  release();
+  await waitFor(() => ['accepted'].includes(scheduler.tasks()[two.task]?.state) && scheduler.tasks()[one.task]?.state === 'accepted');
+  assert.equal(most, 1, 'never two gate runs at once');
+  const rows = [one.task, two.task].map(task => session.events.find(e => e.kind === 'task.check' && e.task === task));
+  assert.equal(typeof rows[0].queuedMs, 'number');
+  assert.equal(session.events.some(e => e.kind === 'task.milestone' && e.task === one.task && /Waiting for a gate slot/.test(e.text)), false, 'the first never queued');
+  assert.ok(rows[1].queuedMs >= 60, `waited ${rows[1].queuedMs} ms`);
+});

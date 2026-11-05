@@ -5,6 +5,7 @@
 // 2026-11-04: send refused every detached run, so control started one run per batch of orders.
 import {randomUUID} from 'node:crypto';
 import {sentByError} from './main-service.js';
+import {applyVerify} from './verify-mode.js';
 
 export function createRunInbox({session}) {
   function run(params = {}) {
@@ -13,7 +14,8 @@ export function createRunInbox({session}) {
     const senderError = sentByError(params);
     if (senderError) return {accepted: false, reason: senderError};
     const requestId = randomUUID();
-    session.append({kind: 'send.queued', requestId, text: params.text, via: 'send', ...(params.caller ? {caller: params.caller} : {})});
+    const text = applyVerify(session, params.text) ?? params.text;
+    session.append({kind: 'send.queued', requestId, text, via: 'send', ...(params.caller ? {caller: params.caller} : {})});
     return {accepted: true, queued: true, requestId};
   }
   return {run, state: () => ({state: pendingSends(session.events).length ? 'queued' : 'idle', currentTurnId: null})};

@@ -130,3 +130,30 @@ test('prune --ended takes a clean copy whose commit a later copy or the checkout
   assert.deepEqual(endedCopies(copies, {now: Date.now() + 8 * day, olderThanMs: 7 * day}).map(c => c.name).sort(), ['aaaaaaa2', 'ddddddd2']);
   assert.match(copyTable(copies), /aaaaaaa2 .* already in copy bbbbbbb2/);
 });
+
+// ace item 11 (2026-11-05): a copy that runs an ace stack takes its Docker volumes with it. Before its folder goes,
+// `ace down --volumes --json` runs in it; when that fails the copy is kept, so the stack is not left without its folder.
+import {aceDown} from '../src/prune.js';
+test('removing a copy with an ace.yaml takes its stack down with its volumes first, and keeps the copy when that fails', async t => {
+  const {root, copy} = home(t);
+  const plain = copy('aaaaaaa3'), stacked = copy('bbbbbbb3'), broken = copy('ccccccc3');
+  fs.writeFileSync(path.join(stacked, 'ace.yaml'), 'name: shop\n');
+  fs.writeFileSync(path.join(broken, 'ace.yaml'), 'name: shop\n');
+  const calls = [];
+  const stackDown = async dir => { calls.push(path.basename(dir)); return dir === broken ? {ok: false, error: 'ace: daemon not running'} : {ok: true, volumes: ['ace-shop-x_db']}; };
+  const copies = listCopies({root});
+  const {removed, failed} = await removeCopies(copies, {stackDown});
+  assert.deepEqual(calls.sort(), ['bbbbbbb3', 'ccccccc3'], 'only copies with an ace.yaml');
+  assert.deepEqual(removed.map(c => [c.name, c.volumes ?? null]).sort(), [['aaaaaaa3', null], ['bbbbbbb3', ['ace-shop-x_db']]]);
+  assert.deepEqual(failed.map(f => [f.copy.name, f.error]), [['ccccccc3', 'its stack was not taken down (ace: daemon not running); the copy is kept: run ace down --volumes there, then prune again']]);
+  assert.deepEqual([fs.existsSync(plain), fs.existsSync(stacked), fs.existsSync(broken)], [false, false, true]);
+  // The real call: `ace down --volumes --json` in the copy, its deleted volumes read from the JSON result.
+  const bin = path.join(root, 'bin');
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, 'ace'), `#!/bin/sh\necho "$PWD $*" >> ${JSON.stringify(path.join(root, 'ace.log'))}\necho '{"ok":true,"data":{"deletedVolumes":["v1","v2"]}}'\n`, {mode: 0o755});
+  const fake = await aceDown(broken, {env: {...process.env, PATH: `${bin}:${process.env.PATH}`}});
+  assert.deepEqual(fake, {ok: true, volumes: ['v1', 'v2']});
+  assert.equal(fs.readFileSync(path.join(root, 'ace.log'), 'utf8'), `${fs.realpathSync(broken)} down --volumes --json\n`);
+  const missing = await aceDown(broken, {env: {...process.env, PATH: '/nonexistent'}});
+  assert.equal(missing.ok, false);
+});

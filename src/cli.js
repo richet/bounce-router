@@ -216,7 +216,8 @@ async function main() {
       if (!values.yes) return console.log(`\n${chosen.length} cop${chosen.length === 1 ? 'y' : 'ies'} would be removed. Add --yes to remove them.`);
       const {removed, failed} = await removeCopies(chosen);
       for (const {copy, error} of failed) console.error(`bounce: could not remove ${copy.name}: ${error}`);
-      return console.log(`\nRemoved ${removed.length} cop${removed.length === 1 ? 'y' : 'ies'}.`);
+      const stacks = removed.filter(copy => copy.volumes);
+      return console.log(`\nRemoved ${removed.length} cop${removed.length === 1 ? 'y' : 'ies'}.${stacks.length ? ` Took down ${stacks.length} stack${stacks.length === 1 ? '' : 's'} with ${stacks.reduce((n, copy) => n + copy.volumes.length, 0)} volumes.` : ''}`);
     }
     const copies = listCopies({root});
     if (values.json) return console.log(JSON.stringify(copies, null, 2));

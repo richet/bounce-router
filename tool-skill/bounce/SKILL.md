@@ -50,6 +50,7 @@ Team, bindings, orchestrator model, cloud-only and parallel workspaces: follow `
     bounce stop REF                             # cancel its task tree and end its daemon
     bounce watch REF [--after N] [--timeout S]  # block until done (0), needs you (2), quiet --idle min (3), timeout (4)
     bounce watch REF --done                     # only the job's end: its answer and the branches it delivered
+    bounce send --session REF "verify=worker"   # who verifies, live: orchestrator | worker | auto
     bounce reserve NAME VALUE --session REF     # hold a shared name (migration 0045, port 5433); --next N takes the first free
     bounce reservations [--session REF]         # what this project's sessions hold; bounce release NAME VALUE gives one back
     bounce prune --ended --older-than 7d --yes  # remove workers' copies of stopped sessions whose task ended (without --yes: list)

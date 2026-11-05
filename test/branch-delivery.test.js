@@ -159,3 +159,25 @@ test('a cancelled task\'s uncommitted work is saved on refs/wip/<task> in its co
   assert.equal(wip.text, `Unfinished work saved: 2 uncommitted files in ${copy} as ${ref} (commit ${wip.commit.slice(0, 12)}). To build on it, name it in the next orders: git fetch ${copy} ${ref}.`);
   assert.match(handoffBlock(session, [session.events.findLast(e => e.kind === 'task.cancelled' && e.task === task)]), new RegExp(`Unfinished work saved: 2 uncommitted files in .* as ${ref}`));
 });
+
+// kb control, 2026-11-05: phase 9 workers committed 130 files under the ignored docs-out/ with git add -f, and they
+// rode in on the delivered branch. The delivery says so.
+test('delivery branch: files the branch adds that the project ignores are named in a warning', async t => {
+  const f = setup(t, {delivery: 'branch', commit: false});
+  fs.writeFileSync(path.join(f.project, '.gitignore'), 'out/\n');
+  git(f.project, 'add', '.gitignore'); git(f.project, 'commit', '-qm', 'ignore out');
+  f.scheduler.close();
+  const adapters = {worker: fakeAdapter(args => {
+    fs.writeFileSync(path.join(args.cwd, 'src/x.js'), 'export const state = "new";\n');
+    fs.mkdirSync(path.join(args.cwd, 'out')); fs.writeFileSync(path.join(args.cwd, 'out/a.html'), 'a'); fs.writeFileSync(path.join(args.cwd, 'out/b.html'), 'b');
+    git(args.cwd, 'checkout', '-qb', 'in-progress'); git(args.cwd, 'add', '-A'); git(args.cwd, 'add', '-f', 'out'); git(args.cwd, 'commit', '-qm', 'in-progress: with output');
+    return [{kind: 'result', status: 'completed', text: report('done')}];
+  })};
+  const scheduler = createScheduler({session: f.session, adapters, profiles: {builder: {adapter: 'worker', model: 'w', mode: 'yolo', fallback: [], role: 'builder', policy: 'write'}}, requireFinalReport: true, gitHead: () => null});
+  t.after(() => scheduler.close());
+  const {task} = scheduler.submit({parent: null, profile: 'builder', orders: 'o', owns: ['src/**'], deadline: null, check: 'grep -q new src/x.js'});
+  await waitFor(() => scheduler.tasks()[task]?.state === 'accepted');
+  const delivered = f.row('task.integrated', task);
+  assert.deepEqual(delivered.ignoredAdded, ['out/a.html', 'out/b.html']);
+  assert.ok(delivered.text.endsWith('WARNING: it adds 2 files the project ignores (committed with git add -f): out/'), delivered.text);
+});
