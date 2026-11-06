@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {Session} from '../src/core.js';
-import {createScheduler as createSchedulerImpl} from '../src/scheduler.js';
+import {STANDING_RULES, createScheduler as createSchedulerImpl} from '../src/scheduler.js';
 const schedulers = new WeakMap();
 const createScheduler = options => {
   const scheduler = createSchedulerImpl(options);
@@ -1100,7 +1100,7 @@ test('S-role: a non-opencode worker receives its role prompt ahead of the orders
   // Both are yolo (write-rank) workers in an isolated copy, so their orders now carry the appended
   // working-copy paragraph (src/scheduler.js inWorkingCopy) after the role-prompt/orders text.
   const workingCopyParagraph = /\n\nYour working copy is .+: it is a copy of the project, and only changes made there are your work: bounce integrates them into the original checkout .+ after review, so edit the copy, never the original\. What your orders ask you to deliver, evidence and reports included, goes inside this copy at the path they name: a file saved anywhere else on disk is not delivered\.$/;
-  assert.equal(seen.fake.startsWith('You are the reviewer.\n\n---\n\nreview the tree'), true, seen.fake);
+  assert.equal(seen.fake.startsWith(`You are the reviewer.\n\n${STANDING_RULES}\n\n---\n\nreview the tree`), true, seen.fake);
   assert.match(seen.fake, workingCopyParagraph);
   // opencode gets the agent natively, so no role prompt; a local worker is told its answer is its report.
   assert.equal(seen.opencode.startsWith('review the tree\n\nFinish with one standalone JSON object'), true, seen.opencode);

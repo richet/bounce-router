@@ -29,7 +29,7 @@ import {jevSidebarLabel} from './jev.js';
 import {rolesFor, agentStore, agentsCommand, agentTable, handAIsToJev} from './agents.js';
 import {bindingsCommand, bindingUpdatesNotice, bindingUpdates, bindingsFile, readBindings} from './bindings.js';
 import {createInterface} from 'node:readline';
-import {listCopies, copyTable, chooseCopies, removeCopies} from './prune.js';
+import {listCopies, copyTable, chooseCopies, removeCopies, endedCopies, parseAge} from './prune.js';
 import stringWidth from 'string-width';
 import {clean, createFormatter, createWorkSummary, workReview, withAsides, continueMain} from './format.js';
 import {validateOrchestration} from './profiles.js';
@@ -46,11 +46,14 @@ import {parseArgs, isDeepStrictEqual} from 'node:util';
 import {Session, Router, config, saveJSON, dataRoot} from './core.js';
 import * as reducers from './reducers.js';
 import {pendingMainActions} from './continuations.js';
+import {pendingSends} from './run-inbox.js';
+import {parseVerify} from './verify-mode.js';
 import {handoffBlock} from './main-service.js';
 import {providers, runProcess} from './providers.js';
 import {projectRoot, fingerprint, validate, supervise, pidAlive} from './reload.js';
 import {listSessions, resolveSessionRef, sessionsTable, sessionAge} from './sessions.js';
 import {sessionLineage, lineageLine} from './lineage.js';
+import {sessionReservations} from './reservations.js';
 import {titleSession, createAsk} from './session-title.js';
 import {askBtw, createBtwAsk} from './btw.js';
 import {createRemoteSession} from './remote.js';
@@ -86,7 +89,7 @@ async function main() {
     image: {type: 'string', multiple: true}, cwd: {type: 'string'}, resume: {type: 'string'}, provider: {type: 'string'}, model: {type: 'string'},
     mode: {type: 'string'}, json: {type: 'boolean'}, verify: {type: 'boolean'}, help: {type: 'boolean', short: 'h'}, version: {type: 'boolean', short: 'v'},
     check: {type: 'boolean'}, scope: {type: 'string'}, force: {type: 'boolean'}, list: {type: 'boolean'}, all: {type: 'boolean'}, session: {type: 'string'}, report: {type: 'boolean'},
-    save: {type: 'boolean'}, fix: {type: 'boolean'}, 'allow-network': {type: 'boolean'}, tasks: {type: 'boolean'}, against: {type: 'string'}, control: {type: 'boolean'},
+    save: {type: 'boolean'}, fix: {type: 'boolean'}, 'allow-network': {type: 'boolean'}, tasks: {type: 'boolean'}, against: {type: 'string'}, control: {type: 'boolean'}, next: {type: 'string'}, ended: {type: 'boolean'}, 'older-than': {type: 'string'}, yes: {type: 'boolean'},
   }});
   if (values.help) {
     const c = new Chalk({level: process.stdout.isTTY && !('NO_COLOR' in process.env) && process.env.TERM !== 'dumb' ? 1 : 0});
@@ -204,6 +207,19 @@ async function main() {
     return console.log(resourceReport({machine, fleet, busy: []}));
   }
   if (positionals[0] === 'prune') {
+    if (values.ended) {
+      const olderThanMs = parseAge(values['older-than'] ?? '7d');
+      if (olderThanMs === null) throw new Error('--older-than takes an age like 7d, 12h or 30m');
+      const chosen = endedCopies(listCopies({root}), {olderThanMs});
+      if (values.json && !values.yes) return console.log(JSON.stringify(chosen, null, 2));
+      if (!chosen.length) return console.log('No ended copies that old.');
+      console.log(copyTable(chosen));
+      if (!values.yes) return console.log(`\n${chosen.length} cop${chosen.length === 1 ? 'y' : 'ies'} would be removed. Add --yes to remove them.`);
+      const {removed, failed} = await removeCopies(chosen);
+      for (const {copy, error} of failed) console.error(`bounce: could not remove ${copy.name}: ${error}`);
+      const stacks = removed.filter(copy => copy.volumes);
+      return console.log(`\nRemoved ${removed.length} cop${removed.length === 1 ? 'y' : 'ies'}.${stacks.length ? ` Took down ${stacks.length} stack${stacks.length === 1 ? '' : 's'} with ${stacks.reduce((n, copy) => n + copy.volumes.length, 0)} volumes.` : ''}`);
+    }
     const copies = listCopies({root});
     if (values.json) return console.log(JSON.stringify(copies, null, 2));
     console.log(copyTable(copies));
@@ -339,6 +355,28 @@ async function main() {
     }
     const rows = taskList(target.events, {all: Boolean(values.all)});
     return console.log(values.json ? JSON.stringify(rows, null, 2) : formatTaskList(rows));
+  }
+  // bounce reserve NAME VALUE|--next FROM, bounce release NAME VALUE, bounce reservations [--json], each for --session
+  // (or the live one): shared names held against every other session of the project (src/reservations.js).
+  if (['reserve', 'release', 'reservations'].includes(positionals[0])) {
+    const ref = values.session || listSessions(root).find(row => row.live)?.id;
+    if (!ref) throw new Error('No running session · name one with --session');
+    const id = resolveSessionRef(root, ref);
+    const target = new Session(process.cwd(), {root, id});
+    let daemon = null;
+    try { daemon = JSON.parse(fs.readFileSync(path.join(target.dir, 'daemon.json'), 'utf8')); } catch {}
+    if (positionals[0] !== 'reservations' && !(Number.isSafeInteger(daemon?.pid) && pidAlive(daemon.pid))) throw new Error(`session ${id.slice(0, 8)} is not running: a reservation lives with a running session`);
+    const ledger = sessionReservations(target, {pid: daemon?.pid ?? process.pid});
+    if (positionals[0] === 'reservations') {
+      const held = ledger.list();
+      return console.log(values.json ? JSON.stringify(held, null, 2) : held.length ? held.map(r => `${r.name} ${r.value} · session ${r.session.slice(0, 8)}${r.task ? ` · task ${r.task.slice(0, 8)}` : ''}`).join('\n') : 'No reservations.');
+    }
+    const [, name, value] = positionals;
+    const done = positionals[0] === 'release' ? ledger.release({name, value})
+      : values.next !== undefined ? ledger.next({name, from: values.next}) : ledger.take({name, value});
+    if (!done.ok) throw new Error(done.reason);
+    if (positionals[0] === 'release' && !done.released) throw new Error(`${name} ${value} is not reserved`);
+    return console.log(`${positionals[0] === 'release' ? 'released' : 'reserved'} ${done.reservation.name} ${done.reservation.value}`);
   }
   // bounce lineage [SESSION] [--json]: which vendor session did what, for one session or all of them.
   if (positionals[0] === 'lineage') {
@@ -493,10 +531,15 @@ async function main() {
     const typed = positionals.slice(1).join(' ');
     const expanded = typed.startsWith('/') ? expandVendorCommand(typed, {root, cwd: session.cwd}) : null;
     try {
-      let result = await router.run(orchestratorBrief + (expanded?.prompt ?? typed), values.image || [], expanded ? {typed} : {});
+      // A detached run's daemon starts a child again for a message sent after the run's own turns ended
+      // (src/reload.js waitForDrain): the prompt was answered, so this child only carries the job.
+      const carryOnly = orchestrating && process.env.BOUNCE_RUN_CARRY === '1';
+      let result = carryOnly ? 'completed' : await router.run(orchestratorBrief + (expanded?.prompt ?? typed), values.image || [], expanded ? {typed} : {});
       // Orchestrated, the first turn usually only dispatches: the job goes on until no outcome is left to hand over.
-      const carried = orchestrating && result === 'completed' ? await carryJob({session, turn: text => router.run(orchestratorBrief + text)}) : null;
+      const carried = orchestrating && result === 'completed' ? await carryJob({session, turn: (text, options) => router.run(orchestratorBrief + text, [], options)}) : null;
       if (carried) result = carried.status;
+      // `bounce watch --done` reads it: the job's own end, which the daemon outlives while work is held.
+      if (orchestrating) session.append({kind: 'run.ended', status: result, waiting: (carried?.waiting ?? []).map(t => t.id)});
       if (carried?.waiting.length) console.log(`[router:waiting] ${carried.waiting.map(t => `${t.id.slice(0, 8)} (${t.profile ?? 'task'})`).join(', ')} need${carried.waiting.length === 1 ? 's' : ''} your answer: bounce --resume ${session.id.slice(0, 8)}`);
       process.exitCode = carried?.waiting.length ? 2 : result === 'completed' ? 0 : result === 'cancelled' ? 130 : 1;
     }
@@ -1482,7 +1525,13 @@ async function main() {
         else notice = 'Setup is working · keep editing, use a slash command, or Esc to cancel setup';
         render(); return;
       }
-      const text = expandPastes(input, pastes).trim(); input = ''; inputCursor = 0; pastes.clear();
+      let text = expandPastes(input, pastes).trim(); input = ''; inputCursor = 0; pastes.clear();
+      // `/verify MODE` is the typed form of `verify=MODE` (src/verify-mode.js): the orchestrator's service applies it.
+      if (/^\/verify\b/i.test(text)) {
+        const mode = parseVerify(text);
+        if (!mode || !orchestrating) { notice = !mode ? 'Use /verify orchestrator|worker|auto' : '/verify needs the orchestrator: /operation orchestrator'; render(); return; }
+        text = `verify=${mode}`;
+      }
       if (text) {
         const decision = inputDisposition(text, {busy, vendorCommand});
         if (agentsOpen && selectedWorker() && decision.kind === 'prompt') {
@@ -1645,22 +1694,43 @@ async function main() {
 // handed; when its tasks have ended or wait on the user, any outcome it has not seen goes to it in one more turn.
 // Found by the integration run 2026-10-21: the job stopped at its first dispatch and slugify was never fixed.
 const MAX_HANDOFF_TURNS = 20;
+// A message sent with `bounce send` (src/run-inbox.js) is the run's next turn, under the sender's requestId.
+async function sentTurn(session, sent, turn) {
+  session.append({kind: 'main.started', from: 'main', context: session.id, requestId: sent.requestId, state: 'running'});
+  const status = await turn(sent.text, {via: sent.via, ...(sent.caller ? {caller: sent.caller} : {})});
+  session.append({kind: 'main.terminal', from: 'main', context: session.id, requestId: sent.requestId, status});
+  return status;
+}
 async function carryJob({session, turn, pollMs = 500}) {
   const hand = (actions, from) => { for (const action of actions) session.append({kind: 'main.disposition', actionId: action.actionId, outcomeSeq: action.outcomeSeq, task: action.task, disposition: 'reported', from: 'main', text: `handed to the orchestrator (${from})`}); };
   let status = 'completed', since = 0;
-  for (let round = 0; round <= MAX_HANDOFF_TURNS; round++) {
-    const served = new Set(session.events.filter(e => e.kind === 'wait.served' && e.seq > since).map(e => e.served));
-    hand(pendingMainActions(session.events).filter(action => served.has(action.outcomeSeq)), 'its own wait');
-    // Its tasks run on in the daemon: wait until each has ended or waits on the user.
+  // Only handoff turns count against the cap: a sent message is the user's turn, not the job looping.
+  for (let round = 0; round <= MAX_HANDOFF_TURNS;) {
+    // Its tasks run on in the daemon: wait until each has ended or waits on the user, or a message is sent to it.
     for (;;) {
       const open = Object.values(reducers.tasks(session.events)).filter(t => !reducers.TERMINAL.has(t.state) && !['blocked', 'input_required'].includes(t.state));
-      if (!open.length) break;
+      if (!open.length || pendingSends(session.events).length) break;
       await new Promise(resolve => setTimeout(resolve, pollMs));
+    }
+    // This process's journal is a copy of the daemon's, and the `wait.served` row of the turn that just ended can land
+    // after the turn does: missed, every outcome the orchestrator had waited on was handed to it again and the fake
+    // orchestrator dispatched anew each time (O2, O10, 2026-11-04). The daemon journaled that row before it answered
+    // the wait, and its rows reach this process in order, so once it has acknowledged this turn's own rows (flush),
+    // the row is here. Read after the wait above too, for outcomes that ended meanwhile.
+    await session.flush?.();
+    const served = new Set(session.events.filter(e => e.kind === 'wait.served' && e.seq > since).map(e => e.served));
+    hand(pendingMainActions(session.events).filter(action => served.has(action.outcomeSeq)), 'its own wait');
+    const [sent] = pendingSends(session.events);
+    if (sent) {
+      status = await sentTurn(session, sent, turn);
+      if (status !== 'completed') return {status, waiting: []};
+      continue;
     }
     const pending = pendingMainActions(session.events);
     const waiting = Object.values(reducers.tasks(session.events)).filter(t => t.state === 'input_required');
     if (!pending.length || round === MAX_HANDOFF_TURNS) return {status, waiting};
     since = session.events.at(-1)?.seq ?? since;
+    round++;
     hand(pending, 'a handoff turn');
     status = await turn(handoffBlock(session, pending.map(action => action.row)));
     if (status !== 'completed') return {status, waiting};

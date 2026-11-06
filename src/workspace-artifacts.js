@@ -6,6 +6,10 @@ import path from 'node:path';
 import {validOwns} from './owned-paths.js';
 
 const EXCLUDED = new Set(['.git', '.bounce', 'node_modules', '.attempt-workspace.json']);
+// Left out at the project's top only. .ace is Ace's state for one checkout (markers, test timings, locks); Ace's own
+// workspaces leave it out too, and a copy's stack runs from ace.yaml without it (Nirby control, 2026-11-05: a copied
+// "record test durations here" marker made every copy's gates rewrite a tracked file).
+const TOP_EXCLUDED = new Set(['.ace']);
 const MAX_FILE = 4 * 1024 * 1024;
 const PREVIEW_MAX = 4096; // what the baseline keeps of a file's text
 const DIFF_FILE_MAX = 40_000; // one file's share of the text a review reads
@@ -48,7 +52,7 @@ function manifest(root) {
   const visit = (dir, prefix = '') => {
     if (fs.existsSync(path.join(dir, GENERATED))) return;
     for (const entry of fs.readdirSync(dir, {withFileTypes: true})) {
-      if (EXCLUDED.has(entry.name)) continue;
+      if (EXCLUDED.has(entry.name) || (!prefix && TOP_EXCLUDED.has(entry.name))) continue;
       const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
       const full = path.join(dir, entry.name);
       const stat = fs.lstatSync(full);
@@ -74,15 +78,15 @@ function atomicJSON(file, value) {
 }
 function readJSON(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } }
 
-function copyTree(source, target) {
+function copyTree(source, target, top = true) {
   fs.mkdirSync(target, {recursive: true, mode: 0o700});
   for (const entry of fs.readdirSync(source, {withFileTypes: true})) {
     if (entry.name === 'node_modules') { fs.cpSync(path.join(source, entry.name), path.join(target, entry.name), {recursive: true, dereference: true, mode: fs.constants.COPYFILE_FICLONE}); continue; }
-    if (EXCLUDED.has(entry.name)) continue;
+    if (EXCLUDED.has(entry.name) || (top && TOP_EXCLUDED.has(entry.name))) continue;
     const from = path.join(source, entry.name), to = path.join(target, entry.name);
     const stat = fs.lstatSync(from);
     if (stat.isSymbolicLink()) throw new Error(`symlink denied: ${entry.name}`);
-    if (stat.isDirectory()) copyTree(from, to);
+    if (stat.isDirectory()) copyTree(from, to, false);
     else if (stat.isFile()) fs.copyFileSync(from, to, fs.constants.COPYFILE_EXCL);
   }
 }
@@ -96,8 +100,14 @@ function realAncestor(dir) {
   return parent === resolved ? resolved : path.join(realAncestor(parent), path.basename(resolved));
 }
 
+// Where a copy's origin pushes: nowhere. git refuses it locally ("unable to find remote helper"), so a worker's push
+// never reaches the checkout or its remote.
+export const COPY_PUSH_URL = 'bounce-copy-cannot-push://origin';
+
 // The copy gets its own git: a clone sharing the source's objects (no duplicated history, about a second),
-// on the source's branch, with a baseline commit of the checkout as copied (see below). It has no remote, so nothing a worker does in git can reach the source, and
+// on the source's branch, with a baseline commit of the checkout as copied (see below). Its origin names the source's
+// origin (the source itself when it has none), so a session run in the copy knows its project, and pushes nowhere
+// (COPY_PUSH_URL), so nothing a worker does in git can reach the source; and
 // .git is outside every manifest, so only file changes are ever integrated. A source that is not a git
 // checkout, or a clone that fails, leaves the copy without git as before.
 function giveGit(source, copy, generated = []) {
@@ -107,19 +117,24 @@ function giveGit(source, copy, generated = []) {
   const staging = path.join(copy, `.git-clone-${crypto.randomUUID()}`);
   try {
     const head = git(source, 'rev-parse', '--verify', '-q', 'HEAD');
+    let origin = source;
+    try { origin = git(source, 'remote', 'get-url', 'origin') || source; } catch {}
     let branch = '';
     try { branch = git(source, 'symbolic-ref', '--short', '-q', 'HEAD'); } catch {}
     git(copy, 'clone', '--shared', '--no-checkout', '--quiet', source, staging);
     fs.renameSync(path.join(staging, '.git'), path.join(copy, '.git'));
+    // Removed and added back rather than repointed: the clone's origin/* refs are the source's local branches.
     git(copy, 'remote', 'remove', 'origin');
+    git(copy, 'remote', 'add', 'origin', origin);
+    git(copy, 'remote', 'set-url', '--push', 'origin', COPY_PUSH_URL);
     if (branch) git(copy, 'update-ref', `refs/heads/${branch}`, head), git(copy, 'symbolic-ref', 'HEAD', `refs/heads/${branch}`);
     else git(copy, 'update-ref', '--no-deref', 'HEAD', head);
     git(copy, 'reset', '--quiet');
     // What the copy leaves out on purpose (.bounce) would otherwise read as deleted in every `git status`.
-    const omitted = execFileSync('git', ['ls-files', '-z', '--', '.bounce', ':(glob)**/.bounce/**'], {cwd: copy, env, stdio: ['ignore', 'pipe', 'ignore']});
+    const omitted = execFileSync('git', ['ls-files', '-z', '--', '.bounce', ':(glob)**/.bounce/**', ':(top).ace'], {cwd: copy, env, stdio: ['ignore', 'pipe', 'ignore']});
     if (omitted.length) execFileSync('git', ['update-index', '--skip-worktree', '-z', '--stdin'], {cwd: copy, env, input: omitted, stdio: ['pipe', 'ignore', 'ignore']});
     fs.mkdirSync(path.join(copy, '.git', 'info'), {recursive: true});
-    fs.appendFileSync(path.join(copy, '.git', 'info', 'exclude'), `\n/.attempt-workspace.json\n${generated.map(rel => `/${rel}/\n`).join('')}`);
+    fs.appendFileSync(path.join(copy, '.git', 'info', 'exclude'), `\n/.attempt-workspace.json\n/.ace/\n${generated.map(rel => `/${rel}/\n`).join('')}`);
     // The checkout as the copy got it — the user's uncommitted edits included — becomes a baseline
     // commit, so `git status` starts clean and `git diff` is only the worker's own work. Found live:
     // a worker read the user's uncommitted edits as its own out-of-scope
@@ -385,6 +400,63 @@ export function advanceBaseline(workspace, artifact, mergedStates = {}) {
   const updated = {...workspace, baseline, baselineHash};
   atomicJSON(path.join(workspace.cwd, '.attempt-workspace.json'), {...updated, cwd: undefined});
   return updated;
+}
+
+// A send-back after a refused integration brings the refused files of the copy up to the checkout, so the worker
+// reconciles against what is there now and the next integrate is clean. Without it a worker that resolved the conflict
+// in its copy conflicted again: the merge base was still where the copy started (Nirby control session, 2026-11-04).
+// Each file's baseline becomes the checkout's version, and the copy gets:
+// - markers: both sides changed it; the worker's change and the checkout's, with git's conflict markers where they overlap.
+// - you_deleted: the worker deleted it and the checkout edited it; the checkout's file is back, deleting it again is the worker's call.
+// - checkout_deleted: the checkout deleted it and the worker edited it; the worker's file stays, keeping it is its call.
+// - binary: not refreshed; it still conflicts.
+const MARKER_LABELS = ['-L', 'your change', '-L', 'where your copy started', '-L', 'the checkout now'];
+export function refreshConflicts(workspace, paths) {
+  const root = fs.realpathSync(workspace.source);
+  const baseline = {...workspace.baseline};
+  const refreshed = [];
+  for (const file of paths) {
+    const target = safeJoin(root, file), copied = safeJoin(workspace.cwd, file);
+    assertNoSymlink(root, file); assertNoSymlink(workspace.cwd, file);
+    const checkout = fs.existsSync(target) ? fs.readFileSync(target) : null;
+    const yours = fs.existsSync(copied) ? fs.readFileSync(copied) : null;
+    if ([checkout, yours].some(data => data?.includes(0))) { refreshed.push({path: file, how: 'binary'}); continue; }
+    let how;
+    if (!checkout) how = 'checkout_deleted';
+    else if (!yours) { fs.mkdirSync(path.dirname(copied), {recursive: true}); fs.writeFileSync(copied, checkout, {mode: fs.statSync(target).mode & 0o777}); how = 'you_deleted'; }
+    else {
+      const start = baselineContent(workspace.cwd, {path: file, before: workspace.baseline[file] ?? null}, workspace.dir) ?? Buffer.alloc(0);
+      fs.writeFileSync(copied, markedMerge(yours, start, checkout));
+      how = 'markers';
+    }
+    if (checkout) {
+      baseline[file] = {hash: hash(checkout), size: checkout.length, mode: fs.statSync(target).mode & 0o777, binary: false, preview: previewOf(checkout.toString('utf8'))};
+      keepContent(workspace.dir, checkout);
+    } else delete baseline[file];
+    refreshed.push({path: file, how});
+  }
+  const updated = {...workspace, baseline, baselineHash: manifestHash(baseline)};
+  atomicJSON(path.join(workspace.cwd, '.attempt-workspace.json'), {...updated, cwd: undefined});
+  return {workspace: updated, refreshed};
+}
+// git merge-file with labelled markers: exit 0 is clean, a positive exit the number of conflicts, both a result.
+function markedMerge(yours, start, checkout) {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-refresh-'));
+  try {
+    for (const [name, data] of [['yours', yours], ['start', start], ['checkout', checkout]]) fs.writeFileSync(path.join(scratch, name), data);
+    const result = spawnSync('git', ['merge-file', '-p', '--diff3', ...MARKER_LABELS, 'yours', 'start', 'checkout'], {cwd: scratch, env: gitEnv(), maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore']});
+    if (result.status === null || result.status < 0 || result.status > 127) throw new Error('git merge-file failed');
+    return result.stdout;
+  } finally {
+    fs.rmSync(scratch, {recursive: true, force: true});
+  }
+}
+// The checkout's version kept by hash, so a later integrate can still merge three ways if the checkout moves again.
+function keepContent(dir, data) {
+  const file = path.join(keptDir(dir), hash(data));
+  if (fs.existsSync(file)) return;
+  fs.mkdirSync(keptDir(dir), {recursive: true, mode: 0o700});
+  fs.writeFileSync(file, data, {mode: 0o600});
 }
 
 const BASELINE_MESSAGE = 'bounce: baseline of the checkout this copy was made from';

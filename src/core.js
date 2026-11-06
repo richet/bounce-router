@@ -145,6 +145,8 @@ export function validateSettings(value) {
   if (typeof value.sidebar !== 'boolean') throw new Error('config.sidebar must be true or false');
   if (value.keepProcess !== undefined && typeof value.keepProcess !== 'boolean') throw new Error('config.keepProcess must be true or false');
   if (value.inline !== undefined && typeof value.inline !== 'boolean') throw new Error('config.inline must be true or false');
+  if (value.verify !== undefined && !['orchestrator', 'worker', 'auto'].includes(value.verify)) throw new Error('config.verify must be orchestrator, worker or auto');
+  if (value.gateSlots !== undefined && (!Number.isInteger(value.gateSlots) || value.gateSlots < 0 || value.gateSlots > 64)) throw new Error('config.gateSlots must be a whole number from 0 (no cap) to 64');
   if (value.taskMinutes !== undefined && (!Number.isInteger(value.taskMinutes) || value.taskMinutes < 1 || value.taskMinutes > 240)) throw new Error('taskMinutes must be a whole number of minutes from 1 to 240');
   if (value.taskCeilingMinutes !== undefined && (!Number.isInteger(value.taskCeilingMinutes) || value.taskCeilingMinutes < 1 || value.taskCeilingMinutes > 240 || value.taskCeilingMinutes < (value.taskMinutes ?? 15))) throw new Error('taskCeilingMinutes must be a whole number of minutes from 1 to 240, and at least taskMinutes');
   if (value.reports !== undefined && !['plain', 'structured'].includes(value.reports)) throw new Error('reports must be "plain" or "structured"');
@@ -186,6 +188,13 @@ export function config(root = dataRoot()) {
   Object.defineProperty(value, 'migratedProfiles', {value: migrated, enumerable: false});
   return value;
 }
+// The checkout's origin URL, recorded on the session row: a worker's vendor session runs in a copy outside the project,
+// so a reader of it (bounce lineage) learns the project from here. Null outside a git checkout or with no origin.
+function originOf(cwd) {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+  try { return execFileSync('git', ['remote', 'get-url', 'origin'], {cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']}).trim() || null; } catch { return null; }
+}
+
 export class Session {
   constructor(cwd, {root = dataRoot(), id} = {}) {
     this.root = root;
@@ -207,7 +216,10 @@ export class Session {
     this.nextSeq = journal.nextSeq;
     this.listeners = new Set(); this.subscriberErrors = []; this.emitQueue = []; this.emitting = false; this.writerUsable = true;
     this.cwd = this.events.find(e => e.kind === 'session')?.cwd ?? fs.realpathSync(cwd);
-    if (!this.events.length) this.append({kind: 'session', cwd: this.cwd, text: this.cwd, schemaVersion: 2, policyVersion: 2, runtime: process.version});
+    if (!this.events.length) {
+      const repository = originOf(this.cwd);
+      this.append({kind: 'session', cwd: this.cwd, text: this.cwd, ...(repository ? {repository} : {}), schemaVersion: 2, policyVersion: 2, runtime: process.version});
+    }
     this.active = this.events.findLast(e => e.kind === 'route')?.provider;
   }
   append(event) {
@@ -423,7 +435,7 @@ export class Router {
   // `typed` is the slash line a prompt was expanded from (vendor-commands.js); the journal
   // keeps the expansion as the request — that is what a fallback agent and later turns must
   // read — and the typed line only for the transcript.
-  async run(prompt, files = [], {typed} = {}) {
+  async run(prompt, files = [], {typed, via, caller} = {}) {
     if (this.controller) throw new Error('A turn is already running');
     this.controller = new AbortController();
     const {signal} = this.controller;
@@ -436,7 +448,7 @@ export class Router {
     try {
       const images = saveImages([...new Set([...imagePaths(prompt, s.cwd), ...files.map(file => path.resolve(s.cwd, file))])], s);
       const isFirstPrompt = !s.events.some(e => e.kind === 'user');
-      s.append({kind: 'user', text: prompt, ...(typed ? {typed} : {}), ...(images.length ? {images} : {})});
+      s.append({kind: 'user', text: prompt, ...(typed ? {typed} : {}), ...(via ? {via} : {}), ...(caller ? {caller} : {}), ...(images.length ? {images} : {})});
       if (isFirstPrompt) { try { this.onFirstUserPrompt(s, this.settings); } catch {} }
       s.append({kind: 'checkpoint', ...gitSnapshot(s.cwd)});
       const first = s.active && cfg.order.includes(s.active) ? s.active : cfg.order[0];

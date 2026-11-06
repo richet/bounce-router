@@ -6,6 +6,7 @@ export function formatTaskView(view) {
   const rows = [
     `${view.task} · ${view.state}${view.profile ? ` · ${view.profile}` : ''}${view.ai ? ` (${view.ai})` : ''}${view.elapsed ? ` · ${view.elapsed}` : ''}${view.inPlace ? ' · in place' : ''}`,
     line('orders', view.orders),
+    view.replacedBy ? `replaced by: ${view.replacedBy.task} · ${view.replacedBy.state}` : null,
     view.inPlace ? `in place: authorized by "${view.inPlace.message}"${view.inPlace.jev ? ` · jev ${view.inPlace.jev.verdict}` : ''}` : null,
     view.lease ? `lease: ${view.lease.minutes} min${view.lease.renewals ? ` · renewed ${view.lease.renewals}×` : ''}` : null,
     view.reviewer ? `review: ${view.reviewer}${view.verdict ? ` · ${view.verdict.verdict}` : ' · running'}` : null,
@@ -32,5 +33,5 @@ export function formatTaskView(view) {
 }
 
 export const formatTaskList = rows => rows.length
-  ? rows.map(row => `${row.task.slice(0, 8)} · ${row.state.padEnd(9)} · ${(row.profile ?? '').padEnd(12)} · ${(row.elapsed ?? '').padStart(7)}${row.findings ? ` · ${row.findings} findings` : ''}${row.doing ? ` · ${row.doing}` : ''}`).join('\n')
+  ? rows.map(row => `${row.task.slice(0, 8)} · ${row.state.padEnd(9)} · ${(row.profile ?? '').padEnd(12)} · ${(row.elapsed ?? '').padStart(7)}${row.findings ? ` · ${row.findings} findings` : ''}${row.doing ? ` · ${row.doing}` : ''}${row.replacedBy ? ` · replaced by ${row.replacedBy.task.slice(0, 8)} (${row.replacedBy.state})` : ''}`).join('\n')
   : 'No tasks.';

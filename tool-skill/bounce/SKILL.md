@@ -48,10 +48,29 @@ Team, bindings, orchestrator model, cloud-only and parallel workspaces: follow `
     bounce task TASK [--json]                   # one task: state, milestones, findings, summary
     bounce attach REF [--json]                  # reopen its view; --json streams the journal
     bounce stop REF                             # cancel its task tree and end its daemon
+    bounce watch REF [--after N] [--timeout S]  # block until done (0), needs you (2), quiet --idle min (3), timeout (4)
+    bounce watch REF --done                     # only the job's end: its answer and the branches it delivered
+    bounce send --session REF "verify=worker"   # who verifies, live: orchestrator | worker | auto
+    bounce reserve NAME VALUE --session REF     # hold a shared name (migration 0045, port 5433); --next N takes the first free
+    bounce reservations [--session REF]         # what this project's sessions hold; bounce release NAME VALUE gives one back
+    bounce prune --ended --older-than 7d --yes  # remove workers' copies of stopped sessions whose task ended (without --yes: list)
+    git config bounce.delivery branch           # in a checkout: never write accepted work into it; report the worker's branch to fetch
 
 REF is a session name, id or unique id prefix. With no `--session`, `send` picks the one live session in the
 current directory. For tools instead of shell calls, register the control server once:
 `claude mcp add bounce-control -- bounce mcp-serve --control` (sessions, status, tasks, task, send, answer, guide).
+
+`watch` replaces polling `tasks`: it prints `--after N` with every return; pass it on the next call so what was
+already reported is not reported again. `--idle` defaults to 10 minutes. A detached run is done when its daemon exits.
+
+Two runs on one project share nothing else: before giving each run a migration number, port or database name in its
+orders, reserve it for that run's session; a refusal names the session that holds it. The orchestrator reserves its
+own the same way and releases them when the task that uses them ends.
+
+A project whose checkout must never be written by accepted work sets `git config bounce.delivery branch` there once.
+The work then stays on the worker's own branch in its copy, the outcome names the copy, branch, head and tree for a
+`git fetch`, and orders must name that branch and have the worker commit on it. `bounce prune` keeps such a copy
+until its head is in the checkout.
 
 Stopping a session or sending into one the user is driving changes their work: confirm first.
 

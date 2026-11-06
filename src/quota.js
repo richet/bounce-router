@@ -253,7 +253,9 @@ export const windowTitle = label => {
   const text = String(label);
   if (windowTitles[text]) return windowTitles[text];
   const match = /^(1h|5h|1d|7d)\s+(.+)$/.exec(text);
-  if (match) return `${windowTitles[match[1]]}, ${match[2]} only`;
+  // A per-model window is a cap of its own, not a separate allowance: the model's use counts in the plan's window of
+  // the same span too (kb control, 2026-11-05: "Weekly, Fable only" read as if Fable did not spend Weekly).
+  if (match) return `${match[2]} cap, inside ${windowTitles[match[1]]}`;
   return `${text.charAt(0).toUpperCase()}${text.slice(1)} window`;
 };
 // Within a day the wall clock is the quickest read; a weekly window needs the distance instead.

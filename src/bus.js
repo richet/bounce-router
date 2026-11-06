@@ -14,7 +14,7 @@ const DECIDABLE = new Set(['blocked', 'reviewing', 'input_required']);
 
 // Peers publish from a positive allowlist: everything a session, the scheduler or the daemon writes is refused regardless of `from`,
 // because handoff() folds user/note rows into every later prompt and Router reads cooldown rows.
-const PEER_KINDS = new Set(['plan.submitted', 'task.submitted', 'task.milestone', 'task.blocked', 'task.input_required', 'task.usage', 'task.activity', 'message', 'task.accepted', 'task.rework', 'task.cancel', 'agents.defined', 'state', 'lesson.learned', 'worker.retire', 'worker.compact']);
+const PEER_KINDS = new Set(['plan.submitted', 'task.submitted', 'task.milestone', 'task.blocked', 'task.input_required', 'task.usage', 'task.activity', 'message', 'task.accepted', 'task.rework', 'task.cancel', 'agents.defined', 'state', 'lesson.learned', 'worker.retire', 'worker.compact', 'reservation.taken', 'reservation.released']);
 const USER_ONLY_PREFIX = 'control.';
 // The scheduler alone owns task lifecycle transitions; a peer may report progress
 // (milestone/blocked/input_required/usage/activity), ask for work (submitted) or
@@ -106,7 +106,7 @@ export async function reapStaleSockets({platform = process.platform, uid = proce
 // being refused, so it never costs the orchestrator a whole turn over an old habit.
 const PLAN_NOT_REVIEWED_NOTE = 'plans are no longer reviewed: dispatch the tasks themselves (task.submitted)';
 
-export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = AUTH_TIMEOUT, validate = () => null, prepare = null, report: receiveReport = null, lesson: receiveLesson = null, retire: retireWorker = null, compact: compactWorker = null, accept: acceptOverride = null, rework: reworkOverride = null, cancel: cancelOverride = null}) {
+export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = AUTH_TIMEOUT, validate = () => null, prepare = null, report: receiveReport = null, lesson: receiveLesson = null, retire: retireWorker = null, compact: compactWorker = null, accept: acceptOverride = null, rework: reworkOverride = null, cancel: cancelOverride = null, reservations = null}) {
   const grants = new Map(); // peer -> {peer, tasks, canSubmit, context, token, file, sockets}
   const tokenToPeer = new Map();
   const tokensDir = path.join(dir, 'tokens');
@@ -214,6 +214,14 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         if (e.retryOf !== undefined && (!authenticated.tasks.includes(e.retryOf) || typeof e.retryOf !== 'string')) return refuse(id, -32001, 'unauthorized retry');
         // A continuation resumes another task's worker: only a task of one's own.
         if (e.continues !== undefined && (!authenticated.tasks.includes(e.continues) || typeof e.continues !== 'string')) return refuse(id, -32001, 'unauthorized continuation');
+        // Shared names the orchestrator reserved for this task's orders (src/reservations.js): bound to the task, they
+        // end when it ends. One this session does not hold refuses the whole submission.
+        if (e.reservations !== undefined) {
+          if (!Array.isArray(e.reservations) || !e.reservations.length || e.reservations.some(name => typeof name !== 'string' || !name.includes(':'))) return refuse(id, -32602, 'invalid event: reservations: a list of name:value, like ["migration:0045"]');
+          if (!reservations) return refuse(id, -32601, 'reservations are not kept in this session');
+          const bound = reservations.bind({task: e.task, names: e.reservations});
+          if (!bound.ok) return refuse(id, -32602, `invalid event: reservations: ${bound.reason}`);
+        }
       } else if (e.kind === 'plan.submitted') {
         // Plans are no longer reviewed (2026-09-29): a refusal here cost the orchestrator a whole turn
         // for an old habit, so an authorized peer gets an ok with a note instead — nothing is journaled.
@@ -233,7 +241,12 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         // and the refusals cost orchestrator turns; the review sends work back at most once now anyway.
         if (e.kind === 'task.accepted') {
           const submitted = session.events.find(row => row.kind === 'task.submitted' && row.task === e.task);
-          if (submitted?.review?.completion) {
+          // A cancelled task's copy can still hold good work (Nirby control session, 2026-11-04: seven cancelled
+          // builders with green checks, landed by hand). Its owner's accept lands the copy as it is now.
+          if (tasks(session.events)[e.task]?.state === 'cancelled') {
+            if (peer !== 'orchestrator' || typeof acceptOverride !== 'function') return refuse(id, -32001, 'unauthorized');
+            e = {...e, overrides: 'cancelled', text: typeof e.text === 'string' && e.text.trim() ? e.text : 'Accepted by the orchestrator after it was cancelled'};
+          } else if (submitted?.review?.completion) {
             const state = tasks(session.events)[e.task]?.state;
             if (!DECIDABLE.has(state)) return refuse(id, -32602, `invalid event: task.accepted: task ${e.task} is ${state ?? 'unknown'}, with no finished work to accept yet; wait for its outcome${state === 'accepted' ? ' (it is already accepted)' : ''}`);
             const blocked = state === 'blocked' ? session.events.findLast(row => row.kind === 'task.blocked' && row.task === e.task) : null;
@@ -274,6 +287,16 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         catch (error) { return refuse(id, -32602, `invalid event: ${error.message}`); }
         send({jsonrpc: '2.0', id, result: compacted});
         return;
+      } else if (e.kind === 'reservation.taken' || e.kind === 'reservation.released') {
+        // A shared name (a migration number, a port) held for this session against every other session of the project.
+        if (peer !== 'orchestrator' && peer !== 'user') return refuse(id, -32001, 'unauthorized');
+        if (!reservations) return refuse(id, -32601, 'reservations are not kept in this session');
+        const done = e.kind === 'reservation.taken'
+          ? e.next !== undefined ? reservations.next({name: e.name, from: e.next}) : reservations.take({name: e.name, value: e.value})
+          : reservations.release({name: e.name, value: e.value});
+        if (!done.ok) return refuse(id, -32602, done.reason);
+        if (e.kind === 'reservation.released' && !done.released) return refuse(id, -32602, `${e.name} ${e.value} is not reserved`);
+        e = {kind: e.kind, name: e.name, value: done.reservation.value};
       } else if (e.kind === 'lesson.learned') {
         // A lesson is the orchestrator's: one line for a job in this
         // project, kept in .bounce/LESSONS.md by the hook, which says in plain words why one is refused.
@@ -296,7 +319,10 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         // What bounce corrected or noticed about this submission, in the reply the orchestrator reads now.
         const notes = session.events.filter(event => event.kind === 'task.corrected' && event.task === e.task).map(event => event.text);
         if (row && notes.length) row = {...row, notes};
-      } else if (e.kind === 'task.accepted' && e.overrides && typeof acceptOverride === 'function') row = acceptOverride(e);
+      } else if (e.kind === 'task.accepted' && e.overrides && typeof acceptOverride === 'function') {
+        try { row = acceptOverride(e); }
+        catch (error) { return refuse(id, -32602, error.message); }
+      }
       else if (e.kind === 'task.rework' && e.overrides && typeof reworkOverride === 'function') row = reworkOverride(e);
       else if (e.kind === 'task.cancel') {
         if (typeof cancelOverride !== 'function') return refuse(id, -32001, 'unauthorized');

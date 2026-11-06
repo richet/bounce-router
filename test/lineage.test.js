@@ -17,6 +17,7 @@ const orchestratorNative = (minute, sessionId) => at(minute, {kind: 'peer.native
 const workerNative = (minute, task, sessionId, provider = 'codex') => at(minute, {kind: 'peer.native', from: `worker:${task}`, provider, sessionId});
 
 const journal = () => [
+  at(0, {kind: 'session', cwd: '/p/app', repository: 'git@github.com:example/app.git'}),
   at(0, {kind: 'user', text: 'do it', via: 'send', caller: 'control-1', requestId: 'r1'}),
   at(0, {kind: 'main.requested', requestId: 'r1'}),
   at(1, {kind: 'main.started', requestId: 'r1', from: 'main'}),
@@ -34,11 +35,27 @@ const journal = () => [
 test('a worker, its turn and its review each say who they are and when', () => {
   const rows = lineageRows(journal(), 'S');
   assert.deepEqual(rows[0], {v: 1, bounceSession: 'S', provider: 'claude', nativeSession: 'orch-a', level: 'orchestrator', role: 'orchestrator', task: null, attempt: null,
-    parentTask: null, continues: null, replaces: null, requestId: 'r1', requestInferred: false, via: 'send', control: 'control-1', from: clock(1), to: clock(6)});
+    parentTask: null, continues: null, replaces: null, requestId: 'r1', requestInferred: false, via: 'send', control: 'control-1', repository: 'git@github.com:example/app.git', from: clock(1), to: clock(6)});
   assert.deepEqual(rows[1], {v: 1, bounceSession: 'S', provider: 'codex', nativeSession: 'thread-1', level: 'task', role: 'builder', task: 't1', attempt: 1,
-    parentTask: null, continues: null, replaces: null, requestId: 'r1', requestInferred: false, via: 'send', control: 'control-1', from: clock(3), to: clock(5)});
+    parentTask: null, continues: null, replaces: null, requestId: 'r1', requestInferred: false, via: 'send', control: 'control-1', repository: 'git@github.com:example/app.git', from: clock(3), to: clock(5)});
   assert.deepEqual([rows[2].level, rows[2].role, rows[2].task, rows[2].nativeSession, rows[2].from, rows[2].to], ['review', 'reviewer', 't1', 'review-1', clock(7), clock(9)]);
   assert.equal(rows.length, 3);
+});
+
+// Nirby control session, 2026-11-04: a worker's vendor session runs in a copy outside the project, so a reader of it
+// could not tell its project. The session row records the checkout's origin, and every lineage row carries it.
+test('a session records its checkout\'s origin, and lineage rows carry it as repository (null without one)', t => {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-lineage-repo-')));
+  t.after(() => fs.rmSync(dir, {recursive: true, force: true}));
+  const project = path.join(dir, 'app');
+  fs.mkdirSync(project);
+  execFileSync('git', ['init', '-q'], {cwd: project});
+  execFileSync('git', ['remote', 'add', 'origin', 'git@github.com:example/app.git'], {cwd: project});
+  const session = new Session(project, {root: path.join(dir, 'home')});
+  assert.equal(session.events[0].repository, 'git@github.com:example/app.git');
+  const plain = new Session(dir, {root: path.join(dir, 'home2')});
+  assert.equal('repository' in plain.events[0], false, 'not a git checkout: no repository');
+  assert.equal(lineageRows(journal().slice(1), 'S')[0].repository, null);
 });
 
 test('one vendor session serving two tasks gives one row per task, each with its own window', () => {

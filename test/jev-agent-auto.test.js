@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {Session} from '../src/core.js';
-import {createScheduler} from '../src/scheduler.js';
+import {createScheduler, STANDING_RULES} from '../src/scheduler.js';
 import {createJevDecisions, aiQuestions, decideAI, decideRoute} from '../src/jev.js';
 import {validateOrchestration, playedBy} from '../src/profiles.js';
 import {agentMetadata, agentTable} from '../src/agents.js';
@@ -190,7 +190,7 @@ test('scheduler: a job on Jev\'s AI survives a daemon restart and follows the ag
   await waitFor(() => live.launched.length === 2);
   await live.settled(live.scheduler.submit({parent: null, profile: 'reviewer', orders: ORDERS, deadline: null}).task);
   assert.deepEqual(live.launched.map(([name]) => name), ['codex', 'claude', 'codex']);
-  assert.deepEqual(live.prompts, ['You are the reviewer.', 'You are the STRICT reviewer.', 'You are the STRICT reviewer.']);
+  assert.deepEqual(live.prompts, ['You are the reviewer.', 'You are the STRICT reviewer.', 'You are the STRICT reviewer.'].map(prompt => `${prompt}\n\n${STANDING_RULES}`));
 });
 
 // Found by the integration run 2026-10-21: with the operation on classic, `bounce agents` and `bounce local` said

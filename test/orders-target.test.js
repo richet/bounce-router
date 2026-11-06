@@ -4,6 +4,7 @@
 // profile list advertised tiers (so it picked the tier itself), the submit example named a cloud
 // profile, and one sentence said local workers are for when the user asks.
 import test from 'node:test';
+import {verifyingOrders} from '../src/verify-mode.js';
 import fs from 'node:fs';
 import assert from 'node:assert/strict';
 import {choosingOrders, defaultTarget} from '../src/reload.js';
@@ -109,4 +110,16 @@ test('the orders say a worker\'s copy is temporary, and that a worker\'s service
     assert.equal(orders.includes(part), true, part);
   assert.equal(contract.includes('Services you start in your copy (a stack, containers, a server) you stop before you end'), true);
   assert.equal(contract.match(/STOP_SERVICES,/g)?.length, 2, 'both worker contracts carry it');
+});
+
+// kb control session, 2026-11-04 (run a639d737): tasks sat 11–64 min while the orchestrator reran every gate one
+// after another and only then dispatched reviews. The orders say how to verify without that wait.
+test('the orders say: gates in the check and the review in review.completion run at once; builder output with its commit between rounds; every gate seen on the final head', () => {
+  const orders = fs.readFileSync(new URL('../src/reload.js', import.meta.url), 'utf8').replaceAll("\\'", "'");
+  assert.equal(orders.includes('verifyingOrders(verifyMode(session.events, settings.verify))'), true, 'the paragraph is the session\'s verify mode (test/verify-mode.test.js)');
+  const auto = verifyingOrders('auto');
+  for (const part of ['Verifying work (mode: auto): put the gates in the task\'s check', 'bounce runs both at once in the worker\'s copy',
+    'Do not rerun the gates yourself and then dispatch a reviewer', 'names the exact commit it ran on is enough to send the next round',
+    'see every gate pass on the final head', 'a merged tree equal to it needs no rerun', 'name the commit each gate ran on, saying so plainly when one is not the delivered head'])
+    assert.equal(auto.includes(part), true, part);
 });

@@ -153,6 +153,9 @@ export function createOps({env = process.env, connect = connectBus, clock = () =
     // A lesson for this project's workers: the bus keeps the file and refuses in plain words.
     retire: ({worker, handoff, ask = false}) => withClient(false, async client => ({ok: true, row: await client.publish({kind: 'worker.retire', worker: String(worker ?? ''), ...(handoff ? {handoff: String(handoff)} : {}), ...(ask ? {ask: true} : {})})})),
     compact: ({worker}) => withClient(false, async client => ({ok: true, row: await client.publish({kind: 'worker.compact', worker: String(worker ?? '')})})),
+    // A shared name held against every other session of this project (src/reservations.js); the bus refuses in plain words.
+    reserve: ({name, value, next}) => withClient(false, async client => ({ok: true, row: await client.publish({kind: 'reservation.taken', name: String(name ?? ''), ...(next !== undefined ? {next: String(next)} : {value: String(value ?? '')})})})),
+    release: ({name, value}) => withClient(false, async client => ({ok: true, row: await client.publish({kind: 'reservation.released', name: String(name ?? ''), value: String(value ?? '')})})),
     lesson: ({agent, text}) => withClient(false, async client => ({ok: true, row: await client.publish({kind: 'lesson.learned', agent: String(agent ?? 'all'), text: String(text ?? '')})})),
     wait: (match, {timeout = DEFAULT_WAIT_MS, afterSeq = 0} = {}) => withClient(false, async client => {
       const deadline = clock() + timeout;

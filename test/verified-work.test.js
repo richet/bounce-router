@@ -117,7 +117,7 @@ test('a worker sent back after a report bounce wrote is told it stopped without 
   ].join('\n'));
 });
 
-test('a task\'s check runs in the worker\'s copy: a pass is integrated, and the review is shown its output', async t => {
+test('a task\'s check runs in the worker\'s copy beside its review: a pass is integrated', async t => {
   let shown = null;
   const f = setup(t, {
     worker: ({cwd}) => {
@@ -128,7 +128,9 @@ test('a task\'s check runs in the worker\'s copy: a pass is integrated, and the 
   });
   const {task} = f.submit({check: says('new')});
   assert.equal(await f.settled(task), 'accepted');
-  assert.deepEqual(shown, ['npm test: 3 passed', `bounce ran the task's check \`${says('new')}\` in the worker's copy: exit code 0. The end of its output:\nfound`]);
+  // The review runs while the check runs (docs/plans/faster-verification.md), so it is not shown the check's output;
+  // bounce decides with both.
+  assert.deepEqual(shown, ['npm test: 3 passed']);
 
   const [check] = f.rows('task.check', task);
   assert.deepEqual([check.command, check.exit, check.passed, check.output, check.weak ?? false], [says('new'), 0, true, 'found', false]);
@@ -151,7 +153,7 @@ test('a failing check sends the work back once with what it printed; a pass afte
   assert.deepEqual(f.rows('task.rework', task).map(row => row.findings), [[
     'The task\'s check failed. bounce ran `grep new src/x.js || { echo "src/x.js does not say new"; exit 3; }` in your working copy: exit code 3. The end of its output:\nsrc/x.js does not say new\nFix what it reports, and run it yourself before you finish.',
   ]]);
-  assert.equal(f.adapters.reviewer.calls.launch, 1, 'a failing check is not reviewed: the review judges work that passes');
+  assert.equal(f.adapters.reviewer.calls.launch, 2, 'each round is reviewed beside its check; the failed check decided the first');
   assert.equal(f.inCheckout(), 'export const state = "new";\n');
 });
 
@@ -169,7 +171,7 @@ test('a check that still fails after the one send-back holds the work: kept, not
   assert.equal(f.rows('task.rework', task).length, 1);
   assert.equal(f.rows('task.integrated', task).length, 0);
   assert.equal(f.inCheckout(), 'export const state = "old";\n');
-  assert.equal(f.adapters.reviewer.calls.launch, 0);
+  assert.equal(f.adapters.reviewer.calls.launch, 2, 'reviewed beside each check; the failed checks decided');
 });
 
 test('work nothing verified is held, and says all that is missing: bounce wrote the report, the task names no check, and the review still objects after the send-back', async t => {
@@ -349,7 +351,7 @@ test('a weak check that passes does not verify work whose report bounce wrote: i
 
   assert.equal(f.rows('task.blocked', task).at(-1).reason, 'unverified');
   assert.equal(f.rows('task.blocked', task).at(-1).text, `Nothing that runs this work has verified it, so it waits for you and is not in the checkout: the task's check only looks for files or text, and the worker wrote no report (bounce wrote one from what it saw). After the one rework round the review still found: An acceptance criterion in the orders is not met. The work is in ${f.copyOf(task)}. Decide: accept it (task.accepted with what you checked), send it back (task.rework with what to fix), or retry it on another AI (retryOf).`);
-  assert.equal(f.shown.at(-1), 'bounce ran the task\'s check `grep -q new src/x.js` in the worker\'s copy: exit code 0. It printed nothing. This check only looks for files or text; it did not run the work.');
+  assert.equal(f.shown.some(line => line.startsWith('bounce ran the task\'s check')), false, 'reviewed beside the check, before its output exists');
   assert.equal(f.inCheckout(), 'export const state = "old";\n');
 });
 
@@ -465,7 +467,7 @@ test('strategy: every way of accepting finished work holds it when it changed fi
 
 // A worker reads the project's lessons for its job after its agent prompt —
 // in the orders for a cloud worker, in the agent definition for a local one — and not another job's.
-test('a worker is handed the project\'s lessons for its job with its agent prompt, and not another job\'s', async t => {
+test('a worker is handed the standing worker rules and the project\'s lessons for its job with its agent prompt, and not another job\'s', async t => {
   let launched = null;
   const f = setup(t, {worker: args => { launched = args; write(args.cwd, 'export const state = "new";\n'); return [{kind: 'result', status: 'completed', text: ownReport('state is now "new"')}]; }});
   fs.mkdirSync(path.join(f.session.cwd, '.bounce'), {recursive: true});
@@ -478,7 +480,34 @@ test('a worker is handed the project\'s lessons for its job with its agent promp
   await waitFor(() => ['completed', 'accepted', 'blocked', 'failed'].includes(scheduler.tasks()[task]?.state));
 
   const block = 'Lessons from earlier sessions in this project:\n- Put evidence inside the working copy.\n- A check must run the work.';
-  assert.equal(launched.profile.agent.prompt, `You are a builder.\n\n${block}`, 'the agent definition a local worker runs as');
-  assert.equal(launched.orders.startsWith(`You are a builder.\n\n${block}\n\n---\n\nMake state "new"`), true, launched.orders.slice(0, 300));
+  // Nirby control session, 2026-11-04: a worker printed file names from the owner's private export in its tool output.
+  // A builder ran two suites at once in one copy and each wiped the other's test databases; another linked a file into
+  // /opt/homebrew/bin. Both rules ride with every worker.
+  const standing = ['Standing rules for every worker:',
+    '- Owner data: when the project holds the owner\'s personal data (exports, archives, mail, messages, notes), show its structure and counts only. Never print its file names, contents or excerpts in commands, output or your report.',
+    '- One test run at a time: never start a test suite while another is running in this working copy, in the background or in parallel. Suites share the project\'s test databases and wipe each other\'s.',
+    '- Stay in your working copy: create, edit, link or install files only inside it and the system temp directory. Never change anything outside it (global packages, /opt/homebrew, /usr/local, ~/.config, shell profiles, other checkouts). If the task needs that, stop and say so in your report.'].join('\n');
+  assert.equal(launched.profile.agent.prompt, `You are a builder.\n\n${standing}\n\n${block}`, 'the agent definition a local worker runs as');
+  assert.equal(launched.orders.startsWith(`You are a builder.\n\n${standing}\n\n${block}\n\n---\n\nMake state "new"`), true, launched.orders.slice(0, 300));
   assert.equal(launched.orders.includes('PASS or FAIL'), false, 'the reviewer\'s line is not the builder\'s');
+});
+
+// kb control, 2026-11-05 (d4b515ea): the owner restricted feedback decisions to the web session after the order went
+// out; the orchestrator told the worker, but the round-3 review graded against the original order and called the
+// restriction a blocker. A completion reviewer gets what was said to the worker after its orders.
+test('a completion reviewer is handed what the worker was told after its orders, in order', async t => {
+  let seen = null, session = null;
+  const f = setup(t, {
+    worker: ({cwd}) => {
+      write(cwd, 'export const state = "new";\n');
+      session.append({kind: 'message', to: `worker:${session.events.findLast(e => e.kind === 'task.submitted').task}`, text: 'Owner decision: only the web session may decide; answer 403 feedback_decision_owner_only otherwise.', from: 'orchestrator'});
+      return [edited, {kind: 'result', status: 'completed', text: ownReport('state is now "new"')}];
+    },
+    reviewer: ({orders}) => { seen = orders; return verdict('accept'); },
+  });
+  session = f.session;
+  const submitted = f.submit({check: says('new')});
+  assert.equal(await f.settled(submitted.task), 'accepted');
+  assert.match(seen, /--- said to the worker after its orders \(they change or add to them: grade against them too\) ---\n.*message: Owner decision: only the web session may decide; answer 403 feedback_decision_owner_only otherwise\./);
+  assert.ok(seen.indexOf('--- said to the worker after its orders') < seen.indexOf('--- worker report ---'), 'before the report');
 });

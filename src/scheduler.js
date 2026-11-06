@@ -4,14 +4,15 @@ import {randomUUID, createHash} from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import {createAttemptWorkspace, captureArtifact, integrateArtifact, advanceBaseline, reviewDiff} from './workspace-artifacts.js';
+import {readDelivery, deliverBranch, saveWip} from './branch-delivery.js';
+import {createAttemptWorkspace, captureArtifact, integrateArtifact, advanceBaseline, refreshConflicts, reviewDiff} from './workspace-artifacts.js';
 import * as reducers from './reducers.js';
 import {takeCheckpoint, sameTree} from './checkpoint.js';
 import {POLICY_RANK, effectivePolicy, LOCAL_ADAPTERS, playedBy, READ_ONLY_ROLES as READONLY_ROLES} from './profiles.js';
 import {modelVersion} from './bindings.js';
 import {defaultStrategy} from './strategy.js';
-import {reportEvent, validateReport, remainingWork} from './reporting.js';
-import {inspectFinalReport, synthesizeReport, synthesizeReportFromChanges, FINAL_REPORT_INSTRUCTION} from './final-report.js';
+import {reportEvent, validateReport, remainingWork, TEXT_MAX} from './reporting.js';
+import {inspectFinalReport, synthesizeReport, synthesizeReportFromChanges, FINAL_REPORT_INSTRUCTION, withoutToolMarkup} from './final-report.js';
 import {lessonsBlock} from './lessons.js';
 import {skillsInUse, skillsBlock} from './skills.js';
 import {workersView, idleWorkerOf, nextWorkerName, pendingHandoffFor} from './workers.js';
@@ -29,6 +30,20 @@ import {routingFallback, PROFILE_TIERS} from './jev.js';
 import {validOwns} from './owned-paths.js';
 import {execFileSync} from 'node:child_process';
 import {parseVerdict} from './verdict.js';
+import {watchedDirs, snapshot as outsideSnapshot, outsideChanges, outsideFinding} from './outside-writes.js';
+
+// What a completion reviewer is told when bounce runs the task's check beside its review (kb control session,
+// 2026-11-04): the gates are covered, so it reads; a reviewer told it could not run commands stopped as blocked,
+// though reading files took the shell.
+export const checkBesideReview = command => `bounce runs this task's check (${String(command).slice(0, 300)}) itself, at the same time as your review: do not run tests, the stack CLI or anything that writes. Read the change with read-only commands (cat, sed, grep, git show, git diff, git log).`;
+
+// Rules every worker and reviewer reads, whatever its job or project (Nirby control session, 2026-11-04): a worker
+// printed file names from the owner's private export in its tool output; a builder ran two suites at once in one copy
+// and each wiped the other's test databases; a builder linked a file into /opt/homebrew/bin.
+export const STANDING_RULES = ['Standing rules for every worker:',
+  "- Owner data: when the project holds the owner's personal data (exports, archives, mail, messages, notes), show its structure and counts only. Never print its file names, contents or excerpts in commands, output or your report.",
+  "- One test run at a time: never start a test suite while another is running in this working copy, in the background or in parallel. Suites share the project's test databases and wipe each other's.",
+  '- Stay in your working copy: create, edit, link or install files only inside it and the system temp directory. Never change anything outside it (global packages, /opt/homebrew, /usr/local, ~/.config, shell profiles, other checkouts). If the task needs that, stop and say so in your report.'].join('\n');
 const processAlive = pid => { try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } };
 
 const FALLBACK_REASONS = new Set(['limited', 'missing', 'backend_unavailable', 'watchdog', 'local_unavailable', 'local_busy', 'worker_runtime', 'incomplete_report']);
@@ -127,6 +142,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   machineSlots = createMachineSlots(),
   // Runs a task's check (src/task-check.js): the command its orders name as proof the work is done.
   checkRunner = runCheck, checkTimeoutMs = CHECK_TIMEOUT_MS,
+  // Full gate runs at once on this machine, across every session (config gateSlots; 0: no cap): a check waits for a
+  // slot, it never fails for want of one (kb control, 2026-11-05: one run takes 8 CPU and 16 GB).
+  gateSlots = 0, gatePollMs = 2000,
+  // The directories watched for writes outside a worker's copy (src/outside-writes.js); null: the ones on PATH.
+  outsideDirs = null,
   sessionMode = 'yolo', depthCap = 1, checkpointRunner, limits: suppliedLimits = {}, strict = false, requireFinalReport = false, reportFormat = 'structured', reportGrant = null, clock = () => Date.now(), watchdog: suppliedWatchdog = {}, strategy = defaultStrategy, jev = null, gitHead = defaultGitHead, maxConcurrentCloud = 3}) {
   // Sizing limits (lines/probes/minutes) gate dispatch ONLY when the caller configures them: a
   // task's declared size is otherwise informational. The old built-in 150/6/15 defaults refused
@@ -140,6 +160,23 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   const intervalOk = watchdogConfig.interval === null || isPositiveInt(watchdogConfig.interval);
   if (!intervalOk || !isPositiveInt(watchdogConfig.startupMs) || !isPositiveInt(watchdogConfig.silence) || !isPositiveInt(watchdogConfig.stall) || !isPositiveInt(watchdogConfig.grace) || !isPositiveInt(watchdogConfig.concludeGrace) || !isPositiveInt(watchdogConfig.concludeCap) || !isPositiveInt(watchdogConfig.reportOnly)) throw new Error('malformed: watchdog');
   const handles = new Map(); // task -> {adapter, handle}
+  // A writing worker's attempt: what the PATH directories held when it started, compared when it ends.
+  const outsideBefore = new Map(); // `${task}:${attempt}` -> {before, dirs, copy}
+  const watchOutside = (task, attempt, profile, owned) => {
+    if (profile.policy === 'read-only') return;
+    const dirs = outsideDirs ?? watchedDirs({exclude: [path.join(session.root, 'w'), session.dir, session.cwd]});
+    if (dirs.length) outsideBefore.set(`${task}:${attempt}`, {before: outsideSnapshot(dirs), dirs, copy: owned?.cwd ?? null});
+  };
+  const outsideAfter = row => {
+    const key = `${row.task}:${row.attempt}`;
+    const watched = outsideBefore.get(key);
+    if (!watched) return;
+    outsideBefore.delete(key);
+    const changes = outsideChanges(watched.before, outsideSnapshot(watched.dirs));
+    if (!changes.length) return;
+    append({kind: 'task.finding', task: row.task, attempt: row.attempt, source: 'outside_write', paths: changes.map(change => change.path),
+      finding: {severity: 'warning', title: 'Written outside the working copy'}, text: `FINDING: ${outsideFinding(changes, watched.copy)}`, from: 'bounce', context: row.context});
+  };
   let closed = false;
   const cancellationRequests = new Set();
   const reviews = new Map(); // task -> {adapter, handle}, one review in flight per task (A3)
@@ -310,18 +347,37 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const submitted = event.task ? session.events.find(e => e.kind === 'task.submitted' && e.task === event.task) : null;
     const row = {...submitted && {jobId: submitted.jobId}, ...event, time: stamp()};
     if (row.kind === 'task.completed') {
-      if (!submitted?.review?.completion && !publishArtifact(row.task, row)) return null;
+      // A task with a check lands only once it passes (handleCompleted), review or not. Found 2026-11-05: without a
+      // review, the work was written into the checkout before its check ran.
+      if (!submitted?.review?.completion && !submitted?.check && !publishArtifact(row.task, row)) return null;
       const actionId = `completion:${row.task}:${reducers.tasks(session.events)[row.task]?.attempt ?? 0}`;
       requestAction(session, {actionId, type: 'completion', task: row.task}, [row]);
       return session.events.findLast(e => e.kind === row.kind && e.task === row.task);
     }
     if (['task.failed', 'task.cancelled', 'task.deadline', 'task.accepted', 'task.rejected'].includes(row.kind)) {
+      if (['task.cancelled', 'task.deadline', 'task.failed'].includes(row.kind)) keepWip(row.task, row.context);
       requestTerminal(row, [row]);
       return session.events.findLast(e => e.kind === row.kind && e.task === row.task);
     }
-    return session.append(row);
+    const written = session.append(row);
+    if (row.kind === 'task.attempt.ended') outsideAfter(row);
+    return written;
   };
   const publish = event => closed ? null : session.publish({...event, time: stamp()});
+  // A task ending unfinished keeps what it left uncommitted in its copy as refs/wip/<task8> (src/branch-delivery.js
+  // saveWip), and says where, so the next attempt does not start without it.
+  function keepWip(task, context) {
+    const copy = session.events.findLast(e => e.kind === 'task.workspace' && e.task === task)?.cwd;
+    if (!copy || copy === session.cwd || !fs.existsSync(copy) || session.events.some(e => e.kind === 'task.wip' && e.task === task)) return;
+    let saved = null;
+    try { saved = saveWip({copy, task}); } catch (error) {
+      session.append({kind: 'diagnostic', task, text: `could not save the unfinished work in ${copy}: ${error.message}`, context, time: stamp()});
+      return;
+    }
+    if (!saved) return;
+    session.append({kind: 'task.wip', task, copy, ...saved, context, time: stamp(),
+      text: `Unfinished work saved: ${saved.files} uncommitted file${saved.files === 1 ? '' : 's'} in ${copy} as ${saved.ref} (commit ${saved.commit.slice(0, 12)}). To build on it, name it in the next orders: git fetch ${copy} ${saved.ref}.`});
+  }
   const localActivity = (task, attempt, context) => event => {
     if (reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state) || launchingAttempts.get(task)?.cancelReason) return;
     append({kind: 'task.milestone', task, attempt, phase: event.phase, text: String(event.text).slice(0, 2000), next: 'continue local worker', context});
@@ -1016,16 +1072,29 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     }
     return append({kind: 'worker.retired', worker, profile: found.profile, by, ...(text ? {handoff: text} : {}), ...(ask ? {asked: true} : {}), ...(context ? {context} : {})});
   }
-  // The agent prompt plus the project's lessons for its job and the index of the skills in use, when there are any and
+  // The agent prompt plus the standing worker rules, the project's lessons for its job and the index of the skills in use, when there are any and
   // the profile has a job. A skill is named by its path in the checkout, which the copy rewrites to its own (the copy
   // carries the skills); an in-place worker reads the user's skills where they are.
   const withLessons = (profile, row = {}) => {
     if (!profile.agent?.prompt || !profile.role) return profile;
     const inUse = skillsInUse(session.root, session.cwd);
     const fileOf = skill => row.inPlace && inUse.source !== 'project' ? path.join(skill.dir, 'SKILL.md') : path.join(session.cwd, '.bounce', 'skills', skill.name, 'SKILL.md');
-    const blocks = [lessonsBlock(session.cwd, profile.role), skillsBlock(inUse.skills, fileOf)].filter(block => block && !profile.agent.prompt.includes(block));
+    const blocks = [STANDING_RULES, lessonsBlock(session.cwd, profile.role), skillsBlock(inUse.skills, fileOf)].filter(block => block && !profile.agent.prompt.includes(block));
     if (!blocks.length) return profile;
     return {...profile, agent: {...profile.agent, prompt: [profile.agent.prompt, ...blocks].join('\n\n')}};
+  };
+  // What a completion critic reads as the worker's report: its whole answer. The one-line summary alone was a document's
+  // title, and the critic failed the work as "only the title" (Nirby control session, 2026-11-04); a report's text is
+  // cut at TEXT_MAX, so a cut one gives way to the worker's own output of that attempt.
+  const workerAnswer = task => {
+    const summary = reducers.tasks(session.events)[task]?.summary ?? '';
+    const reported = session.events.findLast(e => e.kind === 'task.reported' && e.task === task);
+    const output = session.events.findLast(e => e.kind === 'task.output' && e.task === task && (!reported || e.attempt === reported.attempt));
+    let text = typeof reported?.text === 'string' ? reported.text : '';
+    const whole = withoutToolMarkup(output?.text);
+    if (text.length >= TEXT_MAX && whole.length > text.length) text = whole;
+    if (!text.trim()) return summary;
+    return !summary || text.includes(summary) ? text : `${summary}\n\n${text}`;
   };
   const toWorkingCopy = (text, workspace) => {
     const source = fs.realpathSync(session.cwd);
@@ -1099,15 +1168,50 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return false;
   }
 
+  // A cancelled task's copy, captured as it is now: committed or not, its files are the work. Its worker is stopped,
+  // so nothing writes the copy meanwhile. publishArtifact then integrates it like any accepted work.
+  function captureCancelled(task) {
+    const workspace = existingWorkspace(task);
+    if (!workspace) throw new Error(`task ${task} has no working copy to land: it ran read-only or in the checkout, or its copy was removed`);
+    const artifact = captureArtifact(workspace);
+    const context = submittedRow(task)?.context;
+    append({kind: 'task.artifact', task, attempt: reducers.tasks(session.events)[task]?.attempt,
+      artifactId: artifact.id, digest: artifact.digest, resultHash: artifact.resultHash,
+      file: path.join(workspace.dir, 'artifacts', `${artifact.id}.json`), dir: workspace.dir, cwd: workspace.cwd, after: 'cancelled', context});
+    if (artifact.unsupported.length) throw new Error(`task ${task}'s copy holds changes bounce cannot integrate: ${artifact.unsupported.map(entry => `${entry.path} (${entry.reason})`).join(', ')}`);
+  }
+
   // An owner's accept of finished work (blocked, under review, asking for input) closes the task the way a review does:
   // the isolated work integrates into the checkout first and the accepted row lands after it, or the
   // task blocks on the integration failure. Observed live: the row journaled directly left the task
   // blocked and its fix unintegrated.
   function acceptOverride(event) {
+    if (event.overrides === 'cancelled') captureCancelled(event.task);
     const row = {...event, stage: 'completion', context: event.context ?? submittedRow(event.task)?.context};
     if (!publishArtifact(row.task, row)) return session.events.findLast(e => e.kind === 'task.integration.requested' && e.task === row.task);
     append(row);
     return session.events.findLast(e => e.kind === 'task.accepted' && e.task === row.task);
+  }
+
+  // A task blocked by a refused integration and sent back: the refused files of its copy are brought up to the checkout
+  // first (refreshConflicts), and the worker is told what each one needs. Nothing for any other send-back.
+  const REFRESH_NOTES = {
+    markers: file => `${file}: the checkout changed it too. Your copy now holds both versions with conflict markers; keep what both meant and remove the markers.`,
+    you_deleted: file => `${file}: you deleted or moved it, and the checkout edited it. The checkout's version is back in your copy; delete it again only if that is still right.`,
+    checkout_deleted: file => `${file}: the checkout deleted or moved it, and you edited it. Your version is still in your copy; delete it if the checkout was right.`,
+    binary: file => `${file}: a binary file both sides changed; bounce cannot merge it. Rebuild or replace it so it fits the checkout.`,
+  };
+  function refreshRefused(task, context) {
+    const blocked = session.events.findLast(e => e.task === task && ['task.blocked', 'task.rework', 'task.started'].includes(e.kind));
+    if (blocked?.kind !== 'task.blocked' || blocked.reason !== 'integration_conflict' || !blocked.paths?.length) return [];
+    const workspace = existingWorkspace(task);
+    if (!workspace) return [];
+    const {refreshed} = refreshConflicts(workspace, blocked.paths);
+    append({kind: 'task.milestone', task, phase: 'refreshed', reason: 'integration_conflict', paths: blocked.paths, refreshed,
+      text: `Brought ${refreshed.length} refused file${refreshed.length === 1 ? '' : 's'} of the copy up to the checkout: ${blocked.paths.join(', ')}`, context});
+    return ['Your change was refused because the checkout changed the same files since your copy was made. Your copy is now up to date with the checkout for them:',
+      ...refreshed.map(({path: file, how}) => REFRESH_NOTES[how](file)),
+      'A generated file (a lockfile, a golden fixture, a numbered migration) is regenerated or renumbered, never merged by hand. Then run the checks again.'];
   }
 
   // The symmetric "send back": an owner's rework verdict on finished work. This IS a
@@ -1121,7 +1225,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const context = event.context ?? row.context;
     const root = budgetRootOf(task, reducers.tasks(session.events));
     const round = api.roundsUsed(task) + 1;
-    const findings = [event.text];
+    const findings = [event.text, ...refreshRefused(task, context)];
     append({kind: 'budget.reserved', task, root, amount: {rounds: 1}, context});
     append({kind: 'task.rework', task, round, findings, overrides: event.overrides, context});
     void resumeWorker({task, row, round, findings, context});
@@ -1250,6 +1354,36 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // Runs the task's check on the work that just completed, once per completion, in the worker's own
   // copy (an in-place task has none: its work is already in the checkout). False when the task moved
   // on while it ran, for the caller to stop.
+  // The files a check runs on, as git names them: the copy's HEAD and the tree hash of its working files, written
+  // through a temporary index so the copy's own index is untouched. A merged tree equal to this one needs no rerun
+  // (kb control session, 2026-11-04). Empty when the copy has no git.
+  function verifiedTree(copy) {
+    const index = path.join(os.tmpdir(), `bounce-tree-${process.pid}-${randomUUID()}`);
+    const env = {...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))), GIT_INDEX_FILE: index};
+    const git = (...args) => execFileSync('git', args, {cwd: copy, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']}).trim();
+    try {
+      const head = git('rev-parse', '--verify', '-q', 'HEAD');
+      git('read-tree', 'HEAD');
+      git('add', '-A');
+      return {head, tree: git('write-tree')};
+    } catch { return {}; } finally { fs.rmSync(index, {force: true}); }
+  }
+  // A machine-wide gate slot for one check (gateSlots); null when the scheduler closed while it waited.
+  async function gateSlot(task, attempt, context) {
+    const started = Date.now();
+    if (!gateSlots) return {release: () => {}, waitedMs: 0};
+    let told = false;
+    for (;;) {
+      if (closed) return null;
+      const got = machineSlots.acquire({url: 'bounce-gates', slots: gateSlots, holder: {session: session.id, task, kind: 'gate'}});
+      if (got.ok) return {release: () => machineSlots.release(got.token), waitedMs: Date.now() - started};
+      if (!told) {
+        told = true;
+        append({kind: 'task.milestone', task, attempt, phase: 'check', text: `Waiting for a gate slot: ${got.holders.length} of ${gateSlots} gate runs on this machine are in use. The check runs when one is free.`, next: 'run the check', context});
+      }
+      await new Promise(resolve => setTimeout(resolve, gatePollMs));
+    }
+  }
   async function ensureCheck(task, row, context) {
     const completedSeq = completedSeqOf(task);
     if (completedSeq === null || checkRowOf(task)) return true;
@@ -1259,10 +1393,16 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       append({kind: 'task.check', task, attempt, completedSeq, command: row.check, passed: null, text: 'The task\'s check was not run: the worker has no working copy to run it in', context});
       return true;
     }
-    append({kind: 'task.milestone', task, attempt, phase: 'check', text: `Running the task's check: ${row.check}`, next: 'review and integrate if it passes', context});
-    const outcome = await checkRunner({command: row.check, cwd: copy, timeoutMs: checkTimeoutMs});
+    const slot = await gateSlot(task, attempt, context);
+    if (!slot) return false;
+    let outcome, verified;
+    try {
+      append({kind: 'task.milestone', task, attempt, phase: 'check', text: `Running the task's check: ${row.check}`, next: 'review and integrate if it passes', context});
+      verified = verifiedTree(copy);
+      outcome = await checkRunner({command: row.check, cwd: copy, timeoutMs: checkTimeoutMs});
+    } finally { slot.release(); }
     if (closed || completedSeqOf(task) !== completedSeq || !['completed', 'reviewing'].includes(reducers.tasks(session.events)[task]?.state)) return false;
-    append({kind: 'task.check', task, attempt, completedSeq, ...outcome, cwd: copy, context,
+    append({kind: 'task.check', task, attempt, completedSeq, ...outcome, ...verified, queuedMs: slot.waitedMs, cwd: copy, context,
       text: `The task's check ${outcome.passed ? 'passed' : 'failed'}: ${row.check}`});
     return true;
   }
@@ -1272,17 +1412,28 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (!t) return;
     const row = submittedRow(task);
     const context = row?.context;
-    if (row?.check && !(await ensureCheck(task, row, context))) return;
+    // A task with a completion review runs its check and its review at the same time; the verdict waits for the
+    // check (kb control session, 2026-11-04: tasks sat 11–64 min while gates ran before any review).
+    let checking = null;
+    if (row?.check && !checkRowOf(task) && row.review?.completion) checking = ensureCheck(task, row, context);
+    else if (row?.check && !(await ensureCheck(task, row, context))) return;
     const view = reducers.tasks(session.events);
     const hook = invokeHook(() => strategy.onCompleted(task, view, api), task, context);
     if (!hook.ok) return;
     let intent = hook.intent;
+    // No review: a task with a check that passed lands now, as an accept by its check.
+    if (intent === 'none' && row?.check && checkRowOf(task)?.passed === true) intent = {action: 'accept', by: 'check'};
     if (intent === 'none') return;
     // Only work known to have changed files goes to the reviewer agent; anything else (a read-only task has no
     // artifact) is accepted, as an unsure Jev accepts a report that changed nothing. Unverified changes still
     // take the review path, whose verdict strategy holds them for the orchestrator.
     if (intent?.action === 'review' && jevReviewOff(intent.reviewers) && !api.unverifiedChanges(task)
       && !(changesOf(task)?.length && escalationReviewer({lean: REVIEW_OFF, reviewers: intent.reviewers, profiles, changes: changesOf(task)}))) intent = {action: 'accept'};
+    // Anything but a review decides with the check in hand.
+    if (checking && intent?.action !== 'review') {
+      if (!(await checking)) return;
+      return handleCompleted(task);
+    }
     // A check that failed: the work goes back once, or is held for the orchestrator.
     if (intent && typeof intent === 'object' && (intent.action === 'rework' || intent.action === 'escalate')) {
       if (!['completed', 'reviewing'].includes(view[task]?.state)) return;
@@ -1300,12 +1451,12 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // this task.accepted first, by subscriber order, and resolves with it: the bus's
       // `wait.served` names this row's seq, and main-service's pendingHandoffs() has nothing
       // later to announce.
-      const accepted = {kind: 'task.accepted', task, stage: 'completion', by: 'strategy', context};
+      const accepted = {kind: 'task.accepted', task, stage: 'completion', by: intent.by ?? 'strategy', context};
       if (publishArtifact(task, accepted)) append(accepted);
       return;
     }
     if (intent && typeof intent === 'object' && intent.action === 'review') {
-      await runCompletionReview(task, intent);
+      await runCompletionReview(task, intent, {checking});
       return;
     }
     append({kind: 'task.failed', task, reason: 'strategy', text: 'malformed onCompleted intent', context});
@@ -1622,6 +1773,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // this task's own copy and told where it is, instead of a stranger being launched. Probed with the
       // real CLIs (2026-10-01): OpenCode, Claude and Codex all edit the new copy once told.
       const continuation = row.continues ? continuationOf(row, profile) : null;
+      watchOutside(task, attempt, profile, owned);
       const common = {task, attempt, context, signal: admission?.signal,
         onActivity: LOCAL_ADAPTERS.has(profile.adapter) ? localActivity(task, attempt, context) : undefined,
         report: requireFinalReport ? ({report: payload}) => report({task, attempt, context, report: payload}) : undefined};
@@ -1728,6 +1880,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       profile = withLessons(profile, row);
       if (owned && profile.agent?.prompt) profile = {...profile, agent: {...profile.agent, prompt: toWorkingCopy(profile.agent.prompt, owned)}};
       append({kind: 'task.launch.requested', task, attempt, executionKey: `${task}:${attempt}`, resumed: true, context});
+      if (!reportOnly) watchOutside(task, attempt, profile, owned);
       if (owned) message = inWorkingCopy(message, owned);
       // A reportOnly turn asks in plain words on purpose (requestPlainAnswer): the JSON schema
       // reminder below is for every OTHER resume, never appended onto that one turn back.
@@ -1930,6 +2083,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // A stream that broke after the reviewer spoke still carries what it said: read that too.
     const verdict = parseVerdict(resultStatus, resultText ?? '');
     if (streamError) resultText = streamError.message;
+    if (reviewEntry.stopReason) resultText = reviewEntry.stopReason;
     append({kind: 'review.finished', task, stage, round, candidateSeq: review.candidateSeq ?? null, candidateDigest: review.candidateDigest ?? null, verdict: verdict.verdict, text: resultText ?? null, from: peer, context});
     return verdict;
   }
@@ -2170,7 +2324,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       const lead = withLessons(reviewProfile, row).agent?.prompt;
       const roleLead = lead && reviewProfile.adapter !== 'opencode' && reviewProfile.adapter !== 'typesafe' ? `${lead}\n\n---\n\n` : '';
       const orders = roleLead + (stage === 'completion'
-        ? (reviewProfile.role === 'verifier' ? row.steps : `${row.orders}\n\n--- worker report ---\n${reducers.tasks(session.events)[task]?.summary ?? ''}`)
+        ? (reviewProfile.role === 'verifier' ? row.steps : `${row.orders}${afterOrders(task)}\n\n--- worker report ---\n${workerAnswer(task)}${row.check ? `\n\n${checkBesideReview(row.check)}` : ''}`)
         : row.orders);
       // What a decision-model reviewer (typesafe) judges: the raw orders, the worker's final
       // report and the tree's HEAD when the lineage's first worker started — the diff base.
@@ -2252,7 +2406,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return verdicts;
   }
 
-  async function runCompletionReview(task, reviewIntent, {note = null} = {}) {
+  async function runCompletionReview(task, reviewIntent, {note = null, checking = null} = {}) {
     const view = reducers.tasks(session.events);
     const t = view[task];
     if (!t || t.state !== 'reviewing') return; // stale trigger (already handled, or never entered review)
@@ -2290,6 +2444,16 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     }
     verdicts = await reviewDownChain({task, round, reviewer: agentReviewer ?? reviewers[0], verdicts, row, context, root, note, stale});
     if (!verdicts) return;
+    // The check that ran beside the review decides first: a failed one sends the work back whatever the review said.
+    if (checking) {
+      if (!(await checking) || stale()) return;
+      const first = invokeHook(() => strategy.onCompleted(task, reducers.tasks(session.events), api), task, context);
+      if (!first.ok) return;
+      if (first.intent && typeof first.intent === 'object' && (first.intent.action === 'rework' || first.intent.action === 'escalate')) {
+        await applyVerdictIntent(first.intent, {task, stage: 'completion', row, round, context, root, reviewIntent: null});
+        return;
+      }
+    }
 
     const hook = invokeHook(() => strategy.onReviewVerdict(task, verdicts, reducers.tasks(session.events), api), task, context);
     if (!hook.ok) return;
@@ -2592,7 +2756,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const entry = target.review ? [...reviews.values()].find(item => item.task === task && item.handle) : handles.get(task);
     const delivered = (tier, text = null) => append({kind: 'task.delivered', task, tier, message: row.id, text, from: 'bounce', context: row.context});
     if (target.entry && (entry !== target.entry || entry?.handle.turnId !== target.turnId)) return delivered('failed', 'turn changed before delivery');
-    if (!entry || reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) return delivered('queued', 'no live worker');
+    // A task under review is often already `completed`: its reviewer is live while the review runs.
+    if (!entry || (!target.review && reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state))) return delivered('queued', 'no live worker');
     if (typeof row.text !== 'string') return delivered('queued', 'no text');
     let outcome;
     try {
@@ -2639,7 +2804,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     let best = null;
     for (const e of session.events) {
       if (e.task !== task) continue;
-      if (e.kind === 'task.milestone' || e.kind === 'task.blocked' || e.kind === 'task.usage') best = Math.max(best ?? -Infinity, Date.parse(e.time));
+      // A new review is a new reviewer: it is warned before it is stopped, whatever the one before it did.
+      if (e.kind === 'task.milestone' || e.kind === 'task.blocked' || e.kind === 'task.usage' || e.kind === 'review.started') best = Math.max(best ?? -Infinity, Date.parse(e.time));
       // Same exclusion as reducers.watchdog: the watchdog's own corrective delivery is not a
       // reset trigger for the signature it was sent because of.
       else if (e.kind === 'task.delivered' && (e.tier === 'live' || e.tier === 'next-turn')) {
@@ -2793,12 +2959,24 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (!corrected.length) {
       append({kind: 'policy.corrected', task: r.task, reason, text: `${reason} for ${elapsedSeconds} s`, context: row?.context});
       const text = `bounce watchdog: ${reason} for ${elapsedSeconds} s — ${reportInstruction(profiles[row?.profile])} with op:milestone and evidence, or op:blocked with the blocker; include phase, text and next`;
-      append({kind: 'message', to: workerFrom(r.task), from: 'bounce', text, context: row?.context});
+      // In review the silence is the reviewer's: the builder has finished and cannot answer for it.
+      append({kind: 'message', to: r.stage === 'review' ? reviewFrom(r.task) : workerFrom(r.task), from: 'bounce', text, context: row?.context});
       return;
     }
     const correctedAt = Date.parse(corrected.at(-1).time);
     // Missing authored milestones are not evidence of a dead worker while observed work
     // continues. Silence or the hard deadline may terminate it; missing reports alone may not.
+    if (reason === 'silent' && now >= correctedAt + watchdogConfig.grace && r.stage === 'review') {
+      // Only the review stops: it ends unreadable and goes down the reviewer's chain, then to the orchestrator.
+      // Cancelling the task threw away builders' work that had passed its check (Nirby, f1ea92b8, 2026-11-04).
+      const entry = [...reviews.values()].find(item => item.task === r.task && item.handle);
+      if (entry && !entry.stopReason) {
+        entry.stopReason = 'The reviewer was silent through correction and grace; its review was stopped';
+        append({kind: 'policy.escalated', task: r.task, reason: 'review_stopped', text: entry.stopReason, context: row?.context});
+        await stopReview(entry);
+      }
+      return;
+    }
     if (reason === 'silent' && now >= correctedAt + watchdogConfig.grace) {
       append({kind: 'policy.escalated', task: r.task, reason: 'cancelled', text: `${reason} persisted through correction and grace`, context: row?.context});
       await cancel(r.task, {reason: 'watchdog'});
@@ -2848,6 +3026,57 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const attempt = row.attempt ?? reducers.tasks(session.events)[row.task]?.attempt ?? 0;
     requestAction(session, {actionId: `terminal:${row.task}:${row.kind}:${attempt}`, type: 'terminal', task: row.task, payload: {kind: row.kind}}, events);
   }
+  // Branch delivery (docs/plans/branch-delivery.md): true when the project's setting took this action, and the
+  // checkout was not written. A setting bounce cannot read blocks the task; it never falls back to the checkout.
+  // What the task's last check ran on, against what is delivered: a check on an earlier commit or tree is named, so
+  // nobody takes it for a check of the delivered head (kb control, 2026-11-05: gates on c980170, delivered 6a69639).
+  // A refused integration blocks the task again even from a state that otherwise ends it: a cancelled task being landed,
+  // or a completed one whose check passed with no review (src/reducers.js).
+  const reopensFor = task => ['cancelled', 'completed'].includes(reducers.tasks(session.events)[task]?.state) ? {reopens: true} : {};
+  // What the worker was told after its orders: messages to it and the findings it was sent back with. They change or
+  // add to the orders, so a reviewer grades against them too (kb control, 2026-11-05, d4b515ea: a later owner decision,
+  // relayed to the worker, was called a blocker by a review that saw only the original order).
+  function afterOrders(task) {
+    const said = session.events.filter(e => (e.kind === 'message' && e.to === `worker:${task}`) || (e.kind === 'task.rework' && e.task === task))
+      .slice(-12).map(e => e.kind === 'message'
+        ? `${String(e.time ?? '').slice(0, 16)} message: ${String(e.text ?? '').slice(0, 3000)}`
+        : `${String(e.time ?? '').slice(0, 16)} sent back with: ${(Array.isArray(e.findings) ? e.findings.join('; ') : String(e.text ?? '')).slice(0, 3000)}`);
+    return said.length ? `\n\n--- said to the worker after its orders (they change or add to them: grade against them too) ---\n${said.join('\n')}` : '';
+  }
+  function checkedOn(task, delivered) {
+    const check = session.events.findLast(e => e.kind === 'task.check' && e.task === task && typeof e.passed === 'boolean');
+    if (!check) return {checkedTree: null, checkNote: 'No check ran on it.'};
+    const verdict = check.passed ? 'passed' : 'FAILED';
+    if (check.tree === delivered.tree) return {checkedTree: check.tree, checkedHead: check.head ?? null, checkNote: `The check ${verdict} on this tree.`};
+    return {checkedTree: check.tree ?? null, checkedHead: check.head ?? null, checkStale: true,
+      checkNote: `NOT CHECKED AS DELIVERED: the check ${verdict} on tree ${String(check.tree).slice(0, 12)} (head ${String(check.head).slice(0, 12)}), not on this tree.`};
+  }
+  // Up to five paths, then how many more; a folder's files collapse to the folder.
+  function ignoredSample(paths) {
+    const folders = [...new Set(paths.map(file => file.includes('/') ? `${file.split('/')[0]}/` : file))];
+    return `${folders.slice(0, 5).join(', ')}${folders.length > 5 ? ` and ${folders.length - 5} more` : ''}`;
+  }
+  function deliverAsBranch(action, artifact, copy, continuation) {
+    const reopens = reopensFor(action.task);
+    const setting = readDelivery(session.cwd);
+    if (setting.error) {
+      append({kind: 'task.blocked', task: action.task, reason: 'integration_settings', ...reopens, text: `${setting.error}. Nothing was written into the checkout.`, artifactId: artifact.id});
+      return true;
+    }
+    if (setting.delivery !== 'branch') return false;
+    const delivered = copy ? deliverBranch({copy, checkout: session.cwd}) : {error: 'delivery_no_copy'};
+    if (delivered.error) {
+      const why = {delivery_detached: 'the worker\'s copy is not on a branch', delivery_uncommitted: `the worker left changes uncommitted: ${delivered.paths?.join(', ')}`, delivery_no_copy: 'the worker\'s copy is gone'}[delivered.error];
+      append({kind: 'task.blocked', task: action.task, reason: delivered.error, ...reopens, text: `Not delivered: ${why}. Nothing was written into the checkout; the copy is kept.`, ...(delivered.paths ? {paths: delivered.paths} : {}), artifactId: artifact.id});
+      return true;
+    }
+    const checked = checkedOn(action.task, delivered);
+    if (!session.events.some(e => e.kind === 'task.integrated' && e.task === action.task && e.artifactId === artifact.id)) append({kind: 'task.integrated', task: action.task, artifactId: artifact.id, resultHash: artifact.resultHash,
+      delivery: 'branch', copy, ...delivered, ...checked,
+      text: `Delivered as branch ${delivered.branch} (head ${delivered.head.slice(0, 12)}, tree ${delivered.tree.slice(0, 12)}) in ${copy}, not written into the checkout: git fetch ${copy} ${delivered.branch}. ${checked.checkNote}${delivered.ignoredAdded ? ` WARNING: it adds ${delivered.ignoredAdded.length} file${delivered.ignoredAdded.length === 1 ? '' : 's'} the project ignores (committed with git add -f): ${ignoredSample(delivered.ignoredAdded)}` : ''}`});
+    append(continuation);
+    return true;
+  }
   const effects = createActionRunner({session, handlers: {
     integrate: action => {
       try {
@@ -2855,9 +3084,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
         const artifact = JSON.parse(fs.readFileSync(file, 'utf8'));
         if (artifact.id !== artifactId) throw new Error('artifact identity mismatch');
         const copy = session.events.findLast(e => e.kind === 'task.artifact' && e.task === action.task)?.cwd ?? null;
+        if (deliverAsBranch(action, artifact, copy, continuation)) return;
         const result = integrateArtifact({cwd: session.cwd, artifact, dir, base: copy});
         if (result.status !== 'integrated') {
-          append({kind: 'task.blocked', task: action.task, reason: `integration_${result.status}`, text: `Artifact integration ${result.status}${result.paths?.length ? `: ${result.paths.join(', ')}` : result.path ? `: ${result.path}` : ''}; isolated work preserved`, ...(result.paths ? {paths: result.paths} : {}), artifactId});
+          append({kind: 'task.blocked', task: action.task, reason: `integration_${result.status}`, ...reopensFor(action.task), text: `Artifact integration ${result.status}${result.paths?.length ? `: ${result.paths.join(', ')}` : result.path ? `: ${result.path}` : ''}; isolated work preserved`, ...(result.paths ? {paths: result.paths} : {}), artifactId});
           return;
         }
         if (!session.events.some(e => e.kind === 'task.integrated' && e.task === action.task && e.artifactId === artifactId)) append({kind: 'task.integrated', task: action.task, artifactId, resultHash: artifact.resultHash,

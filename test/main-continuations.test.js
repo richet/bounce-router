@@ -356,3 +356,16 @@ test('no sweep while a task runs, with sweepMinutes 0, or with nothing held', as
   await advance(60 * 60_000);
   assert.equal(off.events.some(row => row.kind === 'main.requested' && row.sweep), false, 'sweepMinutes 0 is off');
 });
+
+// A `verify=MODE` line sent or typed to a live orchestrator is journaled, and its turn carries the new verifying
+// orders instead of the bare line (src/verify-mode.js; kb control, 2026-11-05).
+test('verify=worker sent to the orchestrator sets the mode and the turn reads the new orders', async t => {
+  const session = fixture(t);
+  const prompts = [];
+  const main = service(t, session, adapter(args => { prompts.push(args.prompt ?? args.orders ?? args.text); return {events: [{kind: 'result', status: 'completed', text: 'ok'}]}; }));
+  const started = main.run({text: 'verify=worker', via: 'send'});
+  assert.equal(started.accepted, true);
+  for (let i = 0; i < 200 && !session.events.some(e => e.kind === 'main.terminal'); i++) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.deepEqual(session.events.filter(e => e.kind === 'control.verify').map(e => e.mode), ['worker']);
+  assert.match(session.events.find(e => e.kind === 'user').text, /^The user set the verification mode to worker\. From now on:\nVerifying work \(mode: worker\)/);
+});

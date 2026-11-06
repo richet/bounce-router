@@ -27,12 +27,18 @@ import {createBus, connectBus} from './bus.js';
 import {validateOrchestration, LOCAL_ADAPTERS} from './profiles.js';
 import {rolesFor} from './agents.js';
 import {recordLesson, lessonsBlock} from './lessons.js';
+import {sessionReservations} from './reservations.js';
 import {normalizeLocalSettings, discoverLocalModels, localCandidates} from './local-models.js';
 import {createLocalActivation} from './local-activation.js';
 import {providers} from './providers.js';
 import {createScheduler} from './scheduler.js';
 import {hostSession} from './remote.js';
 import {createMainService} from './main-service.js';
+import {createRunInbox, pendingSends} from './run-inbox.js';
+import {verifyingOrders, verifyMode} from './verify-mode.js';
+// Full gate runs at once on this machine when config.json says nothing (kb control, 2026-11-05: 8 CPU and 16 GB each).
+const DEFAULT_GATE_SLOTS = 3;
+import {watchSession, formatWatch, WATCH_EXIT, DEFAULT_IDLE_MS} from './session-watch.js';
 import {createViewServer, connectView, requestViewControl} from './view-transport.js';
 
 const CHILD_KILL_GRACE_MS = 1500; // same grace as runProcess's cancel and live-common's verifiedCancel
@@ -334,6 +340,8 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     // The project's lessons: every line, with its job, and how one is recorded.
     ...(() => { const block = lessonsBlock(session.cwd, 'orchestrator'); return block ? ['', block, ''] : []; })(),
     ...ordersSkills(root, session.cwd),
+    verifyingOrders(verifyMode(session.events, settings.verify)), 'The user changes the mode live with `bounce send "verify=orchestrator|worker|auto"`; you are told when it changes.', '',
+    'Shared names: other bounce sessions may be working on this project at the same time, and a worker sees only its own copy. Before you put a shared name in a worker\'s orders (a migration number, a port, a database or branch name), reserve it with the reserve tool (or publish reservation.taken): value for an exact one, next to take the first free one from a number. A refusal names the session that holds it: take the next one. Pass the reserved names to task_submit as reservations, so they are released when that task ends.', '',
     'Lessons: when a task redid work that had been accepted, or a check failed twice, the handoff asks whether there is a lesson. If there is, record it with the lesson tool (or publish lesson.learned): agent (the job it is for, or all) and text (one sentence, imperative, no task ids). It lands in .bounce/LESSONS.md in the project and in every later worker\'s prompt for that job; a person deletes a line to withdraw it. Record what a worker should do differently here, not what happened.', '',
     `Worker profiles (one AI each): ${Object.entries(profiles).filter(([name, p]) => name !== orchestrator && name !== JEV_REVIEWER && !p.derived).map(([name, p]) => p.model ? `${name} (${p.model})` : name).join(', ') || 'none configured'} — name one only when the user asks for that AI, or for a retry (see above).`,
     ...(jev && autoFallback ? [`    auto → ${routingOn ? 'Jev (TypeSafe) routes each task: to the agent above whose job the orders clearly describe (that agent\'s own models then decide the AI), otherwise by the tier the orders need — the first fitting worker profile of that tier in the provider order; unconfident picks go to' : 'Jev routing is off (/jev routing on): resolves to'} ${autoFallback}`] : []),
@@ -395,6 +403,8 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     'You may publish only: task.submitted, task.accepted, task.rework, task.cancel, task.milestone, task.blocked, task.input_required, task.usage, task.activity, message.',
     'A review sends a task back at most once; after that it is accepted, and what the review still found arrives as `advice` on task.accepted — read it before building on the work. Any task holding finished work (blocked, under review, or asking for input) you may accept yourself (task.accepted with `text`) or send back to the same worker (task.rework with `text` naming what to fix).',
     'When you replace a blocked task with a fresh one, or no longer need a task, cancel it with task.cancel and a reason, so its outcome stops waiting.',
+    'When the checkout refuses a task\'s work (blocked `integration_conflict`, the files named), send it back (task.rework): bounce first brings those files of its copy up to the checkout, with conflict markers, and the worker reconciles them. Never copy a worker\'s files or tree into the checkout yourself.',
+    'A cancelled task whose work you still want (its checks were green, its commit was done): accept it (task.accepted with `text`), and bounce lands its copy as it is now, committed or not. If the checkout changed the same files, it comes back blocked `integration_conflict`: send it back as above.',
     'When a worker is blocked or asks for input because it needs a decision, answer it by publishing a message to worker:<task id>: the same worker resumes with your answer. Do not re-dispatch the job as new work for that.',
     '`bounce agents set` journals agents.defined for you.',
     'Everything else is refused — `user`, `control.*`, and every other task lifecycle row the scheduler owns.',
@@ -520,7 +530,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // `strategy:` setting resolved by validateOrchestration (default: defaultStrategy) applies.
   let bus;
   const reportTokens = new Map();
-  const scheduler = createScheduler({session, adapters, profiles, localSettings: settings.local, sessionMode: settings.mode, strict: orchestration.strict, limits: taskLimits(settings), maxConcurrentCloud: settings.maxConcurrentCloud,
+  const scheduler = createScheduler({session, adapters, profiles, localSettings: settings.local, sessionMode: settings.mode, strict: orchestration.strict, limits: taskLimits(settings), maxConcurrentCloud: settings.maxConcurrentCloud, gateSlots: settings.gateSlots ?? DEFAULT_GATE_SLOTS,
     // How a worker ends: a plain answer (the default) or a report in the fixed format (config.json `reports`).
     requireFinalReport: orchestrating, reportFormat: settings.reports ?? 'plain', reportGrant: ({task, attempt, context}) => {
       if (!orchestrating || !bus) return null;
@@ -534,7 +544,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
     const kept = recordLesson(session.cwd, {agent, text}, {agents: new Set([...readRoles().values()].filter(role => !role.error).map(role => role.name)), session: session.id});
     return kept;
   };
-  bus = await createBus({session, dir: session.dir, validate: scheduler.validate, prepare: scheduler.prepare, report: scheduler.report, lesson: keepLesson, retire: scheduler.retireWorker, compact: scheduler.compactWorker, accept: scheduler.acceptOverride, rework: scheduler.reworkOverride, cancel: scheduler.cancelRequest});
+  bus = await createBus({session, dir: session.dir, validate: scheduler.validate, prepare: scheduler.prepare, report: scheduler.report, lesson: keepLesson, retire: scheduler.retireWorker, compact: scheduler.compactWorker, accept: scheduler.acceptOverride, rework: scheduler.reworkOverride, cancel: scheduler.cancelRequest, reservations: sessionReservations(session)});
   const userGrant = bus.grant({peer: 'user', canSubmit: true, tasks: [], context: session.id});
   // daemon.json is written AFTER the SIGTERM/SIGINT handlers are installed (below), never here:
   // it is the daemon's discovery record, so the moment it exists a `stop`/SIGTERM can arrive, and
@@ -564,6 +574,8 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   const orders = () => writeOrders({session, root, bus, grant: orchestratorGrant, profiles, orchestrator: orchestration.orchestrator, jev: jevBlock() ? readJevSettings(root) : null,
     notes: effectiveNotes(profiles, readRosterNotes(root)), roles: readRoles(), settings, adapterNames});
   if (orchestrating) orders();
+  // A live verify change (src/verify-mode.js) rewrites ORDERS.md, so a later turn or a restart reads the new mode.
+  if (orchestrating) session.subscribe(e => { if (e.kind === 'control.verify') { try { orders(); } catch {} } });
   // No agent is asked to describe the roster's models at start: what it wrote changed between askings and routing
   // flipped with it (integration runs 2026-10-22). Routing reads the catalog, pins and LM Studio's own numbers
   // (src/roster-notes.js routingNote); /jev roster refresh still asks, for reading only.
@@ -719,11 +731,19 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
         return {verified: true, afterAck: () => finish(0)};
       }
     }});
+  } else if (orchestrating && positionals[0] === 'run' && detachedDaemon) {
+    // A detached run's own child drives the orchestrator; the inbox lets `bounce send` queue its next turns.
+    viewServer = await createViewServer({session, main: createRunInbox({session}), token: fs.readFileSync(userGrant.file, 'utf8').trim(), onControl: async message => {
+      if (message.action === 'cancel' && message.task) await scheduler.cancel(message.task);
+      else if (message.action === 'stop') await scheduler.stop();
+    }});
   }
   // Now discoverable: a signal from here on is caught by onSigterm and torn down cleanly.
   writeDaemonJson(session.dir, {pid: process.pid, bus: bus.path, started: new Date().toISOString(), userToken: userGrant.file,
+    // `bounce watch` reads it: a run's daemon exits when the job ends, so only that exit says it is done.
+    ...(positionals[0] === 'run' ? {run: true} : {}),
     ...(viewServer ? {view: viewServer.path, protocol: 1, profile: orchestratorProfile} : {})});
-  if (viewServer) {
+  if (viewServer && main) {
     await new Promise(resolve => { if (finished) resolve(); else wakeViewDaemon = resolve; });
     return;
   }
@@ -732,20 +752,30 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // to already have run, via control.stop/SIGTERM) before the daemon is allowed to
   // exit — a headless `run --detach` whose child process already closed must still
   // stay up while a delegated task runs.
+  // A message sent with `bounce send` meanwhile (src/run-inbox.js) ends the wait too: 'sent', and a run child is
+  // started again to take it as its next turn (Nirby control, 2026-11-05: it sat "queued" for an hour, unrun).
   function waitForDrain() {
+    const sent = () => orchestrating && pendingSends(session.events).length > 0;
     return new Promise(resolve => {
-      if (finished || allRootsTerminal()) return resolve();
-      const unsub = session.subscribe(() => { if (finished || allRootsTerminal()) { unsub(); resolve(); } });
+      if (!finished && sent()) return resolve('sent');
+      if (finished || allRootsTerminal()) return resolve('drained');
+      const unsub = session.subscribe(() => {
+        if (!finished && sent()) { unsub(); resolve('sent'); }
+        else if (finished || allRootsTerminal()) { unsub(); resolve('drained'); }
+      });
     });
   }
 
   let resume = values.resume ? {id: session.id} : null;
+  let carryOnly = false;
   for (;;) {
     if (finished) break;
     const childArgs = args.filter(a => a !== '--detach');
     const childEnv = {
       ...process.env, BOUNCE_SUPERVISED: '1', BOUNCE_REMOTE_SESSION: '1',
       BOUNCE_RESTART: resume ? JSON.stringify(resume) : '',
+      // The run's prompt has been answered: this child only carries the job (sent messages, outcomes).
+      BOUNCE_RUN_CARRY: carryOnly ? '1' : '',
     };
     // Removed first, then set only in orchestrator mode: a classic run must not inherit a stale
     // (or hostile) BOUNCE_ROLE/BOUNCE_BUS from whoever started the daemon.
@@ -797,7 +827,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
     }
     if (outcome.code !== 75 || !outcome.request) {
       if (detachedDaemon) {
-        await waitForDrain();
+        if (await waitForDrain() === 'sent' && !finished) { carryOnly = true; continue; }
       } else {
         // Attached: a live task must not keep `bounce run` alive forever just because
         // its own child process exited — cancel the tree the same way `stop` does.
@@ -996,6 +1026,40 @@ async function sendCommand(args) {
   process.exitCode = sent.accepted && (!values.wait || sent.status === 'completed') ? 0 : 1;
 }
 
+// bounce watch [SESSION] [--after SEQ] [--idle MIN] [--done] [--timeout SEC] [--json]: block until the session is done (exit 0),
+// needs its controller (2), has written nothing for --idle minutes (3), or --timeout passes (4). With --done, only the
+// end of the job (src/session-watch.js watchDone), with its answer and what it delivered. Journal only, no socket.
+async function watchCommand(args, {pollMs = 1000} = {}) {
+  const {positionals, values} = parseArgs({args: args.slice(1), allowPositionals: true, options: {
+    session: {type: 'string'}, after: {type: 'string'}, idle: {type: 'string'}, timeout: {type: 'string'}, done: {type: 'boolean'}, json: {type: 'boolean'}}});
+  const number = (flag, value, what) => {
+    if (value === undefined) return undefined;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed < 0 || (what !== 'a row number' && parsed === 0)) throw new Error(`--${flag} takes ${what}`);
+    return parsed;
+  };
+  const after = number('after', values.after, 'a row number') ?? 0;
+  const idleMs = (number('idle', values.idle, 'minutes, a positive number') ?? DEFAULT_IDLE_MS / 60000) * 60000;
+  const timeout = number('timeout', values.timeout, 'seconds, a positive number');
+  const root = dataRoot();
+  const ref = values.session ?? positionals[0] ?? listSessions(root).find(row => row.live && row.cwd === fs.realpathSync(process.cwd()))?.id;
+  if (!ref) throw new Error('watch needs a session: bounce watch <session>');
+  const id = resolveSessionRef(root, ref);
+  const dir = path.join(root, 'sessions', id);
+  const deadline = timeout === undefined ? Infinity : Date.now() + timeout * 1000;
+  for (;;) {
+    const info = readDaemonJson(dir);
+    const live = Boolean(info && pidAlive(info.pid));
+    const result = watchSession(new Session(process.cwd(), {root, id}).events, {after, live, run: Boolean(info?.run), done: Boolean(values.done), idleMs});
+    if (result.outcome !== 'waiting' || Date.now() >= deadline) {
+      console.log(values.json ? JSON.stringify(result) : formatWatch(result, id));
+      process.exitCode = WATCH_EXIT[result.outcome];
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, Math.min(pollMs, Math.max(0, deadline - Date.now()))));
+  }
+}
+
 async function stopCommand(args) {
   const id = resolveOrRaw(args[1]);
   if (!id) { console.error('bounce: stop requires a session id'); process.exitCode = 2; return; }
@@ -1046,6 +1110,7 @@ export async function supervise(args = process.argv.slice(2), {spawnChild = spaw
   if (command === 'attach') return attachCommand(args);
   if (command === 'send') return sendCommand(args);
   if (command === 'stop') return stopCommand(args);
+  if (command === 'watch') return watchCommand(args);
   if (command === 'run' && args.includes('--detach')) return detachRun(args, {spawnChild});
   if (command === 'run') return daemonSupervise(args, {spawnChild, updateInstall, adapters, profiles, strategy, onReady});
   // Phase 9 (interactive orchestrator): the interactive TUI whose config is orchestrator gets the

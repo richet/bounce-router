@@ -1,3 +1,4 @@
+import {applyVerify} from './verify-mode.js';
 import {candidateResult, isReviewGate} from './task-result.js';
 import {LOCAL_ADAPTERS} from './profiles.js';
 import fs from 'node:fs';
@@ -69,12 +70,23 @@ export function handoffBlock(session, ended) {
         ? `${answer.slice(0, HANDOFF_ANSWER_MAX)}\n[… ${answer.length - HANDOFF_ANSWER_MAX} more characters: task_get with full: true]` : answer;
       lines.push('  answer, in the worker\'s words:', `    ${shown.replace(/\n/g, '\n    ')}`);
     }
+    // Something written outside the worker's copy while it ran (src/outside-writes.js): the orchestrator decides whether it stays.
+    for (const finding of session.events.filter(event => event.kind === 'task.finding' && event.task === row.task && event.source === 'outside_write')) {
+      lines.push(`  outside the working copy: ${String(finding.text).replace(/^FINDING: Written outside the working copy while this attempt ran: /, '').slice(0, HANDOFF_TEXT_MAX)}`);
+    }
     // A task.accepted row may carry advice from an unsure Jev review (src/strategy.js jevAdvice):
     // read it before building on the accepted work, not just its summary.
     if (row.kind === 'task.accepted' && row.advice) lines.push(`  advice: ${String(row.advice).slice(0, HANDOFF_TEXT_MAX)}`);
+    // Unfinished work bounce saved from the copy of a task that ended without finishing (src/branch-delivery.js saveWip).
+    const wip = ['task.cancelled', 'task.deadline', 'task.failed'].includes(row.kind) ? session.events.findLast(event => event.kind === 'task.wip' && event.task === row.task) : null;
+    if (wip) lines.push(`  ${wip.text}`);
+    // Branch delivery (src/branch-delivery.js): the work is on the worker's branch in its copy, not in the checkout.
+    const delivered = ['task.completed', 'task.accepted'].includes(row.kind) ? session.events.findLast(event => event.kind === 'task.integrated' && event.task === row.task && event.delivery === 'branch') : null;
+    if (delivered) lines.push(`  ${delivered.text}`);
     // The task's check, as bounce ran it on the accepted work (src/task-check.js).
     const check = row.kind === 'task.accepted' ? session.events.findLast(event => event.kind === 'task.check' && event.task === row.task && typeof event.passed === 'boolean') : null;
-    if (check) lines.push(`  check: ${check.passed ? 'passed' : 'FAILED'} (exit code ${check.exit})${check.passed && check.weak ? ', but it only looks for files or text and did not run the work' : ''} · ${String(check.command).slice(0, 500)}`);
+    // The tree the check ran on: a merged tree equal to it needs no rerun (kb control session, 2026-11-04).
+    if (check) lines.push(`  check: ${check.passed ? 'passed' : 'FAILED'} (exit code ${check.exit})${check.tree ? ` on tree ${check.tree.slice(0, 12)} (head ${String(check.head).slice(0, 12)})` : ''}${check.passed && check.weak ? ', but it only looks for files or text and did not run the work' : ''} · ${String(check.command).slice(0, 500)}`);
     // A correction of accepted work, or a check that failed twice: the moment a lesson is in hand
     //. The orchestrator decides whether there is one.
     const retryOf = session.events.find(event => event.kind === 'task.submitted' && event.task === row.task)?.retryOf;
@@ -110,6 +122,14 @@ export function handoffBlock(session, ended) {
 // `onFirstUserPrompt` fires once, fire-and-forget, right after a NEW session's first `user` row
 // lands (src/session-title.js); a no-op by default so tests never title a session unless they
 // inject one — see reload.js for the live wiring.
+// `bounce send` (src/send.js): a user turn typed outside the view, marked `via: 'send'` so the journal says so, with
+// who sent it in the sender's own words (a label for `bounce lineage`, which nothing trusts for access).
+export function sentByError(params) {
+  if (params.via !== undefined && params.via !== 'send') return 'invalid_via';
+  if (params.caller !== undefined && (params.via !== 'send' || typeof params.caller !== 'string' || !params.caller.trim() || params.caller.length > 200 || /[\r\n]/.test(params.caller))) return 'invalid_caller';
+  return null;
+}
+
 export function createMainService({session, adapters, profile, settings, profiles = {}, readRouting = () => settings,
   orchestratorEnv = {}, brief = '', handoffDelayMs = HANDOFF_DELAY_MS, typedRetryMs = TYPED_RETRY_MS,
   clock = {}, watchdog = {}, onFirstUserPrompt = () => {}}) {
@@ -489,10 +509,10 @@ export function createMainService({session, adapters, profile, settings, profile
     if (params.files !== undefined && (!Array.isArray(params.files) || params.files.some(file => typeof file !== 'string'))) return {accepted: false, reason: 'invalid_attachments'};
     if (params.mode !== undefined && !['yolo', 'plan'].includes(params.mode)) return {accepted: false, reason: 'invalid_mode'};
     if (params.typed !== undefined && (typeof params.typed !== 'string' || !params.typed.startsWith('/'))) return {accepted: false, reason: 'invalid_typed'};
-    // `bounce send` (src/send.js): a user turn typed outside the view, marked so the journal says so.
-    if (params.via !== undefined && params.via !== 'send') return {accepted: false, reason: 'invalid_via'};
-    // Who sent it, in the sender's own words: a label for `bounce lineage`, which nothing trusts for access.
-    if (params.caller !== undefined && (params.via !== 'send' || typeof params.caller !== 'string' || !params.caller.trim() || params.caller.length > 200 || /[\r\n]/.test(params.caller))) return {accepted: false, reason: 'invalid_caller'};
+    const senderError = sentByError(params);
+    if (senderError) return {accepted: false, reason: senderError};
+    // `verify=MODE` (src/verify-mode.js): journaled, and the turn carries the new verifying orders instead.
+    if (!wake) { const verified = applyVerify(session, params.text); if (verified) params = {...params, text: verified}; }
     if (params.routing !== undefined && (!params.routing || !Array.isArray(params.routing.order)
       || params.routing.order.some(p => !['claude', 'codex', 'muse'].includes(p))
       || !params.routing.models || typeof params.routing.models !== 'object'
