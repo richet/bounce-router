@@ -76,7 +76,7 @@ test('V4 the list is what is live, newest last, one line each', () => {
   assert.deepEqual(taskList(two, {now, all: true}).map(row => row.task), ['land', 'probe', 'old']);
 });
 
-// Nirby control session, 2026-11-04: `bounce tasks` showed a re-dispatched task as "cancelled", and control could not
+// Found live, 2026-11-04: `bounce tasks` showed a re-dispatched task as "cancelled", and control could not
 // tell whether the order was still alive. A cancelled or failed task names the task that carries its order now (the
 // end of the chain of replacements and continuations) and that task's state.
 test('a cancelled or failed task names the task that carries its order now, and that task\'s state', () => {

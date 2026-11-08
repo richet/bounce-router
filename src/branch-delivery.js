@@ -37,7 +37,7 @@ export function deliverBranch({copy, checkout = null}) {
 }
 
 // Files the branch adds that the project's ignore rules match: committed with `git add -f`, they are not work the
-// checkout wants (kb control, 2026-11-05: 130 generated files under an ignored docs-out/ rode in on a delivered branch).
+// checkout wants (found live, 2026-11-05: 130 generated files under an ignored output folder rode in on a delivered branch).
 function ignoredAdds(git, checkout) {
   if (!checkout) return {};
   try {
@@ -62,7 +62,7 @@ export function reachedCheckout({checkout, head}) {
 
 // A task that ends unfinished (deadline, cancel) may leave uncommitted work in its copy. It is saved as a commit on
 // refs/wip/<task8> in that copy, on top of its HEAD, without touching its branch, index or files, so a follow-up
-// can fetch it or continue there (kb control, 2026-11-05, eb26873e: a builder hit the 60-minute limit with nothing
+// can fetch it or continue there (found live, 2026-11-05: a builder hit the 60-minute limit with nothing
 // committed). Null when the copy has nothing uncommitted.
 export function saveWip({copy, task}) {
   const run = (args, env = {}) => execFileSync('git', args, {cwd: copy, env: gitEnv({GIT_AUTHOR_NAME: 'wip', GIT_AUTHOR_EMAIL: 'wip@localhost', GIT_COMMITTER_NAME: 'wip', GIT_COMMITTER_EMAIL: 'wip@localhost', ...env}), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe']}).trim();

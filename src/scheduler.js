@@ -32,12 +32,12 @@ import {execFileSync} from 'node:child_process';
 import {parseVerdict} from './verdict.js';
 import {watchedDirs, snapshot as outsideSnapshot, outsideChanges, outsideFinding} from './outside-writes.js';
 
-// What a completion reviewer is told when bounce runs the task's check beside its review (kb control session,
+// What a completion reviewer is told when bounce runs the task's check beside its review (found live,
 // 2026-11-04): the gates are covered, so it reads; a reviewer told it could not run commands stopped as blocked,
 // though reading files took the shell.
 export const checkBesideReview = command => `bounce runs this task's check (${String(command).slice(0, 300)}) itself, at the same time as your review: do not run tests, the stack CLI or anything that writes. Read the change with read-only commands (cat, sed, grep, git show, git diff, git log).`;
 
-// Rules every worker and reviewer reads, whatever its job or project (Nirby control session, 2026-11-04): a worker
+// Rules every worker and reviewer reads, whatever its job or project (found live, 2026-11-04): a worker
 // printed file names from the owner's private export in its tool output; a builder ran two suites at once in one copy
 // and each wiped the other's test databases; a builder linked a file into /opt/homebrew/bin.
 export const STANDING_RULES = ['Standing rules for every worker:',
@@ -143,7 +143,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // Runs a task's check (src/task-check.js): the command its orders name as proof the work is done.
   checkRunner = runCheck, checkTimeoutMs = CHECK_TIMEOUT_MS,
   // Full gate runs at once on this machine, across every session (config gateSlots; 0: no cap): a check waits for a
-  // slot, it never fails for want of one (kb control, 2026-11-05: one run takes 8 CPU and 16 GB).
+  // slot, it never fails for want of one (found live, 2026-11-05: one run takes 8 CPU and 16 GB).
   gateSlots = 0, gatePollMs = 2000,
   // The directories watched for writes outside a worker's copy (src/outside-writes.js); null: the ones on PATH.
   outsideDirs = null,
@@ -1084,7 +1084,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return {...profile, agent: {...profile.agent, prompt: [profile.agent.prompt, ...blocks].join('\n\n')}};
   };
   // What a completion critic reads as the worker's report: its whole answer. The one-line summary alone was a document's
-  // title, and the critic failed the work as "only the title" (Nirby control session, 2026-11-04); a report's text is
+  // title, and the critic failed the work as "only the title" (found live, 2026-11-04); a report's text is
   // cut at TEXT_MAX, so a cut one gives way to the worker's own output of that attempt.
   const workerAnswer = task => {
     const summary = reducers.tasks(session.events)[task]?.summary ?? '';
@@ -1106,7 +1106,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   const inWorkingCopy = (text, workspace) => {
     const source = fs.realpathSync(session.cwd);
     const rewritten = toWorkingCopy(text, workspace);
-    return `${rewritten}\n\nYour working copy is ${workspace.cwd}: it is a copy of the project, and only changes made there are your work: bounce integrates them into the original checkout (${source}) after review, so edit the copy, never the original. What your orders ask you to deliver, evidence and reports included, goes inside this copy at the path they name: a file saved anywhere else on disk is not delivered.${fs.existsSync(path.join(workspace.cwd, '.git')) ? ' It has its own git with the project\'s history: log, diff and status work, and a commit there stays in the copy — bounce integrates your file changes, not commits.' : ''}`;
+    return `${rewritten}\n\nYour working copy is ${workspace.cwd}: it is a copy of the project, and only changes made there are your work: bounce integrates them into the original checkout (${source}) after review, so edit the copy, never the original. What your orders ask you to deliver, evidence and reports included, goes inside this copy at the path they name: a file saved anywhere else on disk is not delivered.${fs.existsSync(path.join(workspace.cwd, '.git')) ? ' It has its own git with the project\'s history: log, diff and status work, and a commit there stays in the copy — bounce integrates your file changes, not commits.' : ''}${workspace.light ? ' It holds the project\'s tracked files and the user\'s uncommitted changes, not what git ignores: install dependencies and build what you need in it before running tests or the check. Files git ignores are never integrated.' : ''}`;
   };
   // task -> where its workspace is. Never the workspace: its baseline lists every file of the project, and a
   // long session kept one per task for good (found live, with 67 tasks, a daemon out of memory).
@@ -1138,7 +1138,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // owns is a hint for the worker and the orchestrator, not a fence any more (2026-09-29): every
     // working copy owns everything, so any change the worker makes is part of its artifact; what
     // actually protects the checkout is integrateArtifact's conflict check against the real file.
-    const workspace = createAttemptWorkspace({cwd: session.cwd, dir, owns: ['**'], attemptId: `${task}-${attempt}`, skills: skillsInUse(session.root, session.cwd).skills,
+    // A light copy for a git checkout (src/workspace-artifacts.js); a folder that is not one is copied whole.
+    const workspace = createAttemptWorkspace({cwd: session.cwd, dir, owns: ['**'], attemptId: `${task}-${attempt}`, skills: skillsInUse(session.root, session.cwd).skills, light: true,
       ...(nested ? {} : {copyRoot: path.join(session.root, 'w')})});
     remember(task, workspace);
     append({kind: 'task.workspace', task, attempt, purpose: 'publish', cwd: workspace.cwd, metadata: path.join(workspace.cwd, '.attempt-workspace.json'), baselineHash: workspace.baselineHash});
@@ -1356,7 +1357,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // on while it ran, for the caller to stop.
   // The files a check runs on, as git names them: the copy's HEAD and the tree hash of its working files, written
   // through a temporary index so the copy's own index is untouched. A merged tree equal to this one needs no rerun
-  // (kb control session, 2026-11-04). Empty when the copy has no git.
+  // (found live, 2026-11-04). Empty when the copy has no git.
   function verifiedTree(copy) {
     const index = path.join(os.tmpdir(), `bounce-tree-${process.pid}-${randomUUID()}`);
     const env = {...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))), GIT_INDEX_FILE: index};
@@ -1413,7 +1414,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const row = submittedRow(task);
     const context = row?.context;
     // A task with a completion review runs its check and its review at the same time; the verdict waits for the
-    // check (kb control session, 2026-11-04: tasks sat 11–64 min while gates ran before any review).
+    // check (found live, 2026-11-04: tasks sat 11–64 min while gates ran before any review).
     let checking = null;
     if (row?.check && !checkRowOf(task) && row.review?.completion) checking = ensureCheck(task, row, context);
     else if (row?.check && !(await ensureCheck(task, row, context))) return;
@@ -2968,7 +2969,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // continues. Silence or the hard deadline may terminate it; missing reports alone may not.
     if (reason === 'silent' && now >= correctedAt + watchdogConfig.grace && r.stage === 'review') {
       // Only the review stops: it ends unreadable and goes down the reviewer's chain, then to the orchestrator.
-      // Cancelling the task threw away builders' work that had passed its check (Nirby, f1ea92b8, 2026-11-04).
+      // Cancelling the task threw away builders' work that had passed its check (found live, 2026-11-04).
       const entry = [...reviews.values()].find(item => item.task === r.task && item.handle);
       if (entry && !entry.stopReason) {
         entry.stopReason = 'The reviewer was silent through correction and grace; its review was stopped';
@@ -3029,12 +3030,12 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // Branch delivery (docs/plans/branch-delivery.md): true when the project's setting took this action, and the
   // checkout was not written. A setting bounce cannot read blocks the task; it never falls back to the checkout.
   // What the task's last check ran on, against what is delivered: a check on an earlier commit or tree is named, so
-  // nobody takes it for a check of the delivered head (kb control, 2026-11-05: gates on c980170, delivered 6a69639).
+  // nobody takes it for a check of the delivered head (found live, 2026-11-05: the gates ran on one commit and another was delivered).
   // A refused integration blocks the task again even from a state that otherwise ends it: a cancelled task being landed,
   // or a completed one whose check passed with no review (src/reducers.js).
   const reopensFor = task => ['cancelled', 'completed'].includes(reducers.tasks(session.events)[task]?.state) ? {reopens: true} : {};
   // What the worker was told after its orders: messages to it and the findings it was sent back with. They change or
-  // add to the orders, so a reviewer grades against them too (kb control, 2026-11-05, d4b515ea: a later owner decision,
+  // add to the orders, so a reviewer grades against them too (found live, 2026-11-05: a later owner decision,
   // relayed to the worker, was called a blocker by a review that saw only the original order).
   function afterOrders(task) {
     const said = session.events.filter(e => (e.kind === 'message' && e.to === `worker:${task}`) || (e.kind === 'task.rework' && e.task === task))

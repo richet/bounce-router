@@ -1,4 +1,4 @@
-// Shared names reserved across parallel sessions of one project (src/reservations.js). Nirby control session,
+// Shared names reserved across parallel sessions of one project (src/reservations.js). Found live,
 // 2026-11-04: run A was given migration 0045, and run B's builder, which saw only its own copy, took 0045 too.
 import test from 'node:test';
 import assert from 'node:assert/strict';

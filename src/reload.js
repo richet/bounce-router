@@ -36,8 +36,17 @@ import {hostSession} from './remote.js';
 import {createMainService} from './main-service.js';
 import {createRunInbox, pendingSends} from './run-inbox.js';
 import {verifyingOrders, verifyMode} from './verify-mode.js';
-// Full gate runs at once on this machine when config.json says nothing (kb control, 2026-11-05: 8 CPU and 16 GB each).
+import {autoPrune} from './prune.js';
+// Full gate runs at once on this machine when config.json says nothing (found live, 2026-11-05: 8 CPU and 16 GB each).
 const DEFAULT_GATE_SLOTS = 3;
+// Copies of ended work held elsewhere (src/prune.js autoPrune) are removed after this many days (0: never), a minute after a daemon starts and every 6 hours.
+const DEFAULT_PRUNE_AFTER_DAYS = 7;
+function scheduleAutoPrune(root, days) {
+  if (!days) return;
+  const run = () => autoPrune({root, olderThanMs: days * 86400000}).catch(() => {});
+  setTimeout(run, 60000).unref?.();
+  setInterval(run, 6 * 3600000).unref?.();
+}
 import {watchSession, formatWatch, WATCH_EXIT, DEFAULT_IDLE_MS} from './session-watch.js';
 import {createViewServer, connectView, requestViewControl} from './view-transport.js';
 
@@ -474,6 +483,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   const detachedDaemon = process.env.BOUNCE_DETACHED === '1' || process.env.BOUNCE_VIEW_DAEMON === '1';
   const root = dataRoot();
   const settings = config(root);
+  scheduleAutoPrune(root, settings.pruneAfterDays ?? DEFAULT_PRUNE_AFTER_DAYS);
   // The live adapters are orchestrator mode's workers; a test may replace any of them by name.
   // Classic mode never dispatches, so registering them costs it nothing.
   const adapters = {claude: createClaudeLive(), codex: createCodexLive(), muse: createMuseLive(), opencode: createOpencodeLive(), typesafe: createTypesafeLive({samples: JEV_SAMPLES, memoFile: path.join(root, 'jev-memo.json')}), ...extraAdapters};
@@ -753,7 +763,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // exit — a headless `run --detach` whose child process already closed must still
   // stay up while a delegated task runs.
   // A message sent with `bounce send` meanwhile (src/run-inbox.js) ends the wait too: 'sent', and a run child is
-  // started again to take it as its next turn (Nirby control, 2026-11-05: it sat "queued" for an hour, unrun).
+  // started again to take it as its next turn (found live, 2026-11-05: it sat "queued" for an hour, unrun).
   function waitForDrain() {
     const sent = () => orchestrating && pendingSends(session.events).length > 0;
     return new Promise(resolve => {

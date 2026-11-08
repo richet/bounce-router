@@ -1,4 +1,4 @@
-// What a worker writes outside its copy while its attempt runs is seen (src/outside-writes.js). Nirby control session,
+// What a worker writes outside its copy while its attempt runs is seen (src/outside-writes.js). Found live,
 // 2026-11-04: a builder linked a file into /opt/homebrew/bin. Workers run with the vendor's sandbox off, so bounce
 // cannot block it; it watches the directories on PATH and names what appeared as a finding of the task.
 import test from 'node:test';

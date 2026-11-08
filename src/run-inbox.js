@@ -1,7 +1,7 @@
 // A detached orchestrated `bounce run` has no main service: its child process drives the orchestrator itself. The
 // inbox is what the daemon's view socket offers in its place, so `bounce send` can steer the run: a sent message is
 // journaled as `send.queued` and the run takes it as its next orchestrator turn (src/cli.js carryJob), journaling
-// main.started and main.terminal under the same requestId so the sender can follow it. Nirby control session,
+// main.started and main.terminal under the same requestId so the sender can follow it. Found live,
 // 2026-11-04: send refused every detached run, so control started one run per batch of orders.
 import {randomUUID} from 'node:crypto';
 import {sentByError} from './main-service.js';

@@ -19,7 +19,7 @@ test('every picker command is documented, and the help is one source for both su
   assert.doesNotMatch(tui, /one terminal/, 'the transcript block already carries the label');
 });
 
-test('bounce --help reads like ace --help: usage, titled groups, one description column, options', () => {
+test('bounce --help reads as usage, titled groups, one description column, options', () => {
   const text = helpText();
   const lines = text.split('\n');
   assert.deepEqual(lines.slice(0, 5), [

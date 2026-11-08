@@ -1,5 +1,6 @@
-// A worker's build output that the project ignores is not part of its work: the rest integrates, and what was left
-// out is named where the orchestrator reads the task (found live: dist/ binaries refused a whole step).
+// A worker's build output that the project ignores is not part of its work: the rest integrates (found live: dist/
+// binaries refused a whole step). A light copy (the default for a git checkout) never takes ignored paths into the work
+// at all, so nothing is refused and nothing needs naming.
 import './helpers/env.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -12,7 +13,7 @@ import {createScheduler} from '../src/scheduler.js';
 import {taskView} from '../src/task-view.js';
 import {fakeAdapter} from './helpers/fake-adapter.js';
 
-test('a worker\'s ignored build output is left out, the rest integrates, and the task names what was left out', async t => {
+test('a worker\'s ignored build output is not part of its work, and the rest integrates', async t => {
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-ignored-')));
   t.after(() => fs.rmSync(base, {recursive: true, force: true}));
   const cwd = path.join(base, 'project');
@@ -22,7 +23,9 @@ test('a worker\'s ignored build output is left out, the rest integrates, and the
   const git = (...args) => execFileSync('git', args, {cwd, stdio: 'ignore'});
   git('init', '-q'); git('add', '.'); git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'base');
   const session = new Session(cwd, {root: path.join(base, 'home')});
-  const worker = {...fakeAdapter(({cwd: copy}) => {
+  let told = '';
+  const worker = {...fakeAdapter(({cwd: copy, orders}) => {
+    told = orders;
     fs.writeFileSync(path.join(copy, 'src', 'cli.js'), 'new\n');
     fs.mkdirSync(path.join(copy, 'dist'));
     fs.writeFileSync(path.join(copy, 'dist', 'kb'), Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0]));
@@ -37,5 +40,6 @@ test('a worker\'s ignored build output is left out, the rest integrates, and the
 
   assert.equal(fs.readFileSync(path.join(cwd, 'src', 'cli.js'), 'utf8'), 'new\n', JSON.stringify(session.events.filter(e => e.kind === 'task.blocked').map(e => e.text)));
   assert.equal(fs.existsSync(path.join(cwd, 'dist')), false);
-  assert.deepEqual(taskView(session.events, task).artifact.leftOut, [{path: 'dist/kb', reason: 'binary'}]);
+  assert.equal(taskView(session.events, task).artifact.leftOut, undefined, 'nothing was refused');
+  assert.match(told, / It holds the project's tracked files and the user's uncommitted changes, not what git ignores: install dependencies and build what you need in it before running tests or the check\. Files git ignores are never integrated\.$/);
 });
