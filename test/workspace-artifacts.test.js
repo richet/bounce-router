@@ -454,18 +454,18 @@ test('a baseline keeps the previews of its files, not their whole text', async t
 const locked = (dir, body) => { fs.chmodSync(dir, 0o555); try { return body(); } finally { fs.chmodSync(dir, 0o755); } };
 test('an ignored path the checkout cannot write is left out and named; the rest integrates', t => {
   const {source, dir} = setup(t);
-  gitRepo(source, {'.gitignore': '/build/\n', 'README.md': 'old\n'});
-  write(source, 'build/manifest.json', '{"v":1}\n'); write(source, 'build/old.json', '{}\n');
+  gitRepo(source, {'.gitignore': '/generated/\n', 'README.md': 'old\n'});
+  write(source, 'generated/manifest.json', '{"v":1}\n'); write(source, 'generated/old.json', '{}\n');
   const copy = createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'locked-ignored'});
   write(copy.cwd, 'README.md', 'new\n');
-  write(copy.cwd, 'build/manifest.json', '{"v":2}\n'); fs.rmSync(path.join(copy.cwd, 'build/old.json'));
+  write(copy.cwd, 'generated/manifest.json', '{"v":2}\n'); fs.rmSync(path.join(copy.cwd, 'generated/old.json'));
   const artifact = captureArtifact(copy);
-  const result = locked(path.join(source, 'build'), () => integrateArtifact({cwd: source, dir, artifact, base: copy.cwd}));
+  const result = locked(path.join(source, 'generated'), () => integrateArtifact({cwd: source, dir, artifact, base: copy.cwd}));
   assert.equal(result.status, 'integrated');
-  assert.deepEqual(result.leftOut, ['build/manifest.json', 'build/old.json'], 'a delete there is left out too');
+  assert.deepEqual(result.leftOut, ['generated/manifest.json', 'generated/old.json'], 'a delete there is left out too');
   assert.equal(fs.readFileSync(path.join(source, 'README.md'), 'utf8'), 'new\n');
-  assert.equal(fs.readFileSync(path.join(source, 'build/manifest.json'), 'utf8'), '{"v":1}\n');
-  assert.equal(fs.existsSync(path.join(source, 'build/old.json')), true);
+  assert.equal(fs.readFileSync(path.join(source, 'generated/manifest.json'), 'utf8'), '{"v":1}\n');
+  assert.equal(fs.existsSync(path.join(source, 'generated/old.json')), true);
 });
 
 test('a project path the checkout cannot write refuses the change before anything is written', t => {
@@ -543,26 +543,34 @@ test('a delete against an edit is refreshed both ways: the copy gets the checkou
   assert.deepEqual([fs.existsSync(path.join(source, 'gone.txt')), fs.readFileSync(path.join(source, 'kept.txt'), 'utf8')], [false, 'worker kept']);
 });
 
-// Nirby control, 2026-11-05 (session 5f266119): a copy carried the checkout's ignored .ace/ folder, Ace's state for
-// that one checkout, with a "record test durations here" marker, so every copy's gates rewrote a tracked file. A copy
-// leaves the project's .ace/ out, as Ace's own workspaces do; Ace runs the copy's stack from ace.yaml without it.
-// What Ace writes there in the copy is never integrated, and a nested .ace/ (a subproject's) is copied as before.
-test('a copy leaves the checkout\'s .ace/ out, never integrates what Ace writes there, and keeps a nested .ace/', () => {
+// Nirby control, 2026-11-07: 331 copies held 483 GB, a kb copy 3 GB of ignored build output (Rust target, dist) against
+// a 20 MB source, and a copied "record test durations here" marker made every copy's gates rewrite a tracked file.
+// A copy leaves out what the project lists in .bounce/copy-exclude and the default build folders git ignores; it
+// keeps everything else, ignored files included, never drops a tracked path, and never reaches inside node_modules.
+test('a copy leaves out the project\'s copy-exclude paths and ignored build folders, and keeps the rest', () => {
   const {source, dir} = setup(test);
   const git = (cwd, ...args) => execFileSync('git', args, {cwd, encoding: 'utf8', env: {...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t'}}).trim();
   git(source, 'init', '-q', '-b', 'main');
-  write(source, 'ace.yaml', 'project: {id: app}\n'); write(source, '.gitignore', '/.ace/\n'); write(source, 'tools/.ace/keep.txt', 'nested\n');
+  write(source, '.gitignore', '/.ace/\n/.env\ntarget/\n/dist/\nnode_modules/\n');
+  write(source, '.bounce/copy-exclude', '# heavy or checkout-only\n.ace/record-test-durations\ndocs/\nlib/tracked.txt\n');
+  write(source, 'build/tracked.txt', 'tracked\n'); write(source, 'lib/tracked.txt', 'kept\n');
   git(source, 'add', '.'); git(source, 'commit', '-qm', 'First commit');
-  write(source, '.ace/record-test-durations', ''); write(source, '.ace/test-timings/shard-1.json', '{}');
-  const copy = createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'ace'});
-  assert.equal(fs.existsSync(path.join(copy.cwd, '.ace')), false, 'the checkout\'s .ace/ stays in the checkout');
-  assert.equal(fs.readFileSync(path.join(copy.cwd, 'ace.yaml'), 'utf8'), 'project: {id: app}\n');
-  assert.equal(fs.readFileSync(path.join(copy.cwd, 'tools/.ace/keep.txt'), 'utf8'), 'nested\n');
+  write(source, '.ace/record-test-durations', ''); write(source, '.ace/test-timings/shard-1.json', '{}'); write(source, '.env', 'KEY=1\n');
+  write(source, 'desktop/src-tauri/target/debug/app', 'binary'); write(source, 'dist/kb', 'binary');
+  write(source, 'docs/notes.md', 'private\n'); write(source, 'web/dist/bundle.js', 'not ignored\n');
+  write(source, 'node_modules/pkg/dist/index.js', 'package\n');
+  const copy = createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'excludes'});
+  const has = rel => fs.existsSync(path.join(copy.cwd, rel));
+  assert.deepEqual(['.ace/record-test-durations', 'desktop/src-tauri/target', 'dist', 'docs'].filter(has), [], 'listed and ignored build paths stay in the checkout');
+  assert.deepEqual(['.ace/test-timings/shard-1.json', '.env', 'build/tracked.txt', 'lib/tracked.txt', 'web/dist/bundle.js', 'node_modules/pkg/dist/index.js'].filter(has),
+    ['.ace/test-timings/shard-1.json', '.env', 'build/tracked.txt', 'lib/tracked.txt', 'web/dist/bundle.js', 'node_modules/pkg/dist/index.js'],
+    'ignored files, tracked paths, a build folder git does not ignore, and packages are copied');
+  assert.deepEqual(copy.excluded.sort(), ['.ace/record-test-durations', 'desktop/src-tauri/target/', 'dist/', 'docs/']);
   assert.equal(git(copy.cwd, 'status', '--porcelain'), '');
-  write(copy.cwd, '.ace/test-timings/shard-1.json', '{"copy":true}'); write(copy.cwd, 'a.txt', 'work\n');
+  write(copy.cwd, 'dist/kb', 'rebuilt'); write(copy.cwd, 'docs/notes.md', 'worker\n'); write(copy.cwd, '.ace/test-timings/shard-1.json', '{"copy":true}'); write(copy.cwd, 'a.txt', 'work\n');
+  assert.equal(git(copy.cwd, 'status', '--porcelain'), '?? a.txt', 'a recreated excluded folder is not the worker\'s change');
   const artifact = captureArtifact(copy);
-  assert.deepEqual(artifact.changes.map(change => change.path), ['a.txt']);
+  assert.deepEqual(artifact.changes.map(change => change.path), ['.ace/test-timings/shard-1.json', 'a.txt']);
   assert.equal(integrateArtifact({cwd: source, dir, artifact}).status, 'integrated');
-  assert.equal(fs.readFileSync(path.join(source, '.ace/test-timings/shard-1.json'), 'utf8'), '{}');
-  assert.equal(fs.existsSync(path.join(source, '.ace/record-test-durations')), true, 'nothing in the checkout\'s .ace/ is read as deleted');
+  assert.deepEqual([fs.readFileSync(path.join(source, 'dist/kb'), 'utf8'), fs.readFileSync(path.join(source, 'docs/notes.md'), 'utf8')], ['binary', 'private\n']);
 });

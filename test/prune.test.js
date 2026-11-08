@@ -157,3 +157,32 @@ test('removing a copy with an ace.yaml takes its stack down with its volumes fir
   const missing = await aceDown(broken, {env: {...process.env, PATH: '/nonexistent'}});
   assert.equal(missing.ok, false);
 });
+
+// Nirby control, 2026-11-07: 331 copies filled the disk because prune only ran when asked. Each daemon now runs the
+// --ended rule itself (pruneAfterDays, default 3): one daemon at a time, logged to prune.log, copies of running
+// sessions and branches not fetched yet kept as always.
+import {autoPrune} from '../src/prune.js';
+test('autoPrune removes ended copies older than the age, one daemon at a time, and logs what it removed', async t => {
+  const {root, copy, session} = home(t);
+  const done = copy('aaaaaaa4'), running = copy('bbbbbbb4');
+  session('old', lived('t-done', done, {kind: 'task.cancelled', task: 't-done', time: at(11)}));
+  session('live', lived('t-run', running), {pid: process.pid});
+  const day = 86400000, now = Date.now() + 4 * day, stackDown = async () => ({ok: true, volumes: []});
+  assert.equal((await autoPrune({root, olderThanMs: 5 * day, now, stackDown})).removed.length, 0, 'younger than the age: kept');
+  fs.writeFileSync(path.join(root, 'prune.lock'), String(process.pid));
+  assert.equal(await autoPrune({root, olderThanMs: 3 * day, now, stackDown}), null, 'another daemon is pruning');
+  fs.rmSync(path.join(root, 'prune.lock'));
+  const result = await autoPrune({root, olderThanMs: 3 * day, now, stackDown});
+  assert.deepEqual(result.removed.map(c => c.name), ['aaaaaaa4']);
+  assert.deepEqual(fs.readdirSync(path.join(root, 'w')), ['bbbbbbb4']);
+  assert.equal(fs.existsSync(path.join(root, 'prune.lock')), false, 'the lock is released');
+  const log = fs.readFileSync(path.join(root, 'prune.log'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  assert.deepEqual(log.map(entry => [entry.removed, entry.failed]), [[[], []], [['aaaaaaa4'], []]]);
+});
+
+import {defaults, validateSettings} from '../src/core.js';
+test('config.pruneAfterDays takes whole days from 0 (never) to 365', () => {
+  const with_ = pruneAfterDays => () => validateSettings({...defaults(), pruneAfterDays});
+  assert.doesNotThrow(with_(0)); assert.doesNotThrow(with_(3));
+  for (const bad of [-1, 1.5, 366, '3']) assert.throws(with_(bad), {message: 'config.pruneAfterDays must be a whole number of days from 0 (never) to 365'});
+});

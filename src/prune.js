@@ -158,3 +158,22 @@ export async function removeCopies(chosen, {stackDown = aceDown} = {}) {
   }
   return {removed, failed};
 }
+
+// Each daemon runs the --ended rule itself (Nirby control, 2026-11-07: 331 copies, 483 GB, a full disk, because prune
+// ran only when asked). One daemon at a time through prune.lock (a dead holder's lock is taken over); every run
+// appends a line to prune.log. Null when another daemon holds the lock.
+export async function autoPrune({root, olderThanMs, now = Date.now(), stackDown = aceDown}) {
+  const lock = path.join(root, 'prune.lock');
+  const take = () => { try { fs.writeFileSync(lock, String(process.pid), {flag: 'wx'}); return true; } catch { return false; } };
+  if (!take()) {
+    if (pidAlive(pidIn(lock))) return null;
+    fs.rmSync(lock, {force: true});
+    if (!take()) return null;
+  }
+  try {
+    const {removed, failed} = await removeCopies(endedCopies(listCopies({root}), {now, olderThanMs}), {stackDown});
+    fs.appendFileSync(path.join(root, 'prune.log'), `${JSON.stringify({time: new Date(now).toISOString(), olderThanDays: olderThanMs / 86400000,
+      removed: removed.map(copy => copy.name), failed: failed.map(({copy, error}) => ({name: copy.name, error}))})}\n`);
+    return {removed, failed};
+  } finally { fs.rmSync(lock, {force: true}); }
+}

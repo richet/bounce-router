@@ -72,6 +72,11 @@ The work then stays on the worker's own branch in its copy, the outcome names th
 `git fetch`, and orders must name that branch and have the worker commit on it. `bounce prune` keeps such a copy
 until its head is in the checkout.
 
+A worker's copy holds the checkout, ignored files included, except the paths in the project's committed
+`.bounce/copy-exclude` (gitignore patterns) and ignored build folders (`target/`, `dist/`, `build/`, `.next/` …).
+Daemons remove copies of ended work after `pruneAfterDays` (default 3; `~/.bounce/prune.log` says what went).
+When copies are large, `du -sh ~/.bounce/w/*` and list the heavy regenerable folders there; a tracked path is never left out.
+
 Stopping a session or sending into one the user is driving changes their work: confirm first.
 
 ## Models, quota and local models
