@@ -7,7 +7,7 @@ import stripAnsi from 'strip-ansi';
 
 export const TAGLINE = 'one terminal, your coding agents';
 
-// `bounce --help`, laid out like `ace --help`: a usage line, commands grouped by what you are trying to
+// `bounce --help`, laid out as a usage line, commands grouped by what you are trying to
 // do (named without the repeated `bounce`), one description column, then the options. A row is
 // [command, argument hint, description]; the hint is painted apart in /help so the part you type
 // verbatim stands out from the part you fill in.
@@ -271,8 +271,8 @@ export function helpRows({width = 100, paint = {}, vendor = [], tui = false} = {
   ];
 }
 
-// `bounce --help`: plain text in ace's shape. Rows share one description column; a label too wide for
-// it stands on its own line with the description under that column, as ace does.
+// `bounce --help`: plain text. Rows share one description column; a label too wide for
+// it stands on its own line with the description under that column.
 const CLI_COLUMN = 44;
 // Painted with /help's palette when `paint` is given: titles bold cyan, commands cyan, arguments gray,
 // options yellow. Layout is measured on the plain text, so colour never moves a column.

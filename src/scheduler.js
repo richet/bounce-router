@@ -1106,7 +1106,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   const inWorkingCopy = (text, workspace) => {
     const source = fs.realpathSync(session.cwd);
     const rewritten = toWorkingCopy(text, workspace);
-    return `${rewritten}\n\nYour working copy is ${workspace.cwd}: it is a copy of the project, and only changes made there are your work: bounce integrates them into the original checkout (${source}) after review, so edit the copy, never the original. What your orders ask you to deliver, evidence and reports included, goes inside this copy at the path they name: a file saved anywhere else on disk is not delivered.${fs.existsSync(path.join(workspace.cwd, '.git')) ? ' It has its own git with the project\'s history: log, diff and status work, and a commit there stays in the copy — bounce integrates your file changes, not commits.' : ''}`;
+    return `${rewritten}\n\nYour working copy is ${workspace.cwd}: it is a copy of the project, and only changes made there are your work: bounce integrates them into the original checkout (${source}) after review, so edit the copy, never the original. What your orders ask you to deliver, evidence and reports included, goes inside this copy at the path they name: a file saved anywhere else on disk is not delivered.${fs.existsSync(path.join(workspace.cwd, '.git')) ? ' It has its own git with the project\'s history: log, diff and status work, and a commit there stays in the copy — bounce integrates your file changes, not commits.' : ''}${workspace.light ? ' It holds the project\'s tracked files and the user\'s uncommitted changes, not what git ignores: install dependencies and build what you need in it before running tests or the check. Files git ignores are never integrated.' : ''}`;
   };
   // task -> where its workspace is. Never the workspace: its baseline lists every file of the project, and a
   // long session kept one per task for good (found live, with 67 tasks, a daemon out of memory).
@@ -1138,7 +1138,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // owns is a hint for the worker and the orchestrator, not a fence any more (2026-09-29): every
     // working copy owns everything, so any change the worker makes is part of its artifact; what
     // actually protects the checkout is integrateArtifact's conflict check against the real file.
-    const workspace = createAttemptWorkspace({cwd: session.cwd, dir, owns: ['**'], attemptId: `${task}-${attempt}`, skills: skillsInUse(session.root, session.cwd).skills,
+    // A light copy for a git checkout (src/workspace-artifacts.js); a folder that is not one is copied whole.
+    const workspace = createAttemptWorkspace({cwd: session.cwd, dir, owns: ['**'], attemptId: `${task}-${attempt}`, skills: skillsInUse(session.root, session.cwd).skills, light: true,
       ...(nested ? {} : {copyRoot: path.join(session.root, 'w')})});
     remember(task, workspace);
     append({kind: 'task.workspace', task, attempt, purpose: 'publish', cwd: workspace.cwd, metadata: path.join(workspace.cwd, '.attempt-workspace.json'), baselineHash: workspace.baselineHash});

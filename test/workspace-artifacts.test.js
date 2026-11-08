@@ -543,34 +543,37 @@ test('a delete against an edit is refreshed both ways: the copy gets the checkou
   assert.deepEqual([fs.existsSync(path.join(source, 'gone.txt')), fs.readFileSync(path.join(source, 'kept.txt'), 'utf8')], [false, 'worker kept']);
 });
 
-// Nirby control, 2026-11-07: 331 copies held 483 GB, a kb copy 3 GB of ignored build output (Rust target, dist) against
-// a 20 MB source, and a copied "record test durations here" marker made every copy's gates rewrite a tracked file.
-// A copy leaves out what the project lists in .bounce/copy-exclude and the default build folders git ignores; it
-// keeps everything else, ignored files included, never drops a tracked path, and never reaches inside node_modules.
-test('a copy leaves out the project\'s copy-exclude paths and ignored build folders, and keeps the rest', () => {
+// Nirby control, 2026-11-07: 331 full copies held 483 GB, a 3 GB copy of a 20 MB project (ignored build output). A
+// light copy is a shared clone with the checkout's tracked files and uncommitted changes; of what git ignores it takes
+// only what .bounce/copy-include names, and nothing ignored is ever integrated back.
+test('a light copy holds tracked files and uncommitted changes, only the included ignored files, and integrates nothing ignored', () => {
   const {source, dir} = setup(test);
   const git = (cwd, ...args) => execFileSync('git', args, {cwd, encoding: 'utf8', env: {...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t'}}).trim();
   git(source, 'init', '-q', '-b', 'main');
-  write(source, '.gitignore', '/.ace/\n/.env\ntarget/\n/dist/\nnode_modules/\n');
-  write(source, '.bounce/copy-exclude', '# heavy or checkout-only\n.ace/record-test-durations\ndocs/\nlib/tracked.txt\n');
-  write(source, 'build/tracked.txt', 'tracked\n'); write(source, 'lib/tracked.txt', 'kept\n');
+  write(source, '.gitignore', '/.env\n/.local/\ndist/\nnode_modules/\n'); write(source, '.bounce/copy-include', '.env\n');
+  write(source, '.bounce/agents/builder.md', 'agent\n'); write(source, 'a.txt', 'one\n'); write(source, 'gone.txt', 'old\n'); write(source, 'lib/b.txt', 'b\n');
   git(source, 'add', '.'); git(source, 'commit', '-qm', 'First commit');
-  write(source, '.ace/record-test-durations', ''); write(source, '.ace/test-timings/shard-1.json', '{}'); write(source, '.env', 'KEY=1\n');
-  write(source, 'desktop/src-tauri/target/debug/app', 'binary'); write(source, 'dist/kb', 'binary');
-  write(source, 'docs/notes.md', 'private\n'); write(source, 'web/dist/bundle.js', 'not ignored\n');
-  write(source, 'node_modules/pkg/dist/index.js', 'package\n');
-  const copy = createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'excludes'});
-  const has = rel => fs.existsSync(path.join(copy.cwd, rel));
-  assert.deepEqual(['.ace/record-test-durations', 'desktop/src-tauri/target', 'dist', 'docs'].filter(has), [], 'listed and ignored build paths stay in the checkout');
-  assert.deepEqual(['.ace/test-timings/shard-1.json', '.env', 'build/tracked.txt', 'lib/tracked.txt', 'web/dist/bundle.js', 'node_modules/pkg/dist/index.js'].filter(has),
-    ['.ace/test-timings/shard-1.json', '.env', 'build/tracked.txt', 'lib/tracked.txt', 'web/dist/bundle.js', 'node_modules/pkg/dist/index.js'],
-    'ignored files, tracked paths, a build folder git does not ignore, and packages are copied');
-  assert.deepEqual(copy.excluded.sort(), ['.ace/record-test-durations', 'desktop/src-tauri/target/', 'dist/', 'docs/']);
+  write(source, 'a.txt', 'dirty\n'); fs.rmSync(path.join(source, 'gone.txt')); write(source, 'notes/new.md', 'untracked\n');
+  write(source, '.env', 'KEY=1\n'); write(source, '.local/marker', ''); write(source, 'dist/app', 'binary'); write(source, 'node_modules/pkg/index.js', 'pkg\n');
+  const copy = createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'light', light: true});
+  const read = rel => fs.existsSync(path.join(copy.cwd, rel)) ? fs.readFileSync(path.join(copy.cwd, rel), 'utf8') : null;
+  assert.equal(copy.light, true);
+  assert.deepEqual(['a.txt', 'lib/b.txt', 'notes/new.md', '.env', 'gone.txt'].map(read), ['dirty\n', 'b\n', 'untracked\n', 'KEY=1\n', null]);
+  assert.deepEqual(['.local/marker', 'dist/app', 'node_modules', '.bounce/agents/builder.md'].map(rel => fs.existsSync(path.join(copy.cwd, rel))), [false, false, false, false]);
   assert.equal(git(copy.cwd, 'status', '--porcelain'), '');
-  write(copy.cwd, 'dist/kb', 'rebuilt'); write(copy.cwd, 'docs/notes.md', 'worker\n'); write(copy.cwd, '.ace/test-timings/shard-1.json', '{"copy":true}'); write(copy.cwd, 'a.txt', 'work\n');
-  assert.equal(git(copy.cwd, 'status', '--porcelain'), '?? a.txt', 'a recreated excluded folder is not the worker\'s change');
+  assert.equal(git(copy.cwd, 'log', '--format=%s', '-1'), 'bounce: baseline of the checkout this copy was made from (its uncommitted changes included)');
+  assert.equal(git(copy.cwd, 'remote', 'get-url', '--push', 'origin'), COPY_PUSH_URL);
+  write(copy.cwd, 'dist/app', 'rebuilt'); write(copy.cwd, '.env', 'KEY=2\n'); write(copy.cwd, 'a.txt', 'work\n');
   const artifact = captureArtifact(copy);
-  assert.deepEqual(artifact.changes.map(change => change.path), ['.ace/test-timings/shard-1.json', 'a.txt']);
+  assert.deepEqual(artifact.changes.map(change => change.path), ['a.txt']);
   assert.equal(integrateArtifact({cwd: source, dir, artifact}).status, 'integrated');
-  assert.deepEqual([fs.readFileSync(path.join(source, 'dist/kb'), 'utf8'), fs.readFileSync(path.join(source, 'docs/notes.md'), 'utf8')], ['binary', 'private\n']);
+  assert.deepEqual(['a.txt', 'dist/app', '.env'].map(rel => fs.readFileSync(path.join(source, rel), 'utf8')), ['work\n', 'binary', 'KEY=1\n']);
+  // kb control, 2026-11-07: a folder holding only files a nested .gitignore ignores was carried whole (97 MB), because
+  // `git ls-files --others --directory` names such a folder although nothing in it is untracked work.
+  write(source, 'desktop/.gitignore', '/bin/app-*\n'); git(source, 'add', '.'); git(source, 'commit', '-qm', 'Nested ignore');
+  write(source, 'desktop/bin/app-arm64', 'binary');
+  const nested = createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'nested', light: true});
+  assert.equal(fs.existsSync(path.join(nested.cwd, 'desktop/bin')), false, 'a folder of ignored files is not uncommitted work');
+  const full = createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'full'});
+  assert.deepEqual([full.light, fs.existsSync(path.join(full.cwd, 'dist/app'))], [undefined, true], 'without light, the full copy as before');
 });

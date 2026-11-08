@@ -39,8 +39,8 @@ import {verifyingOrders, verifyMode} from './verify-mode.js';
 import {autoPrune} from './prune.js';
 // Full gate runs at once on this machine when config.json says nothing (kb control, 2026-11-05: 8 CPU and 16 GB each).
 const DEFAULT_GATE_SLOTS = 3;
-// Copies of ended work are removed after this many days (0: never), a minute after a daemon starts and every 6 hours.
-const DEFAULT_PRUNE_AFTER_DAYS = 3;
+// Copies of ended work held elsewhere (src/prune.js autoPrune) are removed after this many days (0: never), a minute after a daemon starts and every 6 hours.
+const DEFAULT_PRUNE_AFTER_DAYS = 7;
 function scheduleAutoPrune(root, days) {
   if (!days) return;
   const run = () => autoPrune({root, olderThanMs: days * 86400000}).catch(() => {});

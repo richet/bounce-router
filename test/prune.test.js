@@ -131,53 +131,28 @@ test('prune --ended takes a clean copy whose commit a later copy or the checkout
   assert.match(copyTable(copies), /aaaaaaa2 .* already in copy bbbbbbb2/);
 });
 
-// ace item 11 (2026-11-05): a copy that runs an ace stack takes its Docker volumes with it. Before its folder goes,
-// `ace down --volumes --json` runs in it; when that fails the copy is kept, so the stack is not left without its folder.
-import {aceDown} from '../src/prune.js';
-test('removing a copy with an ace.yaml takes its stack down with its volumes first, and keeps the copy when that fails', async t => {
-  const {root, copy} = home(t);
-  const plain = copy('aaaaaaa3'), stacked = copy('bbbbbbb3'), broken = copy('ccccccc3');
-  fs.writeFileSync(path.join(stacked, 'ace.yaml'), 'name: shop\n');
-  fs.writeFileSync(path.join(broken, 'ace.yaml'), 'name: shop\n');
-  const calls = [];
-  const stackDown = async dir => { calls.push(path.basename(dir)); return dir === broken ? {ok: false, error: 'ace: daemon not running'} : {ok: true, volumes: ['ace-shop-x_db']}; };
-  const copies = listCopies({root});
-  const {removed, failed} = await removeCopies(copies, {stackDown});
-  assert.deepEqual(calls.sort(), ['bbbbbbb3', 'ccccccc3'], 'only copies with an ace.yaml');
-  assert.deepEqual(removed.map(c => [c.name, c.volumes ?? null]).sort(), [['aaaaaaa3', null], ['bbbbbbb3', ['ace-shop-x_db']]]);
-  assert.deepEqual(failed.map(f => [f.copy.name, f.error]), [['ccccccc3', 'its stack was not taken down (ace: daemon not running); the copy is kept: run ace down --volumes there, then prune again']]);
-  assert.deepEqual([fs.existsSync(plain), fs.existsSync(stacked), fs.existsSync(broken)], [false, false, true]);
-  // The real call: `ace down --volumes --json` in the copy, its deleted volumes read from the JSON result.
-  const bin = path.join(root, 'bin');
-  fs.mkdirSync(bin);
-  fs.writeFileSync(path.join(bin, 'ace'), `#!/bin/sh\necho "$PWD $*" >> ${JSON.stringify(path.join(root, 'ace.log'))}\necho '{"ok":true,"data":{"deletedVolumes":["v1","v2"]}}'\n`, {mode: 0o755});
-  const fake = await aceDown(broken, {env: {...process.env, PATH: `${bin}:${process.env.PATH}`}});
-  assert.deepEqual(fake, {ok: true, volumes: ['v1', 'v2']});
-  assert.equal(fs.readFileSync(path.join(root, 'ace.log'), 'utf8'), `${fs.realpathSync(broken)} down --volumes --json\n`);
-  const missing = await aceDown(broken, {env: {...process.env, PATH: '/nonexistent'}});
-  assert.equal(missing.ok, false);
-});
-
 // Nirby control, 2026-11-07: 331 copies filled the disk because prune only ran when asked. Each daemon now runs the
-// --ended rule itself (pruneAfterDays, default 3): one daemon at a time, logged to prune.log, copies of running
-// sessions and branches not fetched yet kept as always.
+// --ended rule itself (pruneAfterDays, default 7), but only on copies whose work is elsewhere: integrated into the
+// checkout, or held by a later copy or the checkout (superseded). A cancelled or failed task's copy, whose unfinished
+// work is saved only there, and a copy no journal names stay for a person to prune. One daemon at a time, logged.
 import {autoPrune} from '../src/prune.js';
-test('autoPrune removes ended copies older than the age, one daemon at a time, and logs what it removed', async t => {
+test('autoPrune removes only ended copies whose work is elsewhere, one daemon at a time, and logs what it removed', async t => {
   const {root, copy, session} = home(t);
-  const done = copy('aaaaaaa4'), running = copy('bbbbbbb4');
-  session('old', lived('t-done', done, {kind: 'task.cancelled', task: 't-done', time: at(11)}));
+  const landed = copy('aaaaaaa4'), cancelled = copy('ccccccc4'), running = copy('bbbbbbb4'); copy('ddddddd4');
+  session('old', [...lived('t-done', landed, {kind: 'task.integrated', task: 't-done', time: at(11)}, {kind: 'task.completed', task: 't-done', time: at(12)}),
+    ...lived('t-cancel', cancelled, {kind: 'task.cancelled', task: 't-cancel', time: at(21)})]);
   session('live', lived('t-run', running), {pid: process.pid});
-  const day = 86400000, now = Date.now() + 4 * day, stackDown = async () => ({ok: true, volumes: []});
-  assert.equal((await autoPrune({root, olderThanMs: 5 * day, now, stackDown})).removed.length, 0, 'younger than the age: kept');
+  const day = 86400000, now = Date.now() + 8 * day;
+  assert.equal((await autoPrune({root, olderThanMs: 9 * day, now})).removed.length, 0, 'younger than the age: kept');
   fs.writeFileSync(path.join(root, 'prune.lock'), String(process.pid));
-  assert.equal(await autoPrune({root, olderThanMs: 3 * day, now, stackDown}), null, 'another daemon is pruning');
+  assert.equal(await autoPrune({root, olderThanMs: 7 * day, now}), null, 'another daemon is pruning');
   fs.rmSync(path.join(root, 'prune.lock'));
-  const result = await autoPrune({root, olderThanMs: 3 * day, now, stackDown});
+  const result = await autoPrune({root, olderThanMs: 7 * day, now});
   assert.deepEqual(result.removed.map(c => c.name), ['aaaaaaa4']);
-  assert.deepEqual(fs.readdirSync(path.join(root, 'w')), ['bbbbbbb4']);
+  assert.deepEqual(fs.readdirSync(path.join(root, 'w')).sort(), ['bbbbbbb4', 'ccccccc4', 'ddddddd4'], 'unfinished work, a running task and an unknown copy stay');
   assert.equal(fs.existsSync(path.join(root, 'prune.lock')), false, 'the lock is released');
   const log = fs.readFileSync(path.join(root, 'prune.log'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
-  assert.deepEqual(log.map(entry => [entry.removed, entry.failed]), [[[], []], [['aaaaaaa4'], []]]);
+  assert.deepEqual(log.map(entry => [entry.removed, entry.kept]), [[[], 0], [['aaaaaaa4'], 2]]);
 });
 
 import {defaults, validateSettings} from '../src/core.js';

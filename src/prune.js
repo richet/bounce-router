@@ -4,7 +4,7 @@
 // panel no task had integrated yet went with them). A copy whose task is still running in a live session is never
 // removed.
 import fs from 'node:fs';
-import {execFile, execFileSync} from 'node:child_process';
+import {execFileSync} from 'node:child_process';
 import path from 'node:path';
 import {pidAlive, readJournal} from './core.js';
 import {reachedCheckout} from './branch-delivery.js';
@@ -126,43 +126,24 @@ export function chooseCopies(answer, copies) {
   return [...picked].sort((a, b) => a - b).map(i => copies[i]).filter(copy => !copy.live);
 }
 
-// `ace down --volumes --json` in a copy (ace item 11, 2026-11-05): its stack and the volumes it declared go with it.
-// {ok, volumes} or {ok: false, error}.
-export function aceDown(dir, {env = process.env, timeoutMs = 120000} = {}) {
-  return new Promise(resolve => {
-    execFile('ace', ['down', '--volumes', '--json'], {cwd: dir, env, timeout: timeoutMs, encoding: 'utf8'}, (error, stdout, stderr) => {
-      if (error) return resolve({ok: false, error: String(stderr || error.message).trim().split('\n').at(-1).slice(0, 300)});
-      let result = null;
-      try { result = JSON.parse(String(stdout).trim().split('\n').at(-1)); } catch {}
-      if (result?.ok === false) return resolve({ok: false, error: String(result.error?.message ?? result.error ?? 'ace down failed').slice(0, 300)});
-      resolve({ok: true, volumes: result?.data?.deletedVolumes ?? []});
-    });
-  });
-}
-
-// Removes the chosen copies; a copy whose task is still running is skipped, whatever was chosen. A copy with an
-// ace.yaml has its stack taken down with its volumes first; when that fails the copy is kept, since its folder is
-// how its stack is found.
-export async function removeCopies(chosen, {stackDown = aceDown} = {}) {
+// Removes the chosen copies; a copy whose task is still running is skipped, whatever was chosen.
+export async function removeCopies(chosen) {
   const removed = [], failed = [];
   for (const copy of chosen) {
     if (copy.live) continue;
-    let volumes = null;
-    if (fs.existsSync(path.join(copy.dir, 'ace.yaml'))) {
-      const down = await stackDown(copy.dir);
-      if (!down.ok) { failed.push({copy, error: `its stack was not taken down (${down.error}); the copy is kept: run ace down --volumes there, then prune again`}); continue; }
-      volumes = down.volumes;
-    }
-    try { await fs.promises.rm(copy.dir, {recursive: true, force: true}); removed.push(volumes ? {...copy, volumes} : copy); }
+    try { await fs.promises.rm(copy.dir, {recursive: true, force: true}); removed.push(copy); }
     catch (error) { failed.push({copy, error: error.message}); }
   }
   return {removed, failed};
 }
 
 // Each daemon runs the --ended rule itself (Nirby control, 2026-11-07: 331 copies, 483 GB, a full disk, because prune
-// ran only when asked). One daemon at a time through prune.lock (a dead holder's lock is taken over); every run
-// appends a line to prune.log. Null when another daemon holds the lock.
-export async function autoPrune({root, olderThanMs, now = Date.now(), stackDown = aceDown}) {
+// ran only when asked), on copies whose work is elsewhere only: integrated into the checkout (a delivered branch once
+// fetched), or superseded. A cancelled or failed task's unfinished work is saved inside its copy (refs/wip), and a
+// copy no journal names is unknown: both stay for a person to prune. One daemon at a time through prune.lock (a dead
+// holder's lock is taken over); every run appends a line to prune.log. Null when another daemon holds the lock.
+export const workElsewhere = copy => Boolean(copy.superseded || (copy.integrated && !copy.unfetched));
+export async function autoPrune({root, olderThanMs, now = Date.now()}) {
   const lock = path.join(root, 'prune.lock');
   const take = () => { try { fs.writeFileSync(lock, String(process.pid), {flag: 'wx'}); return true; } catch { return false; } };
   if (!take()) {
@@ -171,9 +152,10 @@ export async function autoPrune({root, olderThanMs, now = Date.now(), stackDown 
     if (!take()) return null;
   }
   try {
-    const {removed, failed} = await removeCopies(endedCopies(listCopies({root}), {now, olderThanMs}), {stackDown});
+    const ended = endedCopies(listCopies({root}), {now, olderThanMs});
+    const {removed, failed} = await removeCopies(ended.filter(workElsewhere));
     fs.appendFileSync(path.join(root, 'prune.log'), `${JSON.stringify({time: new Date(now).toISOString(), olderThanDays: olderThanMs / 86400000,
-      removed: removed.map(copy => copy.name), failed: failed.map(({copy, error}) => ({name: copy.name, error}))})}\n`);
+      removed: removed.map(copy => copy.name), kept: ended.length - removed.length - failed.length, failed: failed.map(({copy, error}) => ({name: copy.name, error}))})}\n`);
     return {removed, failed};
   } finally { fs.rmSync(lock, {force: true}); }
 }
