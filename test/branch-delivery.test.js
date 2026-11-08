@@ -1,5 +1,5 @@
 // A checkout whose accepted work must never be written into it (`git config bounce.delivery branch`): bounce names the
-// worker's own branch in its copy for a `git fetch`. kb control session, 2026-11-05: sessions 1cd37957 and 39886c0b
+// worker's own branch in its copy for a `git fetch`. Found live, 2026-11-05: two sessions
 // wrote accepted work, a tracked .env line included, into the real checkout on main.
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -119,7 +119,7 @@ test('without a review, a task\'s work reaches the checkout only after its check
   assert.equal(fs.readFileSync(path.join(passing.project, 'src/x.js'), 'utf8'), 'export const state = "new";\n');
 });
 
-// kb control, 2026-11-05 (031d5448): gates ran on c980170 and the delivered head was 6a69639, and nothing said so.
+// Found live, 2026-11-05: the gates ran on one commit, another was delivered, and nothing said so.
 test('delivery branch: a check that ran on another tree than the delivered one is named as such', async t => {
   const f = setup(t, {delivery: 'branch'});
   // The check itself moves the branch on after bounce recorded the tree it ran on.
@@ -131,7 +131,7 @@ test('delivery branch: a check that ran on another tree than the delivered one i
   assert.ok(delivered.text.endsWith(`NOT CHECKED AS DELIVERED: the check passed on tree ${check.tree.slice(0, 12)} (head ${check.head.slice(0, 12)}), not on this tree.`), delivered.text);
 });
 
-// kb control, 2026-11-05 (eb26873e): a builder hit the 60-minute limit with nothing committed and its work was lost to
+// Found live, 2026-11-05: a builder hit the 60-minute limit with nothing committed and its work was lost to
 // the next attempt. A task that ends unfinished has what it left uncommitted saved in its copy, and the handoff says
 // where.
 test('a cancelled task\'s uncommitted work is saved on refs/wip/<task> in its copy, and the handoff names it', async t => {
@@ -160,7 +160,7 @@ test('a cancelled task\'s uncommitted work is saved on refs/wip/<task> in its co
   assert.match(handoffBlock(session, [session.events.findLast(e => e.kind === 'task.cancelled' && e.task === task)]), new RegExp(`Unfinished work saved: 2 uncommitted files in .* as ${ref}`));
 });
 
-// kb control, 2026-11-05: phase 9 workers committed 130 files under the ignored docs-out/ with git add -f, and they
+// Found live, 2026-11-05: workers committed 130 files under an ignored output folder with git add -f, and they
 // rode in on the delivered branch. The delivery says so.
 test('delivery branch: files the branch adds that the project ignores are named in a warning', async t => {
   const f = setup(t, {delivery: 'branch', commit: false});

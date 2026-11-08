@@ -228,7 +228,7 @@ test('P6b completion critic receives the brief plus the worker report', async t 
   assert.equal(seenOrders, 'the brief\n\n--- worker report ---\nsummary text here');
 });
 
-// Nirby control session, 2026-11-04 (an analyst's final reply "arrived truncated"): the critic was handed the report's
+// Found live, 2026-11-04 (an analyst's final reply "arrived truncated"): the critic was handed the report's
 // one-line summary, the document's title, under "worker report", and failed the work as "only the title"; the report's
 // text was also cut at 16000 characters. A critic reads the worker's whole answer.
 test('P6b2 a completion critic reads the worker\'s whole answer, not its one-line summary, past the report\'s 16000-character cut', async t => {

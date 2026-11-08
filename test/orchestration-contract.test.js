@@ -252,7 +252,7 @@ test('b2: two tasks that edit different parts of one text file both integrate; t
   assert.equal(fs.readFileSync(path.join(cwd, 'PROGRESS.md'), 'utf8'), LOG.replace('top\n', 'top\n- step 10\n').replace('bottom\n', 'bottom\n- step 11\n'));
 });
 
-// Nirby control session, 2026-11-04: a task refused for a conflict was cancelled and its work copied by hand; a worker
+// Found live, 2026-11-04: a task refused for a conflict was cancelled and its work copied by hand; a worker
 // that resolved it in its copy would have conflicted again. A send-back after a conflict refreshes the copy first.
 test('b3: a task refused for a conflict and sent back gets the checkout\'s version with markers and a note, and its resolution integrates', async t => {
   const {session, cwd} = fixture(t);
@@ -297,7 +297,7 @@ test('b3: a task refused for a conflict and sent back gets the checkout\'s versi
   assert.equal(fs.readFileSync(path.join(cwd, 'x.txt'), 'utf8'), START.replace('b\n', 'first and second\n'));
 });
 
-// Nirby control session, 2026-11-04: work in a cancelled task's copy, committed or not, was landed by hand.
+// Found live, 2026-11-04: work in a cancelled task's copy, committed or not, was landed by hand.
 test('b4: accepting a cancelled task lands its copy as it is now; a conflicting one is refused with the files named; no copy is refused', async t => {
   const {session, cwd} = fixture(t);
   fs.writeFileSync(path.join(cwd, 'x.txt'), 'old x');

@@ -71,7 +71,7 @@ test('removing takes only the chosen copies, never a running task\'s, and leaves
   assert.equal(fs.existsSync(path.join(root, 'sessions', 'live', 'journal.jsonl')), true);
 });
 
-// Nirby control session, 2026-11-04: 241 old copies (215 GB) sat in ~/.bounce/w, because prune only ran in a terminal.
+// Found live, 2026-11-04: 241 old copies (215 GB) sat in ~/.bounce/w, because prune only ran in a terminal.
 // `bounce prune --ended --older-than D` picks, without asking, the copies of sessions that are not running whose task
 // ended (or that no journal names), unused for D; it lists them, and removes them only with --yes. A copy of a running
 // session stays even when its task ended: a cancelled task can still be accepted and land from its copy.
@@ -104,7 +104,7 @@ test('prune --ended --older-than picks ended copies of sessions not running, unu
   assert.deepEqual([bad.status, bad.stderr.trim()], [1, 'bounce: --older-than takes an age like 7d, 12h or 30m']);
 });
 
-// kb control, 2026-11-05 (6363e2cd): a session left 20 copies holding intermediate states of one branch. A clean copy
+// Found live, 2026-11-05: a session left 20 copies holding intermediate states of one branch. A clean copy
 // whose commit a later copy of the same session already contains, or that the checkout already has, holds nothing
 // else: prune --ended takes it, from a running session too once its task ended, and the copy that holds more stays.
 import {execFileSync} from 'node:child_process';
@@ -131,7 +131,7 @@ test('prune --ended takes a clean copy whose commit a later copy or the checkout
   assert.match(copyTable(copies), /aaaaaaa2 .* already in copy bbbbbbb2/);
 });
 
-// Nirby control, 2026-11-07: 331 copies filled the disk because prune only ran when asked. Each daemon now runs the
+// Found live, 2026-11-07: 331 copies filled the disk because prune only ran when asked. Each daemon now runs the
 // --ended rule itself (pruneAfterDays, default 7), but only on copies whose work is elsewhere: integrated into the
 // checkout, or held by a later copy or the checkout (superseded). A cancelled or failed task's copy, whose unfinished
 // work is saved only there, and a copy no journal names stay for a person to prune. One daemon at a time, logged.

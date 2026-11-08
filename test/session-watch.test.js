@@ -1,5 +1,5 @@
 // `bounce watch`: one call that returns when a session is done, needs attention, or has gone quiet (src/session-watch.js).
-// Nirby control session, 2026-11-04: control polled `bounce tasks --json` every minute with its own idle counter.
+// Found live, 2026-11-04: control polled `bounce tasks --json` every minute with its own idle counter.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {watchSession, WATCH_EXIT} from '../src/session-watch.js';
@@ -62,7 +62,7 @@ test('a live interactive session is done when every task ended and its orchestra
   assert.equal(watchSession(ended, {live: true, after: 4, now: T0 + 4 * 60000}).outcome, 'waiting', 'done already reported');
 });
 
-// Nirby control, 2026-11-05: `watch --idle 40` fired while the orchestrator waited on a builder or ran gates itself, so
+// Found live, 2026-11-05: `watch --idle 40` fired while the orchestrator waited on a builder or ran gates itself, so
 // control kept its own 10-quiet-minutes script. `--done` returns only when the run's job has ended, with its result.
 test('--done waits through quiet stretches and held tasks, and returns when the run\'s job ends, with its answer and what it delivered', () => {
   const working = journal([{kind: 'main.started', requestId: 'r1'}, submitted('a'), {kind: 'main.terminal', requestId: 'r1', status: 'completed'},

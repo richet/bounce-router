@@ -1,5 +1,5 @@
-// A finished task's check and its completion review run at the same time (docs/plans/faster-verification.md). kb
-// control session, 2026-11-04 (run a639d737): tasks sat "held before a decision" 11–64 minutes while gates ran one
+// A finished task's check and its completion review run at the same time (docs/plans/faster-verification.md).
+// Found live, 2026-11-04: tasks sat "held before a decision" 11–64 minutes while gates ran one
 // after another and reviews were dispatched only after them.
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -93,7 +93,7 @@ test('without a check the reviewer is not told bounce runs one', async t => {
   assert.equal(f.seen.reviewOrders.includes('bounce runs this task\'s check'), false);
 });
 
-// kb control, 2026-11-05: one full gate run takes 8 CPU and 16 GB of a 64 GB Docker VM. Checks share a machine-wide
+// Found live, 2026-11-05: one full gate run takes 8 CPU and 16 GB of a 64 GB Docker VM. Checks share a machine-wide
 // cap (gateSlots) as a queue that waits, never a failure, and each check row says how long it waited.
 import {createMachineSlots} from '../src/machine-slots.js';
 test('with one gate slot, a second task\'s check waits for the first to finish, says so, and records the wait', async t => {

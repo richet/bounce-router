@@ -59,7 +59,7 @@ export function listCopies({root}) {
   return copies.map(({checkout, ...copy}) => copy).sort((a, b) => String(b.lastUsed).localeCompare(String(a.lastUsed)));
 }
 
-// kb control, 2026-11-05 (6363e2cd: 20 copies of one branch). A copy holds nothing of its own when it is clean and its
+// Found live, 2026-11-05 (20 copies of one branch). A copy holds nothing of its own when it is clean and its
 // commit is already in another copy of the same session (an ancestor of that copy's HEAD) or in the checkout:
 // `superseded` names where ('the checkout', or the copy's name). Null otherwise, and for a copy whose task runs.
 const gitQuiet = (cwd, ...args) => {
@@ -84,7 +84,7 @@ function markSuperseded(copies) {
   }
 }
 
-// `bounce prune --ended --older-than D`, without asking (Nirby control session, 2026-11-04: 241 copies, 215 GB, because
+// `bounce prune --ended --older-than D`, without asking (found live, 2026-11-04: 241 copies, 215 GB, because
 // prune only ran in a terminal): copies of sessions not running whose task ended, or that no journal names, unused for
 // D. A running session's copies stay even when their task ended: a cancelled task can still be accepted from its copy.
 export function endedCopies(copies, {now = Date.now(), olderThanMs}) {
@@ -137,7 +137,7 @@ export async function removeCopies(chosen) {
   return {removed, failed};
 }
 
-// Each daemon runs the --ended rule itself (Nirby control, 2026-11-07: 331 copies, 483 GB, a full disk, because prune
+// Each daemon runs the --ended rule itself (found live, 2026-11-07: 331 copies, 483 GB, a full disk, because prune
 // ran only when asked), on copies whose work is elsewhere only: integrated into the checkout (a delivered branch once
 // fetched), or superseded. A cancelled or failed task's unfinished work is saved inside its copy (refs/wip), and a
 // copy no journal names is unknown: both stay for a person to prune. One daemon at a time through prune.lock (a dead

@@ -1,5 +1,5 @@
-// Who verifies, per session, changed live (kb control, 2026-11-05). The owner: "some things are better with the
-// orchestrator, to avoid collisions, and others with the worker". It only changes the orchestrator's verifying
+// Who verifies, per session, changed live: some work is better verified by the orchestrator, to avoid collisions, and
+// some by the worker. It only changes the orchestrator's verifying
 // orders; bounce runs a task's check in the worker's copy in every mode. In every mode the gates pass on the final
 // head and the final result names the commit each gate ran on.
 export const VERIFY_MODES = ['orchestrator', 'worker', 'auto'];

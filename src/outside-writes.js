@@ -1,5 +1,5 @@
 // What appeared or changed outside a worker's copy while its attempt ran, in the directories a stray install or link
-// lands in: the ones on PATH. Nirby control session, 2026-11-04: a builder linked a file into /opt/homebrew/bin. Workers
+// lands in: the ones on PATH. Found live, 2026-11-04: a builder linked a file into /opt/homebrew/bin. Workers
 // run with the vendor's sandbox off, so this cannot block the write; it makes it seen. Directories under the temp dir,
 // the copies, the session or the checkout are left out: writing there is allowed.
 import fs from 'node:fs';

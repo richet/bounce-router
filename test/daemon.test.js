@@ -1015,7 +1015,7 @@ test('a resume stops this session\'s stuck daemon that holds the lock, and leave
 // Found by the integration run 2026-10-21: an orchestrated `bounce run`
 // was its first turn only, so an orchestrator that dispatched and ended its turn — as real ones do — never heard back
 // and the job stopped there. The run now hands the outcome over in one more turn, then ends.
-// Nirby control session, 2026-11-04: `bounce send` refused every `bounce run --detach` ("older daemon with no view
+// Found live, 2026-11-04: `bounce send` refused every `bounce run --detach` ("older daemon with no view
 // socket"), so control could not steer a run and started one run per batch of orders.
 test('O12 a detached orchestrated run takes a message sent mid-run as its next turn, marked via send', async t => {
   const root = tmpRoot('bounce-o12-');
@@ -1059,7 +1059,7 @@ test('O12 a detached orchestrated run takes a message sent mid-run as its next t
   assert.equal(daemonInfo.run, true, 'bounce watch reads it: only the exit of a run\'s daemon says the run is done');
 });
 
-// Nirby control session, 2026-11-05 (sessions 1e1476c0, c85e32c8): a run whose own process had ended, its work held
+// Found live, 2026-11-05: a run whose own process had ended, its work held
 // for a decision, kept its daemon up; `bounce send` answered "queued" and nothing ever ran the message (an hour lost).
 test('O13 a message sent after the run\'s own turns ended, its work held, starts a turn instead of waiting forever', async t => {
   const root = tmpRoot('bounce-o13-');

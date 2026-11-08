@@ -480,7 +480,7 @@ test('a worker is handed the standing worker rules and the project\'s lessons fo
   await waitFor(() => ['completed', 'accepted', 'blocked', 'failed'].includes(scheduler.tasks()[task]?.state));
 
   const block = 'Lessons from earlier sessions in this project:\n- Put evidence inside the working copy.\n- A check must run the work.';
-  // Nirby control session, 2026-11-04: a worker printed file names from the owner's private export in its tool output.
+  // Found live, 2026-11-04: a worker printed file names from the owner's private export in its tool output.
   // A builder ran two suites at once in one copy and each wiped the other's test databases; another linked a file into
   // /opt/homebrew/bin. Both rules ride with every worker.
   const standing = ['Standing rules for every worker:',
@@ -492,7 +492,7 @@ test('a worker is handed the standing worker rules and the project\'s lessons fo
   assert.equal(launched.orders.includes('PASS or FAIL'), false, 'the reviewer\'s line is not the builder\'s');
 });
 
-// kb control, 2026-11-05 (d4b515ea): the owner restricted feedback decisions to the web session after the order went
+// Found live, 2026-11-05: the owner restricted feedback decisions to the web session after the order went
 // out; the orchestrator told the worker, but the round-3 review graded against the original order and called the
 // restriction a blocker. A completion reviewer gets what was said to the worker after its orders.
 test('a completion reviewer is handed what the worker was told after its orders, in order', async t => {

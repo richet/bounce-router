@@ -169,7 +169,7 @@ test('a copy of a git checkout has its own git: history and status work, it name
   assert.equal(git(copy.cwd, 'rev-parse', '--abbrev-ref', 'HEAD'), 'main');
   assert.equal(git(copy.cwd, 'status', '--porcelain'), '', 'nothing to see before the worker changes anything; the left-out .bounce is not "deleted"');
   assert.equal(git(copy.cwd, 'diff', '--name-only', 'HEAD~1', 'HEAD'), 'a.txt', 'the user\'s uncommitted edit is in the baseline, not in the worker\'s diff');
-  // Nirby control session, 2026-11-04: with no remote, a copy's sessions carried no project (an archive filed them under
+  // Found live, 2026-11-04: with no remote, a copy's sessions carried no project (an archive filed them under
   // none). The copy names the checkout's origin, or the checkout itself when it has none, and cannot push to it.
   assert.equal(git(copy.cwd, 'remote', 'get-url', 'origin'), fs.realpathSync(source), 'a checkout with no origin: the copy names the checkout');
   assert.equal(git(copy.cwd, 'remote', 'get-url', '--push', 'origin'), COPY_PUSH_URL);
@@ -312,11 +312,11 @@ test('an ignored binary or large file is left out and named; the rest of the wor
   write(source, 'src/x.js', 'old\n');
   git('init', '-q'); git('add', '.'); git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'base');
   const ws = createAttemptWorkspace({cwd: source, dir, owns: ['**'], attemptId: 'ignored'});
-  write(ws.cwd, 'dist/kb', Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0, 1]));
+  write(ws.cwd, 'dist/app', Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0, 1]));
   write(ws.cwd, 'src/x.js', 'new\n');
   const artifact = captureArtifact(ws);
   assert.deepEqual(artifact.unsupported, []);
-  assert.deepEqual(artifact.leftOut, [{path: 'dist/kb', reason: 'binary'}]);
+  assert.deepEqual(artifact.leftOut, [{path: 'dist/app', reason: 'binary'}]);
   assert.deepEqual(artifact.changes.map(change => change.path), ['src/x.js']);
   assert.equal(integrateArtifact({cwd: source, artifact, dir}).status, 'integrated');
   assert.equal(fs.readFileSync(path.join(source, 'src/x.js'), 'utf8'), 'new\n');
@@ -497,7 +497,7 @@ test('a write that fails midway puts back the files already written, and says so
   assert.equal(fs.readFileSync(path.join(source, 'z/b.md'), 'utf8'), 'new b\n');
 });
 
-// Nirby control session, 2026-11-04: a refused integration was cancelled and its work copied over by hand. A worker
+// Found live, 2026-11-04: a refused integration was cancelled and its work copied over by hand. A worker
 // that resolved the conflict in its copy conflicted again, since the merge base was still the copy's old start.
 // A send-back after a conflict now brings those files up to the checkout first.
 const EIGHT = 'a\nb\nc\nd\ne\nf\ng\nh\n';
@@ -543,7 +543,7 @@ test('a delete against an edit is refreshed both ways: the copy gets the checkou
   assert.deepEqual([fs.existsSync(path.join(source, 'gone.txt')), fs.readFileSync(path.join(source, 'kept.txt'), 'utf8')], [false, 'worker kept']);
 });
 
-// Nirby control, 2026-11-07: 331 full copies held 483 GB, a 3 GB copy of a 20 MB project (ignored build output). A
+// Found live, 2026-11-07: 331 full copies held 483 GB, a 3 GB copy of a 20 MB project (ignored build output). A
 // light copy is a shared clone with the checkout's tracked files and uncommitted changes; of what git ignores it takes
 // only what .bounce/copy-include names, and nothing ignored is ever integrated back.
 test('a light copy holds tracked files and uncommitted changes, only the included ignored files, and integrates nothing ignored', () => {
@@ -568,7 +568,7 @@ test('a light copy holds tracked files and uncommitted changes, only the include
   assert.deepEqual(artifact.changes.map(change => change.path), ['a.txt']);
   assert.equal(integrateArtifact({cwd: source, dir, artifact}).status, 'integrated');
   assert.deepEqual(['a.txt', 'dist/app', '.env'].map(rel => fs.readFileSync(path.join(source, rel), 'utf8')), ['work\n', 'binary', 'KEY=1\n']);
-  // kb control, 2026-11-07: a folder holding only files a nested .gitignore ignores was carried whole (97 MB), because
+  // Found live, 2026-11-07: a folder holding only files a nested .gitignore ignores was carried whole (97 MB), because
   // `git ls-files --others --directory` names such a folder although nothing in it is untracked work.
   write(source, 'desktop/.gitignore', '/bin/app-*\n'); git(source, 'add', '.'); git(source, 'commit', '-qm', 'Nested ignore');
   write(source, 'desktop/bin/app-arm64', 'binary');

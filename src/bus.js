@@ -241,7 +241,7 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
         // and the refusals cost orchestrator turns; the review sends work back at most once now anyway.
         if (e.kind === 'task.accepted') {
           const submitted = session.events.find(row => row.kind === 'task.submitted' && row.task === e.task);
-          // A cancelled task's copy can still hold good work (Nirby control session, 2026-11-04: seven cancelled
+          // A cancelled task's copy can still hold good work (found live, 2026-11-04: seven cancelled
           // builders with green checks, landed by hand). Its owner's accept lands the copy as it is now.
           if (tasks(session.events)[e.task]?.state === 'cancelled') {
             if (peer !== 'orchestrator' || typeof acceptOverride !== 'function') return refuse(id, -32001, 'unauthorized');

@@ -358,7 +358,7 @@ test('no sweep while a task runs, with sweepMinutes 0, or with nothing held', as
 });
 
 // A `verify=MODE` line sent or typed to a live orchestrator is journaled, and its turn carries the new verifying
-// orders instead of the bare line (src/verify-mode.js; kb control, 2026-11-05).
+// orders instead of the bare line (src/verify-mode.js; found live, 2026-11-05).
 test('verify=worker sent to the orchestrator sets the mode and the turn reads the new orders', async t => {
   const session = fixture(t);
   const prompts = [];

@@ -1,5 +1,5 @@
 // `bounce watch <session>`: one call that returns when a session is done, needs its controller, or has gone quiet,
-// read from the journal alone, so it works with any daemon and no socket. Nirby control session, 2026-11-04: control
+// read from the journal alone, so it works with any daemon and no socket. Found live, 2026-11-04: control
 // polled `bounce tasks --json` every minute and kept its own idle counter. Pure: events in, outcome out.
 import {tasks as taskStates, TERMINAL} from './reducers.js';
 
@@ -31,7 +31,7 @@ function delivered(events) {
 }
 const answerBefore = (events, seq) => events.findLast(e => e.seq <= seq && e.kind === 'assistant' && !e.task && !e.narration)?.text ?? null;
 
-// `--done` (Nirby control, 2026-11-05): only the end of the job counts. A detached run's job ends at its `run.ended` row
+// `--done` (found live, 2026-11-05): only the end of the job counts. A detached run's job ends at its `run.ended` row
 // (src/cli.js) unless a message was sent after it; an interactive session's when every task ended and its turn did.
 // Quiet stretches and held tasks the orchestrator is handling are not reported; a job that ended with tasks
 // waiting on the user is.

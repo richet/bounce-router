@@ -628,7 +628,7 @@ test('task.accepted: the orchestrator may accept held work whatever held it, and
   assert.deepEqual(['gate', 'unsure', 'nothing', 'unfinished'].map(task => reducers.tasks(session.events)[task].state), ['accepted', 'accepted', 'accepted', 'accepted']);
 });
 
-// Nirby control session, 2026-11-04: seven cancelled builders had green checks, and the orchestrator copied or committed
+// Found live, 2026-11-04: seven cancelled builders had green checks, and the orchestrator copied or committed
 // their copies by hand. The orchestrator may now accept a cancelled task, which lands its copy's work.
 test('task.accepted: the orchestrator may accept a cancelled task, a worker may not, and a refusal to land comes back as the reason', async t => {
   const accepted = [];
@@ -919,7 +919,7 @@ test('an open outcome wait keeps each new row cheap on a long journal', async t 
   assert.ok(elapsed < 1000, `five rows took ${Math.round(elapsed)} ms with one wait open`);
 });
 
-// Shared names across parallel sessions of one project (src/reservations.js). Nirby control session, 2026-11-04: run
+// Shared names across parallel sessions of one project (src/reservations.js). Found live, 2026-11-04: run
 // A was given migration 0045, and run B's builder took 0045 too.
 import {sessionReservations} from '../src/reservations.js';
 test('the orchestrator reserves a shared name against every other session of the project, binds it to the task its orders use, and a worker cannot reserve', async t => {

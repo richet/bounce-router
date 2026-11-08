@@ -1,5 +1,5 @@
 // Names that parallel sessions of one project share (a migration number, a port, a database name), reserved before
-// they are used. Nirby control session, 2026-11-04: run A was given migration 0045, and run B's builder, which saw only
+// they are used. Found live, 2026-11-04: run A was given migration 0045, and run B's builder, which saw only
 // its own copy, took 0045 too. A reservation is a file under the machine directory (shared by every BOUNCE_HOME, like
 // machine-slots.js), taken by an exclusive link, so it is whole or absent. It is free again when it is released, when
 // its session's daemon is gone, or when the task it was bound to has ended.

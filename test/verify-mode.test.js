@@ -1,5 +1,5 @@
-// Who verifies, set per session and changed live (kb control, 2026-11-05; owner: "some things are better with the
-// orchestrator, to avoid collisions, and others with the worker"). It changes the orchestrator's verifying orders
+// Who verifies, set per session and changed live: some work is better verified by the orchestrator, to avoid
+// collisions, and some by the worker. It changes the orchestrator's verifying orders
 // only; in every mode the final head's gates pass and the result names the commit each gate ran on.
 import test from 'node:test';
 import assert from 'node:assert/strict';

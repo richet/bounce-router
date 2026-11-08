@@ -6,7 +6,7 @@ import path from 'node:path';
 import {validOwns} from './owned-paths.js';
 
 const EXCLUDED = new Set(['.git', '.bounce', 'node_modules', '.attempt-workspace.json']);
-// A light copy (the default for a git checkout, Nirby control, 2026-11-07: 331 full copies held 483 GB, a 3 GB copy of a
+// A light copy (the default for a git checkout, found live, 2026-11-07: 331 full copies held 483 GB, a 3 GB copy of a
 // 20 MB project) holds the checkout's tracked files and its uncommitted changes, not what git ignores. The ignored
 // files a worker needs (an .env) are listed in the project's committed .bounce/copy-include, gitignore patterns.
 export const COPY_INCLUDE_FILE = '.bounce/copy-include';
@@ -455,7 +455,7 @@ export function advanceBaseline(workspace, artifact, mergedStates = {}) {
 
 // A send-back after a refused integration brings the refused files of the copy up to the checkout, so the worker
 // reconciles against what is there now and the next integrate is clean. Without it a worker that resolved the conflict
-// in its copy conflicted again: the merge base was still where the copy started (Nirby control session, 2026-11-04).
+// in its copy conflicted again: the merge base was still where the copy started (found live, 2026-11-04).
 // Each file's baseline becomes the checkout's version, and the copy gets:
 // - markers: both sides changed it; the worker's change and the checkout's, with git's conflict markers where they overlap.
 // - you_deleted: the worker deleted it and the checkout edited it; the checkout's file is back, deleting it again is the worker's call.

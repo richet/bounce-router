@@ -17,13 +17,13 @@ function inbox(t) {
 test('a sent message is queued with its sender, and leaves the queue once its turn starts', t => {
   const {session, inbox: box} = inbox(t);
   assert.deepEqual(box.state(), {state: 'idle', currentTurnId: null});
-  const first = box.run({text: 'also fix the docs', via: 'send', caller: 'nirby control'});
+  const first = box.run({text: 'also fix the docs', via: 'send', caller: 'control'});
   const second = box.run({text: 'then the tests', via: 'send'});
   assert.deepEqual([first.accepted, first.queued, second.accepted], [true, true, true]);
   assert.equal(box.state().state, 'queued');
   const queued = pendingSends(session.events);
   assert.deepEqual(queued.map(e => [e.requestId, e.text, e.via, e.caller]),
-    [[first.requestId, 'also fix the docs', 'send', 'nirby control'], [second.requestId, 'then the tests', 'send', undefined]]);
+    [[first.requestId, 'also fix the docs', 'send', 'control'], [second.requestId, 'then the tests', 'send', undefined]]);
   session.append({kind: 'main.started', requestId: first.requestId});
   assert.deepEqual(pendingSends(session.events).map(e => e.requestId), [second.requestId]);
 });

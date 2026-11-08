@@ -452,7 +452,7 @@ test('W14 the live activity map is pruned when a task goes terminal (F2/A5)', as
   assert.equal(scheduler._activitySize(), 0);
 });
 
-// Nirby control session, 2026-11-04 (journal f1ea92b8): two builders passed their checks and went to review; the
+// Found live, 2026-11-04: two builders passed their checks and went to review; the
 // reviewer ran a long test suite and said nothing for five minutes. The watchdog sent its correction to the builder
 // (`no live worker`) and then cancelled the task, so work that had passed its check was never integrated.
 test('W15 a silent reviewer is corrected and its review stopped; the task under review is never cancelled', async t => {

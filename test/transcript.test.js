@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {createFormatter} from '../src/format.js';
 import {conversationEvents} from '../src/tui/transcript.js';
 
-const answer = '## LocalWorker bridge test — passed\n\n**Verified:** `cleartasks-web`\n\n- No edits\n- No version field';
+const answer = '## LocalWorker bridge test — passed\n\n**Verified:** `shop-web`\n\n- No edits\n- No version field';
 const events = [
   {id: '1', kind: 'task.submitted', task: 'task-one', profile: 'LocalWorker'},
   {id: '2', kind: 'task.started', task: 'task-one', requested: 'qwen', time: '2026-09-14T00:00:00Z'},
@@ -81,7 +81,7 @@ test('a run of progress readings for the same thing collapses to its latest valu
 test('a terminal-only answer is retained and rendered as Markdown', () => {
   const rows = conversationEvents([events[6]]);
   const text = rows.flatMap(row => createFormatter({color: false}).event(row, 80)).join('\n');
-  assert.match(text, /Verified: cleartasks-web/);
+  assert.match(text, /Verified: shop-web/);
   assert.doesNotMatch(text, /\*\*|##/);
 });
 

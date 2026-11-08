@@ -42,7 +42,7 @@ test('a worker, its turn and its review each say who they are and when', () => {
   assert.equal(rows.length, 3);
 });
 
-// Nirby control session, 2026-11-04: a worker's vendor session runs in a copy outside the project, so a reader of it
+// Found live, 2026-11-04: a worker's vendor session runs in a copy outside the project, so a reader of it
 // could not tell its project. The session row records the checkout's origin, and every lineage row carries it.
 test('a session records its checkout\'s origin, and lineage rows carry it as repository (null without one)', t => {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-lineage-repo-')));

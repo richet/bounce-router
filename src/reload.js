@@ -37,7 +37,7 @@ import {createMainService} from './main-service.js';
 import {createRunInbox, pendingSends} from './run-inbox.js';
 import {verifyingOrders, verifyMode} from './verify-mode.js';
 import {autoPrune} from './prune.js';
-// Full gate runs at once on this machine when config.json says nothing (kb control, 2026-11-05: 8 CPU and 16 GB each).
+// Full gate runs at once on this machine when config.json says nothing (found live, 2026-11-05: 8 CPU and 16 GB each).
 const DEFAULT_GATE_SLOTS = 3;
 // Copies of ended work held elsewhere (src/prune.js autoPrune) are removed after this many days (0: never), a minute after a daemon starts and every 6 hours.
 const DEFAULT_PRUNE_AFTER_DAYS = 7;
@@ -763,7 +763,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // exit — a headless `run --detach` whose child process already closed must still
   // stay up while a delegated task runs.
   // A message sent with `bounce send` meanwhile (src/run-inbox.js) ends the wait too: 'sent', and a run child is
-  // started again to take it as its next turn (Nirby control, 2026-11-05: it sat "queued" for an hour, unrun).
+  // started again to take it as its next turn (found live, 2026-11-05: it sat "queued" for an hour, unrun).
   function waitForDrain() {
     const sent = () => orchestrating && pendingSends(session.events).length > 0;
     return new Promise(resolve => {
