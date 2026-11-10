@@ -29,12 +29,12 @@ Every brief states:
 
 1. **Goal** — one observable outcome, not a topic.
 2. **Scope** — exact files, paths, or questions in bounds; one writer per file.
-3. **Authority** — read-only, or exactly what it may edit; forbidden side effects (no commits unless stated, no new dependencies, no adjacent refactors, no spawning further workers).
+3. **Authority** — read-only, or exactly what it may edit; forbidden side effects (no commit on the user's main branches — main/master, the checkout's default, or the branch the user is on in their checkout — unless the user said so explicitly; no new dependencies, no adjacent refactors, no spawning further workers).
 4. **Verification** — the commands it must run, or why none can run. Name the project's own test and style rules instead of assuming it finds them.
 5. **Report shape and cap** — e.g. "under ~1.5k tokens: `path:line` refs, commands with results, open risks; never paste file bodies or whole diffs". "Keep it short" is not a cap.
 6. **Known context** — what you already know, so it isn't rediscovered.
 
-Close with: *finish the goal; make and report a small change outside your paths when the goal needs it; stop only for a missing decision or access.* Give the worker the authority its acceptance needs: never require a live check (Docker, a real run) from a worker whose brief forbids it.
+Close with: *finish the goal; make and report a small change outside your paths when the goal needs it; stop only for a missing decision or access.* Give the worker the authority its acceptance needs: never require a live check (Docker, a real run) from a worker whose brief forbids it. Commits on the worker's own branch in its copy are always fine and expected; under branch delivery they are how the work is delivered. When a user says "don't commit", read it as "nothing on my branches, no push" and never pass it on as "leave it uncommitted".
 
 Put a one-shot brief in the task's `orders` field; multi-round work resubmits through bounce's own rework cycle (task.rework), not a hand-maintained file.
 
@@ -52,7 +52,7 @@ Put a one-shot brief in the task's `orders` field; multi-round work resubmits th
 
 A report is evidence, not proof, and so is a terminal row: `task.completed` says a worker believed it was done. Check that it answered the brief, open the actual diff or artifact, and rerun high-risk verification yourself — "tests passed" in a report is a claim.
 
-- **The diff must be the whole change.** Review the specified revision *and* its staged and unstaged working-tree changes. A clean tree is required only when the orders require a commit; otherwise unexpected files or changes are a `FAIL`.
+- **The diff must be the whole change.** Review the specified revision *and* its staged and unstaged working-tree changes. Under branch delivery the work is the worker's commits and the tree must be clean; otherwise unexpected files or changes are a `FAIL`.
 - **A rate limit mid-wave is a wave failure.** Siblings can report "complete" with nothing in them. Check each produced real output before using any of it.
 - Resolve conflicting reports from primary evidence, not by majority.
 

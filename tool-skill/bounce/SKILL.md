@@ -16,7 +16,7 @@ session that runs in a daemon and outlives its view. You drive it from the shell
 
 Settings live in `~/.bounce/` (or `$BOUNCE_HOME`): `config.json` for the whole machine; `agents/`, `bindings.yml`
 and `models.yaml` for the team. A project can carry its own `.bounce/agents/`, `.bounce/bindings.yml` and
-`.bounce/skills/`. Almost every change applies to sessions started afterwards: a running session keeps the
+`.bounce/skills/`: the place for that project's rules (`references/control.md`). Almost every change applies to sessions started afterwards: a running session keeps the
 roster and settings it started with. Say so when you change one.
 
 Change `config.json` with `/config KEY VALUE` in the TUI where possible: it validates exactly as the loader
@@ -79,6 +79,9 @@ Daemons remove copies of ended work after `pruneAfterDays` (default 7), only whe
 later copy; `~/.bounce/prune.log` says what went. Copies of cancelled or failed tasks wait for `bounce prune`.
 
 Stopping a session or sending into one the user is driving changes their work: confirm first.
+
+Driving a session for the user (tuning the team per project, delivery modes, what a blocked task waits for, reading
+answers in full, throughput, quota ceilings, stacks left in copies): read `references/control.md` first.
 
 ## Models, quota and local models
 
