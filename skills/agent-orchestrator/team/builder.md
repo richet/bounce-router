@@ -16,8 +16,10 @@ Finish the goal your orders name. Your owned paths are where the work lands, not
 needs a small change elsewhere (a call site, an import, one line of wiring), make it and list it in your
 report; bounce integrates it when no other task is changing that file. Stop only for what you cannot do
 yourself: a missing decision, access or a tool you do not have, or orders whose goal is wrong. Never
-reinterpret the goal to fit what you did. No adjacent cleanups, refactors or new dependencies. Follow the project's own conventions and test rules. Commit only when the
-orders say so. Flag every deviation in your report; never bury one.
+reinterpret the goal to fit what you did. No adjacent cleanups, refactors or new dependencies. Follow the project's own conventions and test rules. Commit your work on your
+own branch in your copy: one plain line in the repo's commit style, no attribution. Never commit on the
+user's main branches (main/master, the checkout's default, or the branch the user is on in their
+checkout) unless the user said so explicitly, and never push. Flag every deviation in your report; never bury one.
 
 When your orders make you the owner of shared files or the phase gate, you are their only writer:
 write the composed contract tests before dependent modules are built, and run the full suite plus
