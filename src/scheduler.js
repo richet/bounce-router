@@ -864,7 +864,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const requirementProblem = validateRequirements(spec.requires);
     if (requirementProblem) return requirementProblem;
     const requestedProfile = profiles[spec.profile];
-    if (requestedProfile && missingCapabilities(requestedProfile, spec.requires).length) return `capability mismatch: ${missingCapabilities(requestedProfile, spec.requires).join(', ')} unavailable on ${spec.profile}; split analysis from command verification`;
+    if (requestedProfile && !spec.commit && missingCapabilities(requestedProfile, spec.requires).length) return `capability mismatch: ${missingCapabilities(requestedProfile, spec.requires).join(', ')} unavailable on ${spec.profile}; split analysis from command verification`;
     if (typeof spec.orders !== 'string' || !spec.orders) return 'orders';
     if (spec.deadline !== null && spec.deadline !== undefined && !Number.isFinite(spec.deadline)) return 'deadline';
     if (spec.parent != null && !view[spec.parent]) return 'parent';
@@ -876,6 +876,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (spec.checkTimeoutMinutes !== undefined && !spec.check) return 'checkTimeoutMinutes (only with a check)';
     const timedOut = spec.check ? repeatOfTimedOutCheck(spec) : null;
     if (timedOut) return `check (the same check ran out of its ${timedOut.minutes} minutes on task ${timedOut.task.slice(0, 8)}; running it unchanged would time out again: give a longer checkTimeoutMinutes, up to ${CHECK_TIMEOUT_MAX_MINUTES}, or split it into smaller checks)`;
+    if (spec.atProblem) return spec.atProblem;
     if (spec.at !== undefined && (typeof spec.at !== 'string' || !spec.at.trim() || spec.at.startsWith('-'))) return 'at (a branch name or commit)';
     if (spec.at !== undefined && !spec.check) return 'at (a check-only task needs a check)';
     if (spec.risk !== undefined && !RISKS.has(spec.risk)) return 'risk';
@@ -922,6 +923,17 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // with Jev disabled or off for review, the row is untouched and behaviour is exactly today's.
   // `inPlace: true` or `{}` cites the user's latest message (found live: an orchestrator had no seq to
   // cite and was refused twice); an explicit authorizedBy is taken as given. Null: nothing to cite.
+  function checkOnlySpec(spec) {
+    const filled = {...spec,
+      orders: typeof spec.orders === 'string' && spec.orders ? spec.orders : `Check-only: bounce runs \`${spec.check}\` on ${spec.at}.`,
+      requires: spec.requires ?? ['read', 'exec'],
+      // No worker runs, so the agent only labels the task: any agent of the team, with no correction notice.
+      profile: spec.profile ?? matchingAgent(spec) ?? Object.keys(profiles).find(name => profiles[name].role !== 'orchestrator' && profiles[name].adapter !== 'typesafe')};
+    if (typeof spec.at !== 'string' || !spec.at.trim() || spec.at.startsWith('-')) return filled;
+    try { return {...filled, commit: commitIn(session.cwd, spec.at)}; }
+    catch (error) { return {...filled, atProblem: error.message.replace(/^malformed: /, '')}; }
+  }
+
   function inPlaceCitation(inPlace) {
     if (inPlace !== true && (!inPlace || typeof inPlace !== 'object')) return null;
     if (typeof inPlace?.authorizedBy === 'number') return inPlace.authorizedBy;
@@ -929,6 +941,12 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   }
 
   function prepare(spec) {
+    // `commit` is bounce's own resolution of `at`; one sent by a peer is never trusted.
+    spec = (({commit: _commit, atProblem: _atProblem, ...rest}) => rest)(spec);
+    // A check-only task (`at` + `check`) has no worker, so it needs no orders, capabilities or agent: bounce runs the
+    // check itself. Its commit is resolved here, on every submit path, because dispatch keys on the row's `commit`.
+    const checkOnly = spec.at !== undefined && validCheck(spec.check);
+    if (checkOnly) spec = checkOnlySpec(spec);
     spec = correct(spec);
     spec = assignWorker(spec);
     if (spec.inPlace !== undefined && inPlaceCitation(spec.inPlace) !== null) spec = {...spec, inPlace: {authorizedBy: inPlaceCitation(spec.inPlace)}};
@@ -986,7 +1004,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const view = reducers.tasks(session.events);
     const problem = validate(spec, view);
     if (problem) throw new Error(`malformed: ${problem}`);
-    const commit = spec.at !== undefined ? commitIn(session.cwd, spec.at) : null;
+    const commit = spec.commit ?? null;
     const task = spec.task ?? randomUUID();
     const turnRequestId = spec.from === 'orchestrator' ? reducers.openTurnRequest(session.events) : null;
     const row = {

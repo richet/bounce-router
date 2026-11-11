@@ -37,7 +37,8 @@ test('M1 it is an MCP server: initialize, then the bridge verbs as tools', async
   assert.match(submit.description, /task\.submitted/);
   assert.doesNotMatch(submit.description, /plan/i);
   const taskSubmit = list.result.tools.find(tool => tool.name === 'task_submit');
-  assert.equal(taskSubmit.inputSchema.required.includes('requires'), true);
+  // Required on every task but a check-only one (at + check), which no client schema can express: the descriptions say it.
+  for (const field of ['profile', 'orders', 'requires']) assert.match(taskSubmit.inputSchema.properties[field].description, /Required.*check-only task \(at \+ check\)/s);
   assert.deepEqual(taskSubmit.inputSchema.properties.requires.items.enum, ['read', 'exec', 'write']);
   assert.doesNotMatch(taskSubmit.inputSchema.description ?? '', /plan/i);
   assert.equal('planId' in taskSubmit.inputSchema.properties, false);

@@ -34,7 +34,11 @@ export function orchestratorStatus(events, {now = Date.now(), quotas = {}, quota
     .map(w => ({provider, window: w.label, percent: w.percent, ceiling: ceilingAt(quotaSettings, provider, w, now), resetsAt: w.resetsAt})));
   const pause = events.findLast(e => e.kind === 'machine.paused' || e.kind === 'machine.resumed');
   const machine = pause?.kind === 'machine.paused' ? {paused: true, since: pause.time ?? null, text: pause.text} : null;
-  return {orchestrator, note, tasks, blocked, ...(machine ? {machine} : {}), lastAnswer: answer ? clip(answer, ANSWER_MAX) : null, ...(quota.length ? {quota} : {})};
+  // Idle nudges since the orchestrator last dispatched (src/main-service.js): how many, the last one, the step it named.
+  const lastSubmit = events.findLast(e => e.kind === 'task.submitted')?.seq ?? 0;
+  const nudges = events.filter(e => e.kind === 'main.requested' && e.idle && e.seq > lastSubmit);
+  const idle = nudges.length ? {nudges: nudges.length, last: nudges.at(-1).time ?? null, minutes: nudges.at(-1).idleMinutes ?? null, next: nudges.at(-1).next ?? null} : null;
+  return {orchestrator, note, tasks, blocked, ...(machine ? {machine} : {}), ...(idle ? {idle} : {}), lastAnswer: answer ? clip(answer, ANSWER_MAX) : null, ...(quota.length ? {quota} : {})};
 }
 
 export function formatStatus(view) {
@@ -46,6 +50,7 @@ export function formatStatus(view) {
     head,
     view.note ? `Its note: ${view.note}` : null,
     view.machine ? `${view.machine.text}${view.machine.since ? ` (since ${String(view.machine.since).slice(11, 16)}Z)` : ''}` : null,
+    view.idle ? `Idle nudge: ${view.idle.nudges} since its last dispatch${view.idle.last ? `, last at ${String(view.idle.last).slice(11, 16)}Z` : ''}${view.idle.minutes != null ? ` after ${view.idle.minutes} min idle` : ''}${view.idle.next ? `; its note's next: ${view.idle.next}` : ''}` : null,
     view.tasks.length ? `Tasks:\n${view.tasks.map(t => `  ${short(t.task)} · ${t.profile ?? '?'}${t.ai ? ` on ${t.ai}` : ''} · ${t.state}${t.elapsed ? ` · ${t.elapsed}` : ''}${t.doing ? ` · ${t.doing}` : ''}`).join('\n')}` : 'Tasks: none live',
     view.blocked.length ? `Waiting on a decision:\n${view.blocked.map(b => `  ${short(b.task)} · ${b.reason ?? 'blocked'}${b.text ? ` · ${b.text}` : ''}`).join('\n')}` : null,
     view.lastAnswer ? `Last answer:\n${view.lastAnswer}` : null,
