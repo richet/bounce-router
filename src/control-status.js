@@ -23,9 +23,11 @@ export function orchestratorStatus(events, {now = Date.now(), quotas = {}, quota
   const note = events.findLast(e => e.kind === 'state' && typeof e.text === 'string')?.text ?? null;
   const states = taskStates(events);
   const tasks = taskList(events, {now}).map(row => ({...row, ai: events.findLast(e => e.kind === 'task.started' && e.task === row.task)?.requested ?? null}));
-  const blocked = tasks.filter(row => states[row.task]?.state === 'blocked').map(row => {
-    const last = events.findLast(e => e.kind === 'task.blocked' && e.task === row.task);
-    return {task: row.task, reason: last?.reason ?? null, text: cut(last?.text, BLOCKER_MAX) || null};
+  // Blocked or waiting for an answer: both wait on a decision.
+  const blocked = tasks.filter(row => ['blocked', 'input_required'].includes(states[row.task]?.state)).map(row => {
+    const last = events.findLast(e => (e.kind === 'task.blocked' || e.kind === 'task.input_required') && e.task === row.task);
+    const asks = last?.kind === 'task.input_required';
+    return {task: row.task, reason: last?.reason ?? (asks ? 'asks for input' : null), text: cut(last?.text ?? (Array.isArray(last?.questions) ? last.questions.join('; ') : null), BLOCKER_MAX) || null};
   });
   // An older journal holds a failed turn's error as an assistant row too.
   const answer = events.findLast(e => e.kind === 'assistant' && e.from === 'main' && !e.narration && e.text !== failed?.text)?.text;
@@ -38,7 +40,13 @@ export function orchestratorStatus(events, {now = Date.now(), quotas = {}, quota
   const lastSubmit = events.findLast(e => e.kind === 'task.submitted')?.seq ?? 0;
   const nudges = events.filter(e => e.kind === 'main.requested' && e.idle && e.seq > lastSubmit);
   const idle = nudges.length ? {nudges: nudges.length, last: nudges.at(-1).time ?? null, minutes: nudges.at(-1).idleMinutes ?? null, next: nudges.at(-1).next ?? null} : null;
-  return {orchestrator, note, tasks, blocked, ...(machine ? {machine} : {}), ...(idle ? {idle} : {}), lastAnswer: answer ? clip(answer, ANSWER_MAX) : null, ...(quota.length ? {quota} : {})};
+  // Automatic wakes stop when the user stops a turn, until the user sends anything (src/main-service.js): say so, it
+  // is the one state in which nothing will wake the orchestrator.
+  const stopped = events.findLast(e => e.kind === 'main.cancelled');
+  const manual = events.findLast(e => e.kind === 'main.requested' && !e.wake);
+  const wakesPaused = stopped && (!manual || stopped.seq > manual.seq) ? {since: stopped.time ?? null} : null;
+  const lastCheckIn = events.findLast(e => e.kind === 'main.requested' && e.checkIn);
+  return {orchestrator, note, tasks, blocked, ...(machine ? {machine} : {}), ...(idle ? {idle} : {}), ...(wakesPaused ? {wakesPaused} : {}), ...(lastCheckIn ? {checkIn: {last: lastCheckIn.time ?? null, quietMinutes: lastCheckIn.quietMinutes ?? null}} : {}), lastAnswer: answer ? clip(answer, ANSWER_MAX) : null, ...(quota.length ? {quota} : {})};
 }
 
 export function formatStatus(view) {
@@ -50,6 +58,8 @@ export function formatStatus(view) {
     head,
     view.note ? `Its note: ${view.note}` : null,
     view.machine ? `${view.machine.text}${view.machine.since ? ` (since ${String(view.machine.since).slice(11, 16)}Z)` : ''}` : null,
+    view.wakesPaused ? `Automatic wakes are paused: you stopped a turn${view.wakesPaused.since ? ` at ${String(view.wakesPaused.since).slice(11, 16)}Z` : ''}; any message turns them back on.` : null,
+    view.checkIn ? `Last check-in: ${String(view.checkIn.last ?? '').slice(11, 16)}Z${view.checkIn.quietMinutes != null ? `, after ${view.checkIn.quietMinutes} min without a turn` : ''}` : null,
     view.idle ? `Idle nudge: ${view.idle.nudges} since its last dispatch${view.idle.last ? `, last at ${String(view.idle.last).slice(11, 16)}Z` : ''}${view.idle.minutes != null ? ` after ${view.idle.minutes} min idle` : ''}${view.idle.next ? `; its note's next: ${view.idle.next}` : ''}` : null,
     view.tasks.length ? `Tasks:\n${view.tasks.map(t => `  ${short(t.task)} · ${t.profile ?? '?'}${t.ai ? ` on ${t.ai}` : ''} · ${t.state}${t.elapsed ? ` · ${t.elapsed}` : ''}${t.doing ? ` · ${t.doing}` : ''}`).join('\n')}` : 'Tasks: none live',
     view.blocked.length ? `Waiting on a decision:\n${view.blocked.map(b => `  ${short(b.task)} · ${b.reason ?? 'blocked'}${b.text ? ` · ${b.text}` : ''}`).join('\n')}` : null,

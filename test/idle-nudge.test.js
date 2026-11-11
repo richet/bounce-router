@@ -46,7 +46,7 @@ function setup(t, {settings = {}, note = NOTE} = {}) {
   };
   if (note !== null) session.append({kind: 'state', from: 'main', text: note});
   const main = createMainService({session, adapters: {codex: mainAdapter}, profile: {adapter: 'codex', mode: 'plan'},
-    settings: {executables: {}, sweepMinutes: 0, escalateMinutes: 0, ...settings}, clock, handoffDelayMs: 5, typedRetryMs: 5,
+    settings: {executables: {}, sweepMinutes: 0, escalateMinutes: 0, checkInMinutes: 0, ...settings}, clock, handoffDelayMs: 5, typedRetryMs: 5,
     watchdog: {startupMs: 100, runningMs: 100, retryDelayMs: 5, maxWakeAttempts: 2}});
   t.after(() => main.close());
   const turnsEnded = () => session.events.filter(row => row.kind === 'main.terminal').length;

@@ -27,6 +27,8 @@ A gate or an integration run on a commit that already exists is a check-only tas
 
 Never run a gate or an integration check outside bounce; long ones use check-only tasks with `checkTimeoutMinutes`. A gate you start in the background (`run_in_background`, `nohup`, `setsid`, a trailing `&`) is refused, and nothing would wake you when it ended. If you sit idle with no tasks while your note still names a next step, bounce asks you after `idleNudgeMinutes` to dispatch or say what you wait on; when the batch is done or waits on the user, write that in your note's Next.
 
+A task that is blocked or asks for input waits on you until you decide it: answer the worker, accept, send back or cancel. A new task does not close it; name it in `retryOf` when the new one replaces it. Every wake lists what still waits. Each outcome is handed to you once; if something waits on you and nothing woke you, bounce checks in after `checkInMinutes`.
+
 When bounce holds a task as `check_environment` (or a check-only task fails as `environment`), the check failed because of the machine — git objects missing in the copy, a full disk, memory, the Docker daemon or a Docker timeout — and its text names which. The worker has nothing to fix: do not restart or resubmit the builder. Tell the user what is wrong with the machine, wait for it to be fixed (or fix what your authority allows), then rerun the check alone as a check-only task and accept on that.
 
 The same check on the same tree runs once at a time on the machine: a second one waits, and its milestone names the task it waits on. Don't resubmit it or cancel the first to get it going; read the first one's result instead when it is the same commit.

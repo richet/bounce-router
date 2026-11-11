@@ -154,6 +154,7 @@ export function validateSettings(value) {
   // The quiet sweep: minutes with nothing in flight and held work waiting before the orchestrator is asked; 0 turns it off.
   if (value.sweepMinutes !== undefined && (!Number.isInteger(value.sweepMinutes) || value.sweepMinutes < 0 || value.sweepMinutes > 240)) throw new Error('sweepMinutes must be a whole number of minutes from 0 (off) to 240');
   if (value.idleNudgeMinutes !== undefined && (!Number.isInteger(value.idleNudgeMinutes) || value.idleNudgeMinutes < 0 || value.idleNudgeMinutes > 240)) throw new Error('idleNudgeMinutes must be a whole number of minutes from 0 (off) to 240');
+  if (value.checkInMinutes !== undefined && (!Number.isInteger(value.checkInMinutes) || value.checkInMinutes < 0 || value.checkInMinutes > 240)) throw new Error('checkInMinutes must be a whole number of minutes from 0 (off) to 240');
   // A task open this long from its submission is put to the orchestrator once, to tell the user; 0 turns it off.
   if (value.minFreeDiskGB !== undefined && (typeof value.minFreeDiskGB !== 'number' || !Number.isFinite(value.minFreeDiskGB) || value.minFreeDiskGB < 0 || value.minFreeDiskGB > 100000)) throw new Error('minFreeDiskGB must be a number of GB from 0 (off) to 100000');
   if (value.minFreeDiskPercent !== undefined && (!Number.isInteger(value.minFreeDiskPercent) || value.minFreeDiskPercent < 0 || value.minFreeDiskPercent > 90)) throw new Error('minFreeDiskPercent must be a whole number from 0 (off) to 90');

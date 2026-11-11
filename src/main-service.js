@@ -45,6 +45,13 @@ const OVERTIME_CHECK_MS = 60000;
 // red gate until a person noticed. At most one nudge per IDLE_REPEAT_MINUTES, and none after IDLE_NUDGE_MAX in a row
 // that dispatched nothing.
 const IDLE_MINUTES = 5;
+// The check-in: the safety net under every other wake. Whatever the reason nothing woke the orchestrator (a wake that
+// failed, retries spent, an outcome that never came), while work is open or waits on it and it has had no turn for
+// CHECK_IN_MINUTES, bounce gives it one turn with the whole state. A check-in that changes nothing doubles the next
+// interval, up to CHECK_IN_MAX_MINUTES.
+const CHECK_IN_MINUTES = 10;
+const CHECK_IN_MAX_MINUTES = 60;
+const CHECK_IN_PROMPT = 'Check the state above against your orders and note. Act on anything that waits on you (answer, accept, send back, cancel, dispatch the next step). If everything is running as it should, say so in one line and end your turn.';
 const IDLE_REPEAT_MINUTES = 15;
 const IDLE_NUDGE_MAX = 3;
 // A Next that says the work is finished or waits on a person is not work to nudge about.
@@ -77,6 +84,26 @@ function orchestratorsTask(session, view, id) {
   while (view[id]?.replaces && view[view[id].replaces] && !seen.has(id)) { seen.add(id); id = view[id].replaces; }
   return session.events.find(e => e.kind === 'task.submitted' && e.task === id)?.from === 'orchestrator';
 }
+// The orchestrator's tasks parked on a decision (blocked or input_required), oldest first, with what parked them.
+function heldList(session, view = tasks(session.events)) {
+  return Object.values(view).filter(t => ['blocked', 'input_required'].includes(t.state) && orchestratorsTask(session, view, t.id))
+    .map(t => ({...t, since: session.events.findLast(e => (e.kind === 'task.blocked' || e.kind === 'task.input_required') && e.task === t.id),
+      copy: session.events.findLast(e => e.kind === 'task.artifact' && e.task === t.id)?.cwd ?? null}))
+    .sort((a, b) => (a.since?.seq ?? 0) - (b.since?.seq ?? 0));
+}
+const HELD_CLOSE = 'A new task does not close one of these: answer the worker (a message to it), accept it, send it back, or cancel it.';
+function waitingLines(held, at, heading) {
+  const lines = [heading];
+  for (const t of held) {
+    const age = t.since?.time ? Math.max(0, Math.round((at - Date.parse(t.since.time)) / 60000)) : null;
+    lines.push(`- task ${t.id} · profile ${t.profile ?? '?'} · ${t.state}${t.since?.reason ? ` · reason: ${t.since.reason}` : ''}${age !== null ? ` · waiting ${age} min` : ''}${t.copy ? ` · work in ${t.copy}` : ''}`);
+    const text = t.since?.text ?? (Array.isArray(t.since?.questions) ? t.since.questions.join('; ') : null);
+    if (text) lines.push(`  ${String(text).split('\n')[0].slice(0, 300)}`);
+  }
+  lines.push(HELD_CLOSE);
+  return lines;
+}
+
 // The wake-up block: one entry per task whose end the orchestrator has not been handed, with
 // the terminal row's outcome — the final report summary (task.reported, folded by the scheduler
 // into task.completed's `summary`) or the failure text — and the roots still running.
@@ -144,6 +171,10 @@ export function handoffBlock(session, ended) {
     if (earlier.length) lines.push(`  this job has now failed ${earlier.length + 1} times the same way (${[...earlier.map(a => a.reason), row.reason ?? row.kind].join(', ')}): change the scope or the AI before asking again — bounce refuses a third identical attempt.`);
   }
   lines.push(running.length ? `Still running: ${running.map(t => `${t.id} (${t.profile}, ${t.state})`).join(', ')}` : 'No other task of yours is still running.');
+  // Every task of its still parked, on every wake: what waits on its decision, not only what is news this time.
+  const handed = new Set(ended.map(row => row.task));
+  const waiting = heldList(session, view).filter(t => !handed.has(t.id));
+  if (waiting.length) lines.push(...waitingLines(waiting, Date.now(), 'Still waiting on your decision:'));
   // Standing workers: who exists, what each did, who is idle or heavy.
   const roster = rosterLines(session.events);
   if (roster.length) lines.push('Your workers:', ...roster);
@@ -167,6 +198,7 @@ export function createMainService({session, adapters, profile, settings, profile
   const sweepMs = (settings.sweepMinutes ?? SWEEP_MINUTES) * 60000;
   const escalateMs = (settings.escalateMinutes ?? ESCALATE_MINUTES) * 60000;
   const idleMs = (settings.idleNudgeMinutes ?? IDLE_MINUTES) * 60000;
+  const checkInMs = (settings.checkInMinutes ?? CHECK_IN_MINUTES) * 60000;
   const now = clock.now ?? Date.now;
   const setTimer = clock.setTimeout ?? setTimeout;
   const clearTimer = clock.clearTimeout ?? clearTimeout;
@@ -290,11 +322,14 @@ export function createMainService({session, adapters, profile, settings, profile
         ?? delivered;
       if (!action) continue;
       const evidence = action.task ? taskDispositionEvidence(session.events, action, {afterSeq: run.requestedSeq, closingText}) : null;
-      if (action.task && !evidence) continue;
+      // An outcome is handed over once. A turn that saw it and did nothing durable about it has still seen it: handing
+      // it back on every wake taught the orchestrator to read each wake as "nothing new" (found live: the same two
+      // cancels re-handed for two hours, nine turns of "nothing new to act on"). A task still parked stays in front of
+      // it another way: the waiting list on every wake and the check-in.
       rows.push({kind: 'main.disposition', actionId: action.actionId, outcomeSeq: action.outcomeSeq, requestId: run.id,
         ...(action.task ? {task: action.task} : {}),
         ...(evidence?.successor ? {successor: evidence.successor} : {}),
-        disposition: evidence?.disposition ?? 'reported', from: 'main', context: session.id});
+        disposition: evidence?.disposition ?? (action.task ? 'seen' : 'reported'), from: 'main', context: session.id});
     }
     return rows;
   }
@@ -533,7 +568,7 @@ export function createMainService({session, adapters, profile, settings, profile
   function actionBlock(actions) {
     return handoffBlock(session, actions.map(action => action.row));
   }
-  function start(params, {wake, sweep = false, overtime = null, idle = null, forceFresh = false, fromQueue = false} = {}) {
+  function start(params, {wake, sweep = false, overtime = null, idle = null, checkIn = null, forceFresh = false, fromQueue = false} = {}) {
     if (closed) return {accepted: false, reason: 'daemon_closed'};
     if (current && (wake || current.unverified)) return {accepted: false, reason: current.unverified ? 'termination_unverified' : 'busy'};
     if (blockedState && ['termination_uncertain', 'orphaned'].includes(blockedState.reason)) return {accepted: false, reason: 'termination_unverified'};
@@ -584,7 +619,7 @@ export function createMainService({session, adapters, profile, settings, profile
     const held = sweep ? heldTasks() : [];
     if (sweep && !held.length) return {accepted: false, reason: 'nothing_waiting'};
     if (overtime && !overtime.length) return {accepted: false, reason: 'nothing_waiting'};
-    if (wake && !sweep && !overtime && !idle && !actions.length) return {accepted: false, reason: 'nothing_pending'};
+    if (wake && !sweep && !overtime && !idle && !checkIn && !actions.length) return {accepted: false, reason: 'nothing_pending'};
     const actionKey = actions.length ? actionSetKey(actions) : null;
     const run = {id: params.id ?? randomUUID(), provider, selected, routes, images, wake, actionKey, actions,
       actionIds: actions.map(action => action.actionId), outcomeSeqs: actions.map(action => action.outcomeSeq).filter(Number.isInteger),
@@ -598,10 +633,11 @@ export function createMainService({session, adapters, profile, settings, profile
     // requestId reaches main.started; a launch that fails leaves the outcomes pending.
     if (overtime) run.outcomes = overtimeBlock(overtime);
     else if (idle) run.outcomes = idleBlock(idle);
+    else if (checkIn) run.outcomes = checkInBlock(checkIn);
     else if (sweep) run.outcomes = sweepBlock(held);
     else if (actions.length) run.outcomes = actionBlock(actions);
     const requested = {kind: 'main.requested', from: 'main', context: session.id, requestId: run.id,
-      wake, ...(sweep ? {sweep: true} : {}), ...(overtime ? {overtime: true} : {}), ...(idle ? {idle: true, idleMinutes: idle.minutes, next: idle.next} : {}), text: params.text, provider, model: selected.model ?? '', mode: selected.mode, policy: selected.policy,
+      wake, ...(sweep ? {sweep: true} : {}), ...(overtime ? {overtime: true} : {}), ...(idle ? {idle: true, idleMinutes: idle.minutes, next: idle.next} : {}), ...(checkIn ? {checkIn: true, quietMinutes: checkIn.minutes} : {}), text: params.text, provider, model: selected.model ?? '', mode: selected.mode, policy: selected.policy,
       images, actionIds: run.actionIds, outcomeSeqs: run.outcomeSeqs, actionKey,
       attempt: wake && actionKey ? wakeAttempts(session.events, actionKey) + 1 : 1,
       dueAt: wake ? now() : null, ...(params.recoveryOf ? {recoveryOf: params.recoveryOf, rootRequestId: run.rootRequestId} : {})};
@@ -611,7 +647,8 @@ export function createMainService({session, adapters, profile, settings, profile
     if (overtime) {
       for (const t of overtime) committed.push({kind: 'task.overtime', task: t.id, minutes: t.minutes, limitMinutes: Math.round(escalateMs / 60000), requestId: run.id, from: 'bounce', context: session.id});
       committed.push({kind: 'handoff', wake, overtime: true, requestId: run.id, actionIds: [], outcomeSeqs: [], tasks: overtime.map(t => t.id), text: `${run.outcomes}\n\n${params.text}`, from: 'bounce'});
-    } else if (idle) committed.push({kind: 'handoff', wake, idle: true, requestId: run.id, actionIds: [], outcomeSeqs: [], tasks: [], text: `${run.outcomes}\n\n${params.text}`, from: 'bounce'});
+    } else if (checkIn) committed.push({kind: 'handoff', wake, checkIn: true, requestId: run.id, actionIds: [], outcomeSeqs: [], tasks: checkIn.open.map(t => t.id), text: `${run.outcomes}\n\n${params.text}`, from: 'bounce'});
+    else if (idle) committed.push({kind: 'handoff', wake, idle: true, requestId: run.id, actionIds: [], outcomeSeqs: [], tasks: [], text: `${run.outcomes}\n\n${params.text}`, from: 'bounce'});
     else if (sweep) committed.push({kind: 'handoff', wake, sweep: true, requestId: run.id, actionIds: [], outcomeSeqs: [], tasks: held.map(t => t.id), text: `${run.outcomes}\n\n${params.text}`, from: 'bounce'});
     else if (actions.length) committed.push({kind: 'handoff', wake, requestId: run.id,
       actionIds: run.actionIds, outcomeSeqs: run.outcomeSeqs, tasks: actions.filter(action => action.task).map(action => action.task),
@@ -691,11 +728,8 @@ export function createMainService({session, adapters, profile, settings, profile
   // was answered with nothing new since is not repeated; the next row of anyone's re-arms it.
   const QUIET = new Set(['task.usage', 'usage', 'raw', 'delta', 'model', 'checkpoint', 'main.wake.scheduled']);
   let sweepTimer = null;
-  function heldTasks() {
-    const view = tasks(session.events);
-    return Object.values(view).filter(t => t.state === 'blocked' && orchestratorsTask(session, view, t.id))
-      .map(t => ({...t, since: session.events.findLast(e => e.kind === 'task.blocked' && e.task === t.id), copy: session.events.findLast(e => e.kind === 'task.artifact' && e.task === t.id)?.cwd ?? null}));
-  }
+  // Blocked or waiting for input: both wait on the orchestrator (a worker's question was left out before).
+  function heldTasks() { return heldList(session); }
   function inFlight() {
     const view = tasks(session.events);
     return Object.values(view).some(t => !TERMINAL.has(t.state) && !['blocked', 'input_required'].includes(t.state));
@@ -814,6 +848,62 @@ export function createMainService({session, adapters, profile, settings, profile
     idleTimer?.unref?.();
   }
   armIdle();
+
+  // The check-in (see CHECK_IN_MINUTES). A user who stopped a turn has paused automatic wakes on purpose, and a
+  // blocked orchestrator waits for the user: neither is overridden; status says so.
+  let checkInTimer = null;
+  const serviceStartedAt = now();
+  function checkInDue() {
+    if (checkInMs <= 0 || closed || current || blockedState || wakeTimer || autoWakeSuppressed) return null;
+    const view = tasks(session.events);
+    const open = Object.values(view).filter(t => !TERMINAL.has(t.state) && orchestratorsTask(session, view, t.id));
+    // Something must wait on the orchestrator: an outcome not handed over, a held task, or a next step with nothing
+    // open. Tasks merely running are not that: their outcome will wake it.
+    const pending = pendingActions();
+    const held = open.filter(t => ['blocked', 'input_required'].includes(t.state));
+    const next = open.length ? null : nextStep(session.events.findLast(e => e.kind === 'state' && typeof e.text === 'string')?.text);
+    if (!pending.length && !held.length && !next) return null;
+    const lastTurn = session.events.findLast(e => e.kind === 'main.requested');
+    // From its last turn, or from this daemon's start: a restart is not a reason to wake it at once.
+    const since = Math.max(lastTurn ? (lastTurn.dueAt ?? Date.parse(lastTurn.time)) || 0 : 0, serviceStartedAt);
+    // Check-ins in a row with no news between them (an outcome, a submit, a user message) double the wait.
+    let streak = 0;
+    for (let i = session.events.length - 1; i >= 0; i--) {
+      const e = session.events[i];
+      if (e.kind === 'main.requested') { if (!e.checkIn) break; streak++; }
+      else if (OUTCOME_KINDS.has(e.kind) || e.kind === 'task.submitted' || e.kind === 'user') break;
+    }
+    const wait = Math.min(checkInMs * 2 ** streak, Math.max(checkInMs, CHECK_IN_MAX_MINUTES * 60000));
+    if (now() - since < wait) return null;
+    return {minutes: Math.round((now() - since) / 60000), open, pending, next};
+  }
+  function checkInBlock(due) {
+    const lines = [`bounce check-in: you have had no turn for ${due.minutes} min while work is open (delivered by bounce, not typed by the user).`];
+    if (due.pending.length) lines.push(handoffBlock(session, due.pending.map(action => action.row)));
+    else {
+      const running = due.open.filter(t => !['blocked', 'input_required'].includes(t.state));
+      if (running.length) lines.push('Open tasks:', ...running.map(t => {
+        const last = session.events.findLast(e => e.task === t.id && e.kind === 'task.milestone');
+        return `- task ${t.id} · profile ${t.profile ?? '?'} · ${t.state}${last?.text ? ` · last: ${String(last.text).split('\n')[0].slice(0, 200)}` : ''}`;
+      }));
+      const held = heldList(session);
+      if (held.length) lines.push(...waitingLines(held, now(), 'Waiting on your decision:'));
+      if (due.next) lines.push(`Nothing is open, and your note says next: ${due.next}`);
+    }
+    return lines.join('\n');
+  }
+  function armCheckIn() {
+    if (checkInMs <= 0 || closed) return;
+    checkInTimer = setTimer(() => {
+      checkInTimer = null;
+      if (closed) return;
+      const due = checkInDue();
+      if (due) start({text: CHECK_IN_PROMPT}, {wake: true, checkIn: due});
+      armCheckIn();
+    }, OVERTIME_CHECK_MS);
+    checkInTimer?.unref?.();
+  }
+  armCheckIn();
   const service = {
     state,
     subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
@@ -895,6 +985,7 @@ export function createMainService({session, adapters, profile, settings, profile
       if (sweepTimer) { clearTimer(sweepTimer); sweepTimer = null; }
       if (overtimeTimer) { clearTimer(overtimeTimer); overtimeTimer = null; }
       if (idleTimer) { clearTimer(idleTimer); idleTimer = null; }
+      if (checkInTimer) { clearTimer(checkInTimer); checkInTimer = null; }
       unsubscribeIdle();
       if (wakeTimer) { clearTimer(wakeTimer); wakeTimer = null; wakeTimerKey = null; }
       const run = current;

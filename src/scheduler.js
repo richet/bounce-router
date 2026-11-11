@@ -948,6 +948,14 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const checkOnly = spec.at !== undefined && validCheck(spec.check);
     if (checkOnly) spec = checkOnlySpec(spec);
     spec = correct(spec);
+    // A new task does not close a held one of the same agent. Found live: a blocked plan writer was replaced by a
+    // fresh task and left parked until the user asked; said in the submit reply, the submit itself goes ahead.
+    if (spec.from === 'orchestrator' && typeof spec.profile === 'string') {
+      const agent = spec.profile.split('@')[0];
+      const held = Object.values(reducers.tasks(session.events)).filter(t => ['blocked', 'input_required'].includes(t.state)
+        && String(t.profile ?? '').split('@')[0] === agent && t.id !== spec.retryOf && t.id !== spec.replaces && t.id !== spec.continues);
+      if (held.length) spec = {...spec, corrections: [...(spec.corrections ?? []), `held: ${held.map(t => `${t.id} (${t.state})`).join(', ')} of the ${agent} agent still ${held.length === 1 ? 'waits' : 'wait'} on you, and a new task does not close ${held.length === 1 ? 'it' : 'them'}: answer the worker, accept, send back or cancel, or name it in retryOf`]};
+    }
     spec = assignWorker(spec);
     if (spec.inPlace !== undefined && inPlaceCitation(spec.inPlace) !== null) spec = {...spec, inPlace: {authorizedBy: inPlaceCitation(spec.inPlace)}};
     const predecessor = spec.retryOf ?? spec.replaces;
