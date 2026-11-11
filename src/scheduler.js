@@ -26,6 +26,7 @@ import {failedAttempts, repeatRefusal, REPEAT_LIMIT} from './loop-guard.js';
 import {discoverLocalModels} from './local-models.js';
 import {createMachineSlots} from './machine-slots.js';
 import {runCheck, validCheck, weakCheck, CHECK_TIMEOUT_MS, CHECK_TIMEOUT_MAX_MINUTES} from './task-check.js';
+import {environmentCause} from './environment-failures.js';
 import {seenRun, checkPassed, weakCheckNotice, NO_RUN, NO_RUN_AFTER_CHANGE} from './command-output.js';
 import {routingFallback, PROFILE_TIERS} from './jev.js';
 import {validOwns} from './owned-paths.js';
@@ -1462,6 +1463,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       outcome = await checkRunner({command: row.check, cwd: copy, timeoutMs: row.checkTimeoutMinutes ? row.checkTimeoutMinutes * 60_000 : checkTimeoutMs});
     } finally { slot.release(); }
     if (closed || completedSeqOf(task) !== completedSeq || !['completed', 'reviewing'].includes(reducers.tasks(session.events)[task]?.state)) return false;
+    const environment = environmentCause(outcome);
+    if (environment) outcome = {...outcome, environment};
     append({kind: 'task.check', task, attempt, completedSeq, ...outcome, ...verified, queuedMs: slot.waitedMs, cwd: copy, context,
       text: `The task's check ${outcome.passed ? 'passed' : outcome.timedOut ? 'timed out' : 'failed'}: ${row.check}`});
     // Out of time is not a defect the worker can fix by trying again (found live: a cold build plus end-to-end tests
@@ -2249,7 +2252,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const candidate = candidateResult(session.events, task);
     if (REVIEW_GATE_REASONS.has(intent.reason) && candidate) append({kind: 'review.blocked', task, stage: 'completion', reason: intent.reason,
       candidateSeq: candidate.seq, candidateDigest: candidate.digest, text: blockedText, context});
-    append({kind: 'task.blocked', task, reason: intent.reason, text: blockedText, context});
+    append({kind: 'task.blocked', task, reason: intent.reason, ...reopensFor(task), text: blockedText, context});
   }
 
   // Runs a strategy hook and turns a throw into the fixed invariant every hook shares
@@ -2578,6 +2581,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       text: `The check ${outcome.passed ? 'passed' : outcome.timedOut ? 'timed out' : 'failed'} on ${head}: ${row.check}`});
     if (outcome.passed) append({kind: 'task.accepted', task, by: 'check', checkOnly: true, context, text: `The check passed on ${head}: ${row.check}`});
     else if (outcome.timedOut) fail('check_timeout', `The check did not finish in ${outcome.minutes} minutes and was stopped, on ${head}: ${row.check}. Split it into smaller checks, or submit again with a longer checkTimeoutMinutes (up to ${CHECK_TIMEOUT_MAX_MINUTES}).`, {minutes: outcome.minutes});
+    else if (environmentCause(outcome)) {
+      const {cause, label} = environmentCause(outcome);
+      fail('environment', `The check failed for a reason outside the code on ${head}: ${label} (${cause}). Fix the machine, then run the check again.\n${outcome.output ?? ''}`.trim(), {exit: outcome.exit, cause});
+    }
     else fail('check_failed', `The check failed (exit ${outcome.exit}) on ${head}: ${row.check}\n${outcome.output ?? ''}`.trim(), {exit: outcome.exit});
   }
 

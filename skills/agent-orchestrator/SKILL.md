@@ -25,6 +25,8 @@ Submit by job — `analyst` to locate, read and research, `builder` to implement
 
 A gate or an integration run on a commit that already exists is a check-only task, not an agent's turn: submit with `at` (a branch name or commit; a short id is resolved in the checkout) and `check`. bounce runs the check on that commit under the gate slots and the task ends accepted or failed with its output. Give a check that builds from cold or runs end-to-end tests a longer `checkTimeoutMinutes` (default 10, up to 120), or split it. A check that runs out of time fails with `check_timeout`; bounce refuses the same check again with the same limit, so resubmit it with a longer `checkTimeoutMinutes` or split it.
 
+When bounce holds a task as `check_environment` (or a check-only task fails as `environment`), the check failed because of the machine — git objects missing in the copy, a full disk, memory, the Docker daemon or a Docker timeout — and its text names which. The worker has nothing to fix: do not restart or resubmit the builder. Tell the user what is wrong with the machine, wait for it to be fixed (or fix what your authority allows), then rerun the check alone as a check-only task and accept on that.
+
 ## Write the brief
 
 Every brief states:

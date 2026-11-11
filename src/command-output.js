@@ -61,6 +61,10 @@ export function checkCouldNotRun(check) {
   return `The task's check could not be run, so nothing verified this work and it was not put in the checkout. bounce ran \`${check.command}\` in the worker's copy: ${ending(check)}.${printed(check.output)}${joined(check.output)}The check runs in a plain shell with bounce's own environment: name the tool by its full path, or set PATH inside the check. The work is kept. Decide: accept it with what you checked yourself (task.accepted), or retry it with a check that runs (retryOf).`;
 }
 
+export function checkEnvironment(check) {
+  return `The task's check failed for a reason outside the code: ${check.environment.label} (${check.environment.cause}). bounce ran \`${check.command}\` in the worker's copy: ${ending(check)}.${printed(check.output)}${joined(check.output)}The worker has nothing to fix, so it was not sent back and this is not a rework round. The work is kept. Fix the machine first, then decide: accept it with a check you ran yourself (task.accepted), or retry the check (a check-only task with at, or retryOf). Do not restart the builder for it.`;
+}
+
 // Work that changed files and that no check has run waits for the orchestrator (2026-09-29).
 // Found live: 6 wrong results were put in the checkout as soon as their worker finished,
 // and corrected afterwards by the orchestrator, who had caught every one of them by reading it.

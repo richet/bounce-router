@@ -5,7 +5,7 @@
 // `defaultStrategy` reproduces Phase 3–7's inline reaction policy exactly (the decisive
 // self-host proof, CONTRACT §2). `noReviewStrategy` and `quorumStrategy(n)` are Tier 1
 // presets over the same hooks (CONTRACT §3).
-import {checkFinding, checkStillFails, checkCouldNotRun, heldForAccept} from './command-output.js';
+import {checkFinding, checkStillFails, checkCouldNotRun, checkEnvironment, heldForAccept} from './command-output.js';
 
 // Only these dependency states fail a dependent outright (mirrors scheduler.js's own
 // DEPENDENCY_FAIL_STATES) — `completed` (no reviewer yet accepted) and `reviewing` hold the
@@ -47,6 +47,8 @@ function failedCheckIntent(task, api) {
   if (!check || check.passed) return null;
   // A check that could not run says nothing about the work: the worker has nothing to fix.
   if (check.unrunnable) return {action: 'escalate', reason: 'check_unrunnable', text: checkCouldNotRun(check)};
+  // A failure the machine caused (src/environment-failures.js): the worker has nothing to fix.
+  if (check.environment) return {action: 'escalate', reason: 'check_environment', text: checkEnvironment(check)};
   if (sentBack(task, api)) return {action: 'escalate', reason: 'check_failed', text: checkStillFails(check)};
   return {action: 'rework', findings: [checkFinding(check)]};
 }
