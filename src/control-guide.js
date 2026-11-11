@@ -35,7 +35,7 @@ You are the user's side of a bounce session. The orchestrator owns the plan and 
   - a local model that keeps failing the same way;
   - a worker running far past its deadline;
   - many tasks on the same job, the same way, in a row.
-- **Waiting on a decision**: a task bounce stopped for the orchestrator. \`review_unreadable\` is a review with no verdict bounce could read; \`review_not_accepted\` is a send-back past its rounds. The orchestrator is told and usually decides itself; step in only when it is idle and the task is still waiting.
+- **Waiting on a decision**: a task bounce stopped for the orchestrator. \`review_unreadable\` is a review with no verdict bounce could read; \`review_not_accepted\` is a send-back past its rounds. \`review_no_defect\` is a send-back that named no defect, held instead of reaching the worker. The orchestrator is told and usually decides itself; step in only when it is idle and the task is still waiting.
 
 ## Verifying
 - A worker's report and the orchestrator's summary are claims. \`task\` with full: true gives the report, the check bounce ran itself (command and exit code) and the review verdict with its findings.

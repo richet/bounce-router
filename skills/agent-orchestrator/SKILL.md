@@ -55,6 +55,7 @@ A report is evidence, not proof, and so is a terminal row: `task.completed` says
 - **The diff must be the whole change.** Review the specified revision *and* its staged and unstaged working-tree changes. Under branch delivery the work is the worker's commits and the tree must be clean; otherwise unexpected files or changes are a `FAIL`.
 - **A rate limit mid-wave is a wave failure.** Siblings can report "complete" with nothing in them. Check each produced real output before using any of it.
 - Resolve conflicting reports from primary evidence, not by majority.
+- **A send-back names a defect.** A review that asks for rework without a file, line or failing behaviour is held for you as `review_no_defect`, not sent to the worker. Decide yourself: accept with what you checked, or send it back (task.rework) naming the defect. Ask the user only when you cannot decide.
 
 ## Limits
 

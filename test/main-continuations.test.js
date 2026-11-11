@@ -369,3 +369,46 @@ test('verify=worker sent to the orchestrator sets the mode and the turn reads th
   assert.deepEqual(session.events.filter(e => e.kind === 'control.verify').map(e => e.mode), ['worker']);
   assert.match(session.events.find(e => e.kind === 'user').text, /^The user set the verification mode to worker\. From now on:\nVerifying work \(mode: worker\)/);
 });
+
+// A task that runs past escalateMinutes from its submission, waits included, is put to the orchestrator once, to tell
+// the user what it is doing and what blocks it. Found live: seven small fixes took about seven hours and nobody asked.
+test('a task past escalateMinutes is raised to the orchestrator once, with what it is doing', async t => {
+  const session = fixture(t);
+  let now = Date.parse('2026-11-10T10:00:00Z');
+  const timers = [];
+  const clock = {now: () => now, setTimeout: (fn, ms) => { const timer = {fn, at: now + ms}; timers.push(timer); return timer; }, clearTimeout: timer => { const i = timers.indexOf(timer); if (i >= 0) timers.splice(i, 1); }};
+  const advance = async ms => { await new Promise(resolve => setTimeout(resolve, 20)); now += ms; for (const timer of [...timers].filter(timer => timer.at <= now)) { timers.splice(timers.indexOf(timer), 1); timer.fn(); } await new Promise(resolve => setTimeout(resolve, 20)); };
+  const at = () => new Date(now).toISOString();
+  session.append({kind: 'task.submitted', task: 'slow', from: 'orchestrator', profile: 'builder', orders: 'build', time: at()});
+  session.append({kind: 'task.started', task: 'slow', attempt: 1, time: at()});
+  session.append({kind: 'task.milestone', task: 'slow', phase: 'test', text: 'Running the suite', time: at()});
+  const mainAdapter = adapter(() => ({events: [{kind: 'result', status: 'completed', text: 'Told the user.'}]}));
+  service(t, session, mainAdapter, {clock, settings: {executables: {}, sweepMinutes: 0, escalateMinutes: 2}, handoffDelayMs: 5});
+  await advance(60_000);
+  assert.equal(mainAdapter.calls.launch, 0, 'one minute: under the limit');
+  await advance(60_000);
+  await until(() => mainAdapter.calls.launch === 1);
+  const handoff = session.events.find(row => row.kind === 'handoff' && row.overtime);
+  assert.ok(handoff, 'the wake is a handoff marked overtime');
+  assert.match(handoff.text, /^These tasks have been open longer than 2 minutes \(escalateMinutes; delivered by bounce, not typed by the user\):\n- task slow · profile builder · running · open 2 min · last: Running the suite/);
+  assert.match(handoff.text, /Tell the user, for each, what it is doing and what blocks it/);
+  assert.equal(session.events.filter(row => row.kind === 'task.overtime' && row.task === 'slow').length, 1);
+  await until(() => session.events.filter(row => row.kind === 'main.terminal').length === 1);
+  await advance(10 * 60_000);
+  assert.equal(mainAdapter.calls.launch, 1, 'raised once per task');
+});
+
+test('no overtime raise with escalateMinutes 0, or for a task that ended', async t => {
+  const session = fixture(t);
+  let now = Date.parse('2026-11-10T10:00:00Z');
+  const timers = [];
+  const clock = {now: () => now, setTimeout: (fn, ms) => { const timer = {fn, at: now + ms}; timers.push(timer); return timer; }, clearTimeout: timer => { const i = timers.indexOf(timer); if (i >= 0) timers.splice(i, 1); }};
+  const advance = async ms => { await new Promise(resolve => setTimeout(resolve, 20)); now += ms; for (const timer of [...timers].filter(timer => timer.at <= now)) { timers.splice(timers.indexOf(timer), 1); timer.fn(); } await new Promise(resolve => setTimeout(resolve, 20)); };
+  session.append({kind: 'task.submitted', task: 'slow', from: 'orchestrator', profile: 'builder', orders: 'build', time: new Date(now).toISOString()});
+  session.append({kind: 'task.started', task: 'slow', attempt: 1});
+  const mainAdapter = adapter(() => ({events: [{kind: 'result', status: 'completed', text: 'ok'}]}));
+  service(t, session, mainAdapter, {clock, settings: {executables: {}, sweepMinutes: 0, escalateMinutes: 0}, handoffDelayMs: 5});
+  await advance(5 * 60_000);
+  assert.equal(mainAdapter.calls.launch, 0);
+  assert.equal(session.events.some(row => row.kind === 'task.overtime'), false);
+});

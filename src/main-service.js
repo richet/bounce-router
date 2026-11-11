@@ -36,6 +36,11 @@ const HANDOFF_DELAY_MS = 1000; // several tasks ending together become one wake-
 // for sweepMs — the orchestrator is asked once what is waiting on it. Found live: two held tasks waited 91 minutes with nothing running and nobody noticing.
 const SWEEP_MINUTES = 20;
 const SWEEP_PROMPT = 'Decide what is waiting on you: accept it (task.accepted with what you checked), send it back (task.rework with what to fix), or retry it on another AI (retryOf) — or say that nothing is, and end your turn.';
+// A task open longer than this from its submission (waits for a slot, reviews and rework rounds included) is put to the
+// orchestrator once, to tell the user. Found live: seven small fixes took about seven hours with nobody asking why.
+const ESCALATE_MINUTES = 90;
+const OVERTIME_CHECK_MS = 60000;
+const OVERTIME_PROMPT = 'Tell the user, for each, what it is doing and what blocks it (read its milestones and the copy before you answer), and what you will do: let it run, steer it, or cancel it and resubmit something smaller. Then continue your orders.';
 const WAKE_PROMPT = 'Continue your orders. Resolve the pending outcomes and decisions above: schedule the successor, name the event being awaited, finish the authorized scope, or report a concrete blocker. If a task you still need is listed as running, wait on it with `bounce wait` before reporting. Do not re-run finished work.';
 
 // A task is the orchestrator's when the root of its `replaces` lineage was submitted by the
@@ -134,6 +139,7 @@ export function createMainService({session, adapters, profile, settings, profile
   orchestratorEnv = {}, brief = '', handoffDelayMs = HANDOFF_DELAY_MS, typedRetryMs = TYPED_RETRY_MS,
   clock = {}, watchdog = {}, onFirstUserPrompt = () => {}}) {
   const sweepMs = (settings.sweepMinutes ?? SWEEP_MINUTES) * 60000;
+  const escalateMs = (settings.escalateMinutes ?? ESCALATE_MINUTES) * 60000;
   const now = clock.now ?? Date.now;
   const setTimer = clock.setTimeout ?? setTimeout;
   const clearTimer = clock.clearTimeout ?? clearTimeout;
@@ -500,7 +506,7 @@ export function createMainService({session, adapters, profile, settings, profile
   function actionBlock(actions) {
     return handoffBlock(session, actions.map(action => action.row));
   }
-  function start(params, {wake, sweep = false, forceFresh = false, fromQueue = false} = {}) {
+  function start(params, {wake, sweep = false, overtime = null, forceFresh = false, fromQueue = false} = {}) {
     if (closed) return {accepted: false, reason: 'daemon_closed'};
     if (current && (wake || current.unverified)) return {accepted: false, reason: current.unverified ? 'termination_unverified' : 'busy'};
     if (blockedState && ['termination_uncertain', 'orphaned'].includes(blockedState.reason)) return {accepted: false, reason: 'termination_unverified'};
@@ -550,7 +556,8 @@ export function createMainService({session, adapters, profile, settings, profile
     const actions = pendingActions();
     const held = sweep ? heldTasks() : [];
     if (sweep && !held.length) return {accepted: false, reason: 'nothing_waiting'};
-    if (wake && !sweep && !actions.length) return {accepted: false, reason: 'nothing_pending'};
+    if (overtime && !overtime.length) return {accepted: false, reason: 'nothing_waiting'};
+    if (wake && !sweep && !overtime && !actions.length) return {accepted: false, reason: 'nothing_pending'};
     const actionKey = actions.length ? actionSetKey(actions) : null;
     const run = {id: params.id ?? randomUUID(), provider, selected, routes, images, wake, actionKey, actions,
       actionIds: actions.map(action => action.actionId), outcomeSeqs: actions.map(action => action.outcomeSeq).filter(Number.isInteger),
@@ -562,17 +569,21 @@ export function createMainService({session, adapters, profile, settings, profile
     // orchestrator was told. A typed prompt carries them too (`wake: false`): the user's own
     // turn is never raced by a synthetic one. The block counts as delivered only once this
     // requestId reaches main.started; a launch that fails leaves the outcomes pending.
-    if (sweep) run.outcomes = sweepBlock(held);
+    if (overtime) run.outcomes = overtimeBlock(overtime);
+    else if (sweep) run.outcomes = sweepBlock(held);
     else if (actions.length) run.outcomes = actionBlock(actions);
     const requested = {kind: 'main.requested', from: 'main', context: session.id, requestId: run.id,
-      wake, ...(sweep ? {sweep: true} : {}), text: params.text, provider, model: selected.model ?? '', mode: selected.mode, policy: selected.policy,
+      wake, ...(sweep ? {sweep: true} : {}), ...(overtime ? {overtime: true} : {}), text: params.text, provider, model: selected.model ?? '', mode: selected.mode, policy: selected.policy,
       images, actionIds: run.actionIds, outcomeSeqs: run.outcomeSeqs, actionKey,
       attempt: wake && actionKey ? wakeAttempts(session.events, actionKey) + 1 : 1,
       dueAt: wake ? now() : null, ...(params.recoveryOf ? {recoveryOf: params.recoveryOf, rootRequestId: run.rootRequestId} : {})};
     const committed = [requested];
     // A dispatch drained from the queue already journaled its `user` row when it was queued.
     if (!wake && !fromQueue) committed.unshift({kind: 'user', text: params.text, ...(params.typed ? {typed: params.typed} : {}), ...(params.via ? {via: params.via} : {}), ...(params.caller ? {caller: params.caller} : {}), ...(images.length ? {images} : {})});
-    if (sweep) committed.push({kind: 'handoff', wake, sweep: true, requestId: run.id, actionIds: [], outcomeSeqs: [], tasks: held.map(t => t.id), text: `${run.outcomes}\n\n${params.text}`, from: 'bounce'});
+    if (overtime) {
+      for (const t of overtime) committed.push({kind: 'task.overtime', task: t.id, minutes: t.minutes, limitMinutes: Math.round(escalateMs / 60000), requestId: run.id, from: 'bounce', context: session.id});
+      committed.push({kind: 'handoff', wake, overtime: true, requestId: run.id, actionIds: [], outcomeSeqs: [], tasks: overtime.map(t => t.id), text: `${run.outcomes}\n\n${params.text}`, from: 'bounce'});
+    } else if (sweep) committed.push({kind: 'handoff', wake, sweep: true, requestId: run.id, actionIds: [], outcomeSeqs: [], tasks: held.map(t => t.id), text: `${run.outcomes}\n\n${params.text}`, from: 'bounce'});
     else if (actions.length) committed.push({kind: 'handoff', wake, requestId: run.id,
       actionIds: run.actionIds, outcomeSeqs: run.outcomeSeqs, tasks: actions.filter(action => action.task).map(action => action.task),
       text: wake ? `${run.outcomes}\n\n${params.text}` : run.outcomes, from: 'bounce'});
@@ -692,6 +703,44 @@ export function createMainService({session, adapters, profile, settings, profile
   }
   const unsubscribeSweep = session.subscribe(row => { if (!QUIET.has(row.kind)) armSweep(); });
   armSweep();
+
+  // Overtime: once a minute, tasks of the orchestrator's still open escalateMs after they were submitted and not yet
+  // raised are put to it in one turn, when it is between turns.
+  let overtimeTimer = null;
+  function overtimeTasks() {
+    const view = tasks(session.events);
+    const raised = new Set(session.events.filter(e => e.kind === 'task.overtime').map(e => e.task));
+    const due = [];
+    for (const t of Object.values(view)) {
+      if (TERMINAL.has(t.state) || raised.has(t.id) || !orchestratorsTask(session, view, t.id)) continue;
+      const submitted = session.events.find(e => e.kind === 'task.submitted' && e.task === t.id);
+      const since = Date.parse(submitted?.time ?? '');
+      if (!Number.isFinite(since) || now() - since < escalateMs) continue;
+      const last = session.events.findLast(e => e.task === t.id && ['task.milestone', 'task.blocked', 'task.check', 'review.started', 'task.rework'].includes(e.kind));
+      due.push({id: t.id, profile: t.profile, state: t.state, minutes: Math.round((now() - since) / 60000), last: last?.text ? String(last.text).split('\n')[0].slice(0, 200) : null});
+    }
+    return due;
+  }
+  function overtimeBlock(due) {
+    const lines = [`These tasks have been open longer than ${Math.round(escalateMs / 60000)} minutes (escalateMinutes; delivered by bounce, not typed by the user):`];
+    for (const t of due) lines.push(`- task ${t.id} · profile ${t.profile ?? '?'} · ${t.state} · open ${t.minutes} min${t.last ? ` · last: ${t.last}` : ''}`);
+    return lines.join('\n');
+  }
+  function armOvertime() {
+    if (escalateMs <= 0 || closed) return;
+    overtimeTimer = setTimer(() => {
+      overtimeTimer = null;
+      if (closed) return;
+      if (!current && !blockedState) {
+        const due = overtimeTasks();
+        if (due.length) start({text: OVERTIME_PROMPT}, {wake: true, overtime: due});
+      }
+      armOvertime();
+    }, Math.min(OVERTIME_CHECK_MS, escalateMs));
+    // A check that only repeats never keeps the process alive on its own.
+    overtimeTimer?.unref?.();
+  }
+  armOvertime();
   const service = {
     state,
     subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
@@ -771,6 +820,7 @@ export function createMainService({session, adapters, profile, settings, profile
       unsubscribeHandoff();
       unsubscribeSweep();
       if (sweepTimer) { clearTimer(sweepTimer); sweepTimer = null; }
+      if (overtimeTimer) { clearTimer(overtimeTimer); overtimeTimer = null; }
       if (wakeTimer) { clearTimer(wakeTimer); wakeTimer = null; wakeTimerKey = null; }
       const run = current;
       if (!run) return {verified: true};

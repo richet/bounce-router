@@ -54,6 +54,7 @@ Team, bindings, orchestrator model, cloud-only and parallel workspaces: follow `
     bounce reserve NAME VALUE --session REF     # hold a shared name (migration 0045, port 5433); --next N takes the first free
     bounce reservations [--session REF]         # what this project's sessions hold; bounce release NAME VALUE gives one back
     bounce prune --ended --older-than 7d --yes  # remove workers' copies of stopped sessions whose task ended (without --yes: list)
+    bounce prune --stacks [--yes]               # Docker stacks left in copies whose task is not running; --yes takes them down
     git config bounce.delivery branch           # in a checkout: never write accepted work into it; report the worker's branch to fetch
 
 REF is a session name, id or unique id prefix. With no `--session`, `send` picks the one live session in the

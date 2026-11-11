@@ -8,6 +8,7 @@ import {execFileSync} from 'node:child_process';
 import path from 'node:path';
 import {pidAlive, readJournal} from './core.js';
 import {reachedCheckout} from './branch-delivery.js';
+import {stacksDown, mayHoldStack} from './stacks.js';
 import {tasks as taskView, TERMINAL} from './reducers.js';
 
 const COPY = /^[0-9a-f]{8}$/;
@@ -126,12 +127,25 @@ export function chooseCopies(answer, copies) {
   return [...picked].sort((a, b) => a - b).map(i => copies[i]).filter(copy => !copy.live);
 }
 
-// Removes the chosen copies; a copy whose task is still running is skipped, whatever was chosen.
-export async function removeCopies(chosen) {
+// Removes the chosen copies; a copy whose task is still running is skipped, whatever was chosen. A copy that may hold
+// a stack has its stacks taken down first, with their volumes and networks (src/stacks.js); when that fails the copy
+// is kept, since a stack left running with its folder gone is what filled Docker's address pools (found live).
+export async function removeCopies(chosen, {stackDown = stacksDown} = {}) {
   const removed = [], failed = [];
   for (const copy of chosen) {
     if (copy.live) continue;
-    try { await fs.promises.rm(copy.dir, {recursive: true, force: true}); removed.push(copy); }
+    let stacks = null;
+    if (mayHoldStack(copy.dir)) {
+      let down;
+      try { down = await stackDown(copy.dir); } catch (error) { down = {down: [], failed: [{name: 'its stacks', error: error.message}]}; }
+      if (down.failed.length) {
+        const {name, error} = down.failed[0];
+        failed.push({copy, error: `its stack ${name} was not taken down (${error}); the copy is kept: take it down there, then prune again`});
+        continue;
+      }
+      if (down.down.length) stacks = down.down;
+    }
+    try { await fs.promises.rm(copy.dir, {recursive: true, force: true}); removed.push(stacks ? {...copy, stacks} : copy); }
     catch (error) { failed.push({copy, error: error.message}); }
   }
   return {removed, failed};
@@ -158,4 +172,21 @@ export async function autoPrune({root, olderThanMs, now = Date.now()}) {
       removed: removed.map(copy => copy.name), kept: ended.length - removed.length - failed.length, failed: failed.map(({copy, error}) => ({name: copy.name, error}))})}\n`);
     return {removed, failed};
   } finally { fs.rmSync(lock, {force: true}); }
+}
+
+// Stacks left behind (`bounce prune --stacks`): every compose project whose files are in a worker's copy, unless that
+// copy's task is still running. A copy prune already removed still has its stack listed, by the path it had.
+export function leftStacks({root, copies, projects}) {
+  const copyRoot = path.join(root, 'w');
+  const byName = new Map(copies.map(copy => [copy.name, copy]));
+  const rows = [];
+  for (const project of projects) {
+    const file = project.configFiles.find(f => f.startsWith(`${copyRoot}/`));
+    if (!file) continue;
+    const name = file.slice(copyRoot.length + 1).split('/')[0];
+    const copy = byName.get(name);
+    if (copy?.live) continue;
+    rows.push({name: project.name, status: project.status, copy: name, task: copy?.task ?? null, state: copy ? copy.state ?? 'unknown' : 'copy removed'});
+  }
+  return rows;
 }

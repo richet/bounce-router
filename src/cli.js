@@ -29,7 +29,8 @@ import {jevSidebarLabel} from './jev.js';
 import {rolesFor, agentStore, agentsCommand, agentTable, handAIsToJev} from './agents.js';
 import {bindingsCommand, bindingUpdatesNotice, bindingUpdates, bindingsFile, readBindings} from './bindings.js';
 import {createInterface} from 'node:readline';
-import {listCopies, copyTable, chooseCopies, removeCopies, endedCopies, parseAge} from './prune.js';
+import {listCopies, copyTable, chooseCopies, removeCopies, endedCopies, parseAge, leftStacks} from './prune.js';
+import {composeProjects, takeDown} from './stacks.js';
 import stringWidth from 'string-width';
 import {clean, createFormatter, createWorkSummary, workReview, withAsides, continueMain} from './format.js';
 import {validateOrchestration} from './profiles.js';
@@ -89,7 +90,7 @@ async function main() {
     image: {type: 'string', multiple: true}, cwd: {type: 'string'}, resume: {type: 'string'}, provider: {type: 'string'}, model: {type: 'string'},
     mode: {type: 'string'}, json: {type: 'boolean'}, verify: {type: 'boolean'}, help: {type: 'boolean', short: 'h'}, version: {type: 'boolean', short: 'v'},
     check: {type: 'boolean'}, scope: {type: 'string'}, force: {type: 'boolean'}, list: {type: 'boolean'}, all: {type: 'boolean'}, session: {type: 'string'}, report: {type: 'boolean'},
-    save: {type: 'boolean'}, fix: {type: 'boolean'}, 'allow-network': {type: 'boolean'}, tasks: {type: 'boolean'}, against: {type: 'string'}, control: {type: 'boolean'}, next: {type: 'string'}, ended: {type: 'boolean'}, 'older-than': {type: 'string'}, yes: {type: 'boolean'},
+    save: {type: 'boolean'}, fix: {type: 'boolean'}, 'allow-network': {type: 'boolean'}, tasks: {type: 'boolean'}, against: {type: 'string'}, control: {type: 'boolean'}, next: {type: 'string'}, ended: {type: 'boolean'}, stacks: {type: 'boolean'}, 'older-than': {type: 'string'}, yes: {type: 'boolean'},
   }});
   if (values.help) {
     const c = new Chalk({level: process.stdout.isTTY && !('NO_COLOR' in process.env) && process.env.TERM !== 'dumb' ? 1 : 0});
@@ -207,6 +208,19 @@ async function main() {
     return console.log(resourceReport({machine, fleet, busy: []}));
   }
   if (positionals[0] === 'prune') {
+    if (values.stacks) {
+      const left = leftStacks({root, copies: listCopies({root}), projects: await composeProjects()});
+      if (values.json && !values.yes) return console.log(JSON.stringify(left, null, 2));
+      if (!left.length) return console.log('No stacks left in workers\' copies.');
+      for (const stack of left) console.log(`${stack.name}  ${stack.status}  copy ${stack.copy}  ${stack.task ? `task ${stack.task.slice(0, 8)} ${stack.state}` : stack.state}`);
+      if (!values.yes) return console.log(`\n${left.length} stack${left.length === 1 ? '' : 's'} would be taken down with ${left.length === 1 ? 'its' : 'their'} volumes and networks. Add --yes to take them down.`);
+      let failures = 0;
+      for (const stack of left) {
+        const done = await takeDown(stack.name);
+        if (!done.ok) { failures++; console.error(`bounce: could not take down ${stack.name}: ${done.error}`); }
+      }
+      return console.log(`\nTook down ${left.length - failures} stack${left.length - failures === 1 ? '' : 's'}.`);
+    }
     if (values.ended) {
       const olderThanMs = parseAge(values['older-than'] ?? '7d');
       if (olderThanMs === null) throw new Error('--older-than takes an age like 7d, 12h or 30m');

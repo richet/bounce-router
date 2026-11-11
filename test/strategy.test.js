@@ -108,7 +108,7 @@ test('S3b quorum: one reviewer reworks -> task.rework to the same worker, no acc
     c2round++;
     // Round 1 reworks; round 2 (if it ever ran) would hang forever, so the test can assert a
     // stable post-round-1 state with no risk of racing a second round to completion.
-    return c2round === 1 ? [{kind: 'result', status: 'completed', text: '{"verdict":"rework","findings":["fix it"]}'}] : {never: true};
+    return c2round === 1 ? [{kind: 'result', status: 'completed', text: '{"verdict":"rework","findings":["src/x.js:3 throws on empty input"]}'}] : {never: true};
   });
   const profiles = {A: worker(), C1: {...critic(), adapter: 'critic1'}, C2: {...critic(), adapter: 'critic2'}};
   const scheduler = createScheduler({session, adapters: {worker: workerAdapter, critic1: criticAdapter1, critic2: criticAdapter2}, profiles, strategy: quorumStrategy(2)});
@@ -119,7 +119,7 @@ test('S3b quorum: one reviewer reworks -> task.rework to the same worker, no acc
   assert.equal(session.events.some(e => e.kind === 'task.accepted' && e.task === row.task), false);
   assert.equal(workerAdapter.calls.resume, 1);
   const rework = session.events.find(e => e.kind === 'task.rework');
-  assert.deepEqual(rework.findings, ['fix it']);
+  assert.deepEqual(rework.findings, ['src/x.js:3 throws on empty input']);
   await scheduler.cancel(row.task);
 });
 
@@ -135,7 +135,7 @@ test('S3c quorum: a single accept short of quorum (other reworks) never freezes 
   const criticAdapter2 = fakeAdapter(() => {
     c2round++;
     return c2round === 1
-      ? [{kind: 'result', status: 'completed', text: '{"verdict":"rework","findings":["polish"]}'}]
+      ? [{kind: 'result', status: 'completed', text: '{"verdict":"rework","findings":["src/x.js:3 has the wrong label"]}'}]
       : [{kind: 'result', status: 'completed', text: '{"verdict":"accept"}'}];
   });
   const profiles = {A: worker(), C1: {...critic(), adapter: 'critic1'}, C2: {...critic(), adapter: 'critic2'}};

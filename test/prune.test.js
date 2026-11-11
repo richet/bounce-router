@@ -161,3 +161,35 @@ test('config.pruneAfterDays takes whole days from 0 (never) to 365', () => {
   assert.doesNotThrow(with_(0)); assert.doesNotThrow(with_(3));
   for (const bad of [-1, 1.5, 366, '3']) assert.throws(with_(bad), {message: 'config.pruneAfterDays must be a whole number of days from 0 (never) to 365'});
 });
+
+test('removing a copy takes its stacks down first, and keeps the copy when that fails', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-prune-stacks-'));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const make = name => { const dir = path.join(root, name); fs.mkdirSync(dir); fs.writeFileSync(path.join(dir, 'docker-compose.yml'), 'services: {}\n'); return {name, dir, live: false}; };
+  const good = make('good0001'), stuck = make('stuck001'), plain = {name: 'plain001', dir: path.join(root, 'plain001'), live: false};
+  fs.mkdirSync(plain.dir);
+  const asked = [];
+  const stackDown = async dir => { asked.push(path.basename(dir)); return dir === stuck.dir ? {down: [], failed: [{name: 'stuck-stack', error: 'busy'}]} : {down: ['good-stack'], failed: []}; };
+  const {removed, failed} = await removeCopies([good, stuck, plain], {stackDown});
+  assert.deepEqual(asked, ['good0001', 'stuck001'], 'a copy with no compose file is not asked about');
+  assert.deepEqual(removed.map(copy => [copy.name, copy.stacks ?? null]), [['good0001', ['good-stack']], ['plain001', null]]);
+  assert.deepEqual(failed.map(({copy, error}) => [copy.name, error]), [['stuck001', 'its stack stuck-stack was not taken down (busy); the copy is kept: take it down there, then prune again']]);
+  assert.equal(fs.existsSync(stuck.dir), true);
+  assert.equal(fs.existsSync(good.dir), false);
+});
+
+test('stacks left behind: compose projects in the copies folder whose task is not running, including copies already gone', async () => {
+  const {leftStacks} = await import('../src/prune.js');
+  const root = '/home/u/.bounce';
+  const copies = [{name: 'live0001', dir: `${root}/w/live0001`, live: true, task: 't-live'}, {name: 'done0001', dir: `${root}/w/done0001`, live: false, task: 't-done', state: 'accepted'}];
+  const projects = [
+    {name: 'running-task', status: 'running(2)', configFiles: [`${root}/w/live0001/docker-compose.yml`]},
+    {name: 'ended-task', status: 'running(2)', configFiles: [`${root}/w/done0001/docker-compose.yml`]},
+    {name: 'orphan', status: 'exited(2)', configFiles: [`${root}/w/gone0001/docker-compose.yml`]},
+    {name: 'checkout', status: 'running(3)', configFiles: ['/home/u/project/docker-compose.yml']},
+  ];
+  assert.deepEqual(leftStacks({root, copies, projects}), [
+    {name: 'ended-task', status: 'running(2)', copy: 'done0001', task: 't-done', state: 'accepted'},
+    {name: 'orphan', status: 'exited(2)', copy: 'gone0001', task: null, state: 'copy removed'},
+  ]);
+});
