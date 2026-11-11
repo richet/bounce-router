@@ -66,7 +66,9 @@ function taskActions(events) {
     // What the orchestrator did itself is not news to hand back to it, and it settles the task's
     // earlier outcomes. Observed live: its own override accept kept re-waking it with the
     // same task every turn. (A user's action still is news to the orchestrator.)
-    if (row.from === 'orchestrator') { byTask.delete(row.task); continue; }
+    // A cancel it asked for is journaled under the worker's name with reason `orchestrator`: its own act too. Found live:
+    // its own cancels came back to it on every wake for two hours.
+    if (row.from === 'orchestrator' || (row.kind === 'task.cancelled' && row.reason === 'orchestrator')) { byTask.delete(row.task); continue; }
     const task = view[row.task];
     if (!task || carriedByAncestor(view, row.task) || !(TERMINAL.has(task.state) || PARKED.has(task.state))
       || replaced(events, row.task) || !orchestratorsTask(events, view, row.task)) continue;

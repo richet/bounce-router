@@ -64,6 +64,16 @@ function footerText(status, seconds, usage, thinking, context) {
 const thinkingOf = raw => raw?.thinking ?? raw?.output_tokens_details?.thinking_tokens ?? raw?.reasoning_output_tokens ?? raw?.reasoning ?? 0;
 
 // Display-only reduction: retain the journal verbatim for diagnostics and handoffs.
+const WAKE_KIND = {'task.completed': 'finished', 'task.accepted': 'accepted', 'task.failed': 'failed', 'task.cancelled': 'cancelled',
+  'task.deadline': 'ran out of time', 'task.rejected': 'rejected', 'task.blocked': 'blocked', 'task.input_required': 'asks for input'};
+const shortTask = id => String(id ?? '?').length > 12 ? String(id).slice(0, 8) : String(id ?? '?');
+function wakeReason(handoff, bySeq) {
+  if (handoff.checkIn) return 'bounce checked in with the orchestrator: work waits on it and nothing had woken it';
+  const parts = (handoff.outcomeSeqs ?? []).map(seq => bySeq.get(seq)).filter(Boolean)
+    .map(row => `${shortTask(row.task)} ${WAKE_KIND[row.kind] ?? row.kind}${row.reason && !['orchestrator'].includes(row.reason) ? ` (${row.reason})` : ''}`);
+  return parts.length ? `bounce woke the orchestrator: ${parts.join(', ')}` : null;
+}
+
 export function conversationEvents(events, {details = false} = {}) {
   const rows = [];
   const workers = new Map();
@@ -82,6 +92,7 @@ export function conversationEvents(events, {details = false} = {}) {
   // The turn in progress: when its prompt was sent, and the tokens reported since.
   let turnStart = null, turnUsage = {}, turnFirstRow = 0, turnThinking = 0, turnContext = null;
 
+  let bySeq = null;
   for (const event of events) {
     // A wake-up turn (the orchestrator handed worker outcomes) journals no user row; its request opens the turn.
     if (event.kind === 'user' || (event.kind === 'main.requested' && event.wake)) { turnStart = Date.parse(event.time); turnUsage = {}; turnFirstRow = rows.length; turnThinking = 0; turnContext = null; }
@@ -176,6 +187,14 @@ export function conversationEvents(events, {details = false} = {}) {
     if (event.kind === 'user' && event.queued && event.requestId) {
       queuedUserSlots.set(event.requestId, rows.length);
       rows.push(event);
+      continue;
+    }
+    // A turn bounce started (a wake) says in one line why the orchestrator is speaking; the hand-off text itself is
+    // written for the orchestrator and stays in /details. Wakes that already journal their own status line (the
+    // sweep, overtime, the idle nudge) need none.
+    if (event.kind === 'handoff' && event.wake && (event.checkIn || event.actionIds?.length)) {
+      const why = wakeReason(event, bySeq ??= new Map(events.map(row => [row.seq, row])));
+      if (why) rows.push({kind: 'status', from: 'bounce', time: event.time, text: why});
       continue;
     }
     if (HIDDEN.has(event.kind) || MACHINERY.has(event.kind) || event.kind?.startsWith('control.')) continue;

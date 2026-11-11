@@ -90,17 +90,17 @@ test('successive outcomes each answered with a Next: question never exhaust wake
   assert.equal(session.events.some(row => row.kind === 'main.blocked' && row.reason === 'wake_retry_exhausted'), false);
 });
 
-// Regression: a turn that neither addresses the outcome nor asks a question still exhausts its wake
-// retries — the Next: exception must not swallow real failures. Rewritten 2026-09-27: exhaustion no longer
-// blocks the orchestrator; the outcome stays pending (undisposed) and no third wake fires.
-test('a turn that neither resolves nor asks still exhausts wake retries, leaving the outcome pending', async t => {
+// Rewritten 2026-11-11: an outcome is handed over once. A turn that neither addresses it nor asks a question records
+// it as `seen` instead of being woken again with the same outcome (found live: re-handed outcomes taught the
+// orchestrator to read every wake as "nothing new"). A task still parked stays in front of it another way.
+test('a turn that neither resolves nor asks records the outcome as seen, and is not woken again for it', async t => {
   const session = fixture(t);
   const mainAdapter = adapter(() => ({events: [{kind: 'result', status: 'completed', text: 'acknowledged'}]}));
   service(t, session, mainAdapter);
   const outcome = submittedOutcome(session, 'silent-work');
-  await until(() => session.events.filter(row => row.kind === 'main.terminal').length === 2);
-  await delay(50);
-  assert.equal(mainAdapter.calls.launch + mainAdapter.calls.resume, 2);
-  assert.equal(session.events.some(row => row.kind === 'main.disposition' && row.outcomeSeq === outcome.seq), false);
+  await until(() => session.events.some(row => row.kind === 'main.disposition' && row.outcomeSeq === outcome.seq));
+  await delay(100);
+  assert.equal(mainAdapter.calls.launch + mainAdapter.calls.resume, 1);
+  assert.equal(session.events.find(row => row.kind === 'main.disposition' && row.outcomeSeq === outcome.seq).disposition, 'seen');
   assert.equal(session.events.some(row => row.kind === 'main.blocked'), false);
 });

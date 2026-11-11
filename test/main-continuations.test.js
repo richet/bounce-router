@@ -103,21 +103,36 @@ test('failed wake consumers retry at most twice, then stop waking without blocki
 });
 
 // Rewritten 2026-09-27: exhaustion no longer records a blocker; the failed outcome simply stays pending.
-test('successful no-op turns cannot erase a failed outcome, and exhaustion leaves it pending without a blocker', async t => {
+// Rewritten 2026-11-11: an outcome is handed over once. A turn that saw it and did nothing durable records it as
+// `seen`, and the same outcome never wakes the orchestrator again. Found live: the same two cancels were re-handed
+// on every wake for two hours, and the orchestrator came to read every wake as "nothing new".
+test('a failed outcome is handed over once: a no-op turn records it as seen, and it never wakes the orchestrator again', async t => {
   const session = fixture(t);
   const mainAdapter = adapter(() => ({events: [{kind: 'result', status: 'completed', text: 'acknowledged'}]}));
   const main = service(t, session, mainAdapter, {watchdog: {startupMs: 100, runningMs: 100, retryDelayMs: 50, maxWakeAttempts: 2}});
   session.append({kind: 'task.submitted', task: 'failed-work', from: 'orchestrator', profile: 'builder', orders: 'repair'});
   const outcome = session.append({kind: 'task.failed', task: 'failed-work', reason: 'error', text: 'repair failed'});
   await until(() => session.events.filter(row => row.kind === 'main.terminal').length === 1);
-  assert.equal(session.events.some(row => row.kind === 'main.disposition' && row.outcomeSeq === outcome.seq), false,
-    'provider success without an orchestration decision is not disposition evidence');
-  await until(() => session.events.filter(row => row.kind === 'main.terminal').length === 2);
-  await delay(150);
-  assert.equal(mainAdapter.calls.launch + mainAdapter.calls.resume, 2);
+  await until(() => session.events.some(row => row.kind === 'main.disposition' && row.outcomeSeq === outcome.seq));
+  assert.equal(session.events.find(row => row.kind === 'main.disposition' && row.outcomeSeq === outcome.seq).disposition, 'seen');
+  await delay(200);
+  assert.equal(mainAdapter.calls.launch + mainAdapter.calls.resume, 1, 'no second wake for the same outcome');
   assert.equal(session.events.some(row => row.kind === 'main.blocked'), false);
-  assert.equal(session.events.some(row => row.kind === 'main.disposition' && row.outcomeSeq === outcome.seq), false, 'still pending, still visible');
   assert.equal(main.state().state, 'idle');
+});
+
+test('a cancel the orchestrator asked for never wakes it', async t => {
+  const session = fixture(t);
+  const mainAdapter = adapter(() => ({events: [{kind: 'result', status: 'completed', text: 'ok'}]}));
+  service(t, session, mainAdapter);
+  session.append({kind: 'task.submitted', task: 'old', from: 'orchestrator', profile: 'builder', orders: 'build'});
+  session.append({kind: 'task.cancelled', task: 'old', from: 'worker:old', reason: 'orchestrator', text: 'Cancelled by the orchestrator (no reason given)'});
+  await delay(150);
+  assert.equal(mainAdapter.calls.launch, 0);
+  session.append({kind: 'task.submitted', task: 'mine', from: 'orchestrator', profile: 'builder', orders: 'build'});
+  session.append({kind: 'task.cancelled', task: 'mine', from: 'worker:mine', reason: 'user', text: 'Cancelled by the user'});
+  await until(() => mainAdapter.calls.launch === 1);
+  assert.match(session.events.find(row => row.kind === 'handoff').text, /task mine .* task\.cancelled · reason: user/);
 });
 
 // Rewritten 2026-09-27: campaigns were removed. A failed outcome is still dispositioned only once the
@@ -291,7 +306,7 @@ test('the quiet sweep asks the orchestrator about held work once, after nothing 
   session.append({kind: 'task.blocked', task: 'held', reason: 'unverified', text: 'Nothing that runs this work has verified it, so it waits for you.', time: new Date(now).toISOString()});
   const mainAdapter = adapter(() => ({events: [{kind: 'result', status: 'completed', text: 'Nothing is waiting beyond the held task; leaving it.'}]}));
   // one wake per outcome here (the default retries an unresolved outcome once), so the launches count sweeps
-  service(t, session, mainAdapter, {clock, settings: {executables: {}, sweepMinutes: 1}, handoffDelayMs: 5, watchdog: {startupMs: 100, runningMs: 100, retryDelayMs: 5, maxWakeAttempts: 1}});
+  service(t, session, mainAdapter, {clock, settings: {executables: {}, sweepMinutes: 1, checkInMinutes: 0}, handoffDelayMs: 5, watchdog: {startupMs: 100, runningMs: 100, retryDelayMs: 5, maxWakeAttempts: 1}});
   // the held outcome itself wakes the orchestrator first, as before (its wake timer runs on the driven clock too)
   await advance(10);
   await until(() => mainAdapter.calls.launch === 1);

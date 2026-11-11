@@ -111,3 +111,13 @@ test('a task under review is working: it spins, shows its quiet time and turns r
   assert.equal(rowColor({state: 'reviewing', updatedAt: since}, at + 10_000), 'yellow');
   assert.equal(rowColor({state: 'reviewing', updatedAt: since}, at + 10 * 60_000), 'red');
 });
+
+// The session's name is on screen without the sidebar too: the sidebar hides below 100 columns or with /sidebar off.
+test('rendered: with the sidebar off, the status line names the session; with it on, the sidebar does', () => {
+  const metadata = {provider: 'claude', model: 'claude-fable-5-1[1m]', mode: 'yolo', operation: 'orchestrator', orchestrator: 'main', sessionId: 's', cwd: '/p', quotaLines: [], name: 'nightly-integration'};
+  const off = frame({sidebar: false, metadata});
+  assert.match(statusLine(off), / · yolo · session nightly-integration · /);
+  const on = frame({metadata});
+  assert.doesNotMatch(statusLine(on), /session nightly-integration/);
+  assert.match(on, /Session nightly-integration/);
+});

@@ -174,13 +174,13 @@ export function createWorkspace(React, Ink) {
       ...content.rows.map((text, index) => React.createElement(Text, {key: `${index}:${text}`, wrap: 'truncate-end'}, marked(text || ' ', selection, content.visible[index + 1]))));
   }
   // The main worker's status line (under the prompt box): glyph, name, model, state, how long, what it is doing;
-  // a narrow column drops the model and the doing so the state and — sidebar hidden — the AI and mode fit.
+  // a narrow column drops the model and the doing so the state and — sidebar hidden — the AI, mode and session name fit.
   function statusLine({view, columns, sidebar, mainState, mainModel, working, now, where}) {
     const main = view.main ?? {};
     const narrow = columns < 60; // the same bound the agent panes use for a single column
     const quiet = working && quietFor(main.startedAt, now) ? ` ${quietFor(main.startedAt, now)}` : '';
     const doing = !narrow && working && doingLine(main.doing, now, 60) ? ` · ${doingLine(main.doing, now, 60)}` : '';
-    return `${glyph(mainState, now)} ${view.metadata?.orchestrator ?? 'main'}${!narrow && mainModel ? ` · ${mainModel}` : ''} · ${mainState}${quiet}${doing}${sidebar ? '' : ` · ${view.metadata?.provider ?? 'agent'} · ${view.metadata?.mode ?? 'READY'}`}${narrow ? '' : ` · ${where}`}`;
+    return `${glyph(mainState, now)} ${view.metadata?.orchestrator ?? 'main'}${!narrow && mainModel ? ` · ${mainModel}` : ''} · ${mainState}${quiet}${doing}${sidebar ? '' : ` · ${view.metadata?.provider ?? 'agent'} · ${view.metadata?.mode ?? 'READY'} · ${sessionLine(view.metadata ?? {}).replace(/^Session /, 'session ')}`}${narrow ? '' : ` · ${where}`}`;
   }
   // A heading filled with ─ to exactly `columns`: a longer run would be cut by Ink, which ends a cut row with …
   const rule = (head, columns) => head + '─'.repeat(Math.max(0, columns - stringWidth(head)));

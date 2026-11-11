@@ -54,6 +54,8 @@ import {handoffBlock} from './main-service.js';
 import {providers, runProcess} from './providers.js';
 import {projectRoot, fingerprint, validate, supervise, pidAlive} from './reload.js';
 import {listSessions, resolveSessionRef, sessionsTable, sessionAge} from './sessions.js';
+import {deriveSessionName} from './session-names.js';
+import {createWindowTitle} from './window-title.js';
 import {sessionLineage, lineageLine} from './lineage.js';
 import {sessionReservations} from './reservations.js';
 import {titleSession, createAsk} from './session-title.js';
@@ -79,6 +81,8 @@ const handedText = names => `${names.join(', ')} now let Jev pick their AI per t
 // profile write only needs the block to exist: the saved config holds the user's additions and
 // overrides, never a copy of the roster. `main` is written as orchestrator only because the
 // absent field implied it; a present block or orchestrator is never touched.
+const setWindowTitle = createWindowTitle();
+
 function materialiseRoster(settings) {
   if (settings.operation !== 'orchestrator') return settings;
   if (settings.profiles === undefined) settings.profiles = {};
@@ -943,6 +947,7 @@ async function main() {
       menu.push(['Enter answers · PgUp/Dn review · slash commands work · Esc cancels setup only', style.muted]);
     }
     menu.length = Math.min(menu.length, menuBudget);
+    setWindowTitle(reducers.sessionName(session.events) || deriveSessionName(session.id));
     terminal.update({
       suggestion: textPrompt || localSetup || picker ? null : suggestion,
       agentsOpen, details, sidebar: settings.sidebar, selectedId: selectedAgentPane, input: textPrompt?.mask ? '•'.repeat(input.length) : input, inputCursor: clampCursor(input, inputCursor), inputTarget: textPrompt ? textPrompt.label : localSetup ? 'setup' : inputTarget(), scroll, busy, progress,
@@ -1694,7 +1699,7 @@ async function main() {
   quotaAgeTimer.unref?.();
 
   process.on('SIGTERM', () => { if (busy) {router.cancel(); const timer = setInterval(() => {if (!busy) {clearInterval(timer); quit();}}, 100);} else quit(); });
-  process.on('exit', () => { clearInterval(quotaAgeTimer); terminal?.unmount(); });
+  process.on('exit', () => { clearInterval(quotaAgeTimer); terminal?.unmount(); setWindowTitle(null); });
   enter();
   if (!dev && process.env.BOUNCE_NO_UPDATE_CHECK !== '1') {
     void globalInstall().then(() => checkUpdate({root})).then(release => {

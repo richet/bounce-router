@@ -14,7 +14,7 @@ import {createOps} from '../src/bridge-ops.js';
 import {createMcpServer} from '../src/mcp.js';
 
 const git = (cwd, ...args) => execFileSync('git', args, {cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe']}).trim();
-const setup = (t, {delivery = 'branch'} = {}) => {
+const setup = (t, {delivery = 'branch', worker: script = () => { throw new Error('a check-only task launched a worker'); }} = {}) => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-check-only-')));
   const project = path.join(root, 'project');
   fs.mkdirSync(project);
@@ -27,7 +27,7 @@ const setup = (t, {delivery = 'branch'} = {}) => {
   git(project, 'commit', '-qam', 'two');
   if (delivery) git(project, 'config', 'bounce.delivery', delivery);
   const session = new Session(project, {root: path.join(root, 'home')});
-  const worker = fakeAdapter(() => { throw new Error('a check-only task launched a worker'); });
+  const worker = fakeAdapter(script);
   const scheduler = createScheduler({session, adapters: {worker}, requireFinalReport: true, gitHead: () => null,
     profiles: {analyst: {adapter: 'worker', model: 'w', mode: 'yolo', fallback: [], policy: 'read'}}});
   t.after(() => { scheduler.close(); fs.rmSync(root, {recursive: true, force: true}); });
@@ -122,4 +122,18 @@ test('through the orchestrator\'s submit, a ref that names no commit is refused 
   assert.equal(forged.isError, undefined, JSON.stringify(forged));
   assert.equal(session.events.find(e => e.kind === 'task.submitted' && e.task === 'gate5').commit, undefined);
   assert.equal(session.events.some(e => e.kind === 'task.submitted' && e.task === 'gate4'), false);
+});
+
+test('a new task beside a held one of the same agent is accepted, and the reply says the held one still waits', async t => {
+  const context = setup(t, {worker: () => new Promise(() => {})});
+  const {session} = context;
+  const call = await orchestratorMcp(t, context);
+  session.append({kind: 'task.submitted', task: 'plan1', from: 'orchestrator', profile: 'analyst', orders: 'plan', requires: ['read']});
+  session.append({kind: 'task.blocked', task: 'plan1', reason: 'worker_blocked', text: 'Blocked: outside my copy'});
+  const fresh = await call('submit', {event: {kind: 'task.submitted', task: 'plan2', parent: null, profile: 'analyst', orders: 'plan again', requires: ['read']}});
+  assert.equal(fresh.isError, undefined, JSON.stringify(fresh));
+  assert.deepEqual(session.events.filter(e => e.kind === 'task.corrected' && e.task === 'plan2').map(e => e.text),
+    ['held: plan1 (blocked) of the analyst agent still waits on you, and a new task does not close it: answer the worker, accept, send back or cancel, or name it in retryOf']);
+  const retry = context.scheduler.prepare({kind: 'task.submitted', task: 'plan3', parent: null, from: 'orchestrator', profile: 'analyst', orders: 'plan again', requires: ['read'], retryOf: 'plan1'});
+  assert.equal((retry.corrections ?? []).some(text => text.startsWith('held:')), false, 'retryOf names it');
 });
