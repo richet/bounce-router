@@ -11,7 +11,7 @@
 //
 // BOUNCE_LIVE_DOCKER is the one deliberate opt-in (the *.live.test.js files) and is kept.
 // BOUNCE_MACHINE_DIR is set by test/helpers/hermetic.js: without it a test would use the user's real one.
-const KEEP = new Set(['BOUNCE_LIVE_DOCKER', 'BOUNCE_MACHINE_DIR']);
+const KEEP = new Set(['BOUNCE_LIVE_DOCKER', 'BOUNCE_MACHINE_DIR', 'BOUNCE_MACHINE_GUARD']);
 for (const key of Object.keys(process.env)) {
   if (key.startsWith('BOUNCE_') && !KEEP.has(key)) delete process.env[key];
 }

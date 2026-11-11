@@ -31,6 +31,9 @@ if (!String(process.env.NODE_OPTIONS ?? '').includes(self)) {
 // The machine-wide slots for local workers (src/machine-slots.js) live in the user's ~/.bounce, shared
 // by every bounce on this machine. A test process gets its own folder, which the children it starts
 // inherit: tests never write there, and never wait on each other or on a real session.
+// The machine guard reads the real disk and load: test sessions live in a small /tmp and the suite loads the machine,
+// so daemons started here would pause their own dispatch. test/machine-guard.test.js drives it with a fake machine.
+process.env.BOUNCE_MACHINE_GUARD = 'off';
 if (!process.env.BOUNCE_MACHINE_DIR) {
   const machine = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-test-machine-'));
   process.env.BOUNCE_MACHINE_DIR = machine;

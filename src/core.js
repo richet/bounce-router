@@ -154,6 +154,9 @@ export function validateSettings(value) {
   // The quiet sweep: minutes with nothing in flight and held work waiting before the orchestrator is asked; 0 turns it off.
   if (value.sweepMinutes !== undefined && (!Number.isInteger(value.sweepMinutes) || value.sweepMinutes < 0 || value.sweepMinutes > 240)) throw new Error('sweepMinutes must be a whole number of minutes from 0 (off) to 240');
   // A task open this long from its submission is put to the orchestrator once, to tell the user; 0 turns it off.
+  if (value.minFreeDiskGB !== undefined && (typeof value.minFreeDiskGB !== 'number' || !Number.isFinite(value.minFreeDiskGB) || value.minFreeDiskGB < 0 || value.minFreeDiskGB > 100000)) throw new Error('minFreeDiskGB must be a number of GB from 0 (off) to 100000');
+  if (value.minFreeDiskPercent !== undefined && (!Number.isInteger(value.minFreeDiskPercent) || value.minFreeDiskPercent < 0 || value.minFreeDiskPercent > 90)) throw new Error('minFreeDiskPercent must be a whole number from 0 (off) to 90');
+  if (value.maxLoadPerCore !== undefined && (typeof value.maxLoadPerCore !== 'number' || !Number.isFinite(value.maxLoadPerCore) || value.maxLoadPerCore < 0 || value.maxLoadPerCore > 64)) throw new Error('maxLoadPerCore must be a number from 0 (off) to 64');
   if (value.escalateMinutes !== undefined && (!Number.isInteger(value.escalateMinutes) || value.escalateMinutes < 0 || value.escalateMinutes > 1440)) throw new Error('escalateMinutes must be a whole number of minutes from 0 (off) to 1440');
   if (!Number.isFinite(value.contextChars) || value.contextChars < 4000 || value.contextChars > 200000) throw new Error('contextChars must be between 4000 and 200000');
   // Cloud workers (claude/codex/muse) have no per-endpoint slot config the way local does — this is

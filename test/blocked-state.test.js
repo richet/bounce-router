@@ -100,3 +100,15 @@ test('a task sets its own check limit at submit, within bounds and only with a c
   assert.throws(() => scheduler.submit({parent: null, profile: 'builder', orders: 'x', deadline: null, checkTimeoutMinutes: 5}), /checkTimeoutMinutes/);
   assert.ok(task);
 });
+
+test('a check that timed out cannot be submitted again with the same command and limit', async t => {
+  const checkRunner = async ({command, timeoutMs}) => ({command, exit: null, passed: false, output: 'building', ms: timeoutMs, timedOut: true, minutes: Math.round(timeoutMs / 60_000)});
+  const {scheduler} = setup(t, () => [{kind: 'result', status: 'completed', text: final('completed', 'ready')}], {checkRunner});
+  const {task} = scheduler.submit({parent: null, profile: 'builder', orders: 'run the gate', deadline: null, check: 'make e2e'});
+  await waitFor(() => scheduler.tasks()[task]?.state === 'failed');
+  assert.throws(() => scheduler.submit({parent: null, profile: 'builder', orders: 'again', deadline: null, check: 'make e2e'}),
+    /same check ran out of its 10 minutes on task .*longer checkTimeoutMinutes.*split/);
+  assert.throws(() => scheduler.submit({parent: null, profile: 'builder', orders: 'again', deadline: null, check: 'make e2e', checkTimeoutMinutes: 10}), /same check ran out/);
+  assert.ok(scheduler.submit({parent: null, profile: 'builder', orders: 'longer', deadline: null, check: 'make e2e', checkTimeoutMinutes: 30}).task);
+  assert.ok(scheduler.submit({parent: null, profile: 'builder', orders: 'split', deadline: null, check: 'make e2e-desktop'}).task);
+});

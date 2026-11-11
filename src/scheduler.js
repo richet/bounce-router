@@ -26,6 +26,7 @@ import {failedAttempts, repeatRefusal, REPEAT_LIMIT} from './loop-guard.js';
 import {discoverLocalModels} from './local-models.js';
 import {createMachineSlots} from './machine-slots.js';
 import {runCheck, validCheck, weakCheck, CHECK_TIMEOUT_MS, CHECK_TIMEOUT_MAX_MINUTES} from './task-check.js';
+import {environmentCause} from './environment-failures.js';
 import {seenRun, checkPassed, weakCheckNotice, NO_RUN, NO_RUN_AFTER_CHANGE} from './command-output.js';
 import {routingFallback, PROFILE_TIERS} from './jev.js';
 import {validOwns} from './owned-paths.js';
@@ -78,7 +79,22 @@ const TIERS = new Set(['live', 'next-turn', 'queued']);
 
 // The tree's HEAD when a worker starts, recorded on task.started so a completion verdict can
 // diff the worker's whole contribution (committed or not). Null outside a git repository.
-export // A check-only task's `at`, resolved in the checkout when it is submitted: a short id is resolved here, and anything
+export // Free disk in GB and percent (the least of the folders given) and the 1-minute load, for the machine guard.
+function readMachineState(folders) {
+  let freeDiskPercent = 100, freeDiskGB = Infinity;
+  for (const folder of folders) {
+    try {
+      const stats = fs.statfsSync(folder);
+      if (!stats.blocks) continue;
+      freeDiskPercent = Math.min(freeDiskPercent, (stats.bavail / stats.blocks) * 100);
+      freeDiskGB = Math.min(freeDiskGB, (stats.bavail * stats.bsize) / 1e9);
+    } catch {}
+  }
+  const cores = os.availableParallelism?.() ?? os.cpus().length;
+  return {freeDiskPercent, freeDiskGB, load: os.loadavg()[0], cores};
+}
+
+// A check-only task's `at`, resolved in the checkout when it is submitted: a short id is resolved here, and anything
 // that names no commit is refused before any copy or worker exists.
 function commitIn(cwd, at) {
   try {
@@ -155,7 +171,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   checkRunner = runCheck, checkTimeoutMs = CHECK_TIMEOUT_MS,
   // Full gate runs at once on this machine, across every session (config gateSlots; 0: no cap): a check waits for a
   // slot, it never fails for want of one (found live, 2026-11-05: one run takes 8 CPU and 16 GB).
-  gateSlots = 0, gatePollMs = 2000,
+  gateSlots = 0, gatePollMs = 2000, machineGuard = null, machineState = readMachineState, machinePollMs = 15000,
   // The directories watched for writes outside a worker's copy (src/outside-writes.js); null: the ones on PATH.
   outsideDirs = null,
   sessionMode = 'yolo', depthCap = 1, checkpointRunner, limits: suppliedLimits = {}, strict = false, requireFinalReport = false, reportFormat = 'structured', reportGrant = null, clock = () => Date.now(), watchdog: suppliedWatchdog = {}, strategy = defaultStrategy, jev = null, gitHead = defaultGitHead, maxConcurrentCloud = 3, stackDown = stacksDown}) {
@@ -858,6 +874,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (spec.check !== undefined && spec.check !== null && !validCheck(spec.check)) return 'check';
     if (spec.checkTimeoutMinutes !== undefined && (!Number.isInteger(spec.checkTimeoutMinutes) || spec.checkTimeoutMinutes < 1 || spec.checkTimeoutMinutes > CHECK_TIMEOUT_MAX_MINUTES)) return `checkTimeoutMinutes (whole minutes, 1 to ${CHECK_TIMEOUT_MAX_MINUTES})`;
     if (spec.checkTimeoutMinutes !== undefined && !spec.check) return 'checkTimeoutMinutes (only with a check)';
+    const timedOut = spec.check ? repeatOfTimedOutCheck(spec) : null;
+    if (timedOut) return `check (the same check ran out of its ${timedOut.minutes} minutes on task ${timedOut.task.slice(0, 8)}; running it unchanged would time out again: give a longer checkTimeoutMinutes, up to ${CHECK_TIMEOUT_MAX_MINUTES}, or split it into smaller checks)`;
     if (spec.at !== undefined && (typeof spec.at !== 'string' || !spec.at.trim() || spec.at.startsWith('-'))) return 'at (a branch name or commit)';
     if (spec.at !== undefined && !spec.check) return 'at (a check-only task needs a check)';
     if (spec.risk !== undefined && !RISKS.has(spec.risk)) return 'risk';
@@ -947,6 +965,19 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // call, and a report that changed nothing is not reviewed (handleCompleted, 2026-10-25).
     if (!settings.review && !escalationReviewer({lean: REVIEW_OFF, reviewers: [jev.reviewer], profiles, changes: null})) return spec;
     return {...spec, review: {...(spec.review ?? {}), completion: jev.reviewer}};
+  }
+
+  // The check timed out before with the same command and the same limit: found live, gates were resubmitted unchanged
+  // after a timeout and ran out of time again.
+  function repeatOfTimedOutCheck(spec) {
+    const limitMs = spec.checkTimeoutMinutes ? spec.checkTimeoutMinutes * 60_000 : checkTimeoutMs;
+    for (const failed of session.events) {
+      if (failed.kind !== 'task.failed' || failed.reason !== 'check_timeout') continue;
+      const row = submittedRow(failed.task);
+      if (row?.check !== spec.check) continue;
+      if ((row.checkTimeoutMinutes ? row.checkTimeoutMinutes * 60_000 : checkTimeoutMs) === limitMs) return {task: failed.task, minutes: Math.round(limitMs / 60_000)};
+    }
+    return null;
   }
 
   function submit(rawSpec) {
@@ -1414,14 +1445,67 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     } catch { return {}; } finally { fs.rmSync(index, {force: true}); }
   }
   // A machine-wide gate slot for one check (gateSlots); null when the scheduler closed while it waited.
-  async function gateSlot(task, attempt, context) {
+  // The machine guard: no task starts and no check runs while the disk is nearly full or the machine is overloaded
+  // (found live: checks failed at load 49 and with the disk 95% full, and new work kept starting). Dispatch waits,
+  // a session row says why (bounce-control status shows it), and it resumes on its own once the machine is back under
+  // the limits. Off unless the session sets limits (reload.js passes the settings).
+  let machinePause = null;
+  function machineOver() {
+    if (!machineGuard) return null;
+    const state = machineState([session.cwd, session.root].filter(Boolean));
+    const reasons = [];
+    if (machineGuard.minFreeDiskGB > 0 && state.freeDiskGB < machineGuard.minFreeDiskGB) reasons.push(`disk ${Math.floor(state.freeDiskGB)} GB free (limit ${machineGuard.minFreeDiskGB} GB)`);
+    if (machineGuard.minFreeDiskPercent > 0 && state.freeDiskPercent < machineGuard.minFreeDiskPercent) reasons.push(`disk ${Math.floor(state.freeDiskPercent)}% free (limit ${machineGuard.minFreeDiskPercent}%)`);
+    if (machineGuard.maxLoadPerCore > 0 && state.load > machineGuard.maxLoadPerCore * state.cores) reasons.push(`load ${state.load.toFixed(1)} on ${state.cores} cores (limit ${machineGuard.maxLoadPerCore * state.cores})`);
+    return reasons.length ? {reasons, state} : null;
+  }
+  async function machineClear(task, attempt, context, what) {
+    let told = false;
+    for (;;) {
+      if (closed) return false;
+      const over = machineOver();
+      if (!over) {
+        if (machinePause) { append({kind: 'machine.resumed', text: `Dispatch resumed: the machine is back under its limits (paused for ${Math.round((Date.now() - machinePause.at) / 60000)} min).`}); machinePause = null; }
+        return true;
+      }
+      const text = `Dispatch paused: ${over.reasons.join('; ')}. Work starts again on its own once the machine is back under the limits (minFreeDiskGB, minFreeDiskPercent, maxLoadPerCore).`;
+      if (!machinePause || machinePause.text !== text) { append({kind: 'machine.paused', text, ...over.state}); machinePause = {at: machinePause?.at ?? Date.now(), text}; }
+      if (!told) { told = true; append({kind: 'task.milestone', task, attempt, phase: 'machine', text: `Waiting for the machine before ${what}: ${over.reasons.join('; ')}.`, next: what, context}); }
+      await new Promise(resolve => setTimeout(resolve, machinePollMs));
+    }
+  }
+  // The same check (same command on the same tree) runs once at a time on this machine: found live, two identical
+  // end-to-end builds ran at once and left their stacks behind. The later one waits, naming the run it waits on.
+  async function sameCheckSlot(task, attempt, context, same) {
     const started = Date.now();
-    if (!gateSlots) return {release: () => {}, waitedMs: 0};
+    if (!same?.tree) return {release: () => {}, waitedMs: 0};
+    const url = `bounce-check:${same.tree}:${same.command}`;
     let told = false;
     for (;;) {
       if (closed) return null;
-      const got = machineSlots.acquire({url: 'bounce-gates', slots: gateSlots, holder: {session: session.id, task, kind: 'gate'}});
+      const got = machineSlots.acquire({url, slots: 1, holder: {session: session.id, task, kind: 'check'}});
       if (got.ok) return {release: () => machineSlots.release(got.token), waitedMs: Date.now() - started};
+      if (!told) {
+        told = true;
+        const holder = got.holders[0] ?? {};
+        const where = holder.session && holder.session !== session.id ? ` in session ${String(holder.session).slice(0, 8)}` : '';
+        append({kind: 'task.milestone', task, attempt, phase: 'check', waitingOn: holder.task ?? null, context, next: 'run the check when that run ends',
+          text: `Waiting for the same check already running on this tree: task ${String(holder.task ?? 'unknown').slice(0, 8)}${where} runs \`${same.command}\`.`});
+      }
+      await new Promise(resolve => setTimeout(resolve, gatePollMs));
+    }
+  }
+  async function gateSlot(task, attempt, context, same = null) {
+    const started = Date.now();
+    if (machineOver() && !(await machineClear(task, attempt, context, 'running the check'))) return null;
+    const duplicate = await sameCheckSlot(task, attempt, context, same);
+    if (!duplicate) return null;
+    if (!gateSlots) return {release: duplicate.release, waitedMs: Date.now() - started};
+    let told = false;
+    for (;;) {
+      if (closed) { duplicate.release(); return null; }
+      const got = machineSlots.acquire({url: 'bounce-gates', slots: gateSlots, holder: {session: session.id, task, kind: 'gate'}});
+      if (got.ok) return {release: () => { machineSlots.release(got.token); duplicate.release(); }, waitedMs: Date.now() - started};
       if (!told) {
         told = true;
         append({kind: 'task.milestone', task, attempt, phase: 'check', text: `Waiting for a gate slot: ${got.holders.length} of ${gateSlots} gate runs on this machine are in use. The check runs when one is free.`, next: 'run the check', context});
@@ -1438,15 +1522,17 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       append({kind: 'task.check', task, attempt, completedSeq, command: row.check, passed: null, text: 'The task\'s check was not run: the worker has no working copy to run it in', context});
       return true;
     }
-    const slot = await gateSlot(task, attempt, context);
+    const verified = verifiedTree(copy);
+    const slot = await gateSlot(task, attempt, context, {tree: verified.tree, command: row.check});
     if (!slot) return false;
-    let outcome, verified;
+    let outcome;
     try {
       append({kind: 'task.milestone', task, attempt, phase: 'check', text: `Running the task's check: ${row.check}`, next: 'review and integrate if it passes', context});
-      verified = verifiedTree(copy);
       outcome = await checkRunner({command: row.check, cwd: copy, timeoutMs: row.checkTimeoutMinutes ? row.checkTimeoutMinutes * 60_000 : checkTimeoutMs});
     } finally { slot.release(); }
     if (closed || completedSeqOf(task) !== completedSeq || !['completed', 'reviewing'].includes(reducers.tasks(session.events)[task]?.state)) return false;
+    const environment = environmentCause(outcome);
+    if (environment) outcome = {...outcome, environment};
     append({kind: 'task.check', task, attempt, completedSeq, ...outcome, ...verified, queuedMs: slot.waitedMs, cwd: copy, context,
       text: `The task's check ${outcome.passed ? 'passed' : outcome.timedOut ? 'timed out' : 'failed'}: ${row.check}`});
     // Out of time is not a defect the worker can fix by trying again (found live: a cold build plus end-to-end tests
@@ -2234,7 +2320,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const candidate = candidateResult(session.events, task);
     if (REVIEW_GATE_REASONS.has(intent.reason) && candidate) append({kind: 'review.blocked', task, stage: 'completion', reason: intent.reason,
       candidateSeq: candidate.seq, candidateDigest: candidate.digest, text: blockedText, context});
-    append({kind: 'task.blocked', task, reason: intent.reason, text: blockedText, context});
+    append({kind: 'task.blocked', task, reason: intent.reason, ...reopensFor(task), text: blockedText, context});
   }
 
   // Runs a strategy hook and turns a throw into the fixed invariant every hook shares
@@ -2550,7 +2636,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       fail('check_copy', `The copy for the check could not be put on ${row.at} (${row.commit.slice(0, 12)}): ${String(error.stderr || error.message).trim().split('\n').at(-1)}`);
       return;
     }
-    const slot = await gateSlot(task, attempt, context);
+    let tree = null;
+    try { tree = execFileSync('git', ['rev-parse', `${row.commit}^{tree}`], {cwd: workspace.cwd, encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'ignore']}).trim(); } catch {}
+    const slot = await gateSlot(task, attempt, context, {tree, command: row.check});
     if (!slot) return;
     let outcome;
     try {
@@ -2563,6 +2651,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       text: `The check ${outcome.passed ? 'passed' : outcome.timedOut ? 'timed out' : 'failed'} on ${head}: ${row.check}`});
     if (outcome.passed) append({kind: 'task.accepted', task, by: 'check', checkOnly: true, context, text: `The check passed on ${head}: ${row.check}`});
     else if (outcome.timedOut) fail('check_timeout', `The check did not finish in ${outcome.minutes} minutes and was stopped, on ${head}: ${row.check}. Split it into smaller checks, or submit again with a longer checkTimeoutMinutes (up to ${CHECK_TIMEOUT_MAX_MINUTES}).`, {minutes: outcome.minutes});
+    else if (environmentCause(outcome)) {
+      const {cause, label} = environmentCause(outcome);
+      fail('environment', `The check failed for a reason outside the code on ${head}: ${label} (${cause}). Fix the machine, then run the check again.\n${outcome.output ?? ''}`.trim(), {exit: outcome.exit, cause});
+    }
     else fail('check_failed', `The check failed (exit ${outcome.exit}) on ${head}: ${row.check}\n${outcome.output ?? ''}`.trim(), {exit: outcome.exit});
   }
 
@@ -2579,6 +2671,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (handles.has(task) || launchingAttempts.has(task) || [...reviews.values()].some(review => review.task === task)) return;
     row = submittedRow(task) ?? row; // a re-dispatch (held task, restart) sees an already-routed profile
     if (row.commit) return runCheckOnly(row);
+    if (machineOver() && !(await machineClear(task, null, context, 'starting the task'))) return;
     // Sizing refusal, first of all: a task over the skill's sizing rule never launches,
     // checked in a fixed field order so the reported field is deterministic.
     // submit() always stores size; the fallback only covers rows journaled directly (legacy/test rows), never a defaulting path.

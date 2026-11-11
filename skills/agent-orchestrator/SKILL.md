@@ -23,7 +23,13 @@ You never edit the repository, so the first bullet applies only to your own read
 
 Submit by job — `analyst` to locate, read and research, `builder` to implement (including landing shared changes behind the full gate — say so in its orders), `reviewer` to grade, `debugger` once a failure resisted a first attempt — and let bounce pick the AI; your orders say not to pick a tier or a model yourself. A read-only or probing agent is never escalated to get a task done: work that needs writes goes to a writing agent or is refused.
 
-A gate or an integration run on a commit that already exists is a check-only task, not an agent's turn: submit with `at` (a branch name or commit; a short id is resolved in the checkout) and `check`. bounce runs the check on that commit under the gate slots and the task ends accepted or failed with its output. Give a check that builds from cold or runs end-to-end tests a longer `checkTimeoutMinutes` (default 10, up to 120), or split it. A check that runs out of time fails with `check_timeout`.
+A gate or an integration run on a commit that already exists is a check-only task, not an agent's turn: submit with `at` (a branch name or commit; a short id is resolved in the checkout) and `check`. bounce runs the check on that commit under the gate slots and the task ends accepted or failed with its output. Give a check that builds from cold or runs end-to-end tests a longer `checkTimeoutMinutes` (default 10, up to 120), or split it. A check that runs out of time fails with `check_timeout`; bounce refuses the same check again with the same limit, so resubmit it with a longer `checkTimeoutMinutes` or split it.
+
+When bounce holds a task as `check_environment` (or a check-only task fails as `environment`), the check failed because of the machine — git objects missing in the copy, a full disk, memory, the Docker daemon or a Docker timeout — and its text names which. The worker has nothing to fix: do not restart or resubmit the builder. Tell the user what is wrong with the machine, wait for it to be fixed (or fix what your authority allows), then rerun the check alone as a check-only task and accept on that.
+
+The same check on the same tree runs once at a time on the machine: a second one waits, and its milestone names the task it waits on. Don't resubmit it or cancel the first to get it going; read the first one's result instead when it is the same commit.
+
+When the machine is short on disk or overloaded, bounce pauses dispatch (a `machine.paused` row and a milestone on each waiting task name the limit) and resumes on its own. Don't cancel, resubmit or shrink work because of it; tell the user what is short (free disk, load) so they can make room.
 
 ## Write the brief
 

@@ -57,6 +57,7 @@ time fails the task, naming the limit (`checkTimeoutMinutes` at submit, default 
 | `review`, `review_not_accepted`, `review_uncertain` | the reviewer did not accept | read the verdict (`task`, full); if it names no defect, ask the orchestrator to decide or send a concrete one |
 | `review_no_defect` | the review asked for rework without naming a defect, so the worker was not sent back | ask the orchestrator to accept with what it checked, or send it back naming a defect |
 | `review_unavailable`, `review_unreadable` | no usable verdict came back | ask the orchestrator to review it itself or redispatch the review |
+| `check_environment` | the check failed because of the machine (git objects, disk, memory, Docker), named in the text; no rework round was spent | fix the machine, then have the orchestrator rerun the check; never restart the builder |
 | `worker_blocked` | the worker's turn ended on a decision, access or a wrong goal (a blocked report it sends while it keeps working is a milestone) | read its text; answer it through the orchestrator |
 | `delivery_uncommitted`, `delivery_detached`, `delivery_no_copy` | branch delivery refused the work | have the worker commit on its branch (rework), or see the copy; a gate on an existing commit is a check-only task (`at`), which is never delivered |
 | `integration_*` | writing into the checkout failed (conflict, settings) | the copy is kept; ask the orchestrator to reconcile |
@@ -94,6 +95,12 @@ with `time`, `kind` and `task`. The gaps between a task's `task.launch.requested
 `status` and `bounce quota` show each provider's use of its windows. `auto` routing plans to use a weekly window
 only up to its ceiling, set as `quota.ceiling` in `~/.bounce/config.json` (one percent, or one per provider);
 a provider over its ceiling is picked only after those under it. Without a ceiling the whole window counts.
+
+## Machine limits
+
+When `status` shows "Dispatch paused: …", the free disk is below `minFreeDiskGB` (or the optional `minFreeDiskPercent`) or the load is above
+`maxLoadPerCore` per core. Nothing is wrong with the tasks: they start on their own once the machine is back under
+the limits. Free disk or load (ask the user before taking stacks down) rather than cancelling work.
 
 ## Docker hygiene
 
