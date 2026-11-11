@@ -1430,14 +1430,37 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     } catch { return {}; } finally { fs.rmSync(index, {force: true}); }
   }
   // A machine-wide gate slot for one check (gateSlots); null when the scheduler closed while it waited.
-  async function gateSlot(task, attempt, context) {
+  // The same check (same command on the same tree) runs once at a time on this machine: found live, two identical
+  // end-to-end builds ran at once and left their stacks behind. The later one waits, naming the run it waits on.
+  async function sameCheckSlot(task, attempt, context, same) {
     const started = Date.now();
-    if (!gateSlots) return {release: () => {}, waitedMs: 0};
+    if (!same?.tree) return {release: () => {}, waitedMs: 0};
+    const url = `bounce-check:${same.tree}:${same.command}`;
     let told = false;
     for (;;) {
       if (closed) return null;
-      const got = machineSlots.acquire({url: 'bounce-gates', slots: gateSlots, holder: {session: session.id, task, kind: 'gate'}});
+      const got = machineSlots.acquire({url, slots: 1, holder: {session: session.id, task, kind: 'check'}});
       if (got.ok) return {release: () => machineSlots.release(got.token), waitedMs: Date.now() - started};
+      if (!told) {
+        told = true;
+        const holder = got.holders[0] ?? {};
+        const where = holder.session && holder.session !== session.id ? ` in session ${String(holder.session).slice(0, 8)}` : '';
+        append({kind: 'task.milestone', task, attempt, phase: 'check', waitingOn: holder.task ?? null, context, next: 'run the check when that run ends',
+          text: `Waiting for the same check already running on this tree: task ${String(holder.task ?? 'unknown').slice(0, 8)}${where} runs \`${same.command}\`.`});
+      }
+      await new Promise(resolve => setTimeout(resolve, gatePollMs));
+    }
+  }
+  async function gateSlot(task, attempt, context, same = null) {
+    const started = Date.now();
+    const duplicate = await sameCheckSlot(task, attempt, context, same);
+    if (!duplicate) return null;
+    if (!gateSlots) return {release: duplicate.release, waitedMs: Date.now() - started};
+    let told = false;
+    for (;;) {
+      if (closed) { duplicate.release(); return null; }
+      const got = machineSlots.acquire({url: 'bounce-gates', slots: gateSlots, holder: {session: session.id, task, kind: 'gate'}});
+      if (got.ok) return {release: () => { machineSlots.release(got.token); duplicate.release(); }, waitedMs: Date.now() - started};
       if (!told) {
         told = true;
         append({kind: 'task.milestone', task, attempt, phase: 'check', text: `Waiting for a gate slot: ${got.holders.length} of ${gateSlots} gate runs on this machine are in use. The check runs when one is free.`, next: 'run the check', context});
@@ -1454,12 +1477,12 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       append({kind: 'task.check', task, attempt, completedSeq, command: row.check, passed: null, text: 'The task\'s check was not run: the worker has no working copy to run it in', context});
       return true;
     }
-    const slot = await gateSlot(task, attempt, context);
+    const verified = verifiedTree(copy);
+    const slot = await gateSlot(task, attempt, context, {tree: verified.tree, command: row.check});
     if (!slot) return false;
-    let outcome, verified;
+    let outcome;
     try {
       append({kind: 'task.milestone', task, attempt, phase: 'check', text: `Running the task's check: ${row.check}`, next: 'review and integrate if it passes', context});
-      verified = verifiedTree(copy);
       outcome = await checkRunner({command: row.check, cwd: copy, timeoutMs: row.checkTimeoutMinutes ? row.checkTimeoutMinutes * 60_000 : checkTimeoutMs});
     } finally { slot.release(); }
     if (closed || completedSeqOf(task) !== completedSeq || !['completed', 'reviewing'].includes(reducers.tasks(session.events)[task]?.state)) return false;
@@ -2568,7 +2591,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       fail('check_copy', `The copy for the check could not be put on ${row.at} (${row.commit.slice(0, 12)}): ${String(error.stderr || error.message).trim().split('\n').at(-1)}`);
       return;
     }
-    const slot = await gateSlot(task, attempt, context);
+    let tree = null;
+    try { tree = execFileSync('git', ['rev-parse', `${row.commit}^{tree}`], {cwd: workspace.cwd, encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'ignore']}).trim(); } catch {}
+    const slot = await gateSlot(task, attempt, context, {tree, command: row.check});
     if (!slot) return;
     let outcome;
     try {

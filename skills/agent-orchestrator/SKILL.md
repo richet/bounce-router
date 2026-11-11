@@ -27,6 +27,8 @@ A gate or an integration run on a commit that already exists is a check-only tas
 
 When bounce holds a task as `check_environment` (or a check-only task fails as `environment`), the check failed because of the machine — git objects missing in the copy, a full disk, memory, the Docker daemon or a Docker timeout — and its text names which. The worker has nothing to fix: do not restart or resubmit the builder. Tell the user what is wrong with the machine, wait for it to be fixed (or fix what your authority allows), then rerun the check alone as a check-only task and accept on that.
 
+The same check on the same tree runs once at a time on the machine: a second one waits, and its milestone names the task it waits on. Don't resubmit it or cancel the first to get it going; read the first one's result instead when it is the same commit.
+
 ## Write the brief
 
 Every brief states:
