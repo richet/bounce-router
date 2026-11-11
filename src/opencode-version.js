@@ -8,7 +8,7 @@ import {saveJSON} from './core.js';
 // `--version`: 1.x prints the bare version (`1.18.31`), 2.x the command name and a v (`opencode v2.0.29`).
 // The versions the adapter was run against for real (test/local-opencode.live.test.js); another
 // version of a supported major is expected to work, and `bounce doctor` says it is unverified.
-export const VERIFIED = ['1.18.31', '2.0.29'];
+export const VERIFIED = ['1.18.31', '2.0.29', '2.2.6'];
 export const SUPPORTED_MAJORS = [1, 2];
 // What `bounce doctor --fix` installs when the opencode found is missing or unsupported. 2.x is not
 // published to npm (only 1.x is), so the fix is the verified 1.x release.
