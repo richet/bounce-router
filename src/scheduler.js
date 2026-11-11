@@ -25,7 +25,7 @@ import {concludeAsk} from './adapters/live-common.js';
 import {failedAttempts, repeatRefusal, REPEAT_LIMIT} from './loop-guard.js';
 import {discoverLocalModels} from './local-models.js';
 import {createMachineSlots} from './machine-slots.js';
-import {runCheck, validCheck, weakCheck, CHECK_TIMEOUT_MS} from './task-check.js';
+import {runCheck, validCheck, weakCheck, CHECK_TIMEOUT_MS, CHECK_TIMEOUT_MAX_MINUTES} from './task-check.js';
 import {seenRun, checkPassed, weakCheckNotice, NO_RUN, NO_RUN_AFTER_CHANGE} from './command-output.js';
 import {routingFallback, PROFILE_TIERS} from './jev.js';
 import {validOwns} from './owned-paths.js';
@@ -78,7 +78,17 @@ const TIERS = new Set(['live', 'next-turn', 'queued']);
 
 // The tree's HEAD when a worker starts, recorded on task.started so a completion verdict can
 // diff the worker's whole contribution (committed or not). Null outside a git repository.
-export function defaultGitHead(cwd) {
+export // A check-only task's `at`, resolved in the checkout when it is submitted: a short id is resolved here, and anything
+// that names no commit is refused before any copy or worker exists.
+function commitIn(cwd, at) {
+  try {
+    return execFileSync('git', ['rev-parse', '--verify', '--quiet', '--end-of-options', `${at}^{commit}`], {cwd, encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true}).trim();
+  } catch {
+    throw new Error(`malformed: at (${at} names no commit in the checkout; give a branch name or a full commit)`);
+  }
+}
+
+function defaultGitHead(cwd) {
   try { return execFileSync('git', ['rev-parse', 'HEAD'], {cwd, encoding: 'utf8', timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true}).trim() || null; }
   catch { return null; }
 }
@@ -580,7 +590,15 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // policy): a `reason` on the worker's own op:blocked is what lets a later message resume
     // this exact worker (T3c) instead of being mistaken for a review gate or an infra signal,
     // both of which also land as task.blocked with no reason of their own.
-    append(event.kind === 'task.blocked' ? {...event, reason: 'worker_blocked'} : event);
+    // A worker that says it is blocked while its turn goes on is still acting on its own (found live: "waiting one
+    // minute before the required single retry", then it retried). That is a milestone; the task is blocked only when
+    // the turn ends on it (finalizeReport).
+    if (event.kind === 'task.blocked') {
+      const waiting = {...event, kind: 'task.milestone', waiting: true};
+      append(waiting);
+      return waiting;
+    }
+    append(event);
     return event;
   }
 
@@ -838,6 +856,10 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (spec.budget?.rounds !== undefined && !isNonNegativeInt(spec.budget.rounds)) return 'budget';
     if (spec.checkpoint != null && typeof spec.checkpoint !== 'object') return 'checkpoint';
     if (spec.check !== undefined && spec.check !== null && !validCheck(spec.check)) return 'check';
+    if (spec.checkTimeoutMinutes !== undefined && (!Number.isInteger(spec.checkTimeoutMinutes) || spec.checkTimeoutMinutes < 1 || spec.checkTimeoutMinutes > CHECK_TIMEOUT_MAX_MINUTES)) return `checkTimeoutMinutes (whole minutes, 1 to ${CHECK_TIMEOUT_MAX_MINUTES})`;
+    if (spec.checkTimeoutMinutes !== undefined && !spec.check) return 'checkTimeoutMinutes (only with a check)';
+    if (spec.at !== undefined && (typeof spec.at !== 'string' || !spec.at.trim() || spec.at.startsWith('-'))) return 'at (a branch name or commit)';
+    if (spec.at !== undefined && !spec.check) return 'at (a check-only task needs a check)';
     if (spec.risk !== undefined && !RISKS.has(spec.risk)) return 'risk';
     if (spec.tier !== undefined && !PROFILE_TIERS.includes(spec.tier)) return 'tier';
     if (spec.owns !== undefined && !validOwns(spec.owns)) return 'owns';
@@ -933,6 +955,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const view = reducers.tasks(session.events);
     const problem = validate(spec, view);
     if (problem) throw new Error(`malformed: ${problem}`);
+    const commit = spec.at !== undefined ? commitIn(session.cwd, spec.at) : null;
     const task = spec.task ?? randomUUID();
     const turnRequestId = spec.from === 'orchestrator' ? reducers.openTurnRequest(session.events) : null;
     const row = {
@@ -955,6 +978,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       ...(spec.model !== undefined ? {model: spec.model} : {}),
       steps: spec.steps ?? null,
       ...(spec.check ? {check: spec.check} : {}),
+      ...(spec.check && spec.checkTimeoutMinutes ? {checkTimeoutMinutes: spec.checkTimeoutMinutes} : {}),
+      ...(commit ? {at: spec.at, commit} : {}),
       ...(spec.owns ? {owns: spec.owns} : {}),
       ...(spec.inPlace ? {inPlace: spec.inPlace} : {}),
       ...(spec.tier ? {tier: spec.tier} : {}),
@@ -1143,6 +1168,9 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   }
   function workspaceFor(task, profile, attempt) {
     if (POLICY_RANK[effectivePolicy(profile)] < POLICY_RANK.write) return null;
+    return makeWorkspace(task, attempt);
+  }
+  function makeWorkspace(task, attempt) {
     const prior = existingWorkspace(task);
     if (prior) {
       remember(task, prior); return {...prior, attemptId: `${task}-${attempt}`};
@@ -1416,11 +1444,18 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     try {
       append({kind: 'task.milestone', task, attempt, phase: 'check', text: `Running the task's check: ${row.check}`, next: 'review and integrate if it passes', context});
       verified = verifiedTree(copy);
-      outcome = await checkRunner({command: row.check, cwd: copy, timeoutMs: checkTimeoutMs});
+      outcome = await checkRunner({command: row.check, cwd: copy, timeoutMs: row.checkTimeoutMinutes ? row.checkTimeoutMinutes * 60_000 : checkTimeoutMs});
     } finally { slot.release(); }
     if (closed || completedSeqOf(task) !== completedSeq || !['completed', 'reviewing'].includes(reducers.tasks(session.events)[task]?.state)) return false;
     append({kind: 'task.check', task, attempt, completedSeq, ...outcome, ...verified, queuedMs: slot.waitedMs, cwd: copy, context,
-      text: `The task's check ${outcome.passed ? 'passed' : 'failed'}: ${row.check}`});
+      text: `The task's check ${outcome.passed ? 'passed' : outcome.timedOut ? 'timed out' : 'failed'}: ${row.check}`});
+    // Out of time is not a defect the worker can fix by trying again (found live: a cold build plus end-to-end tests
+    // went past the limit, the work was sent back to "fix and rerun", and the task ended blocked). It fails, naming the limit.
+    if (outcome.timedOut) {
+      append({kind: 'task.failed', task, reason: 'check_timeout', minutes: outcome.minutes, reopens: true, context,
+        text: `The check did not finish in ${outcome.minutes} minutes and was stopped: ${row.check}. Split it into smaller checks, or submit again with a longer checkTimeoutMinutes (up to ${CHECK_TIMEOUT_MAX_MINUTES}).`});
+      return false;
+    }
     return true;
   }
 
@@ -1585,7 +1620,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
                 // literally empty answer still needs a turn back, and it asks in plain words.
                 const inspected = inspectFinalReport(event.text);
                 const answer = String(event.text ?? '').trim();
-                if (!answer && artifact?.changes.length) {
+                const waitingOn = session.events.findLast(e => e.kind === 'task.milestone' && e.task === task && e.attempt === attempt);
+                if (!answer && waitingOn?.waiting) {
+                  // The turn ended silent on a blocked report it sent while working: now it waits for an answer.
+                  append({kind: 'task.blocked', task, attempt, reason: 'worker_blocked', phase: waitingOn.phase, text: waitingOn.text, next: waitingOn.next, from, context});
+                } else if (!answer && artifact?.changes.length) {
                   // No words, but real changes: the changes are its answer, with no turn spent asking again.
                   await completeFromWork({task, attempt, from, context, artifact, outputSeq: output.seq, why: 'the worker said nothing after its changes'});
                 } else if (!inspected.diagnostic || inspected.diagnostic === 'report_incomplete') {
@@ -2492,6 +2531,41 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // first await (a checkpoint re-check, a cloud review launch); after a restart the
   // retried action and reconcile's own request both reach that window and would launch twice.
   const dispatching = new Set();
+  // A check-only task (submitted with `at`): no worker turn. Its copy is put on the commit resolved at submit, the
+  // check runs under the gate slots, and the task ends accepted or failed with the check's output. Nothing is
+  // delivered: found live, gate tasks emulated with an analyst checking out a commit ended blocked
+  // "not delivered: the worker's copy is not on a branch" although their check had passed.
+  async function runCheckOnly(row) {
+    const {task, context} = row;
+    if (reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) return;
+    const attempt = 1;
+    const fail = (reason, text, extra = {}) => append({kind: 'task.failed', task, reason, text, ...extra, context});
+    let workspace;
+    try {
+      workspace = makeWorkspace(task, attempt);
+      for (const args of [['checkout', '--quiet', '--force', '--detach', row.commit], ['clean', '-fdq']]) {
+        execFileSync('git', args, {cwd: workspace.cwd, encoding: 'utf8', timeout: 120000, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true});
+      }
+    } catch (error) {
+      fail('check_copy', `The copy for the check could not be put on ${row.at} (${row.commit.slice(0, 12)}): ${String(error.stderr || error.message).trim().split('\n').at(-1)}`);
+      return;
+    }
+    const slot = await gateSlot(task, attempt, context);
+    if (!slot) return;
+    let outcome;
+    try {
+      append({kind: 'task.milestone', task, attempt, phase: 'check', text: `Running the check on ${row.at} (${row.commit.slice(0, 12)}): ${row.check}`, next: 'report the result', context});
+      outcome = await checkRunner({command: row.check, cwd: workspace.cwd, timeoutMs: row.checkTimeoutMinutes ? row.checkTimeoutMinutes * 60_000 : checkTimeoutMs});
+    } finally { slot.release(); }
+    if (closed || reducers.TERMINAL.has(reducers.tasks(session.events)[task]?.state)) return;
+    const head = `${row.at} (${row.commit.slice(0, 12)})`;
+    append({kind: 'task.check', task, attempt, ...outcome, head: row.commit, queuedMs: slot.waitedMs, cwd: workspace.cwd, context,
+      text: `The check ${outcome.passed ? 'passed' : outcome.timedOut ? 'timed out' : 'failed'} on ${head}: ${row.check}`});
+    if (outcome.passed) append({kind: 'task.accepted', task, by: 'check', checkOnly: true, context, text: `The check passed on ${head}: ${row.check}`});
+    else if (outcome.timedOut) fail('check_timeout', `The check did not finish in ${outcome.minutes} minutes and was stopped, on ${head}: ${row.check}. Split it into smaller checks, or submit again with a longer checkTimeoutMinutes (up to ${CHECK_TIMEOUT_MAX_MINUTES}).`, {minutes: outcome.minutes});
+    else fail('check_failed', `The check failed (exit ${outcome.exit}) on ${head}: ${row.check}\n${outcome.output ?? ''}`.trim(), {exit: outcome.exit});
+  }
+
   async function dispatch(row) {
     if (dispatching.has(row.task)) return;
     dispatching.add(row.task);
@@ -2504,6 +2578,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     const {task, parent, context} = row;
     if (handles.has(task) || launchingAttempts.has(task) || [...reviews.values()].some(review => review.task === task)) return;
     row = submittedRow(task) ?? row; // a re-dispatch (held task, restart) sees an already-routed profile
+    if (row.commit) return runCheckOnly(row);
     // Sizing refusal, first of all: a task over the skill's sizing rule never launches,
     // checked in a fixed field order so the reported field is deterministic.
     // submit() always stores size; the fallback only covers rows journaled directly (legacy/test rows), never a defaulting path.

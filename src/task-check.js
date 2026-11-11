@@ -8,6 +8,8 @@ import {outputTail} from './command-output.js';
 
 export const CHECK_MAX = 2000; // characters of command
 export const CHECK_TIMEOUT_MS = 10 * 60_000;
+// A task may give its check more time at submit (a cold build plus end-to-end tests), up to this.
+export const CHECK_TIMEOUT_MAX_MINUTES = 120;
 const KEEP = 64 * 1024; // of output, while it runs
 const DRAIN_MS = 1000; // for output still in the pipes once the shell has exited
 
