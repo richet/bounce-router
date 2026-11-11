@@ -46,6 +46,9 @@ checkout.
 Accepting, reworking or cancelling a task is the orchestrator's call: from outside, send the orchestrator a
 message (`send`) naming the task and what to do, never write to the session's files.
 
+Not blocked: a check-only task ends accepted or failed (`check_failed`, `check_timeout`), and a check that runs out of
+time fails the task, naming the limit (`checkTimeoutMinutes` at submit, default 10, up to 120).
+
 | reason | means | what the controller does |
 |---|---|---|
 | `unverified` | the work changed files and no check ran it; kept in the copy | ask the orchestrator to check and accept, or send it back |
@@ -54,8 +57,8 @@ message (`send`) naming the task and what to do, never write to the session's fi
 | `review`, `review_not_accepted`, `review_uncertain` | the reviewer did not accept | read the verdict (`task`, full); if it names no defect, ask the orchestrator to decide or send a concrete one |
 | `review_no_defect` | the review asked for rework without naming a defect, so the worker was not sent back | ask the orchestrator to accept with what it checked, or send it back naming a defect |
 | `review_unavailable`, `review_unreadable` | no usable verdict came back | ask the orchestrator to review it itself or redispatch the review |
-| `worker_blocked` | the worker stopped for a decision, access or a wrong goal | read its text; answer it through the orchestrator |
-| `delivery_uncommitted`, `delivery_detached`, `delivery_no_copy` | branch delivery refused the work | have the worker commit on its branch (rework), or see the copy |
+| `worker_blocked` | the worker's turn ended on a decision, access or a wrong goal (a blocked report it sends while it keeps working is a milestone) | read its text; answer it through the orchestrator |
+| `delivery_uncommitted`, `delivery_detached`, `delivery_no_copy` | branch delivery refused the work | have the worker commit on its branch (rework), or see the copy; a gate on an existing commit is a check-only task (`at`), which is never delivered |
 | `integration_*` | writing into the checkout failed (conflict, settings) | the copy is kept; ask the orchestrator to reconcile |
 | `termination_unverified`, `orphaned` | a worker from a previous daemon may still run | check the process before anything is resubmitted |
 | `deadline` | the task's deadline passed and it was cancelled | ask for what it reached and a smaller resubmission |

@@ -74,8 +74,10 @@ export function tasks(events) {
     // task.accepted is the one row allowed to act on a task already in a terminal
     // state (completed): every other kind is dropped once terminal, as before. The exception: a cancelled task whose
     // accepted work was refused by the checkout (`reopens`) is blocked again, so its owner can send it back or decide.
+    // Finished work whose check ran out of time fails (`reopens`): there is nothing to decide, only a limit to change.
     // So is a completed task whose checked work the checkout refused (no review: it lands after its check).
-    if (!t || (TERMINAL.has(t.state) && e.kind !== 'task.accepted' && !(e.kind === 'task.blocked' && e.reopens && ['cancelled', 'completed'].includes(t.state)))) continue;
+    if (!t || (TERMINAL.has(t.state) && e.kind !== 'task.accepted' && !(e.kind === 'task.blocked' && e.reopens && ['cancelled', 'completed'].includes(t.state))
+      && !(e.kind === 'task.failed' && e.reopens && ['completed', 'reviewing'].includes(t.state)))) continue;
     switch (e.kind) {
       case 'task.started':
         if (t.state === 'waiting') priorState[e.task] = 'running'; else t.state = 'running';
@@ -148,6 +150,8 @@ export function tasks(events) {
         // first went terminal at `completed`, so settleParent does not re-fire here.
         if (t.state === 'reviewing') { t.state = 'accepted'; t.accepted = true; settleParent(t.parent); }
         else if (t.state === 'completed') { t.state = 'accepted'; t.accepted = true; }
+        // A check-only task has no worker turn: its passed check accepts it straight from the queue.
+        else if (e.checkOnly && ['queued', 'running'].includes(t.state)) { t.state = 'accepted'; t.accepted = true; settleParent(t.parent); }
         // An owner's accept of finished work (bus.js marks it `overrides`) is the exit from
         // `blocked`/`input_required`; a plain accept never moves a parked task.
         // A cancelled task accepted by its owner (bus.js, overrides 'cancelled') landed its copy's work.
