@@ -175,6 +175,7 @@ Switch with Ctrl+O or `/operation orchestrator`. The main agent stops editing an
 | `taskMinutes` / `taskCeilingMinutes` | 15 / 60 | A task's lease, and the most it can be renewed to. |
 | `escalateMinutes` | 90 | Raise a task still open after this long. |
 | `sweepMinutes` | 20 | Hand the orchestrator waiting work when nothing is running. |
+| `idleNudgeMinutes` | 5 | Nudge an orchestrator idle with no tasks while its note names a next step. |
 | `gateSlots` | 3 | Checks that may run at once on the machine. |
 | `maxConcurrentCloud` | 3 | Cloud workers at once. |
 | `minFreeDiskGB` / `maxLoadPerCore` | 30 / 2 | Pause new work below this free disk or above this load. |

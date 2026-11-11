@@ -1,3 +1,4 @@
+import {fileURLToPath} from 'node:url';
 import {createConnection as nodeConnect} from 'node:net';
 import nodeFs from 'node:fs';
 import claude from './claude.js';
@@ -30,7 +31,12 @@ export const shellQuote = value => `'${String(value).replace(/'/g, "'\\''")}'`;
 export const hookCommand = dir =>
   `node -e "const fs=require('fs');fs.writeFileSync(process.argv[1],JSON.stringify({socket:process.env.CLAUDE_CODE_MESSAGING_SOCKET,token:process.env.CLAUDE_CODE_MESSAGING_TOKEN}),{mode:0o600})" ${shellQuote(`${dir}/messaging.json`)}`;
 
-export const settingsFor = dir => JSON.stringify({hooks: {SessionStart: [{hooks: [{type: 'command', command: hookCommand(dir)}]}]}});
+export const settingsFor = (dir, {orchestrator = false} = {}) => JSON.stringify({hooks: {SessionStart: [{hooks: [{type: 'command', command: hookCommand(dir)}]}],
+  ...(orchestrator ? orchestratorHooks : {})}});
+
+// The orchestrator's own Bash calls: a gate started in the background is refused (src/hooks/detached-gate.js).
+export const DETACHED_GATE_HOOK = fileURLToPath(new URL('../hooks/detached-gate.js', import.meta.url));
+export const orchestratorHooks = {PreToolUse: [{matcher: 'Bash', hooks: [{type: 'command', command: `node ${shellQuote(DETACHED_GATE_HOOK)}`}]}]};
 
 export function createClaudeLive({connect = nodeConnect, fs = nodeFs, kill = process.kill, spawn, writeWait = WRITE_WAIT} = {}) {
   const pendingPath = dir => `${dir}/pending.jsonl`;
@@ -39,7 +45,7 @@ export function createClaudeLive({connect = nodeConnect, fs = nodeFs, kill = pro
   const start = ({profile = {}, extraArgs = [], stdin, cwd, dir}) => {
     const {model, mode, images = []} = profile;
     const executable = resolveExecutable('claude', profile.executables?.claude);
-    const args = [...claude.invocation({model, mode, images}), ...extraArgs, '--settings', settingsFor(dir)];
+    const args = [...claude.invocation({model, mode, images}), ...extraArgs, '--settings', settingsFor(dir, {orchestrator: Boolean(profile.orchestratorEnv)})];
     const live = spawnLive({executable, args: [...args, ...(profile.orchestratorEnv ? ['--disallowedTools', 'Agent,Task'] : [])], cwd, env: vendorEnv(process.env, {...profile.orchestratorEnv, ...profile.report}), stdin: claude.stdin(stdin), ...(spawn ? {spawn} : {})});
     return {live, child: live.child, pid: live.child.pid, args, dir, cwd, sessionId: null};
   };

@@ -9,6 +9,9 @@ import {execFileSync} from 'node:child_process';
 import {Session} from '../src/core.js';
 import {createScheduler} from '../src/scheduler.js';
 import {fakeAdapter} from './helpers/fake-adapter.js';
+import {createBus} from '../src/bus.js';
+import {createOps} from '../src/bridge-ops.js';
+import {createMcpServer} from '../src/mcp.js';
 
 const git = (cwd, ...args) => execFileSync('git', args, {cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe']}).trim();
 const setup = (t, {delivery = 'branch'} = {}) => {
@@ -67,4 +70,56 @@ test('a ref that names no commit is refused at submit, before any copy or worker
   assert.throws(() => scheduler.submit({parent: null, profile: 'analyst', orders: 'gate', deadline: null, at: 'deadbee', check: 'true'}), /at \(deadbee names no commit in the checkout/);
   assert.throws(() => scheduler.submit({parent: null, profile: 'analyst', orders: 'gate', deadline: null, at: 'main'}), /check-only task needs a check/);
   assert.equal(session.events.some(e => e.kind === 'task.submitted'), false);
+});
+
+// The orchestrator submits through its MCP tools, which publish on the bus as `orchestrator`: the path a session
+// really uses. A check-only submit with no orders, requires or agent must validate there and run with no worker.
+const orchestratorMcp = async (t, {session, scheduler}) => {
+  const bus = await createBus({session, dir: session.dir, validate: scheduler.validate, prepare: scheduler.prepare});
+  t.after(() => bus.close());
+  const grant = bus.grant({peer: 'orchestrator', canSubmit: true, tasks: []});
+  const mcp = createMcpServer({ops: createOps({env: {BOUNCE_BUS: bus.path, BOUNCE_BUS_TOKEN_FILE: grant.file}}), views: {}});
+  return async (name, args) => (await mcp.handle({jsonrpc: '2.0', id: 1, method: 'tools/call', params: {name, arguments: args}})).result;
+};
+
+test('a check-only submit through the orchestrator\'s task_submit needs only at and check, and runs with no worker', async t => {
+  const context = setup(t);
+  const {session, scheduler, worker, first} = context;
+  const call = await orchestratorMcp(t, context);
+  const result = await call('task_submit', {task: 'gate1', parent: null, at: first.slice(0, 7), check: 'grep -qx one version.txt', checkTimeoutMinutes: 120});
+  assert.equal(result.isError, undefined, JSON.stringify(result));
+  assert.equal(await ended(scheduler, 'gate1'), 'accepted');
+  const row = session.events.find(e => e.kind === 'task.submitted' && e.task === 'gate1');
+  assert.equal(row.commit, first);
+  assert.equal(row.checkTimeoutMinutes, 120);
+  assert.equal(session.events.findLast(e => e.kind === 'task.accepted' && e.task === 'gate1').checkOnly, true);
+  assert.equal(worker.calls.launch, 0);
+  assert.equal(session.events.some(e => e.kind === 'task.corrected' && e.task === 'gate1' && e.text.startsWith('profile:')), false, 'no agent notice for a check-only task');
+});
+
+test('a check-only event through the orchestrator\'s raw submit runs the check itself, even with orders and requires given', async t => {
+  const context = setup(t);
+  const {session, scheduler, worker} = context;
+  const call = await orchestratorMcp(t, context);
+  const bare = await call('submit', {event: {kind: 'task.submitted', task: 'gate2', parent: null, at: 'main', check: 'cat version.txt; exit 3'}});
+  assert.equal(bare.isError, undefined, JSON.stringify(bare));
+  const withOrders = await call('submit', {event: {kind: 'task.submitted', task: 'gate3', parent: null, orders: 'check-only', requires: ['read', 'exec'], at: 'main', check: 'grep -qx two version.txt'}});
+  assert.equal(withOrders.isError, undefined, JSON.stringify(withOrders));
+  assert.equal(await ended(scheduler, 'gate2'), 'failed');
+  assert.equal(session.events.findLast(e => e.kind === 'task.failed' && e.task === 'gate2').reason, 'check_failed');
+  assert.equal(await ended(scheduler, 'gate3'), 'accepted');
+  assert.equal(worker.calls.launch, 0);
+});
+
+test('through the orchestrator\'s submit, a ref that names no commit is refused and a peer-sent commit is ignored', async t => {
+  const context = setup(t);
+  const {session, scheduler, first} = context;
+  const call = await orchestratorMcp(t, context);
+  const refused = await call('task_submit', {task: 'gate4', parent: null, at: 'deadbee', check: 'true'});
+  assert.equal(refused.isError, true);
+  assert.match(refused.content[0].text, /at \(deadbee names no commit in the checkout/);
+  const forged = await call('submit', {event: {kind: 'task.submitted', task: 'gate5', parent: null, profile: 'analyst', orders: 'look', requires: ['read'], commit: first}});
+  assert.equal(forged.isError, undefined, JSON.stringify(forged));
+  assert.equal(session.events.find(e => e.kind === 'task.submitted' && e.task === 'gate5').commit, undefined);
+  assert.equal(session.events.some(e => e.kind === 'task.submitted' && e.task === 'gate4'), false);
 });

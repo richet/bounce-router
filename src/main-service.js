@@ -40,6 +40,32 @@ const SWEEP_PROMPT = 'Decide what is waiting on you: accept it (task.accepted wi
 // orchestrator once, to tell the user. Found live: seven small fixes took about seven hours with nobody asking why.
 const ESCALATE_MINUTES = 90;
 const OVERTIME_CHECK_MS = 60000;
+// The idle nudge: the orchestrator between turns with nothing running, nothing held and nothing pending, while its own
+// note still names a next step. Found live: it ran the integration gate detached, outside bounce, and sat idle with a
+// red gate until a person noticed. At most one nudge per IDLE_REPEAT_MINUTES, and none after IDLE_NUDGE_MAX in a row
+// that dispatched nothing.
+const IDLE_MINUTES = 5;
+const IDLE_REPEAT_MINUTES = 15;
+const IDLE_NUDGE_MAX = 3;
+// A Next that says the work is finished or waits on a person is not work to nudge about.
+const NOT_WORK = /^(none|nothing|n\/a|-|done|finished|complete|all done|batch done|no more|wait(ing)?\b.*\b(owner|user|human|approval|go|answer|review|merge|morning)|(await(ing)?|blocked on)\b.*\b(owner|user|approval|go|answer))\b/i;
+const IDLE_PROMPT = 'Dispatch it, or say what you are waiting on. A gate or an integration run is a check-only task (at + check + checkTimeoutMinutes), never a command you start yourself. If the batch is finished or waits on the user, say so and write it in your note\'s Next, and bounce stops asking.';
+
+// The first step of the orchestrator's note: the line after a `Next` heading, or the text on it. Null when the note
+// names none, or names one that is not work (done, waiting on the user).
+export function nextStep(note) {
+  if (typeof note !== 'string') return null;
+  const lines = note.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const match = lines[i].match(/^\s*(?:[#>*_-]+\s*)*next(?:\s+steps?)?\b\s*(?:\*\*|__)?\s*[:\-—]?\s*(?:\*\*|__)?\s*(.*)$/i);
+    if (!match) continue;
+    const rest = match[1].trim() || lines.slice(i + 1).map(line => line.trim()).find(Boolean) || '';
+    const step = rest.replace(/^([-*•]|\d+[.)])\s+/, '').trim();
+    if (!step || NOT_WORK.test(step)) return null;
+    return step.slice(0, 200);
+  }
+  return null;
+}
 const OVERTIME_PROMPT = 'Tell the user, for each, what it is doing and what blocks it (read its milestones and the copy before you answer), and what you will do: let it run, steer it, or cancel it and resubmit something smaller. Then continue your orders.';
 const WAKE_PROMPT = 'Continue your orders. Resolve the pending outcomes and decisions above: schedule the successor, name the event being awaited, finish the authorized scope, or report a concrete blocker. If a task you still need is listed as running, wait on it with `bounce wait` before reporting. Do not re-run finished work.';
 
@@ -140,6 +166,7 @@ export function createMainService({session, adapters, profile, settings, profile
   clock = {}, watchdog = {}, onFirstUserPrompt = () => {}}) {
   const sweepMs = (settings.sweepMinutes ?? SWEEP_MINUTES) * 60000;
   const escalateMs = (settings.escalateMinutes ?? ESCALATE_MINUTES) * 60000;
+  const idleMs = (settings.idleNudgeMinutes ?? IDLE_MINUTES) * 60000;
   const now = clock.now ?? Date.now;
   const setTimer = clock.setTimeout ?? setTimeout;
   const clearTimer = clock.clearTimeout ?? clearTimeout;
@@ -506,7 +533,7 @@ export function createMainService({session, adapters, profile, settings, profile
   function actionBlock(actions) {
     return handoffBlock(session, actions.map(action => action.row));
   }
-  function start(params, {wake, sweep = false, overtime = null, forceFresh = false, fromQueue = false} = {}) {
+  function start(params, {wake, sweep = false, overtime = null, idle = null, forceFresh = false, fromQueue = false} = {}) {
     if (closed) return {accepted: false, reason: 'daemon_closed'};
     if (current && (wake || current.unverified)) return {accepted: false, reason: current.unverified ? 'termination_unverified' : 'busy'};
     if (blockedState && ['termination_uncertain', 'orphaned'].includes(blockedState.reason)) return {accepted: false, reason: 'termination_unverified'};
@@ -557,7 +584,7 @@ export function createMainService({session, adapters, profile, settings, profile
     const held = sweep ? heldTasks() : [];
     if (sweep && !held.length) return {accepted: false, reason: 'nothing_waiting'};
     if (overtime && !overtime.length) return {accepted: false, reason: 'nothing_waiting'};
-    if (wake && !sweep && !overtime && !actions.length) return {accepted: false, reason: 'nothing_pending'};
+    if (wake && !sweep && !overtime && !idle && !actions.length) return {accepted: false, reason: 'nothing_pending'};
     const actionKey = actions.length ? actionSetKey(actions) : null;
     const run = {id: params.id ?? randomUUID(), provider, selected, routes, images, wake, actionKey, actions,
       actionIds: actions.map(action => action.actionId), outcomeSeqs: actions.map(action => action.outcomeSeq).filter(Number.isInteger),
@@ -570,10 +597,11 @@ export function createMainService({session, adapters, profile, settings, profile
     // turn is never raced by a synthetic one. The block counts as delivered only once this
     // requestId reaches main.started; a launch that fails leaves the outcomes pending.
     if (overtime) run.outcomes = overtimeBlock(overtime);
+    else if (idle) run.outcomes = idleBlock(idle);
     else if (sweep) run.outcomes = sweepBlock(held);
     else if (actions.length) run.outcomes = actionBlock(actions);
     const requested = {kind: 'main.requested', from: 'main', context: session.id, requestId: run.id,
-      wake, ...(sweep ? {sweep: true} : {}), ...(overtime ? {overtime: true} : {}), text: params.text, provider, model: selected.model ?? '', mode: selected.mode, policy: selected.policy,
+      wake, ...(sweep ? {sweep: true} : {}), ...(overtime ? {overtime: true} : {}), ...(idle ? {idle: true, idleMinutes: idle.minutes, next: idle.next} : {}), text: params.text, provider, model: selected.model ?? '', mode: selected.mode, policy: selected.policy,
       images, actionIds: run.actionIds, outcomeSeqs: run.outcomeSeqs, actionKey,
       attempt: wake && actionKey ? wakeAttempts(session.events, actionKey) + 1 : 1,
       dueAt: wake ? now() : null, ...(params.recoveryOf ? {recoveryOf: params.recoveryOf, rootRequestId: run.rootRequestId} : {})};
@@ -583,7 +611,8 @@ export function createMainService({session, adapters, profile, settings, profile
     if (overtime) {
       for (const t of overtime) committed.push({kind: 'task.overtime', task: t.id, minutes: t.minutes, limitMinutes: Math.round(escalateMs / 60000), requestId: run.id, from: 'bounce', context: session.id});
       committed.push({kind: 'handoff', wake, overtime: true, requestId: run.id, actionIds: [], outcomeSeqs: [], tasks: overtime.map(t => t.id), text: `${run.outcomes}\n\n${params.text}`, from: 'bounce'});
-    } else if (sweep) committed.push({kind: 'handoff', wake, sweep: true, requestId: run.id, actionIds: [], outcomeSeqs: [], tasks: held.map(t => t.id), text: `${run.outcomes}\n\n${params.text}`, from: 'bounce'});
+    } else if (idle) committed.push({kind: 'handoff', wake, idle: true, requestId: run.id, actionIds: [], outcomeSeqs: [], tasks: [], text: `${run.outcomes}\n\n${params.text}`, from: 'bounce'});
+    else if (sweep) committed.push({kind: 'handoff', wake, sweep: true, requestId: run.id, actionIds: [], outcomeSeqs: [], tasks: held.map(t => t.id), text: `${run.outcomes}\n\n${params.text}`, from: 'bounce'});
     else if (actions.length) committed.push({kind: 'handoff', wake, requestId: run.id,
       actionIds: run.actionIds, outcomeSeqs: run.outcomeSeqs, tasks: actions.filter(action => action.task).map(action => action.task),
       text: wake ? `${run.outcomes}\n\n${params.text}` : run.outcomes, from: 'bounce'});
@@ -741,6 +770,50 @@ export function createMainService({session, adapters, profile, settings, profile
     overtimeTimer?.unref?.();
   }
   armOvertime();
+
+  // The idle nudge (see IDLE_MINUTES). Idle time runs from the last row that was not noise, kept in memory against the
+  // service clock and seeded from the journal on a restart.
+  let idleTimer = null;
+  let lastActivityAt = Math.min(Date.parse(session.events.findLast(e => !QUIET.has(e.kind))?.time ?? '') || now(), now());
+  const unsubscribeIdle = session.subscribe(row => {
+    if (QUIET.has(row.kind)) return;
+    if (row.kind === 'main.requested' && row.idle) return;
+    if (['handoff', 'status'].includes(row.kind) && (row.idle || row.from === 'main')) return;
+    lastActivityAt = now();
+  });
+  function idleNudge() {
+    if (idleMs <= 0 || closed || current || blockedState || wakeTimer || autoWakeSuppressed) return null;
+    const view = tasks(session.events);
+    if (Object.values(view).some(t => !TERMINAL.has(t.state))) return null;
+    if (pendingActions().length) return null;
+    if (now() - lastActivityAt < idleMs) return null;
+    const next = nextStep(session.events.findLast(e => e.kind === 'state' && typeof e.text === 'string')?.text);
+    if (!next) return null;
+    const nudges = session.events.filter(e => e.kind === 'main.requested' && e.idle);
+    const last = nudges.at(-1);
+    if (last && now() - (last.dueAt ?? Date.parse(last.time) ?? 0) < IDLE_REPEAT_MINUTES * 60000) return null;
+    const lastSubmit = session.events.findLast(e => e.kind === 'task.submitted')?.seq ?? 0;
+    if (nudges.filter(e => e.seq > lastSubmit).length >= IDLE_NUDGE_MAX) return null;
+    return {minutes: Math.round((now() - lastActivityAt) / 60000), next};
+  }
+  function idleBlock(idle) {
+    return `You have been idle ${idle.minutes} min with no tasks running or held (delivered by bounce, not typed by the user). Your note says next: ${idle.next}`;
+  }
+  function armIdle() {
+    if (idleMs <= 0 || closed) return;
+    idleTimer = setTimer(() => {
+      idleTimer = null;
+      if (closed) return;
+      const idle = idleNudge();
+      if (idle) {
+        session.append({kind: 'status', from: 'main', context: session.id, idle: true, text: `The orchestrator has been idle ${idle.minutes} min with no tasks while its note names a next step; asking it to dispatch or say what it waits on.`});
+        start({text: IDLE_PROMPT}, {wake: true, idle});
+      }
+      armIdle();
+    }, Math.min(OVERTIME_CHECK_MS, idleMs));
+    idleTimer?.unref?.();
+  }
+  armIdle();
   const service = {
     state,
     subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
@@ -821,6 +894,8 @@ export function createMainService({session, adapters, profile, settings, profile
       unsubscribeSweep();
       if (sweepTimer) { clearTimer(sweepTimer); sweepTimer = null; }
       if (overtimeTimer) { clearTimer(overtimeTimer); overtimeTimer = null; }
+      if (idleTimer) { clearTimer(idleTimer); idleTimer = null; }
+      unsubscribeIdle();
       if (wakeTimer) { clearTimer(wakeTimer); wakeTimer = null; wakeTimerKey = null; }
       const run = current;
       if (!run) return {verified: true};

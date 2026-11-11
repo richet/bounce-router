@@ -314,8 +314,8 @@ test('U15: the /login branch refreshes quota after the vendor login returns', ()
 });
 
 // U16: the orchestrator's own vendor cannot spawn workers bounce does not see.
-test('U16: in orchestrator mode the claude invocation disallows the Agent/Task tools', () => {
-  assert.match(cliSource, /const noOwnSubagents = provider => provider === 'claude' \? \['--disallowedTools', 'Agent,Task'\] : \[\];/);
+test('U16: in orchestrator mode the claude invocation disallows the Agent/Task tools and carries the detached-gate hook', () => {
+  assert.match(cliSource, /const noOwnSubagents = provider => provider === 'claude' \? \['--disallowedTools', 'Agent,Task', '--settings', JSON\.stringify\(\{hooks: orchestratorHooks\}\)\] : \[\];/);
   assert.match(cliSource, /orchestrating \? \{runner: options => runProcess\(\{\.\.\.options, keepBus: true\}\), extraArgs: noOwnSubagents\}/);
 });
 

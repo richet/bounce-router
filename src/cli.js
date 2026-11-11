@@ -45,6 +45,7 @@ import {randomUUID} from 'node:crypto';
 
 import {parseArgs, isDeepStrictEqual} from 'node:util';
 import {Session, Router, config, saveJSON, dataRoot} from './core.js';
+import {orchestratorHooks} from './adapters/claude-live.js';
 import * as reducers from './reducers.js';
 import {pendingMainActions} from './continuations.js';
 import {pendingSends} from './run-inbox.js';
@@ -513,7 +514,9 @@ async function main() {
   // workers bounce cannot see (observed: told to go on without codex, claude spawned its own
   // Agent and the AGENTS pane stayed empty). Claude Code exposes --disallowedTools for exactly
   // this; other vendors' subagent features have no such switch here yet, so ORDERS.md forbids them.
-  const noOwnSubagents = provider => provider === 'claude' ? ['--disallowedTools', 'Agent,Task'] : [];
+  // A gate it starts in the background is refused the same way (src/hooks/detached-gate.js); the other vendors have no
+  // such hook here, and the idle nudge (src/main-service.js) is what catches an orchestrator left waiting on one.
+  const noOwnSubagents = provider => provider === 'claude' ? ['--disallowedTools', 'Agent,Task', '--settings', JSON.stringify({hooks: orchestratorHooks})] : [];
   // Fire-and-forget: a new session's first prompt gets a model-given title once (src/session-title.js).
   const onFirstUserPrompt = (s, cfg) => { titleSession({session: s, settings: cfg, ask: createAsk({executables: cfg.executables})}).catch(() => {}); };
   const routerOptions = {onFirstUserPrompt, ...(orchestrating ? {runner: options => runProcess({...options, keepBus: true}), extraArgs: noOwnSubagents} : {})};
