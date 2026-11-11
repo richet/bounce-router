@@ -106,7 +106,7 @@ export const defaultStrategy = {
     if (sentBack(task, api)) {
       return acceptOrHold(task, api, {advice: afterReworkAdvice(findings, api.lastFired?.(task)), said: `After the one rework round the review still ${still(findings)}`});
     }
-    return {action: 'rework', findings};
+    return vagueSendBack([v], findings) ?? {action: 'rework', findings};
   },
   onTerminal() { return {submit: []}; },
 };
@@ -151,7 +151,7 @@ export function quorumStrategy(n) {
       const reworks = verdicts.filter(v => v.verdict === 'rework');
       if (reworks.length) {
         const findings = reworks.flatMap(v => v.findings ?? v.questions ?? []);
-        if (!api.lastRework?.(task) && api.roundsUsed(task) < api.roundsCap(task)) return {action: 'rework', findings};
+        if (!api.lastRework?.(task) && api.roundsUsed(task) < api.roundsCap(task)) return vagueSendBack(reworks, findings) ?? {action: 'rework', findings};
         return acceptOrHold(task, api, {advice: afterReworkAdvice(findings), said: `After the one rework round the review still ${still(findings)}`});
       }
       // Every reviewer reported (the CORE waits for all, CONTRACT §5); none rejected or
@@ -160,6 +160,31 @@ export function quorumStrategy(n) {
     },
     onTerminal() { return {submit: []}; },
   };
+}
+
+// A send-back reaches the worker only when it names a defect: a file or line, a code name, or the behaviour that
+// fails. A reviewer's rework that only asks for more verification left a builder with nothing to fix, and it blocked
+// itself for hours (found live). Jev's findings are its checks' fixes, each an action the worker can take.
+const PATH_LIKE = /(?:^|[\s(\[`'"])(?:[\w-]+\/)+[\w.-]+|\b[\w-]+\.[a-z]{2,5}\b|:\d+\b|`[^`]+`/i;
+const FAILING = /\b(?:fail(?:s|ed|ing|ure)?|errors?|throws?|thrown|crash(?:es|ed)?|exceptions?|asserts?|expected|undefined|broken|breaks|regress(?:es|ed|ion)?|incorrect|wrong|bugs?|leaks?)\b/i;
+const findingNamesDefect = finding => {
+  const text = String(finding ?? '');
+  try { const row = JSON.parse(text); if (row && typeof row === 'object' && (row.file || row.line)) return true; } catch {}
+  return PATH_LIKE.test(text) || FAILING.test(text);
+};
+export const namesDefect = findings => (findings ?? []).some(findingNamesDefect);
+// What the worker cannot act on: more checking of work no finding faults.
+const ONLY_CHECKING = /\b(?:verif(?:y|ied|ication)|evidence|confirm|double[- ]check|re-?check|prove|proof|independent(?:ly)?|validat(?:e|ion))\b/i;
+export const asksOnlyForChecking = findings => {
+  const said = (findings ?? []).map(f => String(f ?? '').trim()).filter(Boolean);
+  return !said.length || (!namesDefect(said) && said.every(f => ONLY_CHECKING.test(f)));
+};
+
+function vagueSendBack(verdicts, findings) {
+  if (verdicts.some(v => Array.isArray(v.fired)) || !asksOnlyForChecking(findings)) return null;
+  const said = findings.map(f => String(f).trim()).filter(Boolean).join(' ').slice(-600);
+  return {action: 'escalate', reason: 'review_no_defect',
+    text: `The review asked for rework but named no defect (a file or line, and the behaviour that fails), so the work was not sent back. Decide: accept it (task.accepted, with what you checked), or send it back (task.rework) naming a concrete defect. Ask the user only when you cannot decide.${said ? ` The reviewer said: ${said}` : ' The reviewer said nothing more.'}`};
 }
 
 // Jev checks that only say "the report names remaining work" / "acceptance is not met".

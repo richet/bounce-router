@@ -153,6 +153,8 @@ export function validateSettings(value) {
   if (value.reports !== undefined && !['plain', 'structured'].includes(value.reports)) throw new Error('reports must be "plain" or "structured"');
   // The quiet sweep: minutes with nothing in flight and held work waiting before the orchestrator is asked; 0 turns it off.
   if (value.sweepMinutes !== undefined && (!Number.isInteger(value.sweepMinutes) || value.sweepMinutes < 0 || value.sweepMinutes > 240)) throw new Error('sweepMinutes must be a whole number of minutes from 0 (off) to 240');
+  // A task open this long from its submission is put to the orchestrator once, to tell the user; 0 turns it off.
+  if (value.escalateMinutes !== undefined && (!Number.isInteger(value.escalateMinutes) || value.escalateMinutes < 0 || value.escalateMinutes > 1440)) throw new Error('escalateMinutes must be a whole number of minutes from 0 (off) to 1440');
   if (!Number.isFinite(value.contextChars) || value.contextChars < 4000 || value.contextChars > 200000) throw new Error('contextChars must be between 4000 and 200000');
   // Cloud workers (claude/codex/muse) have no per-endpoint slot config the way local does — this is
   // their one ceiling, machine-wide, distinct from a local endpoint's own maxConcurrent.

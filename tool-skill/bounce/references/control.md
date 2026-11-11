@@ -52,6 +52,7 @@ message (`send`) naming the task and what to do, never write to the session's fi
 | `check_failed` | the task's check failed again after one return to the worker | ask for the failure output and a debugger or a rework with it |
 | `check_unrunnable` | the check could not run (missing tool, stack down) | fix the environment or the check, then ask for a rerun |
 | `review`, `review_not_accepted`, `review_uncertain` | the reviewer did not accept | read the verdict (`task`, full); if it names no defect, ask the orchestrator to decide or send a concrete one |
+| `review_no_defect` | the review asked for rework without naming a defect, so the worker was not sent back | ask the orchestrator to accept with what it checked, or send it back naming a defect |
 | `review_unavailable`, `review_unreadable` | no usable verdict came back | ask the orchestrator to review it itself or redispatch the review |
 | `worker_blocked` | the worker stopped for a decision, access or a wrong goal | read its text; answer it through the orchestrator |
 | `delivery_uncommitted`, `delivery_detached`, `delivery_no_copy` | branch delivery refused the work | have the worker commit on its branch (rework), or see the copy |
@@ -93,13 +94,19 @@ a provider over its ceiling is picked only after those under it. Without a ceili
 
 ## Docker hygiene
 
-A copy whose worker started a stack keeps it after the task ends, with its networks; enough of them exhaust
-Docker's address pools and new stacks fail to start. `bounce prune` takes a copy's stack down with its volumes
-before removing the copy when the project's stack tool supports it, and keeps the copy when that fails. To find
-stacks left behind:
+A stack a worker starts in its copy (any Docker Compose project whose compose file is in the copy) is taken down,
+with its volumes and networks, when its task ends: accepted, failed, cancelled, timed out or rejected. The task's
+record says so (`stacks_down`), or names what is still up (`stacks_left`). `bounce prune` does the same before it
+removes a copy, and keeps the copy when that fails. For stacks already left behind:
 
-    docker compose ls --all          # the CONFIG FILES column shows the ones under ~/.bounce/w
-    docker network ls
+    bounce prune --stacks          # stacks in copies whose task is not running, including copies already removed
+    bounce prune --stacks --yes    # take them down with their volumes and networks
 
-Take one down in its copy with the project's stack tool (or `docker compose down -v`). `docker network prune`
-removes every unused network on the machine, not only bounce's: confirm with the user first.
+Volumes go with them: confirm with the user before `--yes`. `docker network prune` removes every unused network on
+the machine, not only bounce's: confirm first too.
+
+## Long tasks
+
+A task still open `escalateMinutes` after it was submitted (config.json, default 90, 0 off; waits, reviews and rework
+included) is put to the orchestrator once, between its turns, to tell the user what the task is doing and what blocks
+it. The task's record carries a `task.overtime` row.

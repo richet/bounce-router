@@ -70,6 +70,7 @@ export const CLI_SECTIONS = [
     ['doctor', '[--fix]', 'Versions, quota, setup; --fix installs a usable opencode'],
     ['prune', '', 'List the workers\' copies, then remove the ones you pick; a branch not yet fetched is kept'],
     ['prune', '--ended [--older-than 7d] [--yes]', 'Without asking: ended copies of stopped sessions, unused that long'],
+    ['prune', '--stacks [--yes]', 'Docker stacks left in copies whose task is not running; --yes takes them down with their volumes'],
     ['task compare', '<session> <a> <b>', 'Compare two tasks: tokens, wall time, rounds'],
     ['update', '[--check]', 'Install the latest npm release, or only check'],
     ['dev', '', 'Improve bounce itself; validate and reload after changes'],

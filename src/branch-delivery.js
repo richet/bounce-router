@@ -22,6 +22,18 @@ export function readDelivery(cwd) {
   return {delivery: value};
 }
 
+// What every writer is told under branch delivery: its commits are the delivery. Orders that say not to commit (meant as
+// "not on my branch") left every builder's copy dirty and every task refused as delivery_uncommitted (found live), so
+// such orders are read the way the user meant them, and flagged for the orchestrator. Null outside branch delivery.
+const FORBIDS_COMMIT = /\b(?:do\s+not|don'?t|never|no)\s+commit(?:s|ting)?\b|\buncommitted\b/i;
+export function branchCommitNote(delivery, orders) {
+  if (delivery !== 'branch') return null;
+  const forbids = FORBIDS_COMMIT.test(String(orders ?? ''));
+  const line = 'This project uses branch delivery: your work reaches the user only as commits. Commit your work on the branch checked out in your copy before you end (one plain line in the repo\'s commit style, no attribution), leave no uncommitted changes, and never push.'
+    + (forbids ? ' Where your orders say not to commit, that means nothing on the user\'s own branches (main, master, the checkout\'s default, the branch they have checked out); commit in your copy.' : '');
+  return {line, forbids};
+}
+
 const gitEnv = extra => ({...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))), ...extra});
 
 // The worker's own branch at its head, as the worker committed it. bounce commits nothing: a worker that left changes

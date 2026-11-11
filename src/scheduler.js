@@ -4,7 +4,8 @@ import {randomUUID, createHash} from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import {readDelivery, deliverBranch, saveWip} from './branch-delivery.js';
+import {readDelivery, deliverBranch, saveWip, branchCommitNote} from './branch-delivery.js';
+import {stacksDown, mayHoldStack} from './stacks.js';
 import {createAttemptWorkspace, captureArtifact, integrateArtifact, advanceBaseline, refreshConflicts, reviewDiff} from './workspace-artifacts.js';
 import * as reducers from './reducers.js';
 import {takeCheckpoint, sameTree} from './checkpoint.js';
@@ -147,7 +148,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   gateSlots = 0, gatePollMs = 2000,
   // The directories watched for writes outside a worker's copy (src/outside-writes.js); null: the ones on PATH.
   outsideDirs = null,
-  sessionMode = 'yolo', depthCap = 1, checkpointRunner, limits: suppliedLimits = {}, strict = false, requireFinalReport = false, reportFormat = 'structured', reportGrant = null, clock = () => Date.now(), watchdog: suppliedWatchdog = {}, strategy = defaultStrategy, jev = null, gitHead = defaultGitHead, maxConcurrentCloud = 3}) {
+  sessionMode = 'yolo', depthCap = 1, checkpointRunner, limits: suppliedLimits = {}, strict = false, requireFinalReport = false, reportFormat = 'structured', reportGrant = null, clock = () => Date.now(), watchdog: suppliedWatchdog = {}, strategy = defaultStrategy, jev = null, gitHead = defaultGitHead, maxConcurrentCloud = 3, stackDown = stacksDown}) {
   // Sizing limits (lines/probes/minutes) gate dispatch ONLY when the caller configures them: a
   // task's declared size is otherwise informational. The old built-in 150/6/15 defaults refused
   // real orchestrations (a 400-line brief) with no way to see why — a shallow rule, removed.
@@ -357,6 +358,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (['task.failed', 'task.cancelled', 'task.deadline', 'task.accepted', 'task.rejected'].includes(row.kind)) {
       if (['task.cancelled', 'task.deadline', 'task.failed'].includes(row.kind)) keepWip(row.task, row.context);
       requestTerminal(row, [row]);
+      stacksOnEnd(row.task, row.context);
       return session.events.findLast(e => e.kind === row.kind && e.task === row.task);
     }
     const written = session.append(row);
@@ -364,6 +366,20 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return written;
   };
   const publish = event => closed ? null : session.publish({...event, time: stamp()});
+  // A task that ended has its copy's stacks taken down, with their volumes and networks (src/stacks.js): what a worker
+  // left running there otherwise outlives it until prune. Never the checkout's own stacks: an in-place task has none
+  // of its own. In the background; the row says what went, or what is still up.
+  function stacksOnEnd(task, context) {
+    const copy = session.events.findLast(e => e.kind === 'task.workspace' && e.task === task)?.cwd;
+    if (!copy || path.resolve(copy) === path.resolve(session.cwd) || !mayHoldStack(copy)) return;
+    Promise.resolve().then(() => stackDown(copy)).then(({down, failed}) => {
+      if (closed || (!down.length && !failed.length)) return;
+      if (down.length) session.append({kind: 'task.diagnostic', task, reason: 'stacks_down', text: `Took down the stack${down.length === 1 ? '' : 's'} left in ${copy}: ${down.join(', ')}.`, context, time: stamp()});
+      if (failed.length) session.append({kind: 'task.diagnostic', task, reason: 'stacks_left', text: `Could not take down ${failed.map(f => `${f.name} (${f.error})`).join(', ')} in ${copy}: run docker compose -p NAME down --volumes there, or bounce prune --stacks.`, context, time: stamp()});
+    }, error => {
+      if (!closed) session.append({kind: 'task.diagnostic', task, reason: 'stacks_left', text: `Could not list the stacks in ${copy}: ${error.message}`, context, time: stamp()});
+    });
+  }
   // A task ending unfinished keeps what it left uncommitted in its copy as refs/wip/<task8> (src/branch-delivery.js
   // saveWip), and says where, so the next attempt does not start without it.
   function keepWip(task, context) {
@@ -1766,6 +1782,11 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       // — `owned` stays null, so the ordinary
       // cwd/orders fallbacks below already do the right thing with no further branching.
       owned = row.inPlace ? null : workspaceFor(task, profile, attempt);
+      if (owned && profile.policy === 'write') {
+        const note = branchCommitNote(readDelivery(session.cwd).delivery, row.orders);
+        if (note) workerOrders = `${workerOrders}\n\n${note.line}`;
+        if (note?.forbids && attempt === 1) append({kind: 'task.diagnostic', task, reason: 'orders_forbid_commit', text: 'The orders say not to commit, but this checkout uses branch delivery: uncommitted work is not delivered. The worker was told to commit on its own branch in its copy and never on the user\'s branches.', context});
+      }
       // OpenCode takes the agent text as its system prompt, apart from the orders (found live: an agent
       // file naming the checkout sent a local worker to write there); it points into the copy too.
       if (owned && profile.agent?.prompt) profile = {...profile, agent: {...profile.agent, prompt: toWorkingCopy(profile.agent.prompt, owned)}};
@@ -1883,6 +1904,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       append({kind: 'task.launch.requested', task, attempt, executionKey: `${task}:${attempt}`, resumed: true, context});
       if (!reportOnly) watchOutside(task, attempt, profile, owned);
       if (owned) message = inWorkingCopy(message, owned);
+      const commitNote = owned && !reportOnly && profile.policy === 'write' ? branchCommitNote(readDelivery(session.cwd).delivery, row.orders) : null;
+      if (commitNote) message = `${message}\n\n${commitNote.line}`;
       // A reportOnly turn asks in plain words on purpose (requestPlainAnswer): the JSON schema
       // reminder below is for every OTHER resume, never appended onto that one turn back.
       handle = await adapter.resume({peer: workerFrom(task), profile, native, message: reportOnly ? message : reportEnv ? `${message}\n\n${contractFor(profile)}` : LOCAL_ADAPTERS.has(profile.adapter) ? `${message}\n\n${endingLine}` : message, cwd: owned?.cwd ?? session.cwd, dir, checkpoint: row.checkpoint,

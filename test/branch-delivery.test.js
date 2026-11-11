@@ -26,7 +26,7 @@ const report = summary => JSON.stringify({op: 'final', phase: 'complete', text: 
 const gitEnv = {...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t'};
 const git = (cwd, ...args) => execFileSync('git', args, {cwd, encoding: 'utf8', env: gitEnv}).trim();
 
-function setup(t, {delivery, commit = true} = {}) {
+function setup(t, {delivery, commit = true, onLaunch = () => {}} = {}) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-branch-')));
   const project = path.join(root, 'project');
   fs.mkdirSync(path.join(project, 'src'), {recursive: true});
@@ -35,6 +35,7 @@ function setup(t, {delivery, commit = true} = {}) {
   if (delivery) git(project, 'config', 'bounce.delivery', delivery);
   const session = new Session(project, {root: path.join(root, 'home')});
   const adapters = {worker: fakeAdapter(args => {
+    onLaunch(args);
     fs.writeFileSync(path.join(args.cwd, 'src/x.js'), 'export const state = "new";\n');
     fs.writeFileSync(path.join(args.cwd, 'src/y.js'), 'export const y = 1;\n');
     if (commit) { git(args.cwd, 'checkout', '-qb', 'in-progress'); git(args.cwd, 'add', '-A'); git(args.cwd, 'commit', '-qm', 'in-progress: state is new'); }
@@ -180,4 +181,34 @@ test('delivery branch: files the branch adds that the project ignores are named 
   const delivered = f.row('task.integrated', task);
   assert.deepEqual(delivered.ignoredAdded, ['out/a.html', 'out/b.html']);
   assert.ok(delivered.text.endsWith('WARNING: it adds 2 files the project ignores (committed with git add -f): out/'), delivered.text);
+});
+
+test('delivery branch: a writer is told to commit on its own branch, and orders that forbid committing are flagged', async t => {
+  let orders = '';
+  const f = setup(t, {delivery: 'branch', onLaunch: args => { orders = args.orders; }});
+  const {task} = f.scheduler.submit({parent: null, profile: 'builder', orders: 'Make state "new" in src/x.js. Do not commit.', owns: ['src/**'], deadline: null, check: 'grep -q new src/x.js'});
+  assert.equal(await f.settled(task), 'accepted');
+  assert.match(orders, /Commit your work on the branch checked out in your copy/);
+  assert.match(orders, /means nothing on the user's own branches/);
+  const flagged = f.row('task.diagnostic', task);
+  assert.equal(flagged?.reason, 'orders_forbid_commit');
+  assert.match(flagged.text, /branch delivery/);
+});
+
+test('delivery checkout: no commit line is added', async t => {
+  let orders = '';
+  const f = setup(t, {commit: false, onLaunch: args => { orders = args.orders; }});
+  const {task} = f.submit();
+  await f.settled(task);
+  assert.doesNotMatch(orders, /Commit your work on the branch/);
+});
+
+test('branchCommitNote: the line every writer gets under branch delivery, and when orders contradict it', async () => {
+  const {branchCommitNote} = await import('../src/branch-delivery.js');
+  assert.equal(branchCommitNote('checkout', 'Fix it'), null);
+  const plain = branchCommitNote('branch', 'Fix src/x.js');
+  assert.match(plain.line, /Commit your work on the branch checked out in your copy/);
+  assert.equal(plain.forbids, false);
+  for (const orders of ['Do not commit.', "don't commit anything", 'No commits.', 'Never commit; leave it in the tree', 'Leave it uncommitted']) assert.equal(branchCommitNote('branch', orders).forbids, true, orders);
+  assert.match(branchCommitNote('branch', 'Do not commit.').line, /means nothing on the user's own branches/);
 });

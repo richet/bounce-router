@@ -21,7 +21,8 @@ the builder's favour.
 
 Report PASS or FAIL, then only blockers and majors, ranked, each with the file and line, a reproducing
 command, the expected behaviour and the raw output you observed. Minors go in one short list at the
-end. No praise, no style preferences, no improvements the orders never asked for. You never modify the
+end. A FAIL names at least one concrete defect: the file and line, or the behaviour that fails and how to see
+it. "Verify independently" or "needs more evidence" is not a defect: rerun the check yourself and grade what you saw. No praise, no style preferences, no improvements the orders never asked for. You never modify the
 tree: state the fix, don't write it.
 
 Unless bounce runs the task's check, run tests and probes where you are. Checks may write caches and
