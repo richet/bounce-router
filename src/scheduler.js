@@ -858,6 +858,8 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (spec.check !== undefined && spec.check !== null && !validCheck(spec.check)) return 'check';
     if (spec.checkTimeoutMinutes !== undefined && (!Number.isInteger(spec.checkTimeoutMinutes) || spec.checkTimeoutMinutes < 1 || spec.checkTimeoutMinutes > CHECK_TIMEOUT_MAX_MINUTES)) return `checkTimeoutMinutes (whole minutes, 1 to ${CHECK_TIMEOUT_MAX_MINUTES})`;
     if (spec.checkTimeoutMinutes !== undefined && !spec.check) return 'checkTimeoutMinutes (only with a check)';
+    const timedOut = spec.check ? repeatOfTimedOutCheck(spec) : null;
+    if (timedOut) return `check (the same check ran out of its ${timedOut.minutes} minutes on task ${timedOut.task.slice(0, 8)}; running it unchanged would time out again: give a longer checkTimeoutMinutes, up to ${CHECK_TIMEOUT_MAX_MINUTES}, or split it into smaller checks)`;
     if (spec.at !== undefined && (typeof spec.at !== 'string' || !spec.at.trim() || spec.at.startsWith('-'))) return 'at (a branch name or commit)';
     if (spec.at !== undefined && !spec.check) return 'at (a check-only task needs a check)';
     if (spec.risk !== undefined && !RISKS.has(spec.risk)) return 'risk';
@@ -947,6 +949,19 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     // call, and a report that changed nothing is not reviewed (handleCompleted, 2026-10-25).
     if (!settings.review && !escalationReviewer({lean: REVIEW_OFF, reviewers: [jev.reviewer], profiles, changes: null})) return spec;
     return {...spec, review: {...(spec.review ?? {}), completion: jev.reviewer}};
+  }
+
+  // The check timed out before with the same command and the same limit: found live, gates were resubmitted unchanged
+  // after a timeout and ran out of time again.
+  function repeatOfTimedOutCheck(spec) {
+    const limitMs = spec.checkTimeoutMinutes ? spec.checkTimeoutMinutes * 60_000 : checkTimeoutMs;
+    for (const failed of session.events) {
+      if (failed.kind !== 'task.failed' || failed.reason !== 'check_timeout') continue;
+      const row = submittedRow(failed.task);
+      if (row?.check !== spec.check) continue;
+      if ((row.checkTimeoutMinutes ? row.checkTimeoutMinutes * 60_000 : checkTimeoutMs) === limitMs) return {task: failed.task, minutes: Math.round(limitMs / 60_000)};
+    }
+    return null;
   }
 
   function submit(rawSpec) {

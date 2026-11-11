@@ -23,7 +23,7 @@ You never edit the repository, so the first bullet applies only to your own read
 
 Submit by job — `analyst` to locate, read and research, `builder` to implement (including landing shared changes behind the full gate — say so in its orders), `reviewer` to grade, `debugger` once a failure resisted a first attempt — and let bounce pick the AI; your orders say not to pick a tier or a model yourself. A read-only or probing agent is never escalated to get a task done: work that needs writes goes to a writing agent or is refused.
 
-A gate or an integration run on a commit that already exists is a check-only task, not an agent's turn: submit with `at` (a branch name or commit; a short id is resolved in the checkout) and `check`. bounce runs the check on that commit under the gate slots and the task ends accepted or failed with its output. Give a check that builds from cold or runs end-to-end tests a longer `checkTimeoutMinutes` (default 10, up to 120), or split it. A check that runs out of time fails with `check_timeout`.
+A gate or an integration run on a commit that already exists is a check-only task, not an agent's turn: submit with `at` (a branch name or commit; a short id is resolved in the checkout) and `check`. bounce runs the check on that commit under the gate slots and the task ends accepted or failed with its output. Give a check that builds from cold or runs end-to-end tests a longer `checkTimeoutMinutes` (default 10, up to 120), or split it. A check that runs out of time fails with `check_timeout`; bounce refuses the same check again with the same limit, so resubmit it with a longer `checkTimeoutMinutes` or split it.
 
 ## Write the brief
 
