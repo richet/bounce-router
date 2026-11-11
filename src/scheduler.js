@@ -79,7 +79,22 @@ const TIERS = new Set(['live', 'next-turn', 'queued']);
 
 // The tree's HEAD when a worker starts, recorded on task.started so a completion verdict can
 // diff the worker's whole contribution (committed or not). Null outside a git repository.
-export // A check-only task's `at`, resolved in the checkout when it is submitted: a short id is resolved here, and anything
+export // Free disk in GB and percent (the least of the folders given) and the 1-minute load, for the machine guard.
+function readMachineState(folders) {
+  let freeDiskPercent = 100, freeDiskGB = Infinity;
+  for (const folder of folders) {
+    try {
+      const stats = fs.statfsSync(folder);
+      if (!stats.blocks) continue;
+      freeDiskPercent = Math.min(freeDiskPercent, (stats.bavail / stats.blocks) * 100);
+      freeDiskGB = Math.min(freeDiskGB, (stats.bavail * stats.bsize) / 1e9);
+    } catch {}
+  }
+  const cores = os.availableParallelism?.() ?? os.cpus().length;
+  return {freeDiskPercent, freeDiskGB, load: os.loadavg()[0], cores};
+}
+
+// A check-only task's `at`, resolved in the checkout when it is submitted: a short id is resolved here, and anything
 // that names no commit is refused before any copy or worker exists.
 function commitIn(cwd, at) {
   try {
@@ -156,7 +171,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   checkRunner = runCheck, checkTimeoutMs = CHECK_TIMEOUT_MS,
   // Full gate runs at once on this machine, across every session (config gateSlots; 0: no cap): a check waits for a
   // slot, it never fails for want of one (found live, 2026-11-05: one run takes 8 CPU and 16 GB).
-  gateSlots = 0, gatePollMs = 2000,
+  gateSlots = 0, gatePollMs = 2000, machineGuard = null, machineState = readMachineState, machinePollMs = 15000,
   // The directories watched for writes outside a worker's copy (src/outside-writes.js); null: the ones on PATH.
   outsideDirs = null,
   sessionMode = 'yolo', depthCap = 1, checkpointRunner, limits: suppliedLimits = {}, strict = false, requireFinalReport = false, reportFormat = 'structured', reportGrant = null, clock = () => Date.now(), watchdog: suppliedWatchdog = {}, strategy = defaultStrategy, jev = null, gitHead = defaultGitHead, maxConcurrentCloud = 3, stackDown = stacksDown}) {
@@ -1430,6 +1445,35 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     } catch { return {}; } finally { fs.rmSync(index, {force: true}); }
   }
   // A machine-wide gate slot for one check (gateSlots); null when the scheduler closed while it waited.
+  // The machine guard: no task starts and no check runs while the disk is nearly full or the machine is overloaded
+  // (found live: checks failed at load 49 and with the disk 95% full, and new work kept starting). Dispatch waits,
+  // a session row says why (bounce-control status shows it), and it resumes on its own once the machine is back under
+  // the limits. Off unless the session sets limits (reload.js passes the settings).
+  let machinePause = null;
+  function machineOver() {
+    if (!machineGuard) return null;
+    const state = machineState([session.cwd, session.root].filter(Boolean));
+    const reasons = [];
+    if (machineGuard.minFreeDiskGB > 0 && state.freeDiskGB < machineGuard.minFreeDiskGB) reasons.push(`disk ${Math.floor(state.freeDiskGB)} GB free (limit ${machineGuard.minFreeDiskGB} GB)`);
+    if (machineGuard.minFreeDiskPercent > 0 && state.freeDiskPercent < machineGuard.minFreeDiskPercent) reasons.push(`disk ${Math.floor(state.freeDiskPercent)}% free (limit ${machineGuard.minFreeDiskPercent}%)`);
+    if (machineGuard.maxLoadPerCore > 0 && state.load > machineGuard.maxLoadPerCore * state.cores) reasons.push(`load ${state.load.toFixed(1)} on ${state.cores} cores (limit ${machineGuard.maxLoadPerCore * state.cores})`);
+    return reasons.length ? {reasons, state} : null;
+  }
+  async function machineClear(task, attempt, context, what) {
+    let told = false;
+    for (;;) {
+      if (closed) return false;
+      const over = machineOver();
+      if (!over) {
+        if (machinePause) { append({kind: 'machine.resumed', text: `Dispatch resumed: the machine is back under its limits (paused for ${Math.round((Date.now() - machinePause.at) / 60000)} min).`}); machinePause = null; }
+        return true;
+      }
+      const text = `Dispatch paused: ${over.reasons.join('; ')}. Work starts again on its own once the machine is back under the limits (minFreeDiskGB, minFreeDiskPercent, maxLoadPerCore).`;
+      if (!machinePause || machinePause.text !== text) { append({kind: 'machine.paused', text, ...over.state}); machinePause = {at: machinePause?.at ?? Date.now(), text}; }
+      if (!told) { told = true; append({kind: 'task.milestone', task, attempt, phase: 'machine', text: `Waiting for the machine before ${what}: ${over.reasons.join('; ')}.`, next: what, context}); }
+      await new Promise(resolve => setTimeout(resolve, machinePollMs));
+    }
+  }
   // The same check (same command on the same tree) runs once at a time on this machine: found live, two identical
   // end-to-end builds ran at once and left their stacks behind. The later one waits, naming the run it waits on.
   async function sameCheckSlot(task, attempt, context, same) {
@@ -1453,6 +1497,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   }
   async function gateSlot(task, attempt, context, same = null) {
     const started = Date.now();
+    if (machineOver() && !(await machineClear(task, attempt, context, 'running the check'))) return null;
     const duplicate = await sameCheckSlot(task, attempt, context, same);
     if (!duplicate) return null;
     if (!gateSlots) return {release: duplicate.release, waitedMs: Date.now() - started};
@@ -2626,6 +2671,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     if (handles.has(task) || launchingAttempts.has(task) || [...reviews.values()].some(review => review.task === task)) return;
     row = submittedRow(task) ?? row; // a re-dispatch (held task, restart) sees an already-routed profile
     if (row.commit) return runCheckOnly(row);
+    if (machineOver() && !(await machineClear(task, null, context, 'starting the task'))) return;
     // Sizing refusal, first of all: a task over the skill's sizing rule never launches,
     // checked in a fixed field order so the reported field is deterministic.
     // submit() always stores size; the fallback only covers rows journaled directly (legacy/test rows), never a defaulting path.

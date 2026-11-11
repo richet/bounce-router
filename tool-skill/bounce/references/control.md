@@ -96,6 +96,12 @@ with `time`, `kind` and `task`. The gaps between a task's `task.launch.requested
 only up to its ceiling, set as `quota.ceiling` in `~/.bounce/config.json` (one percent, or one per provider);
 a provider over its ceiling is picked only after those under it. Without a ceiling the whole window counts.
 
+## Machine limits
+
+When `status` shows "Dispatch paused: …", the free disk is below `minFreeDiskGB` (or the optional `minFreeDiskPercent`) or the load is above
+`maxLoadPerCore` per core. Nothing is wrong with the tasks: they start on their own once the machine is back under
+the limits. Free disk or load (ask the user before taking stacks down) rather than cancelling work.
+
 ## Docker hygiene
 
 A stack a worker starts in its copy (any Docker Compose project whose compose file is in the copy) is taken down,

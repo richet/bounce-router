@@ -540,7 +540,7 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // `strategy:` setting resolved by validateOrchestration (default: defaultStrategy) applies.
   let bus;
   const reportTokens = new Map();
-  const scheduler = createScheduler({session, adapters, profiles, localSettings: settings.local, sessionMode: settings.mode, strict: orchestration.strict, limits: taskLimits(settings), maxConcurrentCloud: settings.maxConcurrentCloud, gateSlots: settings.gateSlots ?? DEFAULT_GATE_SLOTS,
+  const scheduler = createScheduler({session, adapters, profiles, localSettings: settings.local, sessionMode: settings.mode, strict: orchestration.strict, limits: taskLimits(settings), maxConcurrentCloud: settings.maxConcurrentCloud, gateSlots: settings.gateSlots ?? DEFAULT_GATE_SLOTS, machineGuard: process.env.BOUNCE_MACHINE_GUARD === 'off' ? null : {minFreeDiskGB: settings.minFreeDiskGB ?? 30, minFreeDiskPercent: settings.minFreeDiskPercent ?? 0, maxLoadPerCore: settings.maxLoadPerCore ?? 2},
     // How a worker ends: a plain answer (the default) or a report in the fixed format (config.json `reports`).
     requireFinalReport: orchestrating, reportFormat: settings.reports ?? 'plain', reportGrant: ({task, attempt, context}) => {
       if (!orchestrating || !bus) return null;
