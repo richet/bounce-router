@@ -15,7 +15,7 @@ const launcher = {executables: {claude: fake}};
 const settingsOf = args => JSON.parse(args[args.indexOf('--settings') + 1]);
 const expectedCommand = dir =>
   `node -e "const fs=require('fs');fs.writeFileSync(process.argv[1],JSON.stringify({socket:process.env.CLAUDE_CODE_MESSAGING_SOCKET,token:process.env.CLAUDE_CODE_MESSAGING_TOKEN}),{mode:0o600})" '${dir.replace(/'/g, "'\\''")}/messaging.json'`;
-const expectedSettings = dir => ({hooks: {SessionStart: [{hooks: [{type: 'command', command: expectedCommand(dir)}]}]}});
+const expectedSettings = dir => ({crossSessionInbound: 'accept', hooks: {SessionStart: [{hooks: [{type: 'command', command: expectedCommand(dir)}]}]}});
 
 const tmp = (t, prefix = 'bcl-') => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -78,7 +78,7 @@ test('L2 deliver live: the message and its auth line reach the running turn over
   assert.equal(await waitFor(() => fs.existsSync(ready)), true);
   assert.equal(await adapter.deliver(handle, {text: 'ping'}), 'live');
   assert.equal(await waitFor(() => fs.existsSync(received) && lines(received).length === 2), true);
-  assert.deepEqual(lines(received), ['{"type":"auth","token":"tok-l2"}', '{"type":"user","message":{"role":"user","content":"ping"}}']);
+  assert.deepEqual(lines(received), ['{"type":"auth","token":"tok-l2"}', '{"type":"user","priority":"now","message":{"role":"user","content":"ping"}}']);
   assert.equal(fs.existsSync(path.join(dir, 'pending.jsonl')), false);
 });
 
@@ -93,7 +93,7 @@ test("L2b deliver live: only Claude's authenticated user-envelope acknowledgemen
     });
     socket.on('end', () => {
       const message = received[1];
-      if (authenticated && message?.type === 'user' && message.message?.role === 'user' && message.message?.content === 'ping') socket.end();
+      if (authenticated && message?.type === 'user' && message.priority === 'now' && message.message?.role === 'user' && message.message?.content === 'ping') socket.end();
     });
   });
   await new Promise(resolve => server.listen(sock, resolve));
@@ -104,7 +104,7 @@ test("L2b deliver live: only Claude's authenticated user-envelope acknowledgemen
   assert.equal(await adapter.deliver(handle, {text: 'ping'}), 'live');
   assert.deepEqual(received, [
     {type: 'auth', token: 'protocol-test-token'},
-    {type: 'user', message: {role: 'user', content: 'ping'}},
+    {type: 'user', priority: 'now', message: {role: 'user', content: 'ping'}},
   ]);
   assert.equal(fs.existsSync(path.join(dir, 'pending.jsonl')), false);
 });
@@ -309,5 +309,17 @@ test('L9 an empty result with zero model turns is not the end of the turn: the r
   const events = await drain(adapter, handle);
   assert.deepEqual(events.filter(e => e.kind === 'result'), [{kind: 'result', text: 'ok', success: true, status: 'completed'}]);
   assert.deepEqual(events.filter(e => e.kind === 'diagnostic').map(e => e.text), ['claude reported leftover background tasks with an empty result; waiting for the turn itself']);
+  assert.equal(events.filter(e => e.kind === 'raw' && e.raw.type === 'result').length, 2, 'both results are still journaled raw');
+});
+
+test('L13 a turn that a delivered message cut at a tool call is not the outcome: the turn that reads the message is', async t => {
+  // Captured live with 2.1.319: a message sent with priority now while a tool runs ends that turn with an EMPTY
+  // result (stop_reason tool_use), then the same process runs a second turn that reads the message and answers.
+  const dir = tmp(t);
+  withEnv(t, {FAKE_CUT: '1', FAKE_SOCKET: '', FAKE_SESSION: 'sess-l13', FAKE_HOLD: '', FAKE_TRAP_SIGTERM: '', FAKE_READY: '', FAKE_STDERR_LINES: ''});
+  const adapter = createClaudeLive({});
+  const handle = await adapter.launch({peer: {}, profile: {mode: 'yolo', ...launcher}, orders: 'build', cwd: dir, dir});
+  const events = await drain(adapter, handle);
+  assert.deepEqual(events.filter(e => e.kind === 'result'), [{kind: 'result', text: 'ok', success: true, status: 'completed'}]);
   assert.equal(events.filter(e => e.kind === 'raw' && e.raw.type === 'result').length, 2, 'both results are still journaled raw');
 });
