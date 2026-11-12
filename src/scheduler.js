@@ -174,7 +174,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   gateSlots = 0, gatePollMs = 2000, machineGuard = null, machineState = readMachineState, machinePollMs = 15000,
   // The directories watched for writes outside a worker's copy (src/outside-writes.js); null: the ones on PATH.
   outsideDirs = null,
-  sessionMode = 'yolo', depthCap = 1, checkpointRunner, limits: suppliedLimits = {}, strict = false, requireFinalReport = false, reportFormat = 'structured', reportGrant = null, clock = () => Date.now(), watchdog: suppliedWatchdog = {}, strategy = defaultStrategy, jev = null, gitHead = defaultGitHead, maxConcurrentCloud = 3, stackDown = stacksDown}) {
+  sessionMode = 'yolo', depthCap = 1, checkpointRunner, limits: suppliedLimits = {}, strict = false, requireFinalReport = false, reportFormat = 'structured', reportGrant = null, clock = () => Date.now(), watchdog: suppliedWatchdog = {}, strategy = defaultStrategy, jev = null, gitHead = defaultGitHead, maxConcurrentCloud = 3, stackDown = stacksDown, stackWatch = null}) {
   // Sizing limits (lines/probes/minutes) gate dispatch ONLY when the caller configures them: a
   // task's declared size is otherwise informational. The old built-in 150/6/15 defaults refused
   // real orchestrations (a 400-line brief) with no way to see why — a shallow rule, removed.
@@ -398,7 +398,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   function stacksOnEnd(task, context) {
     const copy = session.events.findLast(e => e.kind === 'task.workspace' && e.task === task)?.cwd;
     if (!copy || path.resolve(copy) === path.resolve(session.cwd) || !mayHoldStack(copy)) return;
-    Promise.resolve().then(() => stackDown(copy)).then(({down, failed}) => {
+    Promise.resolve().then(() => stackDown(copy, {seen: stackWatch?.projects() ?? []})).then(({down, failed}) => {
       if (closed || (!down.length && !failed.length)) return;
       if (down.length) session.append({kind: 'task.diagnostic', task, reason: 'stacks_down', text: `Took down the stack${down.length === 1 ? '' : 's'} left in ${copy}: ${down.join(', ')}.`, context, time: stamp()});
       if (failed.length) session.append({kind: 'task.diagnostic', task, reason: 'stacks_left', text: `Could not take down ${failed.map(f => `${f.name} (${f.error})`).join(', ')} in ${copy}: run docker compose -p NAME down --volumes there, or bounce prune --stacks.`, context, time: stamp()});
@@ -3649,7 +3649,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     spend: () => reducers.spend(session.events),
     // Test-only observable for the live activity map's size (F2/A5) — never used by production code.
     _activitySize: () => activity.size,
-    close: () => { closed = true; for (const entry of [...launchingAttempts.values(), ...reviews.values()]) entry.localController?.abort(); machineSlots.releaseAll(); effects.close(); unsubscribe(); if (watchdogInterval) clearInterval(watchdogInterval); },
+    close: () => { closed = true; for (const entry of [...launchingAttempts.values(), ...reviews.values()]) entry.localController?.abort(); machineSlots.releaseAll(); effects.close(); unsubscribe(); if (watchdogInterval) clearInterval(watchdogInterval); stackWatch?.close(); },
   };
 }
 

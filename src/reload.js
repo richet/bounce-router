@@ -32,6 +32,7 @@ import {normalizeLocalSettings, discoverLocalModels, localCandidates} from './lo
 import {createLocalActivation} from './local-activation.js';
 import {providers} from './providers.js';
 import {createScheduler} from './scheduler.js';
+import {watchStacks} from './stacks.js';
 import {hostSession} from './remote.js';
 import {createMainService} from './main-service.js';
 import {createRunInbox, pendingSends} from './run-inbox.js';
@@ -540,7 +541,9 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // `strategy:` setting resolved by validateOrchestration (default: defaultStrategy) applies.
   let bus;
   const reportTokens = new Map();
-  const scheduler = createScheduler({session, adapters, profiles, localSettings: settings.local, sessionMode: settings.mode, strict: orchestration.strict, limits: taskLimits(settings), maxConcurrentCloud: settings.maxConcurrentCloud, gateSlots: settings.gateSlots ?? DEFAULT_GATE_SLOTS, machineGuard: process.env.BOUNCE_MACHINE_GUARD === 'off' ? null : {minFreeDiskGB: settings.minFreeDiskGB ?? 30, minFreeDiskPercent: settings.minFreeDiskPercent ?? 0, maxLoadPerCore: settings.maxLoadPerCore ?? 2},
+  const scheduler = createScheduler({session, adapters, profiles, localSettings: settings.local, sessionMode: settings.mode, strict: orchestration.strict, limits: taskLimits(settings), maxConcurrentCloud: settings.maxConcurrentCloud,
+    // Remembers the compose projects workers start, so a copy's end takes their volumes down even after a worker's own down.
+    stackWatch: orchestrating && process.env.BOUNCE_STACK_WATCH !== 'off' ? watchStacks() : null, gateSlots: settings.gateSlots ?? DEFAULT_GATE_SLOTS, machineGuard: process.env.BOUNCE_MACHINE_GUARD === 'off' ? null : {minFreeDiskGB: settings.minFreeDiskGB ?? 30, minFreeDiskPercent: settings.minFreeDiskPercent ?? 0, maxLoadPerCore: settings.maxLoadPerCore ?? 2},
     // How a worker ends: a plain answer (the default) or a report in the fixed format (config.json `reports`).
     requireFinalReport: orchestrating, reportFormat: settings.reports ?? 'plain', reportGrant: ({task, attempt, context}) => {
       if (!orchestrating || !bus) return null;
