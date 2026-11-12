@@ -108,7 +108,7 @@ export const defaultStrategy = {
     if (sentBack(task, api)) {
       return acceptOrHold(task, api, {advice: afterReworkAdvice(findings, api.lastFired?.(task)), said: `After the one rework round the review still ${still(findings)}`});
     }
-    return vagueSendBack([v], findings) ?? {action: 'rework', findings};
+    return outsideScope(findings) ?? vagueSendBack([v], findings) ?? {action: 'rework', findings};
   },
   onTerminal() { return {submit: []}; },
 };
@@ -153,7 +153,7 @@ export function quorumStrategy(n) {
       const reworks = verdicts.filter(v => v.verdict === 'rework');
       if (reworks.length) {
         const findings = reworks.flatMap(v => v.findings ?? v.questions ?? []);
-        if (!api.lastRework?.(task) && api.roundsUsed(task) < api.roundsCap(task)) return vagueSendBack(reworks, findings) ?? {action: 'rework', findings};
+        if (!api.lastRework?.(task) && api.roundsUsed(task) < api.roundsCap(task)) return outsideScope(findings) ?? vagueSendBack(reworks, findings) ?? {action: 'rework', findings};
         return acceptOrHold(task, api, {advice: afterReworkAdvice(findings), said: `After the one rework round the review still ${still(findings)}`});
       }
       // Every reviewer reported (the CORE waits for all, CONTRACT §5); none rejected or
@@ -187,6 +187,17 @@ function vagueSendBack(verdicts, findings) {
   const said = findings.map(f => String(f).trim()).filter(Boolean).join(' ').slice(-600);
   return {action: 'escalate', reason: 'review_no_defect',
     text: `The review asked for rework but named no defect (a file or line, and the behaviour that fails), so the work was not sent back. Decide: accept it (task.accepted, with what you checked), or send it back (task.rework) naming a concrete defect. Ask the user only when you cannot decide.${said ? ` The reviewer said: ${said}` : ' The reviewer said nothing more.'}`};
+}
+
+// A finding the reviewer marks `"scope": "outside"` needs a change the task cannot make (a harness, a design, another
+// task's paths). A rework round cannot fix it, so the orchestrator decides at once. Found live: a second round spent on
+// an end-to-end test the harness could not run.
+const OUTSIDE = /"scope"\s*:\s*"outside"/i;
+function outsideScope(findings) {
+  const outside = (findings ?? []).map(f => String(f ?? '').trim()).filter(f => OUTSIDE.test(f));
+  if (!outside.length) return null;
+  return {action: 'escalate', reason: 'review_out_of_scope',
+    text: `The review asks for a change outside this task's scope, so the work was not sent back. Decide: accept it and plan that change as its own task, send it back (task.rework) for the findings inside its scope, or ask the user when it changes the plan. Outside its scope: ${outside.join(' ').slice(-600)}`};
 }
 
 // Jev checks that only say "the report names remaining work" / "acceptance is not met".

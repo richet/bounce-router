@@ -162,7 +162,9 @@ export function createWorkspaceProjection({activityLimit = 400, transcriptLimit 
       if (submittedRows.get(task.task)?.review?.completion) task.underReview = true;
       return true;
     }
-    if (event.kind === 'task.milestone' && event.phase === 'check' && task.state === 'completed') task.state = 'checking';
+    // A check-only task has no worker turn: bounce runs its check straight from the queue, and that run is work too.
+    // Found live: a 12-minute gate whose pane said `queued`.
+    if (event.kind === 'task.milestone' && event.phase === 'check' && ['completed', 'queued'].includes(task.state)) task.state = 'checking';
     if (event.kind === 'task.check' && task.state === 'checking') {
       task.state = event.passed === false ? 'running' : 'completed';
       task.updatedAt = event.time ?? task.updatedAt;
