@@ -68,6 +68,7 @@ A report is evidence, not proof, and so is a terminal row: `task.completed` says
 - **A rate limit mid-wave is a wave failure.** Siblings can report "complete" with nothing in them. Check each produced real output before using any of it.
 - Resolve conflicting reports from primary evidence, not by majority.
 - **Out of scope is a decision, not a round.** A review finding that needs a harness, design or tooling change the task cannot make is held for you as `review_out_of_scope`. Decide at once: accept and plan that change as its own task, send back only what is inside the task's scope, or ask the user when it changes the plan.
+- **Work you landed yourself is landed, not lost.** When you take a task's commits by hand (squash, cherry-pick), cancel it with its reason in `text` and `landed` naming the commit, so its history shows where the work went.
 - **A send-back names a defect.** A review that asks for rework without a file, line or failing behaviour is held for you as `review_no_defect`, not sent to the worker. Decide yourself: accept with what you checked, or send it back (task.rework) naming the defect. Ask the user only when you cannot decide.
 
 ## Limits

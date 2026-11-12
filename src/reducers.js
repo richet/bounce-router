@@ -131,7 +131,8 @@ export function tasks(events) {
         if (t.state === 'completed') settleParent(t.parent);
         break;
       case 'task.failed': t.state = 'failed'; t.reason = e.reason ?? null; t.error = e.text ?? null; settleParent(t.parent); break;
-      case 'task.cancelled': t.state = 'cancelled'; settleParent(t.parent); break;
+      // A cancel whose work the orchestrator landed itself names the commit (src/scheduler.js cancelRequest).
+      case 'task.cancelled': t.state = 'cancelled'; if (e.landed) t.landed = e.landed; settleParent(t.parent); break;
       case 'task.deadline': t.state = 'timed_out'; settleParent(t.parent); break;
       case 'task.rejected':
         if (t.state === 'queued') { t.state = 'rejected'; settleParent(t.parent); }

@@ -265,7 +265,10 @@ export function createBus({session, dir, platform, uid, tmpRoot, authTimeout = A
           // may ask (a worker or reviewer cancelling itself is not a request this bus models), it
           // must say why, and a task already terminal has nothing left to cancel.
           if (peer !== 'orchestrator') return refuse(id, -32001, 'unauthorized');
-          if (typeof e.text !== 'string' || !e.text.trim()) e = {...e, text: 'Cancelled by the orchestrator (no reason given)'};
+          // Its reason was once read only from `text`; one given as `reason` was dropped and the task read as lost work.
+          const why = [e.text, e.reason].find(value => typeof value === 'string' && value.trim() && value !== 'orchestrator');
+          e = {...e, text: why ? why.trim() : 'Cancelled by the orchestrator (no reason given)'};
+          delete e.reason;
           if (TERMINAL.has(tasks(session.events)[e.task]?.state)) return refuse(id, -32602, 'invalid event: task is already terminal, nothing to cancel');
         }
       } else if (e.kind === 'worker.retire') {
