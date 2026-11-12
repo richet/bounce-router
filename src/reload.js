@@ -32,6 +32,7 @@ import {normalizeLocalSettings, discoverLocalModels, localCandidates} from './lo
 import {createLocalActivation} from './local-activation.js';
 import {providers} from './providers.js';
 import {createScheduler} from './scheduler.js';
+import {watchStacks} from './stacks.js';
 import {hostSession} from './remote.js';
 import {createMainService} from './main-service.js';
 import {createRunInbox, pendingSends} from './run-inbox.js';
@@ -411,7 +412,7 @@ function writeOrders({session, root, bus, grant, profiles = {}, orchestrator, je
     'Every task.* row you publish needs `task` (an id from your own publish replies): without it the bus refuses.',
     'You may publish only: task.submitted, task.accepted, task.rework, task.cancel, task.milestone, task.blocked, task.input_required, task.usage, task.activity, message.',
     'A review sends a task back at most once; after that it is accepted, and what the review still found arrives as `advice` on task.accepted — read it before building on the work. Any task holding finished work (blocked, under review, or asking for input) you may accept yourself (task.accepted with `text`) or send back to the same worker (task.rework with `text` naming what to fix).',
-    'When you replace a blocked task with a fresh one, or no longer need a task, cancel it with task.cancel and a reason, so its outcome stops waiting.',
+    'When you replace a blocked task with a fresh one, or no longer need a task, cancel it with task.cancel and its reason in text, so its outcome stops waiting. When you landed its work yourself, add landed with the commit: {"kind":"task.cancel","task":"<id>","text":"<why>","landed":"<commit>"}.',
     'When the checkout refuses a task\'s work (blocked `integration_conflict`, the files named), send it back (task.rework): bounce first brings those files of its copy up to the checkout, with conflict markers, and the worker reconciles them. Never copy a worker\'s files or tree into the checkout yourself.',
     'A cancelled task whose work you still want (its checks were green, its commit was done): accept it (task.accepted with `text`), and bounce lands its copy as it is now, committed or not. If the checkout changed the same files, it comes back blocked `integration_conflict`: send it back as above.',
     'When a worker is blocked or asks for input because it needs a decision, answer it by publishing a message to worker:<task id>: the same worker resumes with your answer. Do not re-dispatch the job as new work for that.',
@@ -540,7 +541,9 @@ async function daemonSupervise(args, {spawnChild, updateInstall, adapters: extra
   // `strategy:` setting resolved by validateOrchestration (default: defaultStrategy) applies.
   let bus;
   const reportTokens = new Map();
-  const scheduler = createScheduler({session, adapters, profiles, localSettings: settings.local, sessionMode: settings.mode, strict: orchestration.strict, limits: taskLimits(settings), maxConcurrentCloud: settings.maxConcurrentCloud, gateSlots: settings.gateSlots ?? DEFAULT_GATE_SLOTS, machineGuard: process.env.BOUNCE_MACHINE_GUARD === 'off' ? null : {minFreeDiskGB: settings.minFreeDiskGB ?? 30, minFreeDiskPercent: settings.minFreeDiskPercent ?? 0, maxLoadPerCore: settings.maxLoadPerCore ?? 2},
+  const scheduler = createScheduler({session, adapters, profiles, localSettings: settings.local, sessionMode: settings.mode, strict: orchestration.strict, limits: taskLimits(settings), maxConcurrentCloud: settings.maxConcurrentCloud,
+    // Remembers the compose projects workers start, so a copy's end takes their volumes down even after a worker's own down.
+    stackWatch: orchestrating && process.env.BOUNCE_STACK_WATCH !== 'off' ? watchStacks() : null, gateSlots: settings.gateSlots ?? DEFAULT_GATE_SLOTS, machineGuard: process.env.BOUNCE_MACHINE_GUARD === 'off' ? null : {minFreeDiskGB: settings.minFreeDiskGB ?? 30, minFreeDiskPercent: settings.minFreeDiskPercent ?? 0, maxLoadPerCore: settings.maxLoadPerCore ?? 2},
     // How a worker ends: a plain answer (the default) or a report in the fixed format (config.json `reports`).
     requireFinalReport: orchestrating, reportFormat: settings.reports ?? 'plain', reportGrant: ({task, attempt, context}) => {
       if (!orchestrating || !bus) return null;

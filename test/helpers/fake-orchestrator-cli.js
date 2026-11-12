@@ -82,6 +82,20 @@ async function main() {
     say(JSON.stringify({foreign, mine, again}));
   }
 
+  // The orchestrator landed the task's work itself: its reason given as `reason`, the commit as `landed`.
+  if (process.env.FAKE_ORCH_LANDED) {
+    let after = 0;
+    for (;;) {
+      const rows = await client.events({afterSeq: after});
+      if (rows.length) after = rows[rows.length - 1].seq ?? after;
+      if (rows.some(row => row.kind === 'task.started' && row.task === task)) break;
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    const unknown = await attempt(client, {kind: 'task.cancel', task, text: 'landed', landed: 'no-such-commit'});
+    const landed = await client.publish({kind: 'task.cancel', task, reason: 'squashed its commits onto the batch branch', landed: process.env.FAKE_ORCH_LANDED}).then(row => ({ok: true, row}), error => ({ok: false, code: error.code}));
+    say(JSON.stringify({unknown, landed}));
+  }
+
   if (process.env.FAKE_ORCH_NOWAIT === '1') { say(`dispatched ${task}`); try { await client.close(); } catch {} return finish(); }
   // A wait on a task outcome answers on ANY terminal row (P15); read the kind, as a real
   // orchestrator must. FAKE_ORCH_HOLD_MS keeps the turn open afterwards for probes that need the

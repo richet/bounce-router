@@ -67,6 +67,8 @@ A report is evidence, not proof, and so is a terminal row: `task.completed` says
 - **The diff must be the whole change.** Review the specified revision *and* its staged and unstaged working-tree changes. Under branch delivery the work is the worker's commits and the tree must be clean; otherwise unexpected files or changes are a `FAIL`.
 - **A rate limit mid-wave is a wave failure.** Siblings can report "complete" with nothing in them. Check each produced real output before using any of it.
 - Resolve conflicting reports from primary evidence, not by majority.
+- **Out of scope is a decision, not a round.** A review finding that needs a harness, design or tooling change the task cannot make is held for you as `review_out_of_scope`. Decide at once: accept and plan that change as its own task, send back only what is inside the task's scope, or ask the user when it changes the plan.
+- **Work you landed yourself is landed, not lost.** When you take a task's commits by hand (squash, cherry-pick), cancel it with its reason in `text` and `landed` naming the commit, so its history shows where the work went.
 - **A send-back names a defect.** A review that asks for rework without a file, line or failing behaviour is held for you as `review_no_defect`, not sent to the worker. Decide yourself: accept with what you checked, or send it back (task.rework) naming the defect. Ask the user only when you cannot decide.
 
 ## Limits
@@ -74,6 +76,8 @@ A report is evidence, not proof, and so is a terminal row: `task.completed` says
 - Probe once before fanning out: one representative read catches a denied path or wrong layout before it fails the whole wave.
 - One writer per file. Never run concurrent workers against the same browser or live state.
 - Cap fan-out at the number of genuinely independent workstreams. Don't delegate to use up capacity.
+- **Keep the queue full.** When fewer than half the slots are busy and approved independent work exists (a later item, its docs, a harness fix), dispatch it now instead of waiting for the running chain.
+- **Split a dependent chain.** Once the contract is agreed (an interface, a schema, a CLI's output), have the tests written against it in parallel with the implementation, not after it.
 - Stop a worker that drifts off its brief; ignore the out-of-scope part and re-brief tighter.
 - Watch for fix-bouncing: check `CHANGES.md` before changing anything a second time. If rounds undo each other, halt and reconcile it yourself.
 - Silence is not a crash. Inspect the worker's latest reported state before concluding anything about it.

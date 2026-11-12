@@ -31,8 +31,11 @@ export const shellQuote = value => `'${String(value).replace(/'/g, "'\\''")}'`;
 export const hookCommand = dir =>
   `node -e "const fs=require('fs');fs.writeFileSync(process.argv[1],JSON.stringify({socket:process.env.CLAUDE_CODE_MESSAGING_SOCKET,token:process.env.CLAUDE_CODE_MESSAGING_TOKEN}),{mode:0o600})" ${shellQuote(`${dir}/messaging.json`)}`;
 
-export const settingsFor = (dir, {orchestrator = false} = {}) => JSON.stringify({hooks: {SessionStart: [{hooks: [{type: 'command', command: hookCommand(dir)}]}],
-  ...(orchestrator ? orchestratorHooks : {})}});
+// crossSessionInbound: with permissions bypassed and no mode asserted by the sender, Claude Code holds a socket
+// message for its user's approval; headless, no one approves it and it is lost (seen with 2.1.319). bounce owns
+// this inbox, so it accepts them.
+export const settingsFor = (dir, {orchestrator = false} = {}) => JSON.stringify({crossSessionInbound: 'accept',
+  hooks: {SessionStart: [{hooks: [{type: 'command', command: hookCommand(dir)}]}], ...(orchestrator ? orchestratorHooks : {})}});
 
 // The orchestrator's own Bash calls: a gate started in the background is refused (src/hooks/detached-gate.js).
 export const DETACHED_GATE_HOOK = fileURLToPath(new URL('../hooks/detached-gate.js', import.meta.url));
@@ -72,7 +75,7 @@ export function createClaudeLive({connect = nodeConnect, fs = nodeFs, kill = pro
     // backgrounded a command). That is not the worker's answer, so the resume is relaunched once
     // — the notice is consumed by then — before a zero-turn result is passed on as the outcome.
     async *events(handle) {
-      let sawResult = false, limited = false;
+      let sawResult = false, limited = false, cut = null;
       for (;;) {
         let relaunch = null, withheld = null;
         for await (const event of handle.live.events) {
@@ -81,12 +84,12 @@ export function createClaudeLive({connect = nodeConnect, fs = nodeFs, kill = pro
           if (event.kind === 'exit') {
             // The turn ended on the withheld zero-turn result alone: a resume is relaunched once (the
             // notice is consumed by then); a launch passes that empty result on as its outcome.
-            if (!sawResult && withheld && handle.relaunch) {
+            if (!sawResult && withheld && !cut && handle.relaunch) {
               relaunch = handle.relaunch; handle.relaunch = null;
               yield {kind: 'status', text: 'Resumed session returned no turn (the CLI spent it on a stopped background task); relaunching the resume once'};
               break;
             }
-            if (!sawResult && withheld) { sawResult = true; yield withheld; return; }
+            if (!sawResult && (cut ?? withheld)) { sawResult = true; yield cut ?? withheld; return; }
             if (!sawResult) yield {kind: 'result', status: event.limited ? 'limited' : 'failed', text: 'protocol error: claude exited without result'};
             return;
           }
@@ -107,6 +110,12 @@ export function createClaudeLive({connect = nodeConnect, fs = nodeFs, kill = pro
               if (normalized.success && raw.num_turns === 0 && !String(raw.result ?? '').trim() && !withheld) {
                 withheld = {kind: 'result', text: normalized.text, success: normalized.success, status: 'completed'};
                 yield {kind: 'diagnostic', text: 'claude reported leftover background tasks with an empty result; waiting for the turn itself'};
+                continue;
+              }
+              // A turn a delivered message cut at a tool call (stop_reason tool_use, seen with 2.1.319): the
+              // same process runs the turn that reads the message next, and that one is the answer.
+              if (normalized.success && raw.stop_reason === 'tool_use') {
+                cut = {kind: 'result', text: normalized.text, success: normalized.success, status: 'completed'};
                 continue;
               }
               sawResult = true;
@@ -150,7 +159,9 @@ export function createClaudeLive({connect = nodeConnect, fs = nodeFs, kill = pro
           socket.on('close', () => finish(wrote)); // only a turn that took the message and closed counts as live
           socket.on('connect', () => {
             socket.write(JSON.stringify({type: 'auth', token: messaging.token}) + '\n');
-            socket.end(JSON.stringify({type: 'user', message: {role: 'user', content: text}}) + '\n');
+            // priority now: Claude reads it after the running tool call; the default (next) stays queued
+            // until a turn that headless never starts (seen with 2.1.319).
+            socket.end(JSON.stringify({type: 'user', priority: 'now', message: {role: 'user', content: text}}) + '\n');
             wrote = true;
           });
         } catch { finish(false); }

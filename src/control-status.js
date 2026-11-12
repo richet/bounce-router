@@ -61,7 +61,7 @@ export function formatStatus(view) {
     view.wakesPaused ? `Automatic wakes are paused: you stopped a turn${view.wakesPaused.since ? ` at ${String(view.wakesPaused.since).slice(11, 16)}Z` : ''}; any message turns them back on.` : null,
     view.checkIn ? `Last check-in: ${String(view.checkIn.last ?? '').slice(11, 16)}Z${view.checkIn.quietMinutes != null ? `, after ${view.checkIn.quietMinutes} min without a turn` : ''}` : null,
     view.idle ? `Idle nudge: ${view.idle.nudges} since its last dispatch${view.idle.last ? `, last at ${String(view.idle.last).slice(11, 16)}Z` : ''}${view.idle.minutes != null ? ` after ${view.idle.minutes} min idle` : ''}${view.idle.next ? `; its note's next: ${view.idle.next}` : ''}` : null,
-    view.tasks.length ? `Tasks:\n${view.tasks.map(t => `  ${short(t.task)} · ${t.profile ?? '?'}${t.ai ? ` on ${t.ai}` : ''} · ${t.state}${t.elapsed ? ` · ${t.elapsed}` : ''}${t.doing ? ` · ${t.doing}` : ''}`).join('\n')}` : 'Tasks: none live',
+    view.tasks.length ? `Tasks:\n${view.tasks.map(t => `  ${short(t.task)} · ${t.profile ?? '?'}${t.ai ? ` on ${t.ai}` : ''} · ${t.state === 'checking' ? 'check running' : t.state}${t.elapsed ? ` · ${t.elapsed}` : ''}${t.doing ? ` · ${t.doing}` : ''}`).join('\n')}` : 'Tasks: none live',
     view.blocked.length ? `Waiting on a decision:\n${view.blocked.map(b => `  ${short(b.task)} · ${b.reason ?? 'blocked'}${b.text ? ` · ${b.text}` : ''}`).join('\n')}` : null,
     view.lastAnswer ? `Last answer:\n${view.lastAnswer}` : null,
     view.quota ? `Quota: ${view.quota.map(q => `${q.provider} ${q.window} ${q.percent}%${q.ceiling < 100 ? ` of ${q.ceiling}` : ''}, resets ${new Date(q.resetsAt).toISOString().slice(0, 16).replace('T', ' ')}Z`).join(' · ')}` : null,

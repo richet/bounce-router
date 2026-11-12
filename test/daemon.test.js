@@ -5,12 +5,14 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {spawn, spawnSync} from 'node:child_process';
+import {spawn, spawnSync, execFileSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {supervise, installControlAuthority, installCrashRecord, releaseStuckDaemon, pidAlive} from '../src/reload.js';
 import {createTypesafeLive} from '../src/adapters/typesafe-live.js';
 import {socketPathFor, connectBus} from '../src/bus.js';
 import {quotaFile} from '../src/quota.js';
+import {taskView} from '../src/task-view.js';
+import {taskTree} from '../src/format.js';
 
 const cliPath = fileURLToPath(new URL('../src/cli.js', import.meta.url));
 const fakeCli = fileURLToPath(new URL('./helpers/fake-cli.js', import.meta.url));
@@ -719,7 +721,7 @@ test('O2 orchestrator single-provider: the orchestrator submits over the bridge,
   assert.equal(orders.includes('You may publish only: task.submitted, task.accepted, task.rework, task.cancel, task.milestone, task.blocked, task.input_required, task.usage, task.activity, message.'), true);
   // A replaced or no-longer-needed task must be told to stop waiting: the
   // orders name the exact verb so the orchestrator doesn't leave a superseded task's outcome pending.
-  assert.equal(orders.includes('When you replace a blocked task with a fresh one, or no longer need a task, cancel it with task.cancel and a reason, so its outcome stops waiting.'), true);
+  assert.equal(orders.includes('When you replace a blocked task with a fresh one, or no longer need a task, cancel it with task.cancel and its reason in text, so its outcome stops waiting. When you landed its work yourself, add landed with the commit: {"kind":"task.cancel","task":"<id>","text":"<why>","landed":"<commit>"}.'), true);
   // steps is refused-without when the completion reviewer is a verifier, so the brief has to name it.
   assert.equal(orders.includes('steps (the verification steps, as text) — required when the completion reviewer is a verifier profile'), true);
   // Milestone/report contract is a worker instruction, not an orchestrator order (item 7): the
@@ -935,6 +937,36 @@ test('O10 orchestrator task.cancel: refuses a foreign task, cancels its own runn
   assert.equal(cancelled.text, 'Cancelled by the orchestrator (no reason given)');
   // the outcome no longer sits pending: the orchestrator's own `wait` resolved on it
   assert.equal(session.events.some(e => e.kind === 'assistant' && e.text === 'child ended: task.cancelled (orchestrator)'), true);
+});
+
+// Found live: a cancel's reason sent as `reason` was dropped ("no reason given"), and a task whose work the orchestrator
+// had squashed onto a branch by hand read as lost work.
+test('orchestrator task.cancel keeps a reason sent as reason, and landed names the commit its work went in as', async t => {
+  const root = tmpRoot('bounce-landed-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  writeOrchestratorConfig(root, {profiles: {main: {adapter: 'codex'}, build: {adapter: 'codex'}}});
+  // The session runs in this file's scratch folder: a commit there for the cancel to name, removed after.
+  const cwd = process.cwd();
+  const git = args => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], {cwd, encoding: 'utf8'}).trim();
+  assert.equal(fs.existsSync(path.join(cwd, '.git')), false);
+  git(['init', '-q']);
+  t.after(() => fs.rmSync(path.join(cwd, '.git'), {recursive: true, force: true}));
+  git(['commit', '-q', '--allow-empty', '-m', 'landed']);
+  const head = git(['rev-parse', 'HEAD']);
+  const session = await runOrchestratorSession(root, {adapters: {codex: heldAdapter()}, env: {FAKE_ORCH_LANDED: head.slice(0, 7)}});
+  const submitted = session.events.find(e => e.kind === 'task.submitted');
+  const tried = JSON.parse(session.events.filter(e => e.kind === 'assistant').map(e => e.text).find(text => text.includes('unknown')));
+  assert.equal(tried.unknown, 'refused -32602', 'a landed that names no commit is refused');
+  assert.equal(tried.landed.ok, true);
+  const cancelled = session.events.find(e => e.kind === 'task.cancelled' && e.task === submitted.task);
+  assert.equal(cancelled.reason, 'orchestrator');
+  assert.equal(cancelled.landed, head);
+  assert.equal(cancelled.text, `Landed by the orchestrator as ${head.slice(0, 12)}: squashed its commits onto the batch branch`);
+  const view = taskView(session.events, submitted.task);
+  assert.equal(view.state, 'cancelled');
+  assert.equal(view.integration, `landed by the orchestrator as ${head.slice(0, 12)}`);
+  assert.equal(view.landed, head);
+  assert.match(taskTree(session.events).find(row => row.task === submitted.task).outcome, new RegExp(`^landed by the orchestrator as ${head.slice(0, 12)}$`));
 });
 
 // Jev (src/jev.js) end to end through the daemon: the config's `jev` block, the registered

@@ -431,7 +431,7 @@ function rootOf(taskView, id, seen = new Set()) {
 function outcomeOf(t) {
   if (t.state === 'failed') return `${t.reason ?? 'failed'}${t.error ? `: ${t.error}` : ''}`;
   if (t.state === 'timed_out') return 'deadline exceeded';
-  if (t.state === 'cancelled') return 'cancelled';
+  if (t.state === 'cancelled') return t.landed ? `landed by the orchestrator as ${t.landed.slice(0, 12)}` : 'cancelled';
   if (t.state === 'rejected') return 'rejected';
   if ((t.state === 'completed' || t.state === 'accepted') && t.summary) return t.summary;
   return null;

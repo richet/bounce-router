@@ -138,7 +138,8 @@ export function taskView(events, task, {now = Date.now(), journal = null, report
     reason: terminal?.reason ?? null,
     blocker: blocked ? cut(blocked.text, TEXT_MAX) : null,
     artifact: lastOf(events, task, 'artifact.captured')?.artifact ?? (artifact ? {id: artifact.artifactId, digest: artifact.digest, resultHash: artifact.resultHash, ...(artifact.leftOut ? {leftOut: artifact.leftOut} : {})} : null),
-    integration: lastOf(events, task, 'artifact.integrated')?.status ?? (integrated ? 'integrated' : null),
+    integration: lastOf(events, task, 'artifact.integrated')?.status ?? (integrated ? 'integrated' : null) ?? (state.landed ? `landed by the orchestrator as ${state.landed.slice(0, 12)}` : null),
+    ...(state.landed ? {landed: state.landed} : {}),
     // The raw material, named — never carried. Whoever wants it reads it themselves.
     journal: journal ? {path: journal, task, fromSeq: seqs.length ? Math.min(...seqs) : null, toSeq: seqs.length ? Math.max(...seqs) : null} : null,
   };
@@ -163,6 +164,15 @@ function replacementOf(events, states, task) {
   return current === task ? null : {task: current, state: states[current].state};
 }
 
+// A check-only task never starts a worker: bounce runs its check while the task still reads `queued`. The check's
+// milestone with no result after it is that run; the view says so, with its time, instead of `queued`.
+function checkRunning(events, task, state) {
+  if (state !== 'queued') return null;
+  const at = events.findLastIndex(e => e.kind === 'task.milestone' && e.task === task && e.phase === 'check');
+  if (at < 0 || events.slice(at + 1).some(e => e.kind === 'task.check' && e.task === task)) return null;
+  return events[at];
+}
+
 // Every task that is still live (or all of them), one line each, in the order they were submitted.
 export function taskList(events, {now = Date.now(), all = false} = {}) {
   const states = taskStates(events);
@@ -173,8 +183,9 @@ export function taskList(events, {now = Date.now(), all = false} = {}) {
       const started = events.find(e => e.kind === 'task.started' && e.task === task);
       const last = rowsOf(events, task, 'task.milestone').at(-1);
       const replacedBy = replacementOf(events, states, task);
-      return {task, state: states[task].state, profile: states[task].profile ?? null,
-        elapsed: started ? minutes(now - Date.parse(started.time)) : null,
+      const check = checkRunning(events, task, states[task].state);
+      return {task, state: check ? 'checking' : states[task].state, profile: states[task].profile ?? null,
+        elapsed: check ? minutes(now - Date.parse(check.time)) : started ? minutes(now - Date.parse(started.time)) : null,
         doing: cut(last?.text, TITLE_MAX) || null,
         findings: rowsOf(events, task, 'task.finding').length,
         ...(replacedBy ? {replacedBy} : {})};

@@ -34,6 +34,8 @@ if (!String(process.env.NODE_OPTIONS ?? '').includes(self)) {
 // The machine guard reads the real disk and load: test sessions live in a small /tmp and the suite loads the machine,
 // so daemons started here would pause their own dispatch. test/machine-guard.test.js drives it with a fake machine.
 process.env.BOUNCE_MACHINE_GUARD = 'off';
+// Docker's event stream (src/stacks.js watchStacks) is the machine's: daemons started here never open it.
+process.env.BOUNCE_STACK_WATCH = 'off';
 if (!process.env.BOUNCE_MACHINE_DIR) {
   const machine = fs.mkdtempSync(path.join(os.tmpdir(), 'bounce-test-machine-'));
   process.env.BOUNCE_MACHINE_DIR = machine;

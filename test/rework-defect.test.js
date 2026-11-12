@@ -51,3 +51,17 @@ test('a finding that faults the work without a location still goes back; only ch
   assert.equal(asksOnlyForChecking(['Needs independent verification.']), true);
   assert.equal(asksOnlyForChecking([]), true);
 });
+
+test('a finding the reviewer marks outside the task\'s scope is held for the orchestrator at once, not sent back', () => {
+  const outside = '{"file": "e2e/update.spec.ts", "severity": "blocker", "scope": "outside", "title": "no signed-install e2e: the harness runs the extracted binary"}';
+  const inside = '{"file": "src/x.js", "line": 12, "severity": "major", "title": "off by one"}';
+  for (const intent of [
+    defaultStrategy.onReviewVerdict('t1', [{verdict: 'rework', source: 'text', findings: [inside, outside]}], view, api()),
+    quorumStrategy(2).onReviewVerdict('t1', [{verdict: 'accept'}, {verdict: 'rework', source: 'text', findings: [outside]}], view, api()),
+  ]) {
+    assert.equal(intent.action, 'escalate');
+    assert.equal(intent.reason, 'review_out_of_scope');
+    assert.match(intent.text, /outside this task's scope.*Outside its scope: .*signed-install e2e/);
+  }
+  assert.ok(REVIEW_GATE_REASONS.has('review_out_of_scope'));
+});

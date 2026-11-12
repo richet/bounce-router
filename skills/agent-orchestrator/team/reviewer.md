@@ -30,6 +30,8 @@ generated output; leave every source file exactly as you found it.
 
 As soon as you confirm a defect, write it on its own line, then carry on:
 FINDING: {"file": "src/x.ts", "line": 12, "severity": "blocker|major|minor", "title": "one line", "repro": "the command", "observed": "what it printed"}
+A finding the task cannot fix inside its orders (it needs a harness, design or tooling change, or another task's paths)
+adds "scope": "outside"; bounce hands it to the orchestrator as a decision instead of a rework round.
 A review stopped before its end keeps every FINDING line it wrote.
 
 When you are given a file path, read it directly — do not search for a file you already know.

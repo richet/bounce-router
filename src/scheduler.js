@@ -174,7 +174,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   gateSlots = 0, gatePollMs = 2000, machineGuard = null, machineState = readMachineState, machinePollMs = 15000,
   // The directories watched for writes outside a worker's copy (src/outside-writes.js); null: the ones on PATH.
   outsideDirs = null,
-  sessionMode = 'yolo', depthCap = 1, checkpointRunner, limits: suppliedLimits = {}, strict = false, requireFinalReport = false, reportFormat = 'structured', reportGrant = null, clock = () => Date.now(), watchdog: suppliedWatchdog = {}, strategy = defaultStrategy, jev = null, gitHead = defaultGitHead, maxConcurrentCloud = 3, stackDown = stacksDown}) {
+  sessionMode = 'yolo', depthCap = 1, checkpointRunner, limits: suppliedLimits = {}, strict = false, requireFinalReport = false, reportFormat = 'structured', reportGrant = null, clock = () => Date.now(), watchdog: suppliedWatchdog = {}, strategy = defaultStrategy, jev = null, gitHead = defaultGitHead, maxConcurrentCloud = 3, stackDown = stacksDown, stackWatch = null}) {
   // Sizing limits (lines/probes/minutes) gate dispatch ONLY when the caller configures them: a
   // task's declared size is otherwise informational. The old built-in 150/6/15 defaults refused
   // real orchestrations (a 400-line brief) with no way to see why — a shallow rule, removed.
@@ -398,7 +398,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   function stacksOnEnd(task, context) {
     const copy = session.events.findLast(e => e.kind === 'task.workspace' && e.task === task)?.cwd;
     if (!copy || path.resolve(copy) === path.resolve(session.cwd) || !mayHoldStack(copy)) return;
-    Promise.resolve().then(() => stackDown(copy)).then(({down, failed}) => {
+    Promise.resolve().then(() => stackDown(copy, {seen: stackWatch?.projects() ?? []})).then(({down, failed}) => {
       if (closed || (!down.length && !failed.length)) return;
       if (down.length) session.append({kind: 'task.diagnostic', task, reason: 'stacks_down', text: `Took down the stack${down.length === 1 ? '' : 's'} left in ${copy}: ${down.join(', ')}.`, context, time: stamp()});
       if (failed.length) session.append({kind: 'task.diagnostic', task, reason: 'stacks_left', text: `Could not take down ${failed.map(f => `${f.name} (${f.error})`).join(', ')} in ${copy}: run docker compose -p NAME down --volumes there, or bounce prune --stacks.`, context, time: stamp()});
@@ -1339,8 +1339,16 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // `cancel()` tagged with reason 'orchestrator' — the same path a user cancel or the
   // superseded-task sweep (cancelSuperseded) drives, so the worker (if any) is stopped the normal
   // way and the task ends task.cancelled through the ordinary lifecycle.
+  // `landed` names the commit the orchestrator already landed the task's work as (taken by hand, squashed onto a branch):
+  // the task ends cancelled, and its row and views say where the work went, not that it was lost.
   async function cancelRequest(event) {
-    await cancel(event.task, {reason: 'orchestrator', text: event.text});
+    let landed = null;
+    if (event.landed != null) {
+      try { landed = commitIn(session.cwd, String(event.landed)); }
+      catch { throw new Error(`invalid event: task.cancel landed ${JSON.stringify(event.landed)} names no commit in ${session.cwd}`); }
+    }
+    const text = landed ? `Landed by the orchestrator as ${landed.slice(0, 12)}: ${event.text}` : event.text;
+    await cancel(event.task, {reason: 'orchestrator', text, landed});
     return session.events.findLast(e => e.kind === 'task.cancelled' && e.task === event.task) ?? null;
   }
 
@@ -3491,7 +3499,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     return [...(view[id]?.children ?? []).flatMap(child => postOrder(view, child, seen)), id];
   };
 
-  async function cancelOne(id, view, reason = 'user', text = null) {
+  async function cancelOne(id, view, reason = 'user', text = null, extra = {}) {
     if (session.events.findLast(e => e.task === id && e.kind === 'task.blocked')?.reason === 'orphaned') return false;
     if (!cancellationRequests.has(id)) {
       cancellationRequests.add(id);
@@ -3502,7 +3510,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       launching.cancelReason = reason;
       launching.localController?.abort();
       if (launching.phase === 'admission') {
-        append({kind: 'task.cancelled', task: id, reason, ...(text ? {text} : {}), from: workerFrom(id), context: view[id].context});
+        append({kind: 'task.cancelled', task: id, reason, ...(text ? {text} : {}), ...extra, from: workerFrom(id), context: view[id].context});
         return true;
       }
       append({kind: 'task.blocked', task: id, text: 'termination pending: worker launch has not resolved', context: view[id].context});
@@ -3534,7 +3542,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
       append({kind: 'task.blocked', task: id, text: 'termination unverified', from: workerFrom(id), context: view[id].context});
       return false;
     }
-    append({kind: 'task.cancelled', task: id, reason, ...(text ? {text} : {}), from: workerFrom(id), context: view[id].context});
+    append({kind: 'task.cancelled', task: id, reason, ...(text ? {text} : {}), ...extra, from: workerFrom(id), context: view[id].context});
     return true;
   }
 
@@ -3568,13 +3576,13 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
   // handler journals `task.deadline` (state -> `timed_out`, terminal) THEN cancels — the process
   // is still live and must actually be torn down, so this one caller needs to reach a task the
   // ordinary terminal-skip below would otherwise treat as already handled.
-  async function cancel(taskId, {force = false, reason = 'user', text = null} = {}) {
+  async function cancel(taskId, {force = false, reason = 'user', text = null, landed = null} = {}) {
     const view = reducers.tasks(session.events);
     if (!view[taskId]) return {verified: true}; // nothing was ever submitted under this id: nothing to cancel
     let verified = true;
     for (const id of postOrder(view, taskId)) {
       if (reducers.TERMINAL.has(view[id]?.state) && !(force && id === taskId)) continue;
-      if (!(await cancelOne(id, view, reason, text))) verified = false;
+      if (!(await cancelOne(id, view, reason, text, id === taskId && landed ? {landed} : {}))) verified = false;
     }
     return {verified};
   }
@@ -3649,7 +3657,7 @@ export function createScheduler({session, adapters, profiles, localSettings, loc
     spend: () => reducers.spend(session.events),
     // Test-only observable for the live activity map's size (F2/A5) — never used by production code.
     _activitySize: () => activity.size,
-    close: () => { closed = true; for (const entry of [...launchingAttempts.values(), ...reviews.values()]) entry.localController?.abort(); machineSlots.releaseAll(); effects.close(); unsubscribe(); if (watchdogInterval) clearInterval(watchdogInterval); },
+    close: () => { closed = true; for (const entry of [...launchingAttempts.values(), ...reviews.values()]) entry.localController?.abort(); machineSlots.releaseAll(); effects.close(); unsubscribe(); if (watchdogInterval) clearInterval(watchdogInterval); stackWatch?.close(); },
   };
 }
 
